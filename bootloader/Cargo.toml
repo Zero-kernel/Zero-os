@@ -1,0 +1,15 @@
+[package]
+name = "bootloader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+uefi = { version = "0.29", features = ["alloc", "global_allocator", "logger"] }
+log = "0.4"
+xmas-elf = "0.9"
+
+[[bin]]
+name = "bootloader"
+path = "src/main.rs"
+test = false
+bench = false

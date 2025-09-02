@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "bootloader",
+    "kernel",
+]
+resolver = "2"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 3
