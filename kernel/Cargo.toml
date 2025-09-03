@@ -9,10 +9,10 @@ lazy_static = { version = "1.4", features = ["spin_no_std"] }
 x86_64 = "0.15"
 uart_16550 = "0.3"
 linked_list_allocator = "0.10"
-crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
+# 暂时移除 crossbeam-queue，或确保正确配置
+# crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [profile.release]
 panic = "abort"
-
-[package.metadata]
-cargo-xbuild = { memcpy = true }
+lto = true
+opt-level = 3

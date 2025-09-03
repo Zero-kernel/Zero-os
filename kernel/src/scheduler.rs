@@ -22,7 +22,6 @@ impl Scheduler {
     }
     
     pub fn schedule(&mut self) -> Option<usize> {
-        // 简单的轮转调度
         if let Some(pid) = self.ready_queue.pop_front() {
             if let Some(current) = self.current_process {
                 self.ready_queue.push_back(current);

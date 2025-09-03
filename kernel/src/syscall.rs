@@ -1,5 +1,5 @@
 use crate::println;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
+use x86_64::structures::idt:: InterruptStackFrame;
 
 // 系统调用包括subscribe、command、allow等，由内核核心处理
 #[derive(Debug)]
