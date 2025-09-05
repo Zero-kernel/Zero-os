@@ -1,6 +1,6 @@
 [Switch to English (切换到英文)](README.md)
 
-# Rust 微内核项目
+# ZERO-os
 
 ## 1. 项目概述
 

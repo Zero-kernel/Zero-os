@@ -1,6 +1,6 @@
 [Switch to Chinese (切换到中文)](README_zh.md)
 
-# Rust Microkernel Project
+# ZERO-os
 
 ## 1. Overview
 
