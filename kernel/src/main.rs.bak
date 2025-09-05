@@ -1,0 +1,47 @@
+#![no_std]
+#![no_main]
+
+use core::panic::PanicInfo;
+
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    // 直接写入 VGA 缓冲区，不使用任何依赖
+    unsafe {
+        let vga = 0xb8000 as *mut u8;
+        
+        // 清屏
+        for i in 0..(80 * 25 * 2) {
+            *vga.offset(i) = if i % 2 == 0 { b' ' } else { 0x07 };
+        }
+        
+        // 写入测试消息
+        let msg = b"KERNEL RUNNING!";
+        for (i, &byte) in msg.iter().enumerate() {
+            *vga.offset(i as isize * 2) = byte;
+            *vga.offset(i as isize * 2 + 1) = 0x0A; // 绿色
+        }
+    }
+    
+    loop {
+        unsafe {
+            core::arch::asm!("hlt");
+        }
+    }
+}
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    unsafe {
+        let vga = 0xb8000 as *mut u8;
+        let msg = b"PANIC!";
+        for (i, &byte) in msg.iter().enumerate() {
+            *vga.offset(i as isize * 2) = byte;
+            *vga.offset(i as isize * 2 + 1) = 0x4F; // 红底白字
+        }
+    }
+    loop {
+        unsafe {
+            core::arch::asm!("hlt");
+        }
+    }
+}
