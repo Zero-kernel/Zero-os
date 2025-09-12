@@ -4,7 +4,7 @@
 OVMF_PATH = /usr/share/OVMF/OVMF_CODE.fd
 QEMU = qemu-system-x86_64
 ESP_DIR = esp/EFI/BOOT
-KERNEL_LD = /home/thefool/rust-microkernel/kernel/kernel.ld
+KERNEL_LD = $(shell pwd)/kernel/kernel.ld
 
 all: build
 
