@@ -15,7 +15,7 @@ const PCI_CONFIG_DATA: u16 = 0xCFC;
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 const VIRTIO_NET_TRANSITIONAL: u16 = 0x1000; // Legacy/transitional device ID
-const VIRTIO_NET_MODERN: u16 = 0x1041;       // Modern device ID
+const VIRTIO_NET_MODERN: u16 = 0x1041; // Modern device ID
 
 const PCI_COMMAND: u8 = 0x04;
 const PCI_BAR0: u8 = 0x10;
@@ -119,7 +119,11 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
 
                 drivers::println!(
                     "    Probing virtio-net candidate: {:02x}:{:02x}.{} device={:#x} subsys={:#x}",
-                    bus, dev, func, device_id, subsystem_id
+                    bus,
+                    dev,
+                    func,
+                    device_id,
+                    subsystem_id
                 );
 
                 // Enable memory space and bus mastering
@@ -149,7 +153,9 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
                 } else {
                     drivers::println!(
                         "    ! virtio-net @ {:02x}:{:02x}.{} lacks modern capabilities",
-                        bus, dev, func
+                        bus,
+                        dev,
+                        func
                     );
                 }
             }

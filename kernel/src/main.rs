@@ -12,10 +12,10 @@ extern crate drivers;
 extern crate arch;
 extern crate block;
 extern crate cap;
-extern crate net;
 extern crate ipc;
 extern crate kernel_core;
 extern crate mm;
+extern crate net;
 extern crate sched;
 extern crate security;
 extern crate vfs;
@@ -101,7 +101,10 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
     match device.write_sync(test_sector, &test_pattern) {
         Ok(n) if n == sector_size => {}
         Ok(n) => {
-            println!("        [FAIL] Write returned {} bytes, expected {}", n, sector_size);
+            println!(
+                "        [FAIL] Write returned {} bytes, expected {}",
+                n, sector_size
+            );
             return false;
         }
         Err(e) => {
@@ -115,7 +118,10 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
     match device.read_sync(test_sector, &mut read_buf) {
         Ok(n) if n == sector_size => {}
         Ok(n) => {
-            println!("        [FAIL] Read returned {} bytes, expected {}", n, sector_size);
+            println!(
+                "        [FAIL] Read returned {} bytes, expected {}",
+                n, sector_size
+            );
             return false;
         }
         Err(e) => {
@@ -380,6 +386,42 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("      ✓ System calls framework ready");
     println!("      ✓ Fork/COW implementation compiled");
 
+    // Phase E: APIC and SMP Initialization
+    println!("[5.5/8] Initializing APIC and SMP...");
+    {
+        // Pass ACPI RSDP address from bootloader to SMP module (required for UEFI systems)
+        if let Some(info) = boot_info {
+            arch::set_rsdp_address(info.rsdp_address);
+        }
+
+        // Initialize BSP's Local APIC
+        unsafe {
+            arch::apic::init();
+        }
+        let bsp_lapic_id = arch::apic::bsp_lapic_id();
+        println!("      ✓ BSP LAPIC initialized (ID: {})", bsp_lapic_id);
+
+        // Initialize BSP's per-CPU data
+        // Get kernel stack top from GDT (set during arch::interrupts::init)
+        let kernel_stack_top = arch::default_kernel_stack_top() as usize;
+        arch::init_bsp(
+            bsp_lapic_id,
+            kernel_stack_top,
+            kernel_stack_top, // IRQ stack (same as kernel stack for now)
+            kernel_stack_top, // Syscall stack (same for now)
+        );
+        println!("      ✓ BSP per-CPU data initialized");
+
+        // Attempt to bring up Application Processors (APs)
+        // This will enumerate CPUs via ACPI MADT and send INIT-SIPI-SIPI
+        let num_cpus = arch::start_aps();
+        if num_cpus > 1 {
+            println!("      ✓ SMP enabled: {} CPU(s) online", num_cpus);
+        } else {
+            println!("      ✓ Single-core mode (no APs found or SMP disabled)");
+        }
+    }
+
     println!("[6/8] Initializing scheduler...");
     sched::enhanced_scheduler::init(); // 注册定时器和重调度回调
     println!("      ✓ Enhanced scheduler initialized");
@@ -428,9 +470,15 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 match vfs::Ext2Fs::mount(device) {
                     Ok(fs) => match vfs::mount("/mnt", fs) {
                         Ok(()) => println!("      ✓ Mounted /dev/{} on /mnt as ext2", name),
-                        Err(e) => println!("      ! Registered /dev/{} but failed to mount on /mnt: {:?}", name, e),
+                        Err(e) => println!(
+                            "      ! Registered /dev/{} but failed to mount on /mnt: {:?}",
+                            name, e
+                        ),
                     },
-                    Err(e) => println!("      ! Registered /dev/{} but failed to initialize ext2: {:?}", name, e),
+                    Err(e) => println!(
+                        "      ! Registered /dev/{} but failed to initialize ext2: {:?}",
+                        name, e
+                    ),
                 }
             }
             Err(e) => println!("      ! Failed to register /dev/{}: {:?}", name, e),
@@ -438,7 +486,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     }
 
     println!("[7.6/8] Initializing audit subsystem...");
-    match audit::init(64) { // Reduced from 256 to save heap memory
+    match audit::init(64) {
+        // Reduced from 256 to save heap memory
         Ok(()) => {
             // Emit boot event
             let _ = audit::emit(
@@ -477,6 +526,28 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 Err(audit::AuditError::AccessDenied)
             });
             println!("      ✓ Audit capability gate registered (CAP_AUDIT_READ)");
+
+            // R66-10 FIX: Register HMAC key authorizer (capability gate for audit config)
+            // Policy: Allow root (euid == 0) OR holders of CAP_AUDIT_WRITE
+            audit::register_hmac_key_authorizer(|| {
+                // Allow root users
+                if let Some(creds) = current_credentials() {
+                    if creds.euid == 0 {
+                        return Ok(());
+                    }
+                }
+                // Allow processes with CAP_AUDIT_WRITE capability
+                if let Some(has_cap) =
+                    with_current_cap_table(|table| table.has_rights(CapRights::AUDIT_WRITE))
+                {
+                    if has_cap {
+                        return Ok(());
+                    }
+                }
+                // Deny all others
+                Err(audit::AuditError::AccessDenied)
+            });
+            println!("      ✓ Audit HMAC key gate registered (CAP_AUDIT_WRITE)");
         }
         Err(e) => {
             println!("      ! Audit initialization failed: {:?}", e);
@@ -571,7 +642,9 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
             buf[i] = b'0' + (n % 10) as u8;
             n /= 10;
             i += 1;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
         }
         while i > 0 {
             i -= 1;
@@ -618,7 +691,9 @@ fn panic(info: &PanicInfo) -> ! {
         impl core::fmt::Write for SerialFmt {
             fn write_str(&mut self, s: &str) -> core::fmt::Result {
                 for b in s.bytes() {
-                    unsafe { serial_write_byte(b); }
+                    unsafe {
+                        serial_write_byte(b);
+                    }
                 }
                 Ok(())
             }

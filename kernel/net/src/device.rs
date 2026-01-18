@@ -357,4 +357,10 @@ pub trait NetDevice: Send {
     fn rx_errors(&self) -> u64 {
         0
     }
+
+    /// Get the number of RX packets dropped due to queue overflow.
+    /// R66-8: Added to track bounded RX queue drops.
+    fn rx_dropped(&self) -> u64 {
+        0
+    }
 }

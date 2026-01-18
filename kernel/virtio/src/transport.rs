@@ -232,10 +232,7 @@ impl VirtioTransport {
             }
             VirtioTransport::Pci(t) => {
                 write_volatile(&mut (*t.common_cfg).queue_select, queue);
-                write_volatile(
-                    &mut (*t.common_cfg).queue_enable,
-                    if ready { 1 } else { 0 },
-                );
+                write_volatile(&mut (*t.common_cfg).queue_enable, if ready { 1 } else { 0 });
                 // Memory barrier to ensure writes are flushed
                 fence(Ordering::SeqCst);
             }
@@ -313,10 +310,8 @@ impl VirtioTransport {
     /// The type `T` must be `repr(C)` and match the device's config layout.
     pub unsafe fn read_config_struct<T: Copy>(&self) -> T {
         let mut out = MaybeUninit::<T>::uninit();
-        let raw = core::slice::from_raw_parts_mut(
-            out.as_mut_ptr() as *mut u8,
-            core::mem::size_of::<T>(),
-        );
+        let raw =
+            core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, core::mem::size_of::<T>());
         self.read_config_bytes(0, raw);
         out.assume_init()
     }

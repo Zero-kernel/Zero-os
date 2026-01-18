@@ -574,7 +574,11 @@ impl GlobalPageCache {
     /// R42-4 FIX: Removed redundant page.get() call. The Arc clone already
     /// increments the reference count. The internal refcount field is now
     /// only used for explicit pinning by callers who need it.
-    pub fn find_get_page(&self, inode_id: InodeId, index: PageIndex) -> Option<Arc<PageCacheEntry>> {
+    pub fn find_get_page(
+        &self,
+        inode_id: InodeId,
+        index: PageIndex,
+    ) -> Option<Arc<PageCacheEntry>> {
         let bucket_idx = hash_key(inode_id, index);
         let bucket = self.buckets[bucket_idx].read();
 
@@ -632,7 +636,11 @@ impl GlobalPageCache {
     }
 
     /// Remove a page from the cache
-    pub fn remove_from_cache(&self, inode_id: InodeId, index: PageIndex) -> Option<Arc<PageCacheEntry>> {
+    pub fn remove_from_cache(
+        &self,
+        inode_id: InodeId,
+        index: PageIndex,
+    ) -> Option<Arc<PageCacheEntry>> {
         let bucket_idx = hash_key(inode_id, index);
         let mut bucket = self.buckets[bucket_idx].write();
 
@@ -904,10 +912,7 @@ pub struct WritebackStats {
 /// Scan the LRU list and writeback dirty pages
 ///
 /// Returns writeback statistics.
-pub fn writeback_dirty_pages<F>(
-    max_pages: usize,
-    write_fn: F,
-) -> WritebackStats
+pub fn writeback_dirty_pages<F>(max_pages: usize, write_fn: F) -> WritebackStats
 where
     F: Fn(&PageCacheEntry) -> Result<(), ()>,
 {

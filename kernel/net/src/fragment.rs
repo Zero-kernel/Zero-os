@@ -113,6 +113,54 @@ impl FragmentStats {
             buffered_bytes: AtomicU64::new(0),
         }
     }
+
+    /// R66-11 FIX: Atomically reserve a fragment slot if within limit.
+    /// Returns true if reservation succeeded, false if limit would be exceeded.
+    pub fn try_reserve_fragment(&self, max_frags: usize) -> bool {
+        self.buffered_fragments
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if (current as usize) < max_frags {
+                    Some(current + 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+
+    /// R66-11 FIX: Atomically reserve bytes if within limit.
+    /// Returns true if reservation succeeded, false if limit would be exceeded.
+    pub fn try_reserve_bytes(&self, bytes: usize, max_bytes: usize) -> bool {
+        self.buffered_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                let new_val = current.saturating_add(bytes as u64);
+                if (new_val as usize) <= max_bytes {
+                    Some(new_val)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+
+    /// R66-11 FIX: Release previously reserved fragment slot.
+    pub fn release_fragment(&self) {
+        // Saturating sub to handle edge cases
+        self.buffered_fragments
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            })
+            .ok();
+    }
+
+    /// R66-11 FIX: Release previously reserved bytes.
+    pub fn release_bytes(&self, bytes: usize) {
+        self.buffered_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(bytes as u64))
+            })
+            .ok();
+    }
 }
 
 // ============================================================================
@@ -274,7 +322,10 @@ impl FragmentQueue {
             received_frags: 0,
             received_bytes: 0,
             // Initial hole: entire possible packet range
-            holes: alloc::vec![FragmentHole { start: 0, end: u16::MAX }],
+            holes: alloc::vec![FragmentHole {
+                start: 0,
+                end: u16::MAX
+            }],
             frags: BTreeMap::new(),
             have_first: false,
             have_last: false,
@@ -317,7 +368,9 @@ impl FragmentQueue {
         }
 
         let frag_start = offset;
-        let frag_end = offset.checked_add(len).ok_or(FragmentDropReason::TooLarge)?;
+        let frag_end = offset
+            .checked_add(len)
+            .ok_or(FragmentDropReason::TooLarge)?;
 
         // Check max packet size
         if frag_end as usize > MAX_PACKET_SIZE {
@@ -529,7 +582,9 @@ impl FragmentCache {
         payload: &[u8],
         now_ms: u64,
     ) -> Result<Option<Vec<u8>>, FragmentDropReason> {
-        self.stats.fragments_received.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .fragments_received
+            .fetch_add(1, Ordering::Relaxed);
 
         let key = FragmentKey::from_header(header);
         let src_ip = key.src_ip();
@@ -557,9 +612,13 @@ impl FragmentCache {
                 self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
                 self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
                 if frag_count > 0 {
-                    self.stats.buffered_fragments.fetch_sub(frag_count, Ordering::Relaxed);
+                    self.stats
+                        .buffered_fragments
+                        .fetch_sub(frag_count, Ordering::Relaxed);
                     // R62-2 FIX: Decrement buffered bytes on arrival-time timeout
-                    self.stats.buffered_bytes.fetch_sub(byte_count, Ordering::Relaxed);
+                    self.stats
+                        .buffered_bytes
+                        .fetch_sub(byte_count, Ordering::Relaxed);
                 }
                 return Err(FragmentDropReason::Timeout);
             }
@@ -580,16 +639,22 @@ impl FragmentCache {
         } else {
             // Check limits before creating new queue
             if current_queues >= GLOBAL_MAX_QUEUES {
-                self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .global_limit_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(FragmentDropReason::GlobalQueueLimit);
             }
             if current_frags >= GLOBAL_MAX_FRAGS {
-                self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .global_limit_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(FragmentDropReason::GlobalFragLimit);
             }
             // R62-2 FIX: Reject if adding this fragment would exceed global byte limit
             if current_bytes.saturating_add(payload.len()) > GLOBAL_MAX_FRAG_BYTES {
-                self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .global_limit_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(FragmentDropReason::GlobalByteLimit);
             }
 
@@ -610,30 +675,63 @@ impl FragmentCache {
             queues.get_mut(&key).unwrap()
         };
 
-        // R62-2 FIX: Pre-check global byte limit before insert for EXISTING queues
-        // (New queue check is above; this catches fragments adding to existing queues)
-        // R63-6 FIX: Also check global fragment count for existing queues
-        if !created_new_queue {
-            let current_bytes = self.stats.buffered_bytes.load(Ordering::Relaxed) as usize;
-            if current_bytes.saturating_add(payload.len()) > GLOBAL_MAX_FRAG_BYTES {
-                self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
-                return Err(FragmentDropReason::GlobalByteLimit);
+        // R66-11 FIX: Use atomic check-and-increment for global limits
+        // This replaces the racy check-then-increment pattern with CAS operations.
+        // We reserve resources BEFORE insertion, then release on failure.
+
+        // For new queues, limits were already checked above (non-atomically is OK there
+        // because we hold the queue lock and haven't committed anything yet).
+        // For existing queues, we must atomically reserve.
+
+        // R66-11 FIX: Atomically reserve fragment slot
+        if !self.stats.try_reserve_fragment(GLOBAL_MAX_FRAGS) {
+            // Codex review fix: Roll back queue creation on reservation failure
+            if created_new_queue {
+                queues.remove(&key);
+                if let Some(count) = per_src.get_mut(&src_ip) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        per_src.remove(&src_ip);
+                    }
+                }
+                self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
             }
-            let current_frags = self.stats.buffered_fragments.load(Ordering::Relaxed) as usize;
-            if current_frags.saturating_add(1) > GLOBAL_MAX_FRAGS {
-                self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
-                return Err(FragmentDropReason::GlobalFragLimit);
-            }
+            self.stats
+                .global_limit_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(FragmentDropReason::GlobalFragLimit);
         }
 
-        // Insert fragment
+        // R66-11 FIX: Atomically reserve bytes
+        if !self
+            .stats
+            .try_reserve_bytes(payload.len(), GLOBAL_MAX_FRAG_BYTES)
+        {
+            // Release the fragment slot we just reserved
+            self.stats.release_fragment();
+
+            // Codex review fix: Roll back queue creation on reservation failure
+            if created_new_queue {
+                queues.remove(&key);
+                if let Some(count) = per_src.get_mut(&src_ip) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        per_src.remove(&src_ip);
+                    }
+                }
+                self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
+            }
+
+            self.stats
+                .global_limit_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(FragmentDropReason::GlobalByteLimit);
+        }
+
+        // Insert fragment (resources are now reserved)
         match queue.insert(offset, more_fragments, payload, now_ms) {
             Ok(complete) => {
-                self.stats.buffered_fragments.fetch_add(1, Ordering::Relaxed);
-                // R62-2 FIX: Track buffered bytes
-                self.stats
-                    .buffered_bytes
-                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                // Resources already accounted for via try_reserve above
 
                 if complete {
                     // Reassembly complete - extract data before removing queue
@@ -650,9 +748,13 @@ impl FragmentCache {
                         }
                     }
                     self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
-                    self.stats.buffered_fragments.fetch_sub(frag_count, Ordering::Relaxed);
+                    self.stats
+                        .buffered_fragments
+                        .fetch_sub(frag_count, Ordering::Relaxed);
                     // R62-2 FIX: Decrement buffered bytes on completion
-                    self.stats.buffered_bytes.fetch_sub(byte_count, Ordering::Relaxed);
+                    self.stats
+                        .buffered_bytes
+                        .fetch_sub(byte_count, Ordering::Relaxed);
                     self.stats.reassembled.fetch_add(1, Ordering::Relaxed);
 
                     Ok(result)
@@ -661,9 +763,15 @@ impl FragmentCache {
                 }
             }
             Err(reason) => {
+                // R66-11 FIX: Release reserved resources since insert failed
+                // We reserved 1 fragment slot and payload.len() bytes before insert
+                self.stats.release_fragment();
+                self.stats.release_bytes(payload.len());
+
                 // RFC 5722 compliance: on overlap OR duplicate, discard the ENTIRE reassembly queue
                 // Both indicate either an attack or a retransmission with different data
-                if reason == FragmentDropReason::Overlap || reason == FragmentDropReason::Duplicate {
+                if reason == FragmentDropReason::Overlap || reason == FragmentDropReason::Duplicate
+                {
                     let frag_count = queue.received_frags as u32;
                     let byte_count = queue.received_bytes as u64;
                     queues.remove(&key);
@@ -675,9 +783,13 @@ impl FragmentCache {
                     }
                     self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
                     if frag_count > 0 {
-                        self.stats.buffered_fragments.fetch_sub(frag_count, Ordering::Relaxed);
+                        self.stats
+                            .buffered_fragments
+                            .fetch_sub(frag_count, Ordering::Relaxed);
                         // R62-2 FIX: Decrement buffered bytes on queue removal
-                        self.stats.buffered_bytes.fetch_sub(byte_count, Ordering::Relaxed);
+                        self.stats
+                            .buffered_bytes
+                            .fetch_sub(byte_count, Ordering::Relaxed);
                     }
                     self.stats.overlap_drops.fetch_add(1, Ordering::Relaxed);
                     return Err(reason);
@@ -698,11 +810,17 @@ impl FragmentCache {
                     }
                     self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
                     if frag_count > 0 {
-                        self.stats.buffered_fragments.fetch_sub(frag_count, Ordering::Relaxed);
+                        self.stats
+                            .buffered_fragments
+                            .fetch_sub(frag_count, Ordering::Relaxed);
                         // R62-2 FIX: Decrement buffered bytes on queue removal
-                        self.stats.buffered_bytes.fetch_sub(byte_count, Ordering::Relaxed);
+                        self.stats
+                            .buffered_bytes
+                            .fetch_sub(byte_count, Ordering::Relaxed);
                     }
-                    self.stats.first_too_small_drops.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .first_too_small_drops
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(reason);
                 }
 
@@ -725,7 +843,9 @@ impl FragmentCache {
                         self.stats.rate_limit_drops.fetch_add(1, Ordering::Relaxed);
                     }
                     FragmentDropReason::FirstTooSmall => {
-                        self.stats.first_too_small_drops.fetch_add(1, Ordering::Relaxed);
+                        self.stats
+                            .first_too_small_drops
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     FragmentDropReason::TooLarge => {
                         self.stats.too_large_drops.fetch_add(1, Ordering::Relaxed);
@@ -753,7 +873,12 @@ impl FragmentCache {
         for (&key, queue) in queues.iter() {
             if queue.is_expired(now_ms) {
                 // R62-2 FIX: Include byte count for cleanup
-                expired_keys.push((key, queue.key.src_ip(), queue.received_frags, queue.received_bytes));
+                expired_keys.push((
+                    key,
+                    queue.key.src_ip(),
+                    queue.received_frags,
+                    queue.received_bytes,
+                ));
             }
         }
 
@@ -769,9 +894,13 @@ impl FragmentCache {
             }
             self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
             self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
-            self.stats.buffered_fragments.fetch_sub(frag_count as u32, Ordering::Relaxed);
+            self.stats
+                .buffered_fragments
+                .fetch_sub(frag_count as u32, Ordering::Relaxed);
             // R62-2 FIX: Decrement buffered bytes on timeout cleanup
-            self.stats.buffered_bytes.fetch_sub(byte_count as u64, Ordering::Relaxed);
+            self.stats
+                .buffered_bytes
+                .fetch_sub(byte_count as u64, Ordering::Relaxed);
         }
 
         count

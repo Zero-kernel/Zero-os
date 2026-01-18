@@ -59,9 +59,8 @@ use audit::{emit_seccomp_violation, AuditSeccompAction, AuditSubject};
 pub mod types;
 
 pub use types::{
-    FastAllowSet, PledgePromises, PledgeState, SeccompAction, SeccompError,
-    SeccompFilter, SeccompFlags, SeccompInsn, SeccompState, SeccompVerdict,
-    MAX_INSNS,
+    FastAllowSet, PledgePromises, PledgeState, SeccompAction, SeccompError, SeccompFilter,
+    SeccompFlags, SeccompInsn, SeccompState, SeccompVerdict, MAX_INSNS,
 };
 
 // ============================================================================
@@ -392,7 +391,7 @@ pub fn notify_violation(
     // Extract errno from action if applicable
     let errno = match verdict.action {
         SeccompAction::Errno(e) => e as i32,
-        SeccompAction::Kill => 9, // SIGKILL-like
+        SeccompAction::Kill => 9,  // SIGKILL-like
         SeccompAction::Trap => 31, // SIGSYS
         _ => 0,
     };

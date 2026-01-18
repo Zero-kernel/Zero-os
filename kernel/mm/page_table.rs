@@ -190,10 +190,7 @@ impl PageTableManager {
         frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     ) -> Result<(), MapError> {
         // R32-MM-2 FIX: Use checked_add to prevent overflow when rounding up
-        let page_count = size
-            .checked_add(0xfff)
-            .ok_or(MapError::InvalidRange)?
-            / 0x1000;
+        let page_count = size.checked_add(0xfff).ok_or(MapError::InvalidRange)? / 0x1000;
 
         // R34-MM-1 FIX: Track successfully mapped pages for rollback on error
         let mut mapped_pages: Vec<Page<Size4KiB>> = Vec::with_capacity(page_count);
@@ -235,10 +232,7 @@ impl PageTableManager {
     /// mirroring the safety measures in map_range().
     pub fn unmap_range(&mut self, start_virt: VirtAddr, size: usize) -> Result<(), UnmapError> {
         // R35-MM-2 FIX: Use checked_add to prevent overflow when rounding up
-        let page_count = size
-            .checked_add(0xfff)
-            .ok_or(UnmapError::InvalidRange)?
-            / 0x1000;
+        let page_count = size.checked_add(0xfff).ok_or(UnmapError::InvalidRange)? / 0x1000;
 
         for i in 0..page_count {
             // R35-MM-2 FIX: Use checked arithmetic for offset calculation
@@ -606,10 +600,7 @@ pub unsafe fn ensure_pte_range(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<(), MapError> {
     // R32-MM-2 FIX: Use checked_add to prevent overflow when rounding up
-    let pages = size
-        .checked_add(0xfff)
-        .ok_or(MapError::InvalidRange)?
-        / 0x1000;
+    let pages = size.checked_add(0xfff).ok_or(MapError::InvalidRange)? / 0x1000;
     for i in 0..pages {
         // R32-MM-2 FIX: Use checked arithmetic for offset calculation
         let offset = (i as u64)
@@ -643,10 +634,7 @@ pub unsafe fn map_mmio(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<(), MapError> {
     // R32-MM-2 FIX: Pre-calculate page count with overflow checking
-    let pages = size
-        .checked_add(0xfff)
-        .ok_or(MapError::InvalidRange)?
-        / 0x1000;
+    let pages = size.checked_add(0xfff).ok_or(MapError::InvalidRange)? / 0x1000;
 
     // First ensure all pages are at 4KB granularity
     ensure_pte_range(virt, size, frame_allocator)?;

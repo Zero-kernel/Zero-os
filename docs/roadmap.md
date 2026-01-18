@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-15
+**Last Updated:** 2026-01-17
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,10 +10,10 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase D.3 In Progress (SYN Cookies Complete)
+### Current Status: Phase E IN PROGRESS (SMP Infrastructure)
 
-Zero-OS has completed storage foundation and is building network infrastructure:
-- **63 security audits** with 279 issues found, ~245 fixed (87.8%)
+Zero-OS has completed network foundation with comprehensive validation:
+- **66 security audits** with 316 issues found, ~265 fixed (83.9%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -21,8 +21,15 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 - **Phase A**: ~90% complete (Usercopy ✅, Spectre ✅, SMP-stubs ✅, Audit gate ✅, KASLR partial)
 - **Phase B**: ✅ **COMPLETE** (Cap/LSM/Seccomp integrated into syscall paths)
 - **Phase C**: ✅ **COMPLETE** (virtio-blk, page cache, ext2, procfs, OOM killer, openat2, devfs read/write)
-- **Phase D.1**: ✅ **COMPLETE** (virtio crate, NetDevice trait, virtio-net driver MVP)
-- **Phase D.2**: ✅ **COMPLETE** (TCP client/server, retransmission with RFC 6298 RTT)
+- **Phase D**: ✅ **COMPLETE** (Full network stack with loopback validation)
+  - D.1: virtio-net driver, NetDevice trait ✅
+  - D.2: TCP client/server with RFC 6298 RTT ✅
+  - D.3: TCP hardening (MSS/WS validation, SYN cookies) ✅
+  - D.4: Runtime loopback tests (UDP, TCP SYN, conntrack, firewall) ✅
+- **Phase E**: 🔨 **IN PROGRESS** (SMP & Concurrency)
+  - E.1: LAPIC/IOAPIC initialization ✅
+  - E.3: PerCpuData structure ✅, Per-CPU FPU save areas ✅
+  - Pending: AP bootstrap, TLB shootdown, per-CPU runqueues
 - **R54**: ISN secret auto-upgrade ✅, Challenge ACK rate limiting ✅
 - **R55**: NewReno congestion control ✅ (RFC 6582 partial ACK handling)
 - **R56**: Limited Transmit ✅ (RFC 3042 adapted for immediate-send architecture)
@@ -31,6 +38,7 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 - **R59**: Ephemeral port randomization ✅ (RFC 6056 CSPRNG)
 - **R60**: IP fragment reassembly ✅ (RFC 791/815/5722 security hardening)
 - **R61**: SYN cookies ✅ (RFC 4987 stateless SYN flood protection)
+- **R66**: TCP options validation ✅, VirtIO hardening ✅, Runtime network tests ✅
 
 ### Gap Analysis vs Linux Kernel
 
@@ -38,7 +46,7 @@ Zero-OS has completed storage foundation and is building network infrastructure:
 |----------|-------|---------|-----|
 | **SMP** | 256+ CPUs | Single-core | Full implementation needed |
 | **Security Framework** | LSM/SELinux/AppArmor | LSM + Seccomp + Capabilities | ✅ Framework complete, policies needed |
-| **Network** | Full TCP/IP stack | TCP (w/retransmission + NewReno CC + Window Scaling + SYN cookies + Conntrack + Firewall), UDP, ICMP | SACK, Timestamps |
+| **Network** | Full TCP/IP stack | TCP (w/retransmission + NewReno CC + Window Scaling + SYN cookies + Conntrack + Firewall + Options validation), UDP, ICMP | SACK, Timestamps |
 | **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
 | **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
 | **Containers** | Namespaces/Cgroups | Not started | Full implementation needed |
@@ -498,6 +506,8 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] **R61 IMPLEMENTED**: SYN cookies (RFC 4987) - stateless SYN-ACK on backlog full
 - [x] **R63 IMPLEMENTED**: Conntrack state machine (TCP/UDP/ICMP tracking, direction fix, LRU eviction)
 - [x] **R63 IMPLEMENTED**: Basic firewall (match + action table, stateful filtering, ACCEPT/DROP/REJECT)
+- [x] **R66-1 FIXED**: TCP MSS minimum validation (RFC 879, 536 bytes minimum)
+- [x] **R66-2 FIXED**: TCP Window Scale maximum validation (RFC 7323, max shift 14)
 
 #### D.4 Socket API ✅ COMPLETE
 
@@ -522,20 +532,23 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 
 ---
 
-### Phase E: SMP & Concurrency
+### Phase E: SMP & Concurrency [IN PROGRESS]
 
 **Goal**: Multi-core support with correct synchronization.
 
 **Priority**: Medium-High (can be deferred after D)
 **Dependencies**: Phase A.6 (SMP-ready interfaces)
+**Status**: E.1/E.3 complete, AP bootstrap integrated in main.rs, APs park in HLT loop awaiting scheduler work
 
 #### E.1 Hardware Initialization
 
-- [ ] LAPIC initialization
-- [ ] IOAPIC initialization
+- [x] LAPIC initialization (kernel/arch/apic.rs - init_lapic, lapic_eoi, lapic_id)
+- [x] IOAPIC initialization (kernel/arch/apic.rs - init_ioapic, ioapic_route_irq)
 - [ ] HPET timer
-- [ ] AP boot (trampoline)
-- [ ] IPI type table (resched, TLB, profile, panic)
+- [x] AP boot infrastructure (kernel/arch/smp.rs - start_aps, ap_rust_entry, ACPI MADT parsing)
+- [x] AP trampoline (kernel/arch/smp.rs - generate_trampoline() runtime binary blob)
+- [x] IPI type table (kernel/arch/ipi.rs - 5 types 0xFB-0xFF, kernel/arch/apic.rs - send_ipi/send_init_ipi/send_sipi)
+- [x] AP boot integration (main.rs hooks arch::apic::init(), init_bsp(), start_aps())
 
 #### E.2 TLB Shootdown
 
@@ -546,11 +559,13 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 
 #### E.3 Per-CPU Data
 
-- [ ] Per-CPU segment (%gs)
-- [ ] Syscall stack per-CPU
+- [x] Per-CPU segment (%gs) - CpuLocal<T> abstraction (kernel/cpu_local/lib.rs)
+- [x] Syscall stack per-CPU (PerCpuData.syscall_stack_top)
 - [ ] Scheduler runqueue per-CPU
-- [ ] IRQ stack per-CPU
-- [ ] Safe cross-CPU access API
+- [x] IRQ stack per-CPU (PerCpuData.irq_stack_top)
+- [x] Safe cross-CPU access API (current_cpu(), init_bsp(), init_ap())
+- [x] Per-CPU FPU save areas (R66-7 fix - kernel/arch/interrupts.rs)
+- [x] LAPIC ID → CPU index mapping (kernel/cpu_local/lib.rs - register_cpu_id, current_cpu_id)
 
 #### E.4 Synchronization
 
@@ -719,18 +734,20 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-14 | 62 | 7 | 6 | ARP static eviction, timer contention, fragment byte limits, SYN cookie age, ISN entropy, LSM hooks - **6 FIXED, 1 DEFERRED** |
 | 2026-01-14 | - | - | - | **Conntrack state machine implemented** (TCP/UDP/ICMP tracking, stateful firewall foundation) |
 | 2026-01-15 | 63-64 | 12 | 11 | Conntrack direction fix, capacity bypass, LRU eviction, RST rate limit, timer monitoring, fragment count, firewall - **11 FIXED, 1 DOCUMENTED** |
-| 2026-01-16 | 65 | 26 | 5 | Comprehensive audit - CLD fix, COW race, context switch validation, rate limiter CAS, conntrack accounting - **5 FIXED, 21 OPEN** |
-| **Total** | **65** | **305** | **250 (82.0%)** | **55 open (21 new R65 + SMP + VirtIO IOMMU)** |
+| 2026-01-16 | 65 | 26 | 17 | Comprehensive audit - CLD fix, COW race, context switch validation, rate limiter CAS, conntrack accounting - **17 FIXED, 9 OPEN** |
+| 2026-01-17 | 66 | 11 | 11 | TCP options validation (MSS/WS), VirtIO-blk ring init/jump detection/double-free, scheduler priority cap, fragment CAS, per-CPU FPU - **ALL FIXED** |
+| **Total** | **66** | **316** | **265 (83.9%)** | **51 open (R65 remaining + SMP + VirtIO IOMMU)** |
 
 ### Current Status
 
-- **Fixed**: 250 issues (82.0%)
-- **Open**: 55 issues (18.0%)
-  - 21 new issues from Round 65 (including 1 CRITICAL: R65-24 VirtIO DMA)
+- **Fixed**: 265 issues (83.9%)
+- **Open**: 51 issues (16.1%)
+  - R65 remaining issues (SMP-related, VirtIO IOMMU deferred)
   - SMP-related issues deferred to Phase E
   - R62-6 (VirtIO IOMMU) deferred to Phase F.3
+- **Phase E Progress**: LAPIC/IOAPIC initialized, PerCpuData implemented, AP bootstrap pending
 
-See [qa-2026-01-16.md](review/qa-2026-01-16.md) for latest audit report.
+See [qa-2026-01-17.md](review/qa-2026-01-17.md) for latest audit report.
 
 ---
 

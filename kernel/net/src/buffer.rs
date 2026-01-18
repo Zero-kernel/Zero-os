@@ -354,9 +354,13 @@ impl NetBuf {
     fn buffer_slice(&self, offset: usize, len: usize) -> &[u8] {
         // R43-4 FIX: Use checked arithmetic and assert! for release safety
         assert!(
-            offset.checked_add(len).map_or(false, |end| end <= self.total_len),
+            offset
+                .checked_add(len)
+                .map_or(false, |end| end <= self.total_len),
             "NetBuf::buffer_slice OOB: offset={}, len={}, total={}",
-            offset, len, self.total_len
+            offset,
+            len,
+            self.total_len
         );
         // SAFETY: Bounds checked by assert above
         unsafe { slice::from_raw_parts(self.virt_base.add(offset), len) }
@@ -369,9 +373,13 @@ impl NetBuf {
     fn buffer_slice_mut(&mut self, offset: usize, len: usize) -> &mut [u8] {
         // R43-4 FIX: Use checked arithmetic and assert! for release safety
         assert!(
-            offset.checked_add(len).map_or(false, |end| end <= self.total_len),
+            offset
+                .checked_add(len)
+                .map_or(false, |end| end <= self.total_len),
             "NetBuf::buffer_slice_mut OOB: offset={}, len={}, total={}",
-            offset, len, self.total_len
+            offset,
+            len,
+            self.total_len
         );
         // SAFETY: Bounds checked by assert above
         unsafe { slice::from_raw_parts_mut(self.virt_base.add(offset), len) }

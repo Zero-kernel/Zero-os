@@ -2,10 +2,17 @@ use crate::fork::PAGE_REF_COUNT;
 use crate::signal::PendingSignals;
 use crate::syscall::{SyscallError, VfsStat};
 use crate::time;
-use alloc::{boxed::Box, collections::{BTreeMap, BTreeSet}, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 use cap::CapTable;
 use core::any::Any;
-use lsm::ProcessCtx as LsmProcessCtx;  // R25-7 FIX: Import LSM for task_exit hook
+use lsm::ProcessCtx as LsmProcessCtx; // R25-7 FIX: Import LSM for task_exit hook
 use mm::memory::FrameAllocator;
 use mm::page_table;
 use seccomp::{PledgeState, SeccompState};
@@ -495,8 +502,8 @@ impl Process {
     pub fn new(pid: ProcessId, ppid: ProcessId, name: String, priority: Priority) -> Self {
         Process {
             pid,
-            tid: pid,   // tid == pid (Linux 语义)
-            tgid: pid,  // 主线程时 tgid == pid
+            tid: pid,  // tid == pid (Linux 语义)
+            tgid: pid, // 主线程时 tgid == pid
             ppid,
             is_thread: false,
             name,
@@ -658,13 +665,20 @@ impl Process {
     ///
     /// 即使低优先级进程被高优先级进程持续抢占，经过足够长的等待时间后，
     /// 其优先级会被逐渐提升直到获得运行机会。
+    ///
+    /// # R66-4 FIX: Priority Boost Cap
+    ///
+    /// Previously, dynamic_priority could be boosted below static priority,
+    /// allowing low-priority processes to gain higher priority than intended.
+    /// Now capped at static priority to prevent priority inversion abuse.
     pub fn check_and_boost_starved(&mut self) {
         // 饥饿阈值：100个tick（约100ms，假设1ms/tick）
         const STARVATION_THRESHOLD: u64 = 100;
 
         if self.wait_ticks >= STARVATION_THRESHOLD {
-            // 提升优先级（降低数值）
-            if self.dynamic_priority > 0 {
+            // R66-4 FIX: Only boost if dynamic > static (never boost beyond static)
+            // This prevents low-priority processes from gaining realtime priority
+            if self.dynamic_priority > self.priority {
                 self.dynamic_priority -= 1;
             }
             // 重置等待计数器
@@ -830,7 +844,9 @@ pub fn thread_group_size(tgid: ProcessId) -> usize {
         .filter(|slot| {
             if let Some(p) = slot {
                 let p = p.lock();
-                p.tgid == tgid && p.state != ProcessState::Zombie && p.state != ProcessState::Terminated
+                p.tgid == tgid
+                    && p.state != ProcessState::Zombie
+                    && p.state != ProcessState::Terminated
             } else {
                 false
             }
@@ -981,7 +997,8 @@ pub fn set_current_supplementary_groups(groups: &[u32]) -> Option<()> {
     creds.supplementary_groups.clear();
     // Take only up to NGROUPS_MAX groups to prevent DoS
     let limit = groups.len().min(NGROUPS_MAX);
-    creds.supplementary_groups
+    creds
+        .supplementary_groups
         .extend(groups[..limit].iter().copied());
     creds.supplementary_groups.sort_unstable();
     creds.supplementary_groups.dedup();
@@ -1375,14 +1392,15 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             // R24-3 fix: 写入 0 到 clear_child_tid 地址（SMAP + fault-tolerant）
             // 注意：需要在正确的地址空间中执行
             unsafe {
+                use crate::usercopy::{copy_to_user_safe, UserAccessGuard};
                 use x86_64::registers::control::Cr3;
                 use x86_64::structures::paging::PhysFrame;
                 use x86_64::PhysAddr;
-                use crate::usercopy::{UserAccessGuard, copy_to_user_safe};
 
                 // 切换到目标进程的地址空间
                 let current_cr3 = Cr3::read();
-                let target_frame = PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
+                let target_frame =
+                    PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
                 Cr3::write(target_frame, current_cr3.1);
 
                 // 将 0 写入 clear_child_tid 地址（带 SMAP 保护和容错处理）

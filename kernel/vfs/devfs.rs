@@ -132,10 +132,7 @@ struct DevDirInode {
 impl DevDirInode {
     /// Get Arc<Self> from self_ref
     fn as_arc(&self) -> Result<Arc<Self>, FsError> {
-        self.self_ref
-            .read()
-            .upgrade()
-            .ok_or(FsError::Invalid)
+        self.self_ref.read().upgrade().ok_or(FsError::Invalid)
     }
 }
 
@@ -446,7 +443,6 @@ impl Inode for ConsoleDevInode {
     }
 }
 
-
 // ============================================================================
 // Helper functions
 // ============================================================================
@@ -456,7 +452,6 @@ impl Inode for ConsoleDevInode {
 fn make_dev(major: u32, minor: u32) -> u32 {
     ((major & 0xFFF) << 8) | (minor & 0xFF) | ((minor & 0xFFF00) << 12)
 }
-
 
 // ============================================================================
 // Block device implementation
@@ -507,7 +502,7 @@ impl Inode for BlockDevInode {
             mode: FileMode::block_device(0o660),
             nlink: 1,
             uid: 0,
-            gid: 6, // disk group
+            gid: 6,                                     // disk group
             rdev: make_dev(8, (self.ino - 100) as u32), // major 8 = sd, minor = device index
             size: capacity,
             blksize: self.device.sector_size(),
@@ -650,5 +645,3 @@ impl Inode for BlockDevInode {
         self
     }
 }
-
-

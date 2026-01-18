@@ -22,6 +22,8 @@ pub use elf_loader::{load_elf, ElfLoadError, ElfLoadResult, USER_STACK_SIZE, USE
 pub use fork::{create_fresh_address_space, sys_fork, ForkError, ForkResult, PAGE_REF_COUNT};
 pub use process::{
     add_supplementary_group,
+    // CLONE_VM sibling detection (R37-1 fix)
+    address_space_share_count,
     allocate_kernel_stack,
     current_cap_table,
     current_credentials,
@@ -30,24 +32,24 @@ pub use process::{
     current_pid,
     current_supplementary_groups,
     current_umask,
+    // Seccomp/Pledge support
+    evaluate_seccomp,
     free_address_space,
     free_kernel_stack,
     get_process,
+    has_no_new_privs,
+    has_seccomp_enabled,
     kernel_stack_slot,
+    non_thread_group_vm_share_count,
     register_ipc_cleanup,
+    // OOM killer support
+    register_oom_callbacks,
     remove_supplementary_group,
     set_current_supplementary_groups,
     set_current_umask,
-    with_current_cap_table,
-    // Seccomp/Pledge support
-    evaluate_seccomp,
-    has_no_new_privs,
-    has_seccomp_enabled,
     // Thread group support (R33-1 fix)
     thread_group_size,
-    // CLONE_VM sibling detection (R37-1 fix)
-    address_space_share_count,
-    non_thread_group_vm_share_count,
+    with_current_cap_table,
     // DAC support
     Credentials,
     FileDescriptor,
@@ -57,13 +59,11 @@ pub use process::{
     KSTACK_STRIDE,
     MAX_FD,
     NGROUPS_MAX,
-    // OOM killer support
-    register_oom_callbacks,
 };
 // Re-export capability types for convenience
 pub use cap::{
-    CapEntry, CapError, CapFlags, CapId, CapObject, CapRights, CapTable,
-    EndpointId, NamespaceId, Shm, Socket, Timer,
+    CapEntry, CapError, CapFlags, CapId, CapObject, CapRights, CapTable, EndpointId, NamespaceId,
+    Shm, Socket, Timer,
 };
 pub use scheduler_hook::{
     force_reschedule, on_scheduler_tick, register_resched_callback, register_timer_callback,
@@ -78,18 +78,29 @@ pub use syscall::{
     register_futex_callback, register_pipe_callback, register_syscall_frame_callback,
     register_vfs_create_callback, register_vfs_lseek_callback, register_vfs_open_callback,
     register_vfs_open_with_resolve_callback, register_vfs_readdir_callback,
-    register_vfs_stat_callback, register_vfs_truncate_callback,
-    register_vfs_unlink_callback, wake_stdin_waiters, DirEntry, FileType, SyscallError,
-    SyscallFrame, VfsStat,
+    register_vfs_stat_callback, register_vfs_truncate_callback, register_vfs_unlink_callback,
+    wake_stdin_waiters, DirEntry, FileType, SyscallError, SyscallFrame, VfsStat,
 };
 pub use time::{current_timestamp_ms, get_ticks, on_timer_tick};
 pub use usercopy::{
     // Type-safe user pointer API (A.1 Security Hardening)
-    copy_from_user, copy_from_user_slice, copy_to_user, copy_to_user_slice, strncpy_from_user,
-    UsercopyError, UserPtr, UserSlice,
+    copy_from_user,
     // Legacy API (for backward compatibility)
-    copy_from_user_safe, copy_to_user_safe, copy_user_cstring, is_in_usercopy,
-    set_usercopy_fault, try_handle_usercopy_fault, UserAccessGuard, MAX_CSTRING_LEN,
+    copy_from_user_safe,
+    copy_from_user_slice,
+    copy_to_user,
+    copy_to_user_safe,
+    copy_to_user_slice,
+    copy_user_cstring,
+    is_in_usercopy,
+    set_usercopy_fault,
+    strncpy_from_user,
+    try_handle_usercopy_fault,
+    UserAccessGuard,
+    UserPtr,
+    UserSlice,
+    UsercopyError,
+    MAX_CSTRING_LEN,
     USER_SPACE_TOP,
 };
 

@@ -19,7 +19,7 @@ const VIRTIO_BLK_MODERN: u16 = 0x1042;
 
 const PCI_COMMAND_OFFSET: u8 = 0x04;
 const PCI_BAR0_OFFSET: u8 = 0x10;
-const PCI_SUBSYSTEM_ID: u8 = 0x2E;  // Subsystem ID (contains virtio device type)
+const PCI_SUBSYSTEM_ID: u8 = 0x2E; // Subsystem ID (contains virtio device type)
 const PCI_CAP_PTR: u8 = 0x34;
 
 /// VirtIO PCI capability types (VirtIO 1.1 Section 4.1.4)

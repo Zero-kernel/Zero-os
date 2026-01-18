@@ -126,7 +126,7 @@ pub enum SeccompInsn {
     /// Right shift accumulator by constant.
     Shr(u8),
     /// Jump if accumulator equals constant.
-    JmpEq(u64, u8, u8),  // (value, true_offset, false_offset)
+    JmpEq(u64, u8, u8), // (value, true_offset, false_offset)
     /// Jump if accumulator not equals constant.
     JmpNe(u64, u8, u8),
     /// Jump if accumulator less than constant.
@@ -181,7 +181,11 @@ pub struct SeccompFilter {
 
 impl SeccompFilter {
     /// Create a new filter from a program.
-    pub fn new(prog: Vec<SeccompInsn>, default_action: SeccompAction, flags: SeccompFlags) -> Result<Self, SeccompError> {
+    pub fn new(
+        prog: Vec<SeccompInsn>,
+        default_action: SeccompAction,
+        flags: SeccompFlags,
+    ) -> Result<Self, SeccompError> {
         // Validate the program
         validate_program(&prog)?;
 
@@ -713,7 +717,11 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
 
     // Handle path syscalls with flag-aware checks
     if matches!(syscall_nr, SYS_OPEN | SYS_OPENAT) {
-        let flags = if syscall_nr == SYS_OPEN { args[1] } else { args[2] };
+        let flags = if syscall_nr == SYS_OPEN {
+            args[1]
+        } else {
+            args[2]
+        };
         let accmode = flags & O_ACCMODE;
         let wants_write = accmode == O_WRONLY || accmode == O_RDWR;
         let wants_create = (flags & (O_CREAT | O_TRUNC)) != 0;
@@ -721,7 +729,10 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
 
         // Require at least one path capability
         let has_path = promises.intersects(
-            PledgePromises::RPATH | PledgePromises::WPATH | PledgePromises::CPATH | PledgePromises::TMPPATH,
+            PledgePromises::RPATH
+                | PledgePromises::WPATH
+                | PledgePromises::CPATH
+                | PledgePromises::TMPPATH,
         );
         if !has_path {
             return false;
@@ -738,7 +749,8 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
 
         // Creation/truncate requires CPATH or TMPPATH
         if wants_create
-            && !(promises.contains(PledgePromises::CPATH) || promises.contains(PledgePromises::TMPPATH))
+            && !(promises.contains(PledgePromises::CPATH)
+                || promises.contains(PledgePromises::TMPPATH))
         {
             return false;
         }

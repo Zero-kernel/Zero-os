@@ -130,12 +130,18 @@ impl PortRange {
 
     /// Create a range matching a single port.
     pub const fn single(port: u16) -> Self {
-        Self { start: port, end: port }
+        Self {
+            start: port,
+            end: port,
+        }
     }
 
     /// Create a range matching all ports.
     pub const fn any() -> Self {
-        Self { start: 0, end: 65535 }
+        Self {
+            start: 0,
+            end: 65535,
+        }
     }
 
     /// Check if a port falls within this range.
@@ -170,7 +176,10 @@ impl IpCidrMatch {
 
     /// Create a matcher for a single host (/32).
     pub const fn host(addr: Ipv4Addr) -> Self {
-        Self { addr, prefix_len: 32 }
+        Self {
+            addr,
+            prefix_len: 32,
+        }
     }
 
     /// Create a matcher that matches any address (/0).
@@ -452,16 +461,24 @@ impl FirewallTable {
             evals += 1;
             if rule.matches(packet) {
                 // Update stats atomically (once per packet)
-                self.stats.rule_evaluations.fetch_add(evals, AtomicOrdering::Relaxed);
+                self.stats
+                    .rule_evaluations
+                    .fetch_add(evals, AtomicOrdering::Relaxed);
                 match rule.action {
                     FirewallAction::Accept => {
-                        self.stats.packets_accepted.fetch_add(1, AtomicOrdering::Relaxed);
+                        self.stats
+                            .packets_accepted
+                            .fetch_add(1, AtomicOrdering::Relaxed);
                     }
                     FirewallAction::Drop => {
-                        self.stats.packets_dropped.fetch_add(1, AtomicOrdering::Relaxed);
+                        self.stats
+                            .packets_dropped
+                            .fetch_add(1, AtomicOrdering::Relaxed);
                     }
                     FirewallAction::Reject { .. } => {
-                        self.stats.packets_rejected.fetch_add(1, AtomicOrdering::Relaxed);
+                        self.stats
+                            .packets_rejected
+                            .fetch_add(1, AtomicOrdering::Relaxed);
                     }
                 }
 
@@ -475,17 +492,27 @@ impl FirewallTable {
 
         // No rule matched, use default action
         // R64-6 FIX: Update rule evaluations count for default path
-        self.stats.rule_evaluations.fetch_add(evals, AtomicOrdering::Relaxed);
-        self.stats.default_hits.fetch_add(1, AtomicOrdering::Relaxed);
+        self.stats
+            .rule_evaluations
+            .fetch_add(evals, AtomicOrdering::Relaxed);
+        self.stats
+            .default_hits
+            .fetch_add(1, AtomicOrdering::Relaxed);
         match self.default_action {
             FirewallAction::Accept => {
-                self.stats.packets_accepted.fetch_add(1, AtomicOrdering::Relaxed);
+                self.stats
+                    .packets_accepted
+                    .fetch_add(1, AtomicOrdering::Relaxed);
             }
             FirewallAction::Drop => {
-                self.stats.packets_dropped.fetch_add(1, AtomicOrdering::Relaxed);
+                self.stats
+                    .packets_dropped
+                    .fetch_add(1, AtomicOrdering::Relaxed);
             }
             FirewallAction::Reject { .. } => {
-                self.stats.packets_rejected.fetch_add(1, AtomicOrdering::Relaxed);
+                self.stats
+                    .packets_rejected
+                    .fetch_add(1, AtomicOrdering::Relaxed);
             }
         }
 
@@ -522,7 +549,7 @@ fn match_field_port(rule: Option<PortRange>, value: Option<u16>) -> bool {
     match (rule, value) {
         (Some(range), Some(port)) => range.matches(port),
         (Some(_), None) => false, // Rule requires port but packet has none
-        (None, _) => true, // No port requirement
+        (None, _) => true,        // No port requirement
     }
 }
 
@@ -578,9 +605,8 @@ static FIREWALL_TABLE: Once<FirewallTable> = Once::new();
 
 /// Get the global firewall table.
 pub fn firewall_table() -> &'static FirewallTable {
-    FIREWALL_TABLE.call_once(|| {
-        FirewallTable::new_with_rules(FirewallAction::Accept, default_rules())
-    })
+    FIREWALL_TABLE
+        .call_once(|| FirewallTable::new_with_rules(FirewallAction::Accept, default_rules()))
 }
 
 // ============================================================================
@@ -618,13 +644,17 @@ fn can_log(now_ms: u64) -> bool {
     // If current is 0, the closure returns None and fetch_update returns Err,
     // indicating no token was available.
     FW_LOG_TOKENS
-        .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |current| {
-            if current > 0 {
-                Some(current - 1)
-            } else {
-                None
-            }
-        })
+        .fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |current| {
+                if current > 0 {
+                    Some(current - 1)
+                } else {
+                    None
+                }
+            },
+        )
         .is_ok()
 }
 

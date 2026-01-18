@@ -9,6 +9,7 @@ use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
 use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode};
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::table::boot::{AllocateType, MemoryType};
+use uefi::table::cfg::{ACPI2_GUID, ACPI_GUID};
 use uefi::CStr16;
 use uefi::Identify;
 use xmas_elf::program::Type;
@@ -81,6 +82,33 @@ fn generate_kaslr_slide() -> u64 {
     }
 }
 
+/// Locate the ACPI RSDP via the UEFI configuration table.
+///
+/// Prefers ACPI 2.0 GUID, falls back to ACPI 1.0 GUID if not available.
+/// Returns 0 if RSDP cannot be found.
+fn find_rsdp_address(system_table: &SystemTable<Boot>) -> u64 {
+    // Try ACPI 2.0 first (preferred)
+    for entry in system_table.config_table() {
+        if entry.guid == ACPI2_GUID {
+            let addr = entry.address as usize as u64;
+            info!("ACPI 2.0 RSDP found at 0x{:x}", addr);
+            return addr;
+        }
+    }
+
+    // Fall back to ACPI 1.0
+    for entry in system_table.config_table() {
+        if entry.guid == ACPI_GUID {
+            let addr = entry.address as usize as u64;
+            info!("ACPI 1.0 RSDP found at 0x{:x}", addr);
+            return addr;
+        }
+    }
+
+    info!("ACPI RSDP not found in UEFI configuration table");
+    0
+}
+
 /// 内存映射信息，传递给内核
 #[repr(C)]
 pub struct MemoryMapInfo {
@@ -127,6 +155,8 @@ pub struct BootInfo {
     pub framebuffer: FramebufferInfo,
     /// R39-7 FIX: KASLR slide value (0 if KASLR disabled)
     pub kaslr_slide: u64,
+    /// ACPI RSDP physical address (from UEFI configuration table)
+    pub rsdp_address: u64,
 }
 
 #[entry]
@@ -138,236 +168,237 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     // R39-7 FIX: Get entry point, KASLR slide, and kernel size from loading block
     // Codex Review Fix: kernel_size needed for accurate page table setup
-    let (entry_point, kaslr_slide, kernel_size) = {
-        let boot_services = system_table.boot_services();
+    let (entry_point, kaslr_slide, kernel_size) =
+        {
+            let boot_services = system_table.boot_services();
 
-        let fs_handle = boot_services
-            .locate_handle_buffer(uefi::table::boot::SearchType::ByProtocol(
-                &SimpleFileSystem::GUID,
-            ))
-            .expect("Failed to locate file system handles");
+            let fs_handle = boot_services
+                .locate_handle_buffer(uefi::table::boot::SearchType::ByProtocol(
+                    &SimpleFileSystem::GUID,
+                ))
+                .expect("Failed to locate file system handles");
 
-        let fs_handle = fs_handle[0];
+            let fs_handle = fs_handle[0];
 
-        let mut fs = boot_services
-            .open_protocol_exclusive::<SimpleFileSystem>(fs_handle)
-            .expect("Failed to open file system protocol");
+            let mut fs = boot_services
+                .open_protocol_exclusive::<SimpleFileSystem>(fs_handle)
+                .expect("Failed to open file system protocol");
 
-        let mut root_dir = fs.open_volume().expect("Failed to open root directory");
+            let mut root_dir = fs.open_volume().expect("Failed to open root directory");
 
-        info!("Loading kernel...");
-        let kernel_path = CStr16::from_u16_with_nul(&[
-            b'k' as u16,
-            b'e' as u16,
-            b'r' as u16,
-            b'n' as u16,
-            b'e' as u16,
-            b'l' as u16,
-            b'.' as u16,
-            b'e' as u16,
-            b'l' as u16,
-            b'f' as u16,
-            0,
-        ])
-        .unwrap();
+            info!("Loading kernel...");
+            let kernel_path = CStr16::from_u16_with_nul(&[
+                b'k' as u16,
+                b'e' as u16,
+                b'r' as u16,
+                b'n' as u16,
+                b'e' as u16,
+                b'l' as u16,
+                b'.' as u16,
+                b'e' as u16,
+                b'l' as u16,
+                b'f' as u16,
+                0,
+            ])
+            .unwrap();
 
-        let mut kernel_file = root_dir
-            .open(kernel_path, FileMode::Read, FileAttribute::empty())
-            .expect("Failed to open kernel.elf")
-            .into_regular_file()
-            .expect("kernel.elf is not a regular file");
+            let mut kernel_file = root_dir
+                .open(kernel_path, FileMode::Read, FileAttribute::empty())
+                .expect("Failed to open kernel.elf")
+                .into_regular_file()
+                .expect("kernel.elf is not a regular file");
 
-        let mut info_buffer = [0u8; 512];
-        let info = kernel_file
-            .get_info::<FileInfo>(&mut info_buffer)
-            .expect("Failed to get file info");
+            let mut info_buffer = [0u8; 512];
+            let info = kernel_file
+                .get_info::<FileInfo>(&mut info_buffer)
+                .expect("Failed to get file info");
 
-        let file_size = info.file_size() as usize;
+            let file_size = info.file_size() as usize;
 
-        let mut kernel_data = Vec::with_capacity(file_size);
-        kernel_data.resize(file_size, 0);
+            let mut kernel_data = Vec::with_capacity(file_size);
+            kernel_data.resize(file_size, 0);
 
-        // 循环读取直到完整读取整个文件
-        let mut total_read = 0usize;
-        while total_read < file_size {
-            let read_size = kernel_file
-                .read(&mut kernel_data[total_read..])
-                .expect("Failed to read kernel file");
+            // 循环读取直到完整读取整个文件
+            let mut total_read = 0usize;
+            while total_read < file_size {
+                let read_size = kernel_file
+                    .read(&mut kernel_data[total_read..])
+                    .expect("Failed to read kernel file");
 
-            if read_size == 0 {
-                // 读取返回0但文件未读完，说明发生了截断
-                panic!(
-                    "Kernel file read truncated: expected {} bytes, got {} bytes",
-                    file_size, total_read
-                );
-            }
-            total_read += read_size;
-        }
-
-        info!("Kernel loaded: {} bytes", total_read);
-
-        info!("Parsing ELF...");
-        let elf = ElfFile::new(&kernel_data).expect("Failed to parse ELF file");
-
-        let entry_point = elf.header.pt2.entry_point();
-        info!("Entry point: 0x{:x}", entry_point);
-
-        assert_eq!(
-            elf.header.pt1.magic,
-            [0x7f, 0x45, 0x4c, 0x46],
-            "Invalid ELF magic"
-        );
-
-        // 首先，计算内核需要的总内存大小
-        let mut min_addr = u64::MAX;
-        let mut max_addr = 0u64;
-
-        for program_header in elf.program_iter() {
-            if program_header.get_type() != Ok(Type::Load) {
-                continue;
-            }
-            let virt_addr = program_header.virtual_addr();
-            let mem_size = program_header.mem_size();
-
-            if virt_addr < min_addr {
-                min_addr = virt_addr;
-            }
-            if virt_addr + mem_size > max_addr {
-                max_addr = virt_addr + mem_size;
-            }
-        }
-
-        // 分配一块连续的内存来容纳整个内核
-        // R39-7 FIX: KASLR - try to allocate at randomized address first
-        let mut kaslr_slide = generate_kaslr_slide();
-        let mut kernel_phys_base = KERNEL_PHYS_BASE + kaslr_slide;
-        let kernel_size = (max_addr - min_addr) as usize;
-        let pages = (kernel_size + 0xFFF) / 0x1000;
-
-        info!(
-            "Allocating {} pages ({} bytes) for kernel at 0x{:x} (KASLR slide=0x{:x})",
-            pages, kernel_size, kernel_phys_base, kaslr_slide
-        );
-
-        // 尝试在指定地址分配整块内存
-        // R39-7 FIX: Try KASLR address first, fall back to fixed address if unavailable
-        let result = boot_services.allocate_pages(
-            AllocateType::Address(kernel_phys_base),
-            MemoryType::LOADER_DATA,
-            pages,
-        );
-
-        let actual_phys_base = match result {
-            Ok(_) => kernel_phys_base,
-            Err(status) => {
-                if kaslr_slide != 0 {
-                    // KASLR address unavailable, retry without slide
-                    info!(
-                        "KASLR slide 0x{:x} unavailable ({:?}), retrying at fixed address",
-                        kaslr_slide, status
+                if read_size == 0 {
+                    // 读取返回0但文件未读完，说明发生了截断
+                    panic!(
+                        "Kernel file read truncated: expected {} bytes, got {} bytes",
+                        file_size, total_read
                     );
-                    kaslr_slide = 0;
-                    kernel_phys_base = KERNEL_PHYS_BASE;
+                }
+                total_read += read_size;
+            }
 
-                    let fallback = boot_services.allocate_pages(
-                        AllocateType::Address(kernel_phys_base),
-                        MemoryType::LOADER_DATA,
-                        pages,
-                    );
+            info!("Kernel loaded: {} bytes", total_read);
 
-                    if fallback.is_err() {
+            info!("Parsing ELF...");
+            let elf = ElfFile::new(&kernel_data).expect("Failed to parse ELF file");
+
+            let entry_point = elf.header.pt2.entry_point();
+            info!("Entry point: 0x{:x}", entry_point);
+
+            assert_eq!(
+                elf.header.pt1.magic,
+                [0x7f, 0x45, 0x4c, 0x46],
+                "Invalid ELF magic"
+            );
+
+            // 首先，计算内核需要的总内存大小
+            let mut min_addr = u64::MAX;
+            let mut max_addr = 0u64;
+
+            for program_header in elf.program_iter() {
+                if program_header.get_type() != Ok(Type::Load) {
+                    continue;
+                }
+                let virt_addr = program_header.virtual_addr();
+                let mem_size = program_header.mem_size();
+
+                if virt_addr < min_addr {
+                    min_addr = virt_addr;
+                }
+                if virt_addr + mem_size > max_addr {
+                    max_addr = virt_addr + mem_size;
+                }
+            }
+
+            // 分配一块连续的内存来容纳整个内核
+            // R39-7 FIX: KASLR - try to allocate at randomized address first
+            let mut kaslr_slide = generate_kaslr_slide();
+            let mut kernel_phys_base = KERNEL_PHYS_BASE + kaslr_slide;
+            let kernel_size = (max_addr - min_addr) as usize;
+            let pages = (kernel_size + 0xFFF) / 0x1000;
+
+            info!(
+                "Allocating {} pages ({} bytes) for kernel at 0x{:x} (KASLR slide=0x{:x})",
+                pages, kernel_size, kernel_phys_base, kaslr_slide
+            );
+
+            // 尝试在指定地址分配整块内存
+            // R39-7 FIX: Try KASLR address first, fall back to fixed address if unavailable
+            let result = boot_services.allocate_pages(
+                AllocateType::Address(kernel_phys_base),
+                MemoryType::LOADER_DATA,
+                pages,
+            );
+
+            let actual_phys_base = match result {
+                Ok(_) => kernel_phys_base,
+                Err(status) => {
+                    if kaslr_slide != 0 {
+                        // KASLR address unavailable, retry without slide
+                        info!(
+                            "KASLR slide 0x{:x} unavailable ({:?}), retrying at fixed address",
+                            kaslr_slide, status
+                        );
+                        kaslr_slide = 0;
+                        kernel_phys_base = KERNEL_PHYS_BASE;
+
+                        let fallback = boot_services.allocate_pages(
+                            AllocateType::Address(kernel_phys_base),
+                            MemoryType::LOADER_DATA,
+                            pages,
+                        );
+
+                        if fallback.is_err() {
+                            panic!(
+                                "FATAL: Cannot allocate kernel memory at fixed address 0x{:x}",
+                                kernel_phys_base
+                            );
+                        }
+                        kernel_phys_base
+                    } else {
                         panic!(
-                            "FATAL: Cannot allocate kernel memory at fixed address 0x{:x}",
+                            "FATAL: Cannot allocate kernel memory at required address 0x{:x}. \
+                            Page table mappings require kernel at this fixed address. \
+                            Ensure no UEFI runtime or reserved regions overlap.",
                             kernel_phys_base
                         );
                     }
-                    kernel_phys_base
-                } else {
-                    panic!(
-                        "FATAL: Cannot allocate kernel memory at required address 0x{:x}. \
-                            Page table mappings require kernel at this fixed address. \
-                            Ensure no UEFI runtime or reserved regions overlap.",
-                        kernel_phys_base
-                    );
                 }
-            }
-        };
+            };
 
-        info!("Kernel memory allocated at 0x{:x}", actual_phys_base);
+            info!("Kernel memory allocated at 0x{:x}", actual_phys_base);
 
-        // 清零整块内存
-        unsafe {
-            core::ptr::write_bytes(actual_phys_base as *mut u8, 0, kernel_size);
-        }
-
-        // 加载所有程序段到物理地址 0x100000
-        for program_header in elf.program_iter() {
-            if program_header.get_type() != Ok(Type::Load) {
-                continue;
+            // 清零整块内存
+            unsafe {
+                core::ptr::write_bytes(actual_phys_base as *mut u8, 0, kernel_size);
             }
 
-            let virt_addr = program_header.virtual_addr();
-            let mem_size = program_header.mem_size();
-            let file_size = program_header.file_size();
-            let file_offset = program_header.offset();
+            // 加载所有程序段到物理地址 0x100000
+            for program_header in elf.program_iter() {
+                if program_header.get_type() != Ok(Type::Load) {
+                    continue;
+                }
 
-            // R24-10 fix: Validate that file_offset + file_size doesn't exceed kernel_data bounds
-            // A malformed ELF could have segments pointing beyond the file, causing OOB read
-            let file_end = file_offset
-                .checked_add(file_size)
-                .expect("ELF segment offset+size overflow");
-            if file_end as usize > kernel_data.len() {
-                panic!(
+                let virt_addr = program_header.virtual_addr();
+                let mem_size = program_header.mem_size();
+                let file_size = program_header.file_size();
+                let file_offset = program_header.offset();
+
+                // R24-10 fix: Validate that file_offset + file_size doesn't exceed kernel_data bounds
+                // A malformed ELF could have segments pointing beyond the file, causing OOB read
+                let file_end = file_offset
+                    .checked_add(file_size)
+                    .expect("ELF segment offset+size overflow");
+                if file_end as usize > kernel_data.len() {
+                    panic!(
                     "ELF segment out of bounds: offset=0x{:x}, file_size=0x{:x}, file_len=0x{:x}",
                     file_offset, file_size, kernel_data.len()
                 );
-            }
+                }
 
-            // 计算物理地址：虚拟地址 - 虚拟基址 + 物理基址
-            // 虚拟基址是 min_addr (0xffffffff80000000)，物理基址是 actual_phys_base (0x100000)
-            let phys_addr = actual_phys_base + (virt_addr - min_addr);
+                // 计算物理地址：虚拟地址 - 虚拟基址 + 物理基址
+                // 虚拟基址是 min_addr (0xffffffff80000000)，物理基址是 actual_phys_base (0x100000)
+                let phys_addr = actual_phys_base + (virt_addr - min_addr);
 
-            // 清零整个段内存区域（包括.bss）
-            unsafe {
-                let dest = phys_addr as *mut u8;
-                core::ptr::write_bytes(dest, 0, mem_size as usize);
-            }
-
-            // 复制段数据（file_size可能小于mem_size，剩余部分已清零）
-            if file_size > 0 {
+                // 清零整个段内存区域（包括.bss）
                 unsafe {
                     let dest = phys_addr as *mut u8;
-                    let src = kernel_data.as_ptr().add(file_offset as usize);
-                    core::ptr::copy_nonoverlapping(src, dest, file_size as usize);
+                    core::ptr::write_bytes(dest, 0, mem_size as usize);
                 }
+
+                // 复制段数据（file_size可能小于mem_size，剩余部分已清零）
+                if file_size > 0 {
+                    unsafe {
+                        let dest = phys_addr as *mut u8;
+                        let src = kernel_data.as_ptr().add(file_offset as usize);
+                        core::ptr::copy_nonoverlapping(src, dest, file_size as usize);
+                    }
+                }
+
+                info!(
+                    "Loaded segment: virt=0x{:x}, phys=0x{:x}, filesz=0x{:x}, memsz=0x{:x}",
+                    virt_addr, phys_addr, file_size, mem_size
+                );
             }
 
-            info!(
-                "Loaded segment: virt=0x{:x}, phys=0x{:x}, filesz=0x{:x}, memsz=0x{:x}",
-                virt_addr, phys_addr, file_size, mem_size
-            );
-        }
+            // 验证内核代码已加载到物理地址
+            unsafe {
+                let kernel_start = actual_phys_base as *const u8;
+                let first_bytes = core::slice::from_raw_parts(kernel_start, 16);
+                info!(
+                    "First 16 bytes at phys 0x{:x}: {:x?}",
+                    actual_phys_base, first_bytes
+                );
+            }
 
-        // 验证内核代码已加载到物理地址
-        unsafe {
-            let kernel_start = actual_phys_base as *const u8;
-            let first_bytes = core::slice::from_raw_parts(kernel_start, 16);
+            // 链接脚本现在将入口点设置为 0xffffffff80100000
+            // 这对应物理地址 0x100000，通过页表映射正确
+            // R39-7 FIX: Apply KASLR slide to entry point
+            let adjusted_entry = entry_point + kaslr_slide;
             info!(
-                "First 16 bytes at phys 0x{:x}: {:x?}",
-                actual_phys_base, first_bytes
+                "Using ELF entry point: 0x{:x} (slide applied: 0x{:x}, final: 0x{:x})",
+                entry_point, kaslr_slide, adjusted_entry
             );
-        }
-
-        // 链接脚本现在将入口点设置为 0xffffffff80100000
-        // 这对应物理地址 0x100000，通过页表映射正确
-        // R39-7 FIX: Apply KASLR slide to entry point
-        let adjusted_entry = entry_point + kaslr_slide;
-        info!(
-            "Using ELF entry point: 0x{:x} (slide applied: 0x{:x}, final: 0x{:x})",
-            entry_point, kaslr_slide, adjusted_entry
-        );
-        (adjusted_entry, kaslr_slide, kernel_size) // R39-7: Return entry, slide, and size
-    };
+            (adjusted_entry, kaslr_slide, kernel_size) // R39-7: Return entry, slide, and size
+        };
 
     // 测试 VGA 缓冲区是否可访问 - 在 info! 之前
     unsafe {
@@ -380,6 +411,9 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     }
 
     info!("Automatically jumping to kernel...");
+
+    // Find ACPI RSDP before exiting boot services (EFI config table won't be accessible after)
+    let rsdp_address = find_rsdp_address(&system_table);
 
     // 分配 BootInfo 结构的内存（在低于 4GiB 的位置，便于恒等映射访问）
     let boot_info_ptr = {
@@ -647,7 +681,8 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 descriptor_version: memory_map_meta.desc_version,
             },
             framebuffer: framebuffer_info,
-            kaslr_slide, // R39-7 FIX: Pass KASLR slide to kernel
+            kaslr_slide,  // R39-7 FIX: Pass KASLR slide to kernel
+            rsdp_address, // ACPI RSDP for SMP CPU enumeration
         };
         // 阻止 memory_map 被释放，因为内核需要访问它
         core::mem::forget(memory_map);

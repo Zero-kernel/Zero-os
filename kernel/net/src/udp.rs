@@ -438,7 +438,7 @@ mod tests {
             0x00, 0x50, // dst_port = 80
             0x00, 0x10, // length = 16
             0x12, 0x34, // checksum
-            // 8 bytes of payload...
+                  // 8 bytes of payload...
         ];
         let header = parse_udp_header(&data).unwrap();
         assert_eq!(header.src_port, 8080);
@@ -475,7 +475,10 @@ mod tests {
         let src_ip = Ipv4Addr::new(192, 168, 1, 100);
         let dst_ip = Ipv4Addr::new(192, 168, 1, 1);
 
-        assert_eq!(parse_udp(&data, src_ip, dst_ip), Err(UdpError::ZeroChecksum));
+        assert_eq!(
+            parse_udp(&data, src_ip, dst_ip),
+            Err(UdpError::ZeroChecksum)
+        );
     }
 
     #[test]
@@ -489,7 +492,10 @@ mod tests {
         let src_ip = Ipv4Addr::new(192, 168, 1, 100);
         let dst_ip = Ipv4Addr::new(192, 168, 1, 1);
 
-        assert_eq!(parse_udp(&data, src_ip, dst_ip), Err(UdpError::LengthMismatch));
+        assert_eq!(
+            parse_udp(&data, src_ip, dst_ip),
+            Err(UdpError::LengthMismatch)
+        );
     }
 
     #[test]

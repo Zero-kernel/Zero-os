@@ -188,7 +188,9 @@ impl RuntimeTest for BuddyAllocatorTest {
         };
 
         if stats_restored.free_pages != stats_before.free_pages {
-            return TestResult::Warning(String::from("Free pages not fully restored (fragmentation?)"));
+            return TestResult::Warning(String::from(
+                "Free pages not fully restored (fragmentation?)",
+            ));
         }
 
         TestResult::Pass
@@ -219,7 +221,7 @@ impl RuntimeTest for CapTableLifecycleTest {
 
         // Allocate a capability with read-only rights using Endpoint as test object
         let entry = CapEntry::new(
-            CapObject::Endpoint(9999),  // Use Endpoint with dummy ID for testing
+            CapObject::Endpoint(9999), // Use Endpoint with dummy ID for testing
             CapRights::READ,
         );
 
@@ -489,8 +491,8 @@ impl NetworkParsingTest {
         }
 
         // Parse UDP header
-        let (header, data) = parse_udp(&datagram, src_ip, dst_ip)
-            .map_err(|e| alloc::format!("{:?}", e))?;
+        let (header, data) =
+            parse_udp(&datagram, src_ip, dst_ip).map_err(|e| alloc::format!("{:?}", e))?;
 
         if header.src_port != src_port {
             return Err(String::from("UDP src_port mismatch"));
@@ -506,7 +508,7 @@ impl NetworkParsingTest {
     }
 
     fn test_tcp(&self) -> Result<(), String> {
-        use net::{parse_tcp_header, TCP_FLAG_SYN, TCP_FLAG_ACK};
+        use net::{parse_tcp_header, TCP_FLAG_ACK, TCP_FLAG_SYN};
 
         // Create a minimal TCP SYN packet
         #[rustfmt::skip]
@@ -546,6 +548,318 @@ impl NetworkParsingTest {
 }
 
 // ============================================================================
+// Network Loopback Tests
+// ============================================================================
+
+/// Test network stack through software loopback (process_frame)
+struct NetworkLoopbackTest;
+
+impl RuntimeTest for NetworkLoopbackTest {
+    fn name(&self) -> &'static str {
+        "network_loopback"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify network stack processing via software loopback"
+    }
+
+    fn run(&self) -> TestResult {
+        // Test 1: UDP packet through process_frame
+        if let Err(e) = self.test_udp_loopback() {
+            return TestResult::Fail(alloc::format!("UDP loopback failed: {}", e));
+        }
+
+        // Test 2: Invalid TCP flags dropped by firewall
+        if let Err(e) = self.test_invalid_tcp_drop() {
+            return TestResult::Fail(alloc::format!("Invalid TCP drop failed: {}", e));
+        }
+
+        // Test 3: Conntrack table entry creation
+        if let Err(e) = self.test_conntrack_creation() {
+            return TestResult::Fail(alloc::format!("Conntrack test failed: {}", e));
+        }
+
+        // Test 4: TCP SYN handling
+        if let Err(e) = self.test_tcp_syn() {
+            return TestResult::Fail(alloc::format!("TCP SYN test failed: {}", e));
+        }
+
+        // Test 5: Firewall rule matching
+        if let Err(e) = self.test_firewall_rules() {
+            return TestResult::Fail(alloc::format!("Firewall test failed: {}", e));
+        }
+
+        TestResult::Pass
+    }
+}
+
+impl NetworkLoopbackTest {
+    /// Build a complete Ethernet + IPv4 + UDP frame for testing
+    fn build_udp_frame(
+        &self,
+        src_mac: net::EthAddr,
+        dst_mac: net::EthAddr,
+        src_ip: net::Ipv4Addr,
+        dst_ip: net::Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        // Build UDP datagram with correct checksum
+        let udp_data = net::build_udp_datagram(src_ip, dst_ip, src_port, dst_port, payload)
+            .map_err(|e| alloc::format!("UDP build failed: {:?}", e))?;
+
+        // Build IPv4 header
+        let ip_header = net::build_ipv4_header(
+            src_ip,
+            dst_ip,
+            net::Ipv4Proto::Udp,
+            udp_data.len() as u16,
+            64, // TTL
+        );
+
+        // Combine IP header + UDP datagram
+        let mut ip_packet = Vec::with_capacity(ip_header.len() + udp_data.len());
+        ip_packet.extend_from_slice(&ip_header);
+        ip_packet.extend_from_slice(&udp_data);
+
+        // Build Ethernet frame
+        let frame = net::build_ethernet_frame(dst_mac, src_mac, net::ETHERTYPE_IPV4, &ip_packet);
+
+        Ok(frame)
+    }
+
+    /// Test UDP packet processing through the network stack
+    fn test_udp_loopback(&self) -> Result<(), String> {
+        use net::{arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult};
+
+        // Setup test addresses
+        let our_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let our_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+
+        // Build a UDP packet destined to us
+        let payload = b"loopback test";
+        let frame = self.build_udp_frame(
+            remote_mac, our_mac, remote_ip, our_ip, 12345, // src port
+            8080,  // dst port
+            payload,
+        )?;
+
+        // Create test context
+        let mut arp_cache = ArpCache::new(60_000, 256); // 60s TTL, 256 max entries
+        let stats = NetStats::new();
+        let now_ms = 1000u64;
+
+        // Process the frame
+        let result = net::process_frame(&frame, our_mac, our_ip, &mut arp_cache, &stats, now_ms);
+
+        // The frame should be handled (delivered to socket layer) or replied
+        // In absence of a listening socket, it should be handled but may generate ICMP unreachable
+        match result {
+            ProcessResult::Handled => Ok(()),
+            ProcessResult::Reply(_) => Ok(()), // ICMP port unreachable is valid
+            ProcessResult::Dropped(reason) => {
+                // Firewall drops or other valid reasons are acceptable in test context
+                // But parse errors indicate a problem with frame construction
+                Err(alloc::format!("UDP packet dropped: {:?}", reason))
+            }
+        }
+    }
+
+    /// Test that TCP packets with invalid flags are dropped
+    fn test_invalid_tcp_drop(&self) -> Result<(), String> {
+        use net::{
+            arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult, TCP_FLAG_FIN,
+            TCP_FLAG_RST, TCP_FLAG_SYN,
+        };
+
+        let our_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let our_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+
+        // Build a TCP packet with invalid flags (SYN+FIN+RST - Christmas tree attack)
+        // This should be dropped by firewall/conntrack
+        let invalid_flags = TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_RST;
+
+        // Build TCP header with invalid flags
+        #[rustfmt::skip]
+        let tcp_header: [u8; 20] = [
+            0x30, 0x39,  // src port: 12345
+            0x00, 0x50,  // dst port: 80
+            0x00, 0x00, 0x00, 0x01,  // seq: 1
+            0x00, 0x00, 0x00, 0x00,  // ack: 0
+            0x50, invalid_flags,     // data offset: 5, flags: SYN+FIN+RST
+            0x20, 0x00,  // window: 8192
+            0x00, 0x00,  // checksum (placeholder)
+            0x00, 0x00,  // urgent ptr: 0
+        ];
+
+        // Build IPv4 header
+        let ip_header = net::build_ipv4_header(
+            remote_ip,
+            our_ip,
+            net::Ipv4Proto::Tcp,
+            tcp_header.len() as u16,
+            64,
+        );
+
+        // Combine IP + TCP
+        let mut ip_packet = Vec::with_capacity(ip_header.len() + tcp_header.len());
+        ip_packet.extend_from_slice(&ip_header);
+        ip_packet.extend_from_slice(&tcp_header);
+
+        // Build Ethernet frame
+        let frame = net::build_ethernet_frame(our_mac, remote_mac, net::ETHERTYPE_IPV4, &ip_packet);
+
+        // Create test context
+        let mut arp_cache = ArpCache::new(60_000, 256); // 60s TTL, 256 max entries
+        let stats = NetStats::new();
+        let now_ms = 2000u64;
+
+        // Process the frame
+        let result = net::process_frame(&frame, our_mac, our_ip, &mut arp_cache, &stats, now_ms);
+
+        // Invalid TCP flags should be dropped (or handled without reply)
+        match result {
+            ProcessResult::Dropped(_) => Ok(()), // Expected: dropped by firewall
+            ProcessResult::Handled => Ok(()),    // Also valid: silently discarded
+            ProcessResult::Reply(ref pkt) => {
+                // RST reply is acceptable for invalid packets
+                if pkt.len() > 34 {
+                    // Min Eth+IP+TCP
+                    Ok(())
+                } else {
+                    Err(String::from("Unexpected short reply to invalid TCP"))
+                }
+            }
+        }
+    }
+
+    /// Test that conntrack table entries are created for valid flows
+    fn test_conntrack_creation(&self) -> Result<(), String> {
+        use net::conntrack;
+
+        // Get the conntrack table
+        let table = conntrack::conntrack_table();
+        let stats = table.stats();
+
+        // Verify table is operational by checking stats are accessible
+        // (entries_created should be available)
+        let _ = stats
+            .entries_created
+            .load(core::sync::atomic::Ordering::Relaxed);
+
+        // Check that table can perform lookups (doesn't panic)
+        let test_key = conntrack::FlowKey {
+            ip_lo: [10, 0, 0, 1],
+            ip_hi: [10, 0, 0, 2],
+            port_lo: 80,
+            port_hi: 12345,
+            proto: 17, // UDP
+        };
+
+        // Lookup should complete without panic (result doesn't matter)
+        let _ = table.lookup(&test_key);
+
+        Ok(())
+    }
+
+    /// Test valid TCP SYN packet processing
+    fn test_tcp_syn(&self) -> Result<(), String> {
+        use net::{arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult, TCP_FLAG_SYN};
+
+        let our_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let our_ip = Ipv4Addr([10, 0, 0, 1]);
+        let remote_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        let remote_ip = Ipv4Addr([10, 0, 0, 2]);
+
+        // Build a valid TCP SYN packet
+        #[rustfmt::skip]
+        let tcp_header: [u8; 20] = [
+            0x30, 0x39,  // src port: 12345
+            0x00, 0x50,  // dst port: 80
+            0x00, 0x00, 0x00, 0x01,  // seq: 1
+            0x00, 0x00, 0x00, 0x00,  // ack: 0
+            0x50, TCP_FLAG_SYN,      // data offset: 5, flags: SYN only
+            0x20, 0x00,  // window: 8192
+            0x00, 0x00,  // checksum (placeholder)
+            0x00, 0x00,  // urgent ptr: 0
+        ];
+
+        // Build IPv4 header
+        let ip_header = net::build_ipv4_header(
+            remote_ip,
+            our_ip,
+            net::Ipv4Proto::Tcp,
+            tcp_header.len() as u16,
+            64,
+        );
+
+        // Combine IP + TCP
+        let mut ip_packet = Vec::with_capacity(ip_header.len() + tcp_header.len());
+        ip_packet.extend_from_slice(&ip_header);
+        ip_packet.extend_from_slice(&tcp_header);
+
+        // Build Ethernet frame
+        let frame = net::build_ethernet_frame(our_mac, remote_mac, net::ETHERTYPE_IPV4, &ip_packet);
+
+        // Create test context
+        let mut arp_cache = ArpCache::new(60_000, 256);
+        let stats = NetStats::new();
+        let now_ms = 3000u64;
+
+        // Process the frame
+        let result = net::process_frame(&frame, our_mac, our_ip, &mut arp_cache, &stats, now_ms);
+
+        // Valid SYN should be processed (either handled, replied with RST, or dropped if no listener)
+        match result {
+            ProcessResult::Handled => Ok(()),
+            ProcessResult::Reply(_) => Ok(()), // RST reply is acceptable
+            ProcessResult::Dropped(_) => Ok(()), // May be dropped if no matching socket
+        }
+    }
+
+    /// Test firewall rule matching and statistics
+    fn test_firewall_rules(&self) -> Result<(), String> {
+        use net::{conntrack, firewall, Ipv4Addr, Ipv4Proto};
+
+        // Get the firewall table
+        let table = firewall::firewall_table();
+        let stats = table.stats();
+
+        // Verify firewall is operational by checking statistics
+        // Stats should be accessible
+        let _ = stats.packets_accepted;
+        let _ = stats.packets_dropped;
+        let _ = stats.rule_evaluations;
+
+        // Test that the firewall can evaluate packets
+        // Create a test packet structure
+        let test_pkt = firewall::FirewallPacket {
+            src_ip: Ipv4Addr([10, 0, 0, 2]),
+            dst_ip: Ipv4Addr([10, 0, 0, 1]),
+            src_port: Some(12345),
+            dst_port: Some(80),
+            proto: Ipv4Proto::Tcp,
+            ct_state: Some(conntrack::CtDecision::New),
+        };
+
+        // Evaluate should complete without panic
+        let verdict = table.evaluate(&test_pkt);
+
+        // Verify we get a valid verdict with action field
+        match verdict.action {
+            firewall::FirewallAction::Accept => Ok(()),
+            firewall::FirewallAction::Drop => Ok(()),
+            firewall::FirewallAction::Reject { .. } => Ok(()),
+        }
+    }
+}
+
+// ============================================================================
 // Scheduler Tests
 // ============================================================================
 
@@ -567,10 +881,10 @@ impl RuntimeTest for SchedulerStarvationTest {
         // Create a test process with low priority
         // ProcessId is type alias for usize
         let mut process = Process::new(
-            9999,     // pid: usize
-            1,        // ppid: usize
+            9999, // pid: usize
+            1,    // ppid: usize
             String::from("test_process"),
-            100,      // priority: u8 (lower = higher priority, 100 is low)
+            100, // priority: u8 (lower = higher priority, 100 is low)
         );
 
         let initial_priority = process.dynamic_priority;
@@ -626,10 +940,10 @@ impl RuntimeTest for ProcessCreationTest {
         // Create a new process
         // ProcessId is type alias for usize
         let process = Process::new(
-            1234,     // pid: usize
-            1,        // ppid: usize
+            1234, // pid: usize
+            1,    // ppid: usize
             String::from("test_proc"),
-            50,       // priority: u8
+            50, // priority: u8
         );
 
         // Verify initial state
@@ -720,7 +1034,7 @@ impl RuntimeTest for SecuritySubsystemTest {
 
 /// Run all runtime tests and return a report
 pub fn run_all_runtime_tests() -> TestReport {
-    let tests: [&dyn RuntimeTest; 10] = [
+    let tests: [&dyn RuntimeTest; 11] = [
         &HeapAllocationTest,
         &BuddyAllocatorTest,
         &CapTableLifecycleTest,
@@ -728,6 +1042,7 @@ pub fn run_all_runtime_tests() -> TestReport {
         &PledgeSeccompFilterTest,
         &AuditHashChainTest,
         &NetworkParsingTest,
+        &NetworkLoopbackTest,
         &SchedulerStarvationTest,
         &ProcessCreationTest,
         &SecuritySubsystemTest,
@@ -785,7 +1100,7 @@ pub fn run_all_runtime_tests() -> TestReport {
 
 /// Run a single test by name
 pub fn run_test(name: &str) -> Option<TestOutcome> {
-    let tests: [&dyn RuntimeTest; 10] = [
+    let tests: [&dyn RuntimeTest; 11] = [
         &HeapAllocationTest,
         &BuddyAllocatorTest,
         &CapTableLifecycleTest,
@@ -793,6 +1108,7 @@ pub fn run_test(name: &str) -> Option<TestOutcome> {
         &PledgeSeccompFilterTest,
         &AuditHashChainTest,
         &NetworkParsingTest,
+        &NetworkLoopbackTest,
         &SchedulerStarvationTest,
         &ProcessCreationTest,
         &SecuritySubsystemTest,

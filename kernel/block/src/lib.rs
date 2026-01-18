@@ -415,7 +415,10 @@ impl Bio {
         }
 
         // Bounds check: sector + total_sectors must not overflow or exceed capacity
-        let end_sector = self.sector.checked_add(sectors).ok_or(BlockError::Invalid)?;
+        let end_sector = self
+            .sector
+            .checked_add(sectors)
+            .ok_or(BlockError::Invalid)?;
         if end_sector > device_capacity {
             return Err(BlockError::Invalid);
         }
@@ -558,12 +561,7 @@ pub struct RequestQueue {
 
 impl RequestQueue {
     /// Create a new request queue with the given parameters.
-    pub fn new(
-        sector_size: u32,
-        max_sectors: u32,
-        max_depth: usize,
-        device_capacity: u64,
-    ) -> Self {
+    pub fn new(sector_size: u32, max_sectors: u32, max_depth: usize, device_capacity: u64) -> Self {
         Self {
             queue: Mutex::new(VecDeque::with_capacity(max_depth)),
             max_depth,

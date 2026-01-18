@@ -56,9 +56,27 @@ pub mod tcp;
 pub mod udp;
 pub mod virtio_net;
 
+pub use arp::{
+    build_arp_reply, build_arp_request, build_gratuitous_arp, parse_arp, process_arp,
+    serialize_arp, ArpCache, ArpEntry, ArpEntryKind, ArpError, ArpOp, ArpPacket, ArpResult,
+    ArpStats, ARP_RX_RATE_LIMITER, ARP_TX_RATE_LIMITER,
+};
 pub use buffer::{BufPool, NetBuf};
 pub use device::{
     DeviceCaps, LinkStatus, MacAddress, NetDevice, NetError, OperatingMode, RxError, TxError,
+};
+pub use ethernet::{
+    build_ethernet_frame, parse_ethernet, EthAddr, EthError, EthHeader, ETHERTYPE_ARP,
+    ETHERTYPE_IPV4,
+};
+pub use firewall::{
+    firewall_table, log_match, CtStateMask, FirewallAction, FirewallPacket, FirewallRule,
+    FirewallRuleBuilder, FirewallStats, FirewallStatsSnapshot, FirewallTable, FirewallVerdict,
+    IpCidrMatch, PortRange,
+};
+pub use fragment::{
+    cleanup_expired_fragments, fragment_cache, process_fragment, FragmentCache, FragmentDropReason,
+    FragmentKey, FragmentStats, FRAG_TIMEOUT_MS, MAX_FRAGS_PER_QUEUE, MAX_PACKET_SIZE,
 };
 pub use icmp::{
     build_echo_reply, parse_icmp, IcmpError, IcmpHeader, TokenBucket, ICMP_RATE_LIMITER,
@@ -68,55 +86,36 @@ pub use icmp::{
 pub use ipv4::{
     build_ipv4_header, compute_checksum, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
 };
-pub use ethernet::{
-    parse_ethernet, build_ethernet_frame, EthAddr, EthHeader, EthError,
-    ETHERTYPE_IPV4, ETHERTYPE_ARP,
-};
-pub use stack::{
-    process_frame, network_config, transmit_tcp_segment, transmit_udp_datagram, handle_timer_tick,
-    DropReason, NetConfigSnapshot, NetStats, ProcessResult,
-};
-pub use virtio_net::VirtioNetDevice;
-pub use arp::{
-    parse_arp, serialize_arp, build_arp_reply, build_arp_request, build_gratuitous_arp,
-    process_arp, ArpCache, ArpEntry, ArpEntryKind, ArpError, ArpOp, ArpPacket, ArpResult,
-    ArpStats, ARP_RX_RATE_LIMITER, ARP_TX_RATE_LIMITER,
-};
-pub use udp::{
-    parse_udp, parse_udp_header, build_udp_datagram, compute_udp_checksum, verify_udp_checksum,
-    UdpError, UdpHeader, UdpResult, UdpStats, UDP_HEADER_LEN, UDP_PROTO,
-};
-pub use tcp::{
-    parse_tcp_header, parse_tcp_options, build_tcp_segment, build_tcp_segment_with_options,
-    serialize_tcp_option, serialize_tcp_options, compute_tcp_checksum,
-    verify_tcp_checksum, generate_isn, seq_lt, seq_le, seq_gt, seq_ge, seq_in_window,
-    update_rtt, handle_ack, update_congestion_control, handle_retransmission_timeout,
-    validate_cwnd_after_idle, initial_cwnd, calc_wscale, decode_window, encode_window,
-    generate_syn_cookie_isn, validate_syn_cookie, syn_cookie_select_mss, SynCookieData,
-    TcpHeader, TcpOptions, TcpOptionKind, TcpState, TcpCongestionState, TcpControlBlock,
-    TcpConnKey, TcpSegment, AckUpdate, CongestionAction, TcpError, TcpResult, TcpStats,
-    TCP_HEADER_MIN_LEN, TCP_HEADER_MAX_LEN, TCP_PROTO, TCP_DEFAULT_MSS, TCP_ETHERNET_MSS,
-    TCP_TIME_WAIT_MS, TCP_FIN_TIMEOUT_MS, TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES, TCP_MAX_RTO_MS,
-    TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_ACCEPT_BACKLOG, TCP_INITIAL_SSTHRESH,
-    TCP_MAX_WINDOW_SCALE, TCP_MAX_SCALED_WINDOW, TCP_DEFAULT_RCV_WINDOW_BYTES, TCP_DEFAULT_WINDOW,
-    TCP_FLAG_FIN, TCP_FLAG_SYN, TCP_FLAG_RST, TCP_FLAG_PSH, TCP_FLAG_ACK, TCP_FLAG_URG,
-    TCP_SYN_COOKIE_MSS_TABLE, TCP_SYN_COOKIE_MAX_AGE_MS,
-};
 pub use socket::{
-    socket_table, register_socket_wait_hooks, PendingDatagram, SocketDomain, SocketError,
+    register_socket_wait_hooks, socket_table, PendingDatagram, SocketDomain, SocketError,
     SocketLabel, SocketProtocol, SocketState, SocketStats, SocketTable, SocketType,
     SocketWaitHooks, TableStats, TcpConnectResult, WaitOutcome, WaitQueue,
 };
-pub use fragment::{
-    process_fragment, cleanup_expired_fragments, fragment_cache,
-    FragmentCache, FragmentDropReason, FragmentKey, FragmentStats,
-    FRAG_TIMEOUT_MS, MAX_PACKET_SIZE, MAX_FRAGS_PER_QUEUE,
+pub use stack::{
+    handle_timer_tick, network_config, process_frame, transmit_tcp_segment, transmit_udp_datagram,
+    DropReason, NetConfigSnapshot, NetStats, ProcessResult,
 };
-pub use firewall::{
-    firewall_table, log_match, CtStateMask, FirewallAction, FirewallPacket, FirewallRule,
-    FirewallRuleBuilder, FirewallStats, FirewallStatsSnapshot, FirewallTable, FirewallVerdict,
-    IpCidrMatch, PortRange,
+pub use tcp::{
+    build_tcp_segment, build_tcp_segment_with_options, calc_wscale, compute_tcp_checksum,
+    decode_window, encode_window, generate_isn, generate_syn_cookie_isn, handle_ack,
+    handle_retransmission_timeout, initial_cwnd, parse_tcp_header, parse_tcp_options, seq_ge,
+    seq_gt, seq_in_window, seq_le, seq_lt, serialize_tcp_option, serialize_tcp_options,
+    syn_cookie_select_mss, update_congestion_control, update_rtt, validate_cwnd_after_idle,
+    validate_syn_cookie, verify_tcp_checksum, AckUpdate, CongestionAction, SynCookieData,
+    TcpCongestionState, TcpConnKey, TcpControlBlock, TcpError, TcpHeader, TcpOptionKind,
+    TcpOptions, TcpResult, TcpSegment, TcpState, TcpStats, TCP_DEFAULT_MSS,
+    TCP_DEFAULT_RCV_WINDOW_BYTES, TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS, TCP_FIN_TIMEOUT_MS,
+    TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_FLAG_URG,
+    TCP_HEADER_MAX_LEN, TCP_HEADER_MIN_LEN, TCP_INITIAL_SSTHRESH, TCP_MAX_ACCEPT_BACKLOG,
+    TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES, TCP_MAX_RTO_MS, TCP_MAX_SCALED_WINDOW, TCP_MAX_SEND_SIZE,
+    TCP_MAX_SYN_BACKLOG, TCP_MAX_WINDOW_SCALE, TCP_PROTO, TCP_SYN_COOKIE_MAX_AGE_MS,
+    TCP_SYN_COOKIE_MSS_TABLE, TCP_TIME_WAIT_MS,
 };
+pub use udp::{
+    build_udp_datagram, compute_udp_checksum, parse_udp, parse_udp_header, verify_udp_checksum,
+    UdpError, UdpHeader, UdpResult, UdpStats, UDP_HEADER_LEN, UDP_PROTO,
+};
+pub use virtio_net::VirtioNetDevice;
 
 // ============================================================================
 // Network Constants
@@ -302,7 +301,9 @@ unsafe fn map_pci_mmio(phys_base: u64, size: usize) -> Result<i64, NetError> {
 
     drivers::println!(
         "      [NET MMIO] Mapping phys {:#x} -> virt {:#x} (size {:#x})",
-        phys_base, virt_addr, aligned_size
+        phys_base,
+        virt_addr,
+        aligned_size
     );
 
     // Create the mapping using the mm crate's map_mmio function
@@ -335,12 +336,17 @@ unsafe fn map_virtio_pci_regions(
     // The regions are: common_cfg, notify_base, isr, device_cfg
     // They're typically close together in a single BAR
 
-    let min_addr = [addrs.common_cfg, addrs.notify_base, addrs.isr, addrs.device_cfg]
-        .iter()
-        .filter(|&&a| a != 0)
-        .min()
-        .copied()
-        .ok_or(NetError::NotSupported)?;
+    let min_addr = [
+        addrs.common_cfg,
+        addrs.notify_base,
+        addrs.isr,
+        addrs.device_cfg,
+    ]
+    .iter()
+    .filter(|&&a| a != 0)
+    .min()
+    .copied()
+    .ok_or(NetError::NotSupported)?;
 
     let max_addr = [
         addrs.common_cfg + 64, // VirtioPciCommonCfg is ~64 bytes
@@ -395,19 +401,16 @@ pub fn init() -> usize {
                 Err(e) => {
                     drivers::println!(
                         "      ! MMIO mapping failed for {:02x}:{:02x}.{}: {:?}",
-                        pci_dev.slot.bus, pci_dev.slot.device, pci_dev.slot.function, e
+                        pci_dev.slot.bus,
+                        pci_dev.slot.device,
+                        pci_dev.slot.function,
+                        e
                     );
                     continue;
                 }
             };
 
-            match unsafe {
-                VirtioNetDevice::probe_pci(
-                    pci_dev.addrs,
-                    virt_offset as u64,
-                    &name,
-                )
-            } {
+            match unsafe { VirtioNetDevice::probe_pci(pci_dev.addrs, virt_offset as u64, &name) } {
                 Ok(device) => {
                     let mac = device.mac_address();
                     let link = device.link_status();
@@ -426,11 +429,7 @@ pub fn init() -> usize {
                             registered += 1;
                         }
                         Err(e) => {
-                            drivers::println!(
-                                "      ! Failed to register {}: {:?}",
-                                name,
-                                e
-                            );
+                            drivers::println!("      ! Failed to register {}: {:?}", name, e);
                         }
                     }
                 }

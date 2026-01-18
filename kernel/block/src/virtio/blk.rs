@@ -13,18 +13,18 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU16, Ordering};
 use spin::Mutex;
 
 use super::{
-    blk_features, blk_status, blk_types, mb, rmb, wmb, MmioTransport, VirtioPciAddrs,
-    VirtioPciTransport, VirtioBlkConfig, VirtioBlkReqHeader, VirtioTransport, VringAvail,
-    VringDesc, VringUsed, VringUsedElem, VIRTIO_DEVICE_BLK, VIRTIO_F_VERSION_1,
-    VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
-    VIRTIO_STATUS_FEATURES_OK, VIRTIO_VERSION_LEGACY, VIRTIO_VERSION_MODERN, VRING_DESC_F_NEXT,
-    VRING_DESC_F_WRITE,
+    blk_features, blk_status, blk_types, mb, rmb, wmb, MmioTransport, VirtioBlkConfig,
+    VirtioBlkReqHeader, VirtioPciAddrs, VirtioPciTransport, VirtioTransport, VringAvail, VringDesc,
+    VringUsed, VringUsedElem, VIRTIO_DEVICE_BLK, VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE,
+    VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK,
+    VIRTIO_VERSION_LEGACY, VIRTIO_VERSION_MODERN, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,
 };
 use crate::{Bio, BioOp, BioResult, BioVec, BlockDevice, BlockError};
 
@@ -101,7 +101,9 @@ fn virt_to_phys_dma(ptr: *const u8, len: usize) -> Result<u64, BlockError> {
 
     // Overflow check: ensure the entire buffer is within valid physical memory
     // The direct map covers 0-1GB (0x0 to 0x40000000)
-    let end = phys.checked_add(len as u64 - 1).ok_or(BlockError::Invalid)?;
+    let end = phys
+        .checked_add(len as u64 - 1)
+        .ok_or(BlockError::Invalid)?;
     if end >= 0x4000_0000 {
         // Beyond direct map coverage - likely an error
         return Err(BlockError::Invalid);
@@ -130,6 +132,9 @@ pub struct VirtQueue {
     free_head: AtomicU16,
     /// Free descriptor stack.
     free_list: Mutex<Vec<u16>>,
+    /// R66-6 FIX: Allocation bitmap for double-free detection.
+    /// True = descriptor is allocated, False = descriptor is free.
+    alloc_bitmap: Mutex<Vec<bool>>,
     /// Last seen used index.
     last_used_idx: AtomicU16,
     /// Physical address of descriptor table.
@@ -189,10 +194,19 @@ impl VirtQueue {
             free_list.push(i);
         }
 
-        // Zero out the rings
+        // R66-3 FIX: Zero out entire ring structures, not just 1 byte.
+        // Previously only 1 byte was zeroed, leaving uninitialized memory
+        // exposed to device DMA (info leak) and causing random ring state.
         core::ptr::write_bytes(desc, 0, queue_size as usize);
-        core::ptr::write_bytes(avail, 0, 1);
-        core::ptr::write_bytes(used, 0, 1);
+        // avail ring: flags(2) + idx(2) + ring[queue_size](2*N) + used_event(2)
+        let avail_bytes = 4 + 2 * queue_size as usize + 2;
+        core::ptr::write_bytes(avail as *mut u8, 0, avail_bytes);
+        // used ring: flags(2) + idx(2) + ring[queue_size](8*N) + avail_event(2)
+        let used_bytes = 4 + 8 * queue_size as usize + 2;
+        core::ptr::write_bytes(used as *mut u8, 0, used_bytes);
+
+        // R66-6 FIX: Initialize allocation bitmap (all false = all free initially)
+        let alloc_bitmap = vec![false; queue_size as usize];
 
         Self {
             size: queue_size,
@@ -202,6 +216,7 @@ impl VirtQueue {
             used,
             free_head: AtomicU16::new(0),
             free_list: Mutex::new(free_list),
+            alloc_bitmap: Mutex::new(alloc_bitmap),
             last_used_idx: AtomicU16::new(0),
             desc_phys,
             avail_phys,
@@ -210,12 +225,50 @@ impl VirtQueue {
     }
 
     /// Allocate a descriptor from the free list.
+    /// R66-6 FIX: Track allocation in bitmap for double-free detection.
     fn alloc_desc(&self) -> Option<u16> {
-        self.free_list.lock().pop()
+        let mut alloc = self.alloc_bitmap.lock();
+        let mut free = self.free_list.lock();
+        let idx = free.pop()?;
+        // Mark as allocated
+        if let Some(slot) = alloc.get_mut(idx as usize) {
+            *slot = true;
+        }
+        Some(idx)
     }
 
     /// Free a descriptor back to the free list.
+    /// R66-6 FIX: Check bitmap to detect and prevent double-free.
     fn free_desc(&self, idx: u16) {
+        // Bounds check
+        if idx >= self.size {
+            println!(
+                "[virtio-blk] R66-6: free_desc called with OOB index {}",
+                idx
+            );
+            return;
+        }
+
+        // Check allocation bitmap - prevent double-free
+        {
+            let mut alloc = self.alloc_bitmap.lock();
+            if let Some(slot) = alloc.get_mut(idx as usize) {
+                if !*slot {
+                    // Already free - double-free attempt detected
+                    println!(
+                        "[virtio-blk] R66-6 SECURITY: double-free detected for descriptor {}",
+                        idx
+                    );
+                    return;
+                }
+                // Mark as free
+                *slot = false;
+            } else {
+                return; // Index out of bounds
+            }
+        }
+
+        // Now safe to push back to free list
         self.free_list.lock().push(idx);
     }
 
@@ -252,6 +305,9 @@ impl VirtQueue {
     }
 
     /// Pop a used entry.
+    /// R66-5 FIX: Validate used.idx to detect malicious device behavior:
+    /// - Large jumps (more entries than queue size)
+    /// - Rollback attacks (used_idx going backwards)
     fn pop_used(&self) -> Option<VringUsedElem> {
         unsafe {
             let used = &*self.used;
@@ -262,13 +318,45 @@ impl VirtQueue {
                 return None;
             }
 
+            // R66-5 FIX: Calculate pending entries with wrapping arithmetic
+            // pending = used_idx - last (handling u16 wrap)
+            let pending = used_idx.wrapping_sub(last);
+
+            // R66-5 FIX: Validate that pending entries don't exceed queue size
+            // A malicious device could set used_idx to arbitrary values
+            if pending > self.size {
+                // Possible attack: device reported too many completions or rolled back
+                println!(
+                    "[virtio-blk] R66-5 SECURITY: invalid used.idx jump detected! \
+                     used_idx={}, last={}, pending={}, size={}",
+                    used_idx, last, pending, self.size
+                );
+                // Reset last_used_idx to used_idx to prevent infinite loop
+                // but don't process any entries
+                self.last_used_idx.store(used_idx, Ordering::Relaxed);
+                return None;
+            }
+
             rmb();
 
             let ring_idx = (last % self.size) as usize;
             let ring_ptr = used.ring.as_ptr();
             let elem = read_volatile(ring_ptr.add(ring_idx));
 
-            self.last_used_idx.store(last.wrapping_add(1), Ordering::Relaxed);
+            // R66-5 FIX: Validate that the returned descriptor ID is within bounds
+            if elem.id >= self.size as u32 {
+                println!(
+                    "[virtio-blk] R66-5 SECURITY: invalid used.id={} exceeds queue size={}",
+                    elem.id, self.size
+                );
+                // Skip this invalid entry
+                self.last_used_idx
+                    .store(last.wrapping_add(1), Ordering::Relaxed);
+                return None;
+            }
+
+            self.last_used_idx
+                .store(last.wrapping_add(1), Ordering::Relaxed);
 
             Some(elem)
         }
@@ -385,8 +473,7 @@ impl VirtioBlkDevice {
         virt_offset: u64,
         name: &str,
     ) -> Result<Arc<Self>, BlockError> {
-        let transport = MmioTransport::probe(mmio_phys, virt_offset)
-            .ok_or(BlockError::NotFound)?;
+        let transport = MmioTransport::probe(mmio_phys, virt_offset).ok_or(BlockError::NotFound)?;
         Self::probe_with_transport(VirtioTransport::Mmio(transport), virt_offset, name)
     }
 
@@ -529,7 +616,7 @@ impl VirtioBlkDevice {
                 header: VirtioBlkReqHeader::default(),
                 status: 0,
                 in_use: false,
-                pending: None,  // R39-1 FIX: Initialize pending metadata
+                pending: None, // R39-1 FIX: Initialize pending metadata
             });
         }
 
@@ -557,8 +644,7 @@ impl VirtioBlkDevice {
         let pages = (size + 4095) / 4096;
 
         // Allocate from buddy allocator
-        let frame = buddy_allocator::alloc_physical_pages(pages)
-            .ok_or(BlockError::NoMem)?;
+        let frame = buddy_allocator::alloc_physical_pages(pages).ok_or(BlockError::NoMem)?;
 
         let phys_addr = frame.start_address().as_u64();
 
@@ -709,11 +795,9 @@ impl VirtioBlkDevice {
         // Handle abandoned requests (late completions)
         if abandoned {
             // Decrement leaked counter since we've now recovered the resources
-            let _ = TIMEOUT_LEAKED_REQUESTS.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| v.checked_sub(1),
-            );
+            let _ =
+                TIMEOUT_LEAKED_REQUESTS
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
             println!(
                 "[virtio-blk] late completion for abandoned request head={} status={}",
                 head, status
@@ -750,12 +834,8 @@ impl VirtioBlkDevice {
         }
 
         // Convert to byte offsets for consistent bounds checking
-        let start_byte = sector
-            .checked_mul(sector_size)
-            .ok_or(BlockError::Invalid)?;
-        let end_byte = start_byte
-            .checked_add(buf_len)
-            .ok_or(BlockError::Invalid)?;
+        let start_byte = sector.checked_mul(sector_size).ok_or(BlockError::Invalid)?;
+        let end_byte = start_byte.checked_add(buf_len).ok_or(BlockError::Invalid)?;
         let capacity_bytes = self
             .capacity
             .checked_mul(VIRTIO_CAPACITY_SECTOR_SIZE)
@@ -789,7 +869,7 @@ impl VirtioBlkDevice {
                         blk_types::VIRTIO_BLK_T_IN
                     };
                     buffers[i].header.reserved = 0;
-                    buffers[i].header.sector = header_sector;  // R32-BLK-1: Use 512-byte sector units
+                    buffers[i].header.sector = header_sector; // R32-BLK-1: Use 512-byte sector units
                     buffers[i].status = 0xFF; // Invalid status
                     i
                 }
@@ -800,7 +880,11 @@ impl VirtioBlkDevice {
         // DMA bounce buffer for header/status: heap buffers don't have correct virt-to-phys mapping
         // Allocate DMA memory from buddy allocator which provides correct physical addresses
         let header_size = core::mem::size_of::<VirtioBlkReqHeader>();
-        let header_status_dma_size = if header_size + 1 < 32 { 32 } else { header_size + 1 };
+        let header_status_dma_size = if header_size + 1 < 32 {
+            32
+        } else {
+            header_size + 1
+        };
         let header_status_dma_phys = match Self::alloc_dma_memory(header_status_dma_size) {
             Ok(p) => p,
             Err(e) => {
@@ -975,7 +1059,10 @@ impl VirtioBlkDevice {
                 println!(
                     "[virtio-blk] timeout waiting for request head={} sector={} bytes={}, \
                      buffers pinned (reset required, total leaked={})",
-                    desc0, sector, buf.len(), leaked
+                    desc0,
+                    sector,
+                    buf.len(),
+                    leaked
                 );
                 // Leave req_buffers[buf_idx].in_use = true to prevent reuse until device completes
                 return Err(BlockError::Io);
@@ -1227,7 +1314,7 @@ impl BlockDevice for VirtioBlkDevice {
             let mut buffers = self.req_buffers.lock();
             buffers[buf_idx].pending = Some(RequestMeta {
                 head: desc0,
-                desc_chain: [desc0, desc1, 0],  // Only 2 descriptors for flush
+                desc_chain: [desc0, desc1, 0], // Only 2 descriptors for flush
                 desc_count: 2,
                 header_status_dma_phys,
                 header_status_dma_size,

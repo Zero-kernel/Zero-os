@@ -194,7 +194,8 @@ impl Vfs {
         *self.root_fs.write() = Some(ramfs.clone());
 
         // Mount ramfs at / first
-        self.mount("/", ramfs.clone()).expect("Failed to mount ramfs at /");
+        self.mount("/", ramfs.clone())
+            .expect("Failed to mount ramfs at /");
 
         // Create mount point directories in root ramfs so they appear in ls
         // These directories are needed so that readdir("/") shows /dev and /proc
@@ -249,8 +250,7 @@ impl Vfs {
         // LSM policy can block mounts even for root users
         if let Some(task) = LsmProcessCtx::from_current() {
             let path_hash = hash_path(&path);
-            lsm::hook_file_mount(&task, 0, path_hash, 0, 0)
-                .map_err(|_| FsError::PermDenied)?;
+            lsm::hook_file_mount(&task, 0, path_hash, 0, 0).map_err(|_| FsError::PermDenied)?;
         }
 
         let mut mounts = self.mounts.write();
@@ -282,8 +282,7 @@ impl Vfs {
         // LSM policy can block unmounts even for root users
         if let Some(task) = LsmProcessCtx::from_current() {
             let path_hash = hash_path(&path);
-            lsm::hook_file_umount(&task, path_hash, 0)
-                .map_err(|_| FsError::PermDenied)?;
+            lsm::hook_file_umount(&task, path_hash, 0).map_err(|_| FsError::PermDenied)?;
         }
 
         let mut mounts = self.mounts.write();
@@ -772,11 +771,21 @@ impl Vfs {
         if let Some(task) = LsmProcessCtx::from_current() {
             let name_hash = hash_path(filename);
             if masked_mode.is_dir() {
-                lsm::hook_file_mkdir(&task, latest_parent_stat.ino, name_hash, masked_mode.to_raw())
-                    .map_err(|_| FsError::PermDenied)?;
+                lsm::hook_file_mkdir(
+                    &task,
+                    latest_parent_stat.ino,
+                    name_hash,
+                    masked_mode.to_raw(),
+                )
+                .map_err(|_| FsError::PermDenied)?;
             } else {
-                lsm::hook_file_create(&task, latest_parent_stat.ino, name_hash, masked_mode.to_raw())
-                    .map_err(|_| FsError::PermDenied)?;
+                lsm::hook_file_create(
+                    &task,
+                    latest_parent_stat.ino,
+                    name_hash,
+                    masked_mode.to_raw(),
+                )
+                .map_err(|_| FsError::PermDenied)?;
             }
         }
 
@@ -1247,8 +1256,7 @@ fn vfs_readdir_callback(fd: i32) -> Result<alloc::vec::Vec<kernel_core::DirEntry
     // R37-4 FIX (Codex review): Add MAC check for sys_getdents64.
     let dir_stat = inode.stat().map_err(fs_error_to_syscall)?;
     if let Some(task) = LsmProcessCtx::from_current() {
-        lsm::hook_file_permission(&task, dir_stat.ino, 0x05)
-            .map_err(|_| SyscallError::EACCES)?;
+        lsm::hook_file_permission(&task, dir_stat.ino, 0x05).map_err(|_| SyscallError::EACCES)?;
     }
 
     // Read directory entries starting from current offset
@@ -1317,8 +1325,7 @@ fn vfs_truncate_callback(fd: i32, length: u64) -> Result<(), SyscallError> {
     // LSM policy can block file truncation
     if let Some(task) = LsmProcessCtx::from_current() {
         let stat = file_handle.inode.stat().map_err(fs_error_to_syscall)?;
-        lsm::hook_file_truncate(&task, stat.ino, length)
-            .map_err(|_| SyscallError::EPERM)?;
+        lsm::hook_file_truncate(&task, stat.ino, length).map_err(|_| SyscallError::EPERM)?;
     }
 
     file_handle

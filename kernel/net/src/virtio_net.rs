@@ -22,10 +22,10 @@ use crate::{
 };
 use mm::{buddy_allocator, PHYSICAL_MEMORY_OFFSET};
 use virtio::{
-    VirtQueue, VirtioPciAddrs, VirtioPciTransport, VirtioTransport, MmioTransport,
-    VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, VIRTIO_DEVICE_NET, VIRTIO_F_VERSION_1,
-    VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
-    VIRTIO_STATUS_FEATURES_OK, VIRTIO_VERSION_MODERN,
+    MmioTransport, VirtQueue, VirtioPciAddrs, VirtioPciTransport, VirtioTransport,
+    VIRTIO_DEVICE_NET, VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
+    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK, VIRTIO_VERSION_MODERN, VRING_DESC_F_NEXT,
+    VRING_DESC_F_WRITE,
 };
 
 // ============================================================================
@@ -47,6 +47,9 @@ const VIRTIO_NET_F_CTRL_VQ: u64 = 1 << 17;
 const QUEUE_RX: u16 = 0;
 const QUEUE_TX: u16 = 1;
 const DEFAULT_QUEUE_SIZE: u16 = 256;
+/// R66-8 FIX: Maximum number of completed RX buffers we keep queued for delivery.
+/// This prevents unbounded memory growth under packet flood conditions.
+const MAX_RX_READY_QUEUE: usize = DEFAULT_QUEUE_SIZE as usize;
 
 // ============================================================================
 // VirtIO Network Header
@@ -121,6 +124,8 @@ struct NetStats {
     rx_bytes: u64,
     tx_errors: u64,
     rx_errors: u64,
+    /// R66-8 FIX: Count of packets dropped due to RX ready queue overflow.
+    rx_dropped: u64,
 }
 
 /// R65-24 FIX: Driver-owned metadata for inflight RX buffers.
@@ -149,8 +154,8 @@ impl VirtioNetDevice {
         virt_offset: u64,
         name: &str,
     ) -> Result<Self, NetError> {
-        let transport = MmioTransport::probe(mmio_phys, virt_offset)
-            .ok_or(NetError::NotInitialized)?;
+        let transport =
+            MmioTransport::probe(mmio_phys, virt_offset).ok_or(NetError::NotInitialized)?;
         Self::init_with_transport(VirtioTransport::Mmio(transport), virt_offset, name)
     }
 
@@ -163,8 +168,8 @@ impl VirtioNetDevice {
         virt_offset: u64,
         name: &str,
     ) -> Result<Self, NetError> {
-        let transport = VirtioPciTransport::from_addrs(pci_addrs, virt_offset)
-            .ok_or(NetError::NotSupported)?;
+        let transport =
+            VirtioPciTransport::from_addrs(pci_addrs, virt_offset).ok_or(NetError::NotSupported)?;
         Self::init_with_transport(VirtioTransport::Pci(transport), virt_offset, name)
     }
 
@@ -251,7 +256,12 @@ impl VirtioNetDevice {
             "[net] {} ({}) MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             name,
             transport.kind(),
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         );
 
         Ok(Self {
@@ -325,7 +335,11 @@ impl VirtioNetDevice {
         }
 
         // Use driver-tracked chain link, not device-controlled descriptor
-        if let Some(next) = self.tx_chain_next.get_mut(head as usize).and_then(Option::take) {
+        if let Some(next) = self
+            .tx_chain_next
+            .get_mut(head as usize)
+            .and_then(Option::take)
+        {
             self.tx_queue.free_desc(next);
         }
         self.tx_queue.free_desc(head);
@@ -340,7 +354,11 @@ impl VirtioNetDevice {
         }
 
         // Use driver-tracked chain link, not device-controlled descriptor
-        if let Some(next) = self.rx_chain_next.get_mut(head as usize).and_then(Option::take) {
+        if let Some(next) = self
+            .rx_chain_next
+            .get_mut(head as usize)
+            .and_then(Option::take)
+        {
             self.rx_queue.free_desc(next);
         }
         self.rx_queue.free_desc(head);
@@ -365,7 +383,8 @@ impl VirtioNetDevice {
             // Log the invalid descriptor for debugging
             drivers::println!(
                 "[net] WARNING: device returned invalid used.id {} >= {}",
-                head_raw, qsize
+                head_raw,
+                qsize
             );
             return Err(RxError::BufferError);
         }
@@ -403,8 +422,8 @@ impl VirtioNetDevice {
             if let Some(pool) = pool {
                 pool.free(buf);
             } else {
-                // R48-5: Recycle locally when no pool provided
-                self.rx_ready.push(buf);
+                // R48-5 + R66-8: Recycle locally when no pool provided (bounded)
+                self.enqueue_rx_ready(buf);
             }
             // Free descriptors using driver-owned metadata
             if let Some(next) = data_idx {
@@ -425,7 +444,8 @@ impl VirtioNetDevice {
             self.stats.rx_errors += 1;
             drivers::println!(
                 "[net] WARNING: device reported len {} > posted capacity {}, clamping",
-                raw_payload_len, capacity
+                raw_payload_len,
+                capacity
             );
             capacity
         } else {
@@ -440,8 +460,8 @@ impl VirtioNetDevice {
             if let Some(pool) = pool {
                 pool.free(buf);
             } else {
-                // R48-5: Recycle locally when no pool provided
-                self.rx_ready.push(buf);
+                // R48-5 + R66-8: Recycle locally when no pool provided (bounded)
+                self.enqueue_rx_ready(buf);
             }
             // Free descriptors using driver-owned metadata
             if let Some(next) = data_idx {
@@ -461,6 +481,20 @@ impl VirtioNetDevice {
         self.stats.rx_bytes += payload_len as u64;
 
         Ok(Some(buf))
+    }
+
+    /// R66-8 FIX: Enqueue a completed RX buffer with bounded queue.
+    ///
+    /// Drops excess packets when the queue exceeds MAX_RX_READY_QUEUE to prevent
+    /// unbounded memory growth under packet flood conditions. Dropped packets are
+    /// counted in rx_dropped for monitoring.
+    fn enqueue_rx_ready(&mut self, buf: NetBuf) {
+        if self.rx_ready.len() >= MAX_RX_READY_QUEUE {
+            // Drop the packet - buffer will be deallocated when it goes out of scope
+            self.stats.rx_dropped += 1;
+            return;
+        }
+        self.rx_ready.push(buf);
     }
 }
 
@@ -535,7 +569,8 @@ impl NetDevice for VirtioNetDevice {
 
         unsafe {
             // Write virtio-net header at buffer base (in headroom)
-            let hdr_virt = (buf.buffer_phys_addr().as_u64() + PHYSICAL_MEMORY_OFFSET) as *mut VirtioNetHdr;
+            let hdr_virt =
+                (buf.buffer_phys_addr().as_u64() + PHYSICAL_MEMORY_OFFSET) as *mut VirtioNetHdr;
             write_bytes(hdr_virt, 0, 1);
 
             // Setup header descriptor (device reads)
@@ -561,7 +596,8 @@ impl NetDevice for VirtioNetDevice {
             self.tx_queue.push_avail(header_idx);
 
             // Notify device
-            self.transport.notify(QUEUE_TX, self.tx_queue.notify_offset());
+            self.transport
+                .notify(QUEUE_TX, self.tx_queue.notify_offset());
         }
 
         Ok(())
@@ -578,7 +614,8 @@ impl NetDevice for VirtioNetDevice {
                 self.stats.tx_errors += 1;
                 drivers::println!(
                     "[net] WARNING: TX device returned invalid used.id {} >= {}",
-                    head_raw, qsize
+                    head_raw,
+                    qsize
                 );
                 continue;
             }
@@ -588,7 +625,11 @@ impl NetDevice for VirtioNetDevice {
             self.free_tx_chain(head);
 
             // Release buffer
-            if let Some(buf) = self.tx_inflight.get_mut(head as usize).and_then(Option::take) {
+            if let Some(buf) = self
+                .tx_inflight
+                .get_mut(head as usize)
+                .and_then(Option::take)
+            {
                 self.stats.tx_packets += 1;
                 self.stats.tx_bytes += buf.len() as u64;
                 reclaimed += 1;
@@ -687,7 +728,8 @@ impl NetDevice for VirtioNetDevice {
         // Notify device about new buffers
         if posted > 0 {
             unsafe {
-                self.transport.notify(QUEUE_RX, self.rx_queue.notify_offset());
+                self.transport
+                    .notify(QUEUE_RX, self.rx_queue.notify_offset());
             }
         }
 
@@ -707,7 +749,8 @@ impl NetDevice for VirtioNetDevice {
         loop {
             match self.pop_rx_used(None) {
                 Ok(Some(buf)) => {
-                    self.rx_ready.push(buf);
+                    // R66-8 FIX: Use bounded enqueue to prevent memory exhaustion
+                    self.enqueue_rx_ready(buf);
                     rx_done += 1;
                 }
                 Ok(None) => break,
@@ -748,6 +791,10 @@ impl NetDevice for VirtioNetDevice {
 
     fn rx_errors(&self) -> u64 {
         self.stats.rx_errors
+    }
+
+    fn rx_dropped(&self) -> u64 {
+        self.stats.rx_dropped
     }
 }
 

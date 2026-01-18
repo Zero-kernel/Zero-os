@@ -307,11 +307,7 @@ mod smp_stubs {
     /// 2. Wait for all targets to acknowledge
     /// 3. Clear pending requests
     /// 4. Return
-    pub fn send_tlb_shootdown_ipi(
-        _target_cr3: u64,
-        _start: u64,
-        _len: usize,
-    ) {
+    pub fn send_tlb_shootdown_ipi(_target_cr3: u64, _start: u64, _len: usize) {
         // TODO: Implement when SMP support is added
         // For now, this is never called (single-core mode)
     }

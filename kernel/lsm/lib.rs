@@ -281,14 +281,7 @@ impl ProcessCtx {
     }
 
     /// Create a process context with explicit values.
-    pub fn new(
-        pid: ProcessId,
-        tgid: ProcessId,
-        uid: u32,
-        gid: u32,
-        euid: u32,
-        egid: u32,
-    ) -> Self {
+    pub fn new(pid: ProcessId, tgid: ProcessId, uid: u32, gid: u32, euid: u32, egid: u32) -> Self {
         Self {
             pid,
             tgid,
@@ -490,7 +483,9 @@ struct PolicySlot {
 }
 
 #[cfg(feature = "lsm")]
-static PERMISSIVE_SLOT: PolicySlot = PolicySlot { policy: &PERMISSIVE };
+static PERMISSIVE_SLOT: PolicySlot = PolicySlot {
+    policy: &PERMISSIVE,
+};
 
 /// Active policy slot pointer.
 ///
@@ -616,7 +611,10 @@ pub fn hook_task_fork(parent: &ProcessCtx, child: &ProcessCtx) -> LsmResult {
         let res = policy().task_fork(parent, child);
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(parent.pid, parent.uid, parent.gid, parent.cap);
-            let object = AuditObject::Process { pid: child.pid as u32, signal: None };
+            let object = AuditObject::Process {
+                pid: child.pid as u32,
+                signal: None,
+            };
             emit_denial_audit(subject, object, "task_fork", err);
         }
         res
@@ -636,7 +634,11 @@ pub fn hook_task_exec(task: &ProcessCtx, path_hash: u64) -> LsmResult {
         let res = policy().task_exec(task, path_hash);
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode: 0, mode: 0, path_hash };
+            let object = AuditObject::Path {
+                inode: 0,
+                mode: 0,
+                path_hash,
+            };
             emit_denial_audit(subject, object, "task_exec", err);
         }
         res
@@ -770,7 +772,11 @@ pub fn hook_file_lookup(task: &ProcessCtx, parent_inode: u64, name_hash: u64) ->
         // R25-3 FIX: Add denial audit
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode: parent_inode, mode: 0, path_hash: name_hash };
+            let object = AuditObject::Path {
+                inode: parent_inode,
+                mode: 0,
+                path_hash: name_hash,
+            };
             emit_denial_audit(subject, object, "file_lookup", err);
         }
         res
@@ -808,7 +814,12 @@ pub fn hook_file_open(task: &ProcessCtx, inode: u64, flags: OpenFlags, ctx: &Fil
 
 /// Hook: file create.
 #[inline]
-pub fn hook_file_create(task: &ProcessCtx, parent_inode: u64, name_hash: u64, mode: u32) -> LsmResult {
+pub fn hook_file_create(
+    task: &ProcessCtx,
+    parent_inode: u64,
+    name_hash: u64,
+    mode: u32,
+) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
         let res = policy().file_create(task, parent_inode, name_hash, mode);
@@ -839,7 +850,11 @@ pub fn hook_file_mmap(task: &ProcessCtx, inode: u64, prot: u32, flags: u32) -> L
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
             // Use Memory object for mmap denials
-            let object = AuditObject::Memory { vaddr: 0, size: 0, prot };
+            let object = AuditObject::Memory {
+                vaddr: 0,
+                size: 0,
+                prot,
+            };
             emit_denial_audit(subject, object, "file_mmap", err);
         }
         res
@@ -859,7 +874,11 @@ pub fn hook_file_chmod(task: &ProcessCtx, inode: u64, mode: u32) -> LsmResult {
         let res = policy().file_chmod(task, inode, mode);
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode, mode, path_hash: 0 };
+            let object = AuditObject::Path {
+                inode,
+                mode,
+                path_hash: 0,
+            };
             emit_denial_audit(subject, object, "file_chmod", err);
         }
         res
@@ -879,7 +898,11 @@ pub fn hook_file_chown(task: &ProcessCtx, inode: u64, uid: u32, gid: u32) -> Lsm
         let res = policy().file_chown(task, inode, uid, gid);
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode, mode: 0, path_hash: 0 };
+            let object = AuditObject::Path {
+                inode,
+                mode: 0,
+                path_hash: 0,
+            };
             emit_denial_audit(subject, object, "file_chown", err);
         }
         res
@@ -899,7 +922,11 @@ pub fn hook_file_unlink(task: &ProcessCtx, parent_inode: u64, name_hash: u64) ->
         let res = policy().file_unlink(task, parent_inode, name_hash);
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode: parent_inode, mode: 0, path_hash: name_hash };
+            let object = AuditObject::Path {
+                inode: parent_inode,
+                mode: 0,
+                path_hash: name_hash,
+            };
             emit_denial_audit(subject, object, "file_unlink", err);
         }
         res
@@ -926,7 +953,11 @@ pub fn hook_file_rename(
         // R25-3 FIX: Add denial audit
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode: old_parent, mode: 0, path_hash: old_name_hash };
+            let object = AuditObject::Path {
+                inode: old_parent,
+                mode: 0,
+                path_hash: old_name_hash,
+            };
             emit_denial_audit(subject, object, "file_rename", err);
         }
         res
@@ -947,7 +978,11 @@ pub fn hook_file_link(task: &ProcessCtx, inode: u64, new_parent: u64, name_hash:
         // R25-3 FIX: Add denial audit
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode, mode: 0, path_hash: name_hash };
+            let object = AuditObject::Path {
+                inode,
+                mode: 0,
+                path_hash: name_hash,
+            };
             emit_denial_audit(subject, object, "file_link", err);
         }
         res
@@ -961,14 +996,23 @@ pub fn hook_file_link(task: &ProcessCtx, inode: u64, new_parent: u64, name_hash:
 
 /// Hook: file symlink.
 #[inline]
-pub fn hook_file_symlink(task: &ProcessCtx, parent_inode: u64, name_hash: u64, target_hash: u64) -> LsmResult {
+pub fn hook_file_symlink(
+    task: &ProcessCtx,
+    parent_inode: u64,
+    name_hash: u64,
+    target_hash: u64,
+) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
         let res = policy().file_symlink(task, parent_inode, name_hash, target_hash);
         // R25-3 FIX: Add denial audit
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode: parent_inode, mode: 0, path_hash: name_hash };
+            let object = AuditObject::Path {
+                inode: parent_inode,
+                mode: 0,
+                path_hash: name_hash,
+            };
             emit_denial_audit(subject, object, "file_symlink", err);
         }
         res
@@ -982,14 +1026,23 @@ pub fn hook_file_symlink(task: &ProcessCtx, parent_inode: u64, name_hash: u64, t
 
 /// Hook: mkdir.
 #[inline]
-pub fn hook_file_mkdir(task: &ProcessCtx, parent_inode: u64, name_hash: u64, mode: u32) -> LsmResult {
+pub fn hook_file_mkdir(
+    task: &ProcessCtx,
+    parent_inode: u64,
+    name_hash: u64,
+    mode: u32,
+) -> LsmResult {
     #[cfg(feature = "lsm")]
     {
         let res = policy().file_mkdir(task, parent_inode, name_hash, mode);
         // R25-3 FIX: Add denial audit
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode: parent_inode, mode, path_hash: name_hash };
+            let object = AuditObject::Path {
+                inode: parent_inode,
+                mode,
+                path_hash: name_hash,
+            };
             emit_denial_audit(subject, object, "file_mkdir", err);
         }
         res
@@ -1010,7 +1063,11 @@ pub fn hook_file_rmdir(task: &ProcessCtx, parent_inode: u64, name_hash: u64) -> 
         // R25-3 FIX: Add denial audit
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode: parent_inode, mode: 0, path_hash: name_hash };
+            let object = AuditObject::Path {
+                inode: parent_inode,
+                mode: 0,
+                path_hash: name_hash,
+            };
             emit_denial_audit(subject, object, "file_rmdir", err);
         }
         res
@@ -1031,7 +1088,11 @@ pub fn hook_file_truncate(task: &ProcessCtx, inode: u64, size: u64) -> LsmResult
         // R25-3 FIX: Add denial audit
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode, mode: 0, path_hash: 0 };
+            let object = AuditObject::Path {
+                inode,
+                mode: 0,
+                path_hash: 0,
+            };
             emit_denial_audit(subject, object, "file_truncate", err);
         }
         res
@@ -1052,7 +1113,11 @@ pub fn hook_file_permission(task: &ProcessCtx, inode: u64, access_mask: u32) -> 
         // R25-3 FIX: Add denial audit
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode, mode: access_mask, path_hash: 0 };
+            let object = AuditObject::Path {
+                inode,
+                mode: access_mask,
+                path_hash: 0,
+            };
             emit_denial_audit(subject, object, "file_permission", err);
         }
         res
@@ -1079,7 +1144,11 @@ pub fn hook_file_mount(
         // R25-3 FIX: Add denial audit
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode: 0, mode: 0, path_hash: target_hash };
+            let object = AuditObject::Path {
+                inode: 0,
+                mode: 0,
+                path_hash: target_hash,
+            };
             emit_denial_audit(subject, object, "file_mount", err);
         }
         res
@@ -1100,7 +1169,11 @@ pub fn hook_file_umount(task: &ProcessCtx, target_hash: u64, flags: u64) -> LsmR
         // R25-3 FIX: Add denial audit
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Path { inode: 0, mode: 0, path_hash: target_hash };
+            let object = AuditObject::Path {
+                inode: 0,
+                mode: 0,
+                path_hash: target_hash,
+            };
             emit_denial_audit(subject, object, "file_umount", err);
         }
         res
@@ -1133,7 +1206,11 @@ pub fn hook_memory_mmap(
         let res = policy().memory_mmap(task, addr, len, prot, flags);
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Memory { vaddr: addr, size: len, prot };
+            let object = AuditObject::Memory {
+                vaddr: addr,
+                size: len,
+                prot,
+            };
             emit_denial_audit(subject, object, "memory_mmap", err);
         }
         res
@@ -1155,7 +1232,11 @@ pub fn hook_memory_mprotect(task: &ProcessCtx, addr: u64, len: u64, prot: u32) -
         let res = policy().memory_mprotect(task, addr, len, prot);
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Memory { vaddr: addr, size: len, prot };
+            let object = AuditObject::Memory {
+                vaddr: addr,
+                size: len,
+                prot,
+            };
             emit_denial_audit(subject, object, "memory_mprotect", err);
         }
         res
@@ -1177,7 +1258,11 @@ pub fn hook_memory_brk(task: &ProcessCtx, new_brk: u64) -> LsmResult {
         let res = policy().memory_brk(task, new_brk);
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Memory { vaddr: new_brk, size: 0, prot: 0 };
+            let object = AuditObject::Memory {
+                vaddr: new_brk,
+                size: 0,
+                prot: 0,
+            };
             emit_denial_audit(subject, object, "memory_brk", err);
         }
         res
@@ -1200,7 +1285,11 @@ pub fn hook_memory_munmap(task: &ProcessCtx, addr: u64, len: u64) -> LsmResult {
         let res = policy().memory_munmap(task, addr, len);
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Memory { vaddr: addr, size: len, prot: 0 };
+            let object = AuditObject::Memory {
+                vaddr: addr,
+                size: len,
+                prot: 0,
+            };
             emit_denial_audit(subject, object, "memory_munmap", err);
         }
         res
@@ -1281,7 +1370,11 @@ pub fn hook_ipc_futex(task: &ProcessCtx, addr: usize, op: u32) -> LsmResult {
         // R25-3 FIX: Add denial audit
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Memory { vaddr: addr as u64, size: 0, prot: 0 };
+            let object = AuditObject::Memory {
+                vaddr: addr as u64,
+                size: 0,
+                prot: 0,
+            };
             emit_denial_audit(subject, object, "ipc_futex", err);
         }
         res
@@ -1302,7 +1395,11 @@ pub fn hook_ipc_shm(task: &ProcessCtx, shm_id: u64, size: usize, rights: CapRigh
         // R25-3 FIX: Add denial audit
         if let Err(ref err) = res {
             let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
-            let object = AuditObject::Memory { vaddr: 0, size: size as u64, prot: 0 };
+            let object = AuditObject::Memory {
+                vaddr: 0,
+                size: size as u64,
+                prot: 0,
+            };
             emit_denial_audit(subject, object, "ipc_shm", err);
         }
         res

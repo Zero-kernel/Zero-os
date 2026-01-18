@@ -17,8 +17,8 @@ use x86_64::instructions::interrupts;
 
 // 导入arch模块的上下文切换功能
 use arch::Context as ArchContext;
-use arch::{default_kernel_stack_top, set_kernel_stack};
 use arch::{assert_kernel_context, enter_usermode, save_context, switch_context};
+use arch::{default_kernel_stack_top, set_kernel_stack};
 
 /// 调度器调试输出开关
 ///
@@ -117,7 +117,12 @@ impl Scheduler {
         for (priority, bucket) in queue.iter() {
             for (&pid, pcb) in bucket.iter() {
                 let state = pcb.lock().state;
-                sched_debug!("[SCHED] queue: pid={}, priority={}, state={:?}", pid, priority, state);
+                sched_debug!(
+                    "[SCHED] queue: pid={}, priority={}, state={:?}",
+                    pid,
+                    priority,
+                    state
+                );
             }
         }
 
@@ -539,7 +544,13 @@ impl Scheduler {
             };
 
             // 获取新进程的上下文指针、内核栈顶、CS（用于判断 Ring 3）和 FS/GS base（TLS）
-            let (new_ctx_ptr, next_kstack_top, next_cs, next_fs_base, next_gs_base): (*const ArchContext, u64, u64, u64, u64) = {
+            let (new_ctx_ptr, next_kstack_top, next_cs, next_fs_base, next_gs_base): (
+                *const ArchContext,
+                u64,
+                u64,
+                u64,
+                u64,
+            ) = {
                 let guard = next_pcb.lock();
                 let ctx = &guard.context as *const _ as *const ArchContext;
                 let kstack_top = guard.kernel_stack_top.as_u64();

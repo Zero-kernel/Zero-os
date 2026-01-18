@@ -19,10 +19,195 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
+use core::ptr::null_mut;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::Once;
 
 /// Maximum number of CPUs supported
 const MAX_CPUS: usize = 64;
+
+/// Invalid LAPIC ID marker
+const INVALID_LAPIC_ID: u32 = u32::MAX;
+
+/// LAPIC ID to CPU index mapping table.
+///
+/// Index = CPU logical index, Value = hardware LAPIC ID.
+/// Used by `current_cpu_id()` to map LAPIC ID to CPU index.
+static LAPIC_ID_MAP: [AtomicU32; MAX_CPUS] = {
+    // Initialize all entries to INVALID_LAPIC_ID
+    const INIT: AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
+    [INIT; MAX_CPUS]
+};
+
+// ============================================================================
+// Per-CPU Data Structure for SMP Support (Phase E)
+// ============================================================================
+
+/// Raw task pointer used to avoid circular dependencies with the scheduler.
+pub type RawTaskPtr = *mut ();
+
+/// Per-CPU data required for SMP operation.
+///
+/// This structure contains all per-CPU metadata needed by the scheduler,
+/// interrupt handlers, and RCU subsystem. All fields use atomics for
+/// safe access from interrupt handlers and cross-CPU visibility.
+///
+/// # Memory Layout
+///
+/// Fields are ordered to minimize padding and optimize cache line usage.
+/// The structure is designed to fit within a single cache line (64 bytes)
+/// for the core fields.
+#[repr(C)]
+pub struct PerCpuData {
+    /// Logical CPU index in the OS scheduler (0-based)
+    pub cpu_id: AtomicUsize,
+    /// Local APIC ID read from hardware
+    pub lapic_id: AtomicU32,
+    /// Preemption disable nesting counter (non-zero = preemption disabled)
+    pub preempt_count: AtomicU32,
+    /// Interrupt disable nesting counter
+    pub irq_count: AtomicU32,
+    /// Set by scheduler/interrupts to trigger a reschedule
+    pub need_resched: AtomicBool,
+    /// Padding for alignment
+    _pad: [u8; 3],
+    /// Currently running task (raw pointer to avoid scheduler dependency)
+    pub current_task: AtomicPtr<()>,
+    /// Top of the privilege 0 kernel stack
+    pub kernel_stack_top: AtomicUsize,
+    /// Top of the interrupt stack (IST1)
+    pub irq_stack_top: AtomicUsize,
+    /// Top of the syscall entry stack
+    pub syscall_stack_top: AtomicUsize,
+    /// Epoch counter for RCU/quiescent state tracking
+    pub rcu_epoch: AtomicU64,
+}
+
+// Safety: PerCpuData uses only atomics, so it's Send+Sync
+unsafe impl Send for PerCpuData {}
+unsafe impl Sync for PerCpuData {}
+
+impl PerCpuData {
+    /// Construct a zeroed per-CPU record.
+    pub const fn new() -> Self {
+        Self {
+            cpu_id: AtomicUsize::new(0),
+            lapic_id: AtomicU32::new(0),
+            preempt_count: AtomicU32::new(0),
+            irq_count: AtomicU32::new(0),
+            need_resched: AtomicBool::new(false),
+            _pad: [0; 3],
+            current_task: AtomicPtr::new(null_mut()),
+            kernel_stack_top: AtomicUsize::new(0),
+            irq_stack_top: AtomicUsize::new(0),
+            syscall_stack_top: AtomicUsize::new(0),
+            rcu_epoch: AtomicU64::new(0),
+        }
+    }
+
+    /// Initialize this CPU slot with identity and stack metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `cpu_id` - Logical CPU index (0 = BSP, 1+ = APs)
+    /// * `lapic_id` - Hardware Local APIC ID
+    /// * `kernel_stack_top` - Top of kernel privilege stack
+    /// * `irq_stack_top` - Top of interrupt stack (IST1)
+    /// * `syscall_stack_top` - Top of syscall entry stack
+    pub fn init(
+        &self,
+        cpu_id: usize,
+        lapic_id: u32,
+        kernel_stack_top: usize,
+        irq_stack_top: usize,
+        syscall_stack_top: usize,
+    ) {
+        self.cpu_id.store(cpu_id, Ordering::Relaxed);
+        self.lapic_id.store(lapic_id, Ordering::Relaxed);
+        self.current_task.store(null_mut(), Ordering::Relaxed);
+        self.need_resched.store(false, Ordering::Relaxed);
+        self.kernel_stack_top
+            .store(kernel_stack_top, Ordering::Relaxed);
+        self.irq_stack_top.store(irq_stack_top, Ordering::Relaxed);
+        self.syscall_stack_top
+            .store(syscall_stack_top, Ordering::Relaxed);
+        self.preempt_count.store(0, Ordering::Relaxed);
+        self.irq_count.store(0, Ordering::Relaxed);
+        self.rcu_epoch.store(0, Ordering::Relaxed);
+    }
+
+    /// Disable preemption on this CPU.
+    ///
+    /// Returns the new preemption count. Preemption is disabled when count > 0.
+    #[inline]
+    pub fn preempt_disable(&self) -> u32 {
+        self.preempt_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Enable preemption on this CPU.
+    ///
+    /// Returns the new preemption count. Panics if count would go negative.
+    #[inline]
+    pub fn preempt_enable(&self) -> u32 {
+        let old = self.preempt_count.fetch_sub(1, Ordering::Relaxed);
+        assert!(old > 0, "preempt_enable called with count already 0");
+        old - 1
+    }
+
+    /// Check if preemption is enabled on this CPU.
+    #[inline]
+    pub fn preemptible(&self) -> bool {
+        self.preempt_count.load(Ordering::Relaxed) == 0
+            && self.irq_count.load(Ordering::Relaxed) == 0
+    }
+
+    /// Enter an IRQ handler context.
+    #[inline]
+    pub fn irq_enter(&self) {
+        self.irq_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Exit an IRQ handler context.
+    #[inline]
+    pub fn irq_exit(&self) {
+        let old = self.irq_count.fetch_sub(1, Ordering::Relaxed);
+        assert!(old > 0, "irq_exit called with count already 0");
+    }
+
+    /// Check if we're currently in an IRQ handler.
+    #[inline]
+    pub fn in_irq(&self) -> bool {
+        self.irq_count.load(Ordering::Relaxed) > 0
+    }
+
+    /// Mark that a reschedule is needed on this CPU.
+    #[inline]
+    pub fn set_need_resched(&self) {
+        self.need_resched.store(true, Ordering::Release);
+    }
+
+    /// Clear and return the need_resched flag.
+    #[inline]
+    pub fn clear_need_resched(&self) -> bool {
+        self.need_resched.swap(false, Ordering::AcqRel)
+    }
+
+    /// Get the current task pointer.
+    #[inline]
+    pub fn get_current_task(&self) -> RawTaskPtr {
+        self.current_task.load(Ordering::Acquire)
+    }
+
+    /// Set the current task pointer.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure the task pointer is valid for the duration it's set.
+    #[inline]
+    pub unsafe fn set_current_task(&self, task: RawTaskPtr) {
+        self.current_task.store(task, Ordering::Release);
+    }
+}
 
 /// Per-CPU storage wrapper
 ///
@@ -111,12 +296,162 @@ impl<T> CpuLocal<T> {
 /// ```
 #[inline]
 pub fn current_cpu_id() -> usize {
-    // Single-core fallback - always CPU 0
-    // TODO: Implement proper APIC ID reading for SMP
+    // Read LAPIC ID from hardware (0xFEE00020)
+    let apic_id = unsafe {
+        let apic_base = 0xFEE0_0020 as *const u32;
+        (core::ptr::read_volatile(apic_base) >> 24) as u32
+    };
+
+    // Look up CPU index in the mapping table
+    for i in 0..MAX_CPUS {
+        if LAPIC_ID_MAP[i].load(Ordering::Relaxed) == apic_id {
+            return i;
+        }
+    }
+
+    // Fallback to CPU 0 if not found (during early boot before registration)
     0
+}
+
+/// Register the LAPIC ID to CPU index mapping.
+///
+/// This must be called for each CPU during bring-up to enable
+/// proper `current_cpu_id()` operation.
+///
+/// # Arguments
+///
+/// * `cpu_id` - Logical CPU index (0 = BSP, 1+ = APs)
+/// * `lapic_id` - Hardware LAPIC ID
+///
+/// # Panics
+///
+/// Panics if `cpu_id` is out of range.
+pub fn register_cpu_id(cpu_id: usize, lapic_id: u32) {
+    assert!(cpu_id < MAX_CPUS, "CPU ID {} out of range", cpu_id);
+    LAPIC_ID_MAP[cpu_id].store(lapic_id, Ordering::Relaxed);
 }
 
 /// Get the maximum number of supported CPUs
 pub const fn max_cpus() -> usize {
     MAX_CPUS
+}
+
+// ============================================================================
+// Global Per-CPU Data Access
+// ============================================================================
+
+/// Global per-CPU data block for scheduler and IRQ metadata.
+///
+/// This is the primary per-CPU data structure used by the kernel.
+/// Access it via `current_cpu()` or `PER_CPU_DATA.with()`.
+pub static PER_CPU_DATA: CpuLocal<PerCpuData> = CpuLocal::new(PerCpuData::new);
+
+/// Access the current CPU's `PerCpuData`.
+///
+/// This is the primary way to access per-CPU state. The returned reference
+/// is valid for the duration of the current CPU's execution (i.e., until
+/// migration to another CPU, which is not yet supported).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use cpu_local::current_cpu;
+///
+/// current_cpu().set_need_resched();
+/// if current_cpu().preemptible() {
+///     // Safe to reschedule
+/// }
+/// ```
+#[inline]
+pub fn current_cpu() -> &'static PerCpuData {
+    // We use a closure that returns the reference directly since
+    // the underlying storage is static
+    PER_CPU_DATA.with(|d| {
+        // Safety: The PerCpuData is stored in static memory with 'static lifetime
+        unsafe { &*(d as *const PerCpuData) }
+    })
+}
+
+/// Initialize the bootstrap processor's per-CPU slot.
+///
+/// Must be invoked during early boot before interrupts are enabled.
+/// The BSP (CPU 0) is initialized with the provided stack addresses.
+///
+/// # Arguments
+///
+/// * `lapic_id` - Hardware Local APIC ID of the BSP
+/// * `kernel_stack_top` - Top of the kernel privilege stack
+/// * `irq_stack_top` - Top of the interrupt stack (IST1)
+/// * `syscall_stack_top` - Top of the syscall entry stack
+///
+/// # Panics
+///
+/// Panics if called when not on CPU 0.
+pub fn init_bsp(
+    lapic_id: u32,
+    kernel_stack_top: usize,
+    irq_stack_top: usize,
+    syscall_stack_top: usize,
+) {
+    // Register BSP's LAPIC ID mapping first
+    register_cpu_id(0, lapic_id);
+
+    current_cpu().init(
+        0,
+        lapic_id,
+        kernel_stack_top,
+        irq_stack_top,
+        syscall_stack_top,
+    );
+}
+
+/// Initialize an application processor's per-CPU slot.
+///
+/// Called by AP bootstrap code after the AP has started executing.
+///
+/// # Arguments
+///
+/// * `cpu_id` - Logical CPU index (1+ for APs)
+/// * `lapic_id` - Hardware Local APIC ID of this AP
+/// * `kernel_stack_top` - Top of the kernel privilege stack
+/// * `irq_stack_top` - Top of the interrupt stack (IST1)
+/// * `syscall_stack_top` - Top of the syscall entry stack
+///
+/// # Panics
+///
+/// Panics if cpu_id is 0 (BSP) or out of range.
+pub fn init_ap(
+    cpu_id: usize,
+    lapic_id: u32,
+    kernel_stack_top: usize,
+    irq_stack_top: usize,
+    syscall_stack_top: usize,
+) {
+    assert!(cpu_id > 0, "init_ap must not be called for BSP (CPU 0)");
+    assert!(cpu_id < MAX_CPUS, "CPU ID {} out of range", cpu_id);
+
+    // Register AP's LAPIC ID mapping
+    register_cpu_id(cpu_id, lapic_id);
+
+    // Initialize this CPU's PerCpuData
+    // Note: We access via PER_CPU_DATA since current_cpu_id() now uses LAPIC map
+    PER_CPU_DATA.with(|d| {
+        d.init(
+            cpu_id,
+            lapic_id,
+            kernel_stack_top,
+            irq_stack_top,
+            syscall_stack_top,
+        );
+    });
+}
+
+/// Get the number of online CPUs.
+///
+/// Currently returns 1 for single-core operation.
+/// Will be updated when SMP AP startup is implemented.
+#[inline]
+pub fn num_online_cpus() -> usize {
+    // TODO: Track online CPU count when APs are started
+    1
 }

@@ -135,7 +135,10 @@ const SYSCALL_MAX_CPUS: usize = 64;
 
 // 编译时断言：确保 SYSCALL_MAX_CPUS 与 cpu_local::max_cpus() 一致
 const _: () = {
-    assert!(SYSCALL_MAX_CPUS == 64, "SYSCALL_MAX_CPUS must match cpu_local::max_cpus()");
+    assert!(
+        SYSCALL_MAX_CPUS == 64,
+        "SYSCALL_MAX_CPUS must match cpu_local::max_cpus()"
+    );
     // 注意：cpu_local::max_cpus() 是 const fn，但由于跨 crate 常量引用限制，
     // 这里硬编码为 64。如果 cpu_local 修改了 MAX_CPUS，需要同步更新此处。
 };
@@ -311,22 +314,22 @@ pub fn get_lstar() -> u64 {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SyscallFrame {
-    pub rax: u64,  // 0x00: 系统调用号 / 返回值
-    pub rcx: u64,  // 0x08: 用户 RIP (syscall 保存)
-    pub rdx: u64,  // 0x10: arg2
-    pub rbx: u64,  // 0x18: callee-saved
-    pub rsp: u64,  // 0x20: 用户 RSP
-    pub rbp: u64,  // 0x28: callee-saved
-    pub rsi: u64,  // 0x30: arg1
-    pub rdi: u64,  // 0x38: arg0
-    pub r8: u64,   // 0x40: arg4
-    pub r9: u64,   // 0x48: arg5
-    pub r10: u64,  // 0x50: arg3
-    pub r11: u64,  // 0x58: 用户 RFLAGS (syscall 保存)
-    pub r12: u64,  // 0x60: callee-saved
-    pub r13: u64,  // 0x68: callee-saved
-    pub r14: u64,  // 0x70: callee-saved
-    pub r15: u64,  // 0x78: callee-saved
+    pub rax: u64, // 0x00: 系统调用号 / 返回值
+    pub rcx: u64, // 0x08: 用户 RIP (syscall 保存)
+    pub rdx: u64, // 0x10: arg2
+    pub rbx: u64, // 0x18: callee-saved
+    pub rsp: u64, // 0x20: 用户 RSP
+    pub rbp: u64, // 0x28: callee-saved
+    pub rsi: u64, // 0x30: arg1
+    pub rdi: u64, // 0x38: arg0
+    pub r8: u64,  // 0x40: arg4
+    pub r9: u64,  // 0x48: arg5
+    pub r10: u64, // 0x50: arg3
+    pub r11: u64, // 0x58: 用户 RFLAGS (syscall 保存)
+    pub r12: u64, // 0x60: callee-saved
+    pub r13: u64, // 0x68: callee-saved
+    pub r14: u64, // 0x70: callee-saved
+    pub r15: u64, // 0x78: callee-saved
 }
 
 /// 获取当前 CPU 的 syscall 帧指针

@@ -10,6 +10,7 @@ path = "lib.rs"
 kernel_core = { path = "../kernel_core" }
 drivers = { path = "../drivers" }
 cpu_local = { path = "../cpu_local" }
+mm = { path = "../mm" }
 x86_64 = "0.15"
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
