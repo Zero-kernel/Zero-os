@@ -174,3 +174,31 @@ pub fn default_kernel_stack_top() -> u64 {
     let stack_start = VirtAddr::from_ptr(unsafe { &raw const KERNEL_STACK.0 });
     (stack_start + KERNEL_STACK_SIZE as u64).as_u64()
 }
+
+/// Initialize GDT for an Application Processor (AP).
+///
+/// APs share the same GDT with the BSP, but each AP needs to:
+/// 1. Load the GDT into GDTR
+/// 2. Set segment registers to point to kernel segments
+/// 3. Load the TSS (currently skipped - see note below)
+///
+/// # Safety
+///
+/// Must only be called once per AP during SMP bring-up, after the AP
+/// has switched to 64-bit mode but before any interrupt handling.
+pub unsafe fn init_for_ap() {
+    // Load the shared GDT
+    GDT.0.load();
+
+    // Set segment registers to kernel segments
+    // This is critical: the AP was using trampoline's GDT with different selectors
+    CS::set_reg(GDT.1.kernel_code);
+    DS::set_reg(GDT.1.kernel_data);
+    SS::set_reg(GDT.1.kernel_data);
+
+    // NOTE: TSS loading is skipped on APs
+    // Each CPU needs its own TSS for proper interrupt handling (RSP0/IST stacks).
+    // The BSP's TSS is marked "busy" and cannot be shared via LTR.
+    // TODO: Implement per-CPU TSS allocation for production SMP support.
+    // For now, APs run without a TSS - interrupts on APs will not work correctly.
+}

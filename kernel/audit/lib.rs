@@ -409,28 +409,19 @@ const HMAC_OPAD: u8 = 0x5c;
 
 /// SHA-256 initial state constants (FIPS 180-4)
 const SHA256_INIT_STATE: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
 /// SHA-256 round constants (FIPS 180-4)
 const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
-    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
 /// Pure Rust SHA-256 implementation for no_std kernel environment
@@ -469,8 +460,7 @@ impl Sha256 {
 
         while !input.is_empty() {
             let take = core::cmp::min(64 - self.buffer_len, input.len());
-            self.buffer[self.buffer_len..self.buffer_len + take]
-                .copy_from_slice(&input[..take]);
+            self.buffer[self.buffer_len..self.buffer_len + take].copy_from_slice(&input[..take]);
             self.buffer_len += take;
             self.total_len = self.total_len.wrapping_add(take as u64);
 
@@ -823,11 +813,7 @@ fn hash_event(prev_hash: [u8; 32], event: &AuditEvent) -> [u8; 32] {
 ///
 /// 32-byte digest (SHA-256 or HMAC-SHA256)
 #[allow(dead_code)]
-fn hash_event_prefixed(
-    prev_hash: [u8; 32],
-    event: &AuditEvent,
-    key: Option<&[u8]>,
-) -> [u8; 32] {
+fn hash_event_prefixed(prev_hash: [u8; 32], event: &AuditEvent, key: Option<&[u8]>) -> [u8; 32] {
     match key {
         Some(k) => {
             // HMAC-SHA256 mode: proper keyed authentication
@@ -876,6 +862,20 @@ impl HmacKey {
 
     fn as_slice(&self) -> &[u8] {
         &self.data[..self.len]
+    }
+}
+
+/// R66-10 FIX: Zeroize key material on drop to prevent memory disclosure.
+impl Drop for HmacKey {
+    fn drop(&mut self) {
+        // Zeroize key material to avoid lingering secrets in memory
+        // Use volatile writes to prevent optimization away
+        for byte in self.data.iter_mut() {
+            unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+        self.len = 0;
+        // Memory barrier to ensure zeroization is not reordered
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1077,6 +1077,26 @@ pub struct AuditStats {
 /// ```
 pub type SnapshotAuthorizer = fn() -> Result<(), AuditError>;
 
+/// R66-10 FIX: Callback type for HMAC key configuration authorization.
+///
+/// Implementations should enforce CAP_AUDIT_WRITE or a bootstrap policy that
+/// is equivalent during early kernel initialization.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// fn check_audit_write_cap() -> Result<(), audit::AuditError> {
+///     if process::current_has_cap(CapRights::AUDIT_WRITE) {
+///         Ok(())
+///     } else {
+///         Err(audit::AuditError::AccessDenied)
+///     }
+/// }
+///
+/// audit::register_hmac_key_authorizer(check_audit_write_cap);
+/// ```
+pub type HmacKeyAuthorizer = fn() -> Result<(), AuditError>;
+
 /// Callback type for pre-snapshot flush hook.
 ///
 /// This function is called by `snapshot()` immediately before draining
@@ -1111,6 +1131,12 @@ static SNAPSHOT_AUTHORIZER: Mutex<Option<SnapshotAuthorizer>> = Mutex::new(None)
 /// allowing other subsystems to flush pending audit data.
 static FLUSH_HOOK: Mutex<Option<FlushHook>> = Mutex::new(None);
 
+/// R66-10 FIX: Optional capability gate for audit HMAC key configuration.
+///
+/// If unset, `set_hmac_key` fails closed with AccessDenied. Kernel init code
+/// should register an authorizer (root/CAP_AUDIT_WRITE) before configuring the key.
+static HMAC_KEY_AUTHORIZER: Mutex<Option<HmacKeyAuthorizer>> = Mutex::new(None);
+
 /// Register the snapshot authorizer callback.
 ///
 /// This function should be called during kernel initialization by code
@@ -1138,6 +1164,37 @@ static FLUSH_HOOK: Mutex<Option<FlushHook>> = Mutex::new(None);
 pub fn register_snapshot_authorizer(authorizer: SnapshotAuthorizer) {
     interrupts::without_interrupts(|| {
         let mut guard = SNAPSHOT_AUTHORIZER.lock();
+        *guard = Some(authorizer);
+    });
+}
+
+/// R66-10 FIX: Register the HMAC key configuration authorizer.
+///
+/// Must be set during kernel init before calling `set_hmac_key` to enforce
+/// CAP_AUDIT_WRITE (or a bootstrap allow policy during early boot).
+///
+/// # Arguments
+///
+/// * `authorizer` - Function that checks if current context has CAP_AUDIT_WRITE
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // During kernel init, register an authorizer that checks CAP_AUDIT_WRITE:
+/// audit::register_hmac_key_authorizer(|| {
+///     if kernel_core::current_has_cap(cap::CapRights::AUDIT_WRITE) {
+///         Ok(())
+///     } else {
+///         Err(audit::AuditError::AccessDenied)
+///     }
+/// });
+///
+/// // For early boot before process subsystem is up, use permissive authorizer:
+/// audit::register_hmac_key_authorizer(|| Ok(()));  // Bootstrap allow
+/// ```
+pub fn register_hmac_key_authorizer(authorizer: HmacKeyAuthorizer) {
+    interrupts::without_interrupts(|| {
+        let mut guard = HMAC_KEY_AUTHORIZER.lock();
         *guard = Some(authorizer);
     });
 }
@@ -1190,6 +1247,32 @@ fn run_flush_hook() {
 fn ensure_snapshot_authorized() -> Result<(), AuditError> {
     let authorizer = interrupts::without_interrupts(|| {
         let guard = SNAPSHOT_AUTHORIZER.lock();
+        *guard
+    });
+
+    match authorizer {
+        Some(check_fn) => check_fn(),
+        None => {
+            // Fail closed: no authorizer means no access
+            Err(AuditError::AccessDenied)
+        }
+    }
+}
+
+/// R66-10 FIX: Enforce the HMAC key configuration capability gate.
+///
+/// Fails closed when no authorizer is registered. Kernel bootstrap paths that
+/// need to set the key before the process subsystem is ready should install
+/// a temporary authorizer that applies the appropriate policy.
+///
+/// # Returns
+///
+/// - If authorizer is registered and allows → Ok(())
+/// - If no authorizer is registered → AccessDenied
+/// - If authorizer denies → AccessDenied
+fn ensure_hmac_key_authorized() -> Result<(), AuditError> {
+    let authorizer = interrupts::without_interrupts(|| {
+        let guard = HMAC_KEY_AUTHORIZER.lock();
         *guard
     });
 
@@ -1281,13 +1364,21 @@ pub fn init(capacity: usize) -> Result<(), AuditError> {
 ///
 /// * `Ok(())` - Key was set successfully
 /// * `Err(Uninitialized)` - Audit subsystem not initialized
+/// * `Err(AccessDenied)` - Caller lacks CAP_AUDIT_WRITE or no authorizer registered (R66-10)
 /// * `Err(KeyTooLarge)` - Key exceeds MAX_HMAC_KEY_SIZE
 /// * `Err(KeyAlreadySet)` - Key was already set
+///
+/// # Security Requirements (R66-10)
+///
+/// Caller must have CAP_AUDIT_WRITE capability, enforced via registered authorizer.
+/// During early boot before the process subsystem is up, use a permissive bootstrap
+/// authorizer registered via `register_hmac_key_authorizer`.
 ///
 /// # Example
 ///
 /// ```rust,ignore
 /// // During secure boot, set the audit HMAC key
+/// // (requires CAP_AUDIT_WRITE or early-boot authorizer)
 /// let key = get_secure_random_bytes::<32>();
 /// audit::set_hmac_key(&key)?;
 /// ```
@@ -1296,11 +1387,17 @@ pub fn set_hmac_key(key: &[u8]) -> Result<(), AuditError> {
         return Err(AuditError::Uninitialized);
     }
 
+    // R66-10 FIX: Enforce capability check before allowing HMAC key configuration
+    ensure_hmac_key_authorized()?;
+
     interrupts::without_interrupts(|| {
         let mut ring = AUDIT_RING.lock();
         if let Some(ref mut r) = *ring {
             r.set_key(key)?;
-            println!("  Audit HMAC key set ({} bytes) - integrity protection active", key.len());
+            println!(
+                "  Audit HMAC key set ({} bytes) - integrity protection active",
+                key.len()
+            );
             Ok(())
         } else {
             Err(AuditError::Uninitialized)
@@ -1434,11 +1531,7 @@ pub fn emit_lsm_denial(
     timestamp: u64,
 ) -> Result<(), AuditError> {
     let hook_hash = hash_bytes(hook.as_bytes());
-    let args = [
-        AuditSecurityClass::Lsm as u64,
-        hook_hash,
-        reason as u64,
-    ];
+    let args = [AuditSecurityClass::Lsm as u64, hook_hash, reason as u64];
 
     emit(
         AuditKind::Security,
@@ -1572,11 +1665,7 @@ pub fn emit_security_allow(
     timestamp: u64,
 ) -> Result<(), AuditError> {
     let hook_hash = hash_bytes(hook.as_bytes());
-    let args = [
-        AuditSecurityClass::Lsm as u64,
-        hook_hash,
-        syscall_nr,
-    ];
+    let args = [AuditSecurityClass::Lsm as u64, hook_hash, syscall_nr];
 
     emit(
         AuditKind::Security,
@@ -1800,8 +1889,7 @@ pub fn hash_binary_prefix(data: &[u8], max_len: usize) -> u64 {
     let digest = Sha256::digest(&data[..len]);
     // Truncate to 64 bits (first 8 bytes of SHA-256)
     u64::from_be_bytes([
-        digest[0], digest[1], digest[2], digest[3],
-        digest[4], digest[5], digest[6], digest[7],
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
     ])
 }
 
@@ -1845,10 +1933,9 @@ mod tests {
         // NIST test vector: SHA-256("abc") = ba7816bf...
         let digest = Sha256::digest(b"abc");
         let expected = [
-            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
-            0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
-            0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
-            0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
         ];
         assert_eq!(digest, expected);
     }
@@ -1858,10 +1945,9 @@ mod tests {
         // SHA-256("") = e3b0c442...
         let digest = Sha256::digest(b"");
         let expected = [
-            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
-            0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
-            0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
-            0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+            0x78, 0x52, 0xb8, 0x55,
         ];
         assert_eq!(digest, expected);
     }
@@ -1879,10 +1965,9 @@ mod tests {
         // Pre-computed: SHA-256 of 128 'a's
         // echo -n "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" | sha256sum
         let expected = [
-            0x76, 0xb7, 0xd0, 0x74, 0xc5, 0x46, 0x4f, 0x46,
-            0x85, 0xa5, 0x4b, 0x5b, 0xdd, 0x69, 0x60, 0xde,
-            0x46, 0x83, 0x45, 0x41, 0x72, 0x6d, 0x1c, 0x35,
-            0xbd, 0x02, 0xdb, 0x2a, 0x6c, 0x4d, 0xa7, 0xa2,
+            0x76, 0xb7, 0xd0, 0x74, 0xc5, 0x46, 0x4f, 0x46, 0x85, 0xa5, 0x4b, 0x5b, 0xdd, 0x69,
+            0x60, 0xde, 0x46, 0x83, 0x45, 0x41, 0x72, 0x6d, 0x1c, 0x35, 0xbd, 0x02, 0xdb, 0x2a,
+            0x6c, 0x4d, 0xa7, 0xa2,
         ];
         assert_eq!(digest, expected);
     }
@@ -1999,7 +2084,7 @@ mod tests {
 
         // Tamper with event1's data
         let mut tampered_event1 = event1.clone();
-        tampered_event1.args[0] = 999;  // Modify data without updating hash
+        tampered_event1.args[0] = 999; // Modify data without updating hash
 
         let events = alloc::vec![tampered_event1, event2];
         assert!(!verify_chain(&events), "Tampering should be detected");
@@ -2016,12 +2101,14 @@ mod tests {
         });
 
         let expected = [
-            0xf7, 0xbc, 0x83, 0xf4, 0x30, 0x53, 0x84, 0x24,
-            0xb1, 0x32, 0x98, 0xe6, 0xaa, 0x6f, 0xb1, 0x43,
-            0xef, 0x4d, 0x59, 0xa1, 0x49, 0x46, 0x10, 0xbd,
-            0x0a, 0x1e, 0x82, 0x64, 0x72, 0xa3, 0xd3, 0xaa,
+            0xf7, 0xbc, 0x83, 0xf4, 0x30, 0x53, 0x84, 0x24, 0xb1, 0x32, 0x98, 0xe6, 0xaa, 0x6f,
+            0xb1, 0x43, 0xef, 0x4d, 0x59, 0xa1, 0x49, 0x46, 0x10, 0xbd, 0x0a, 0x1e, 0x82, 0x64,
+            0x72, 0xa3, 0xd3, 0xaa,
         ];
-        assert_eq!(digest, expected, "HMAC-SHA256 must match RFC 4231 test vector");
+        assert_eq!(
+            digest, expected,
+            "HMAC-SHA256 must match RFC 4231 test vector"
+        );
     }
 
     #[test]
@@ -2046,7 +2133,10 @@ mod tests {
         });
 
         // Should produce a valid non-zero digest
-        assert_ne!(digest, [0u8; 32], "Long key HMAC should produce valid digest");
+        assert_ne!(
+            digest, [0u8; 32],
+            "Long key HMAC should produce valid digest"
+        );
     }
 
     #[test]

@@ -192,7 +192,12 @@ static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("clone_test.elf").len()
 /// - sys_write (fd 1, stdout)
 /// - sys_getpid
 /// - sys_exit
-#[cfg(not(any(feature = "shell", feature = "syscall_test", feature = "musl_test", feature = "clone_test")))]
+#[cfg(not(any(
+    feature = "shell",
+    feature = "syscall_test",
+    feature = "musl_test",
+    feature = "clone_test"
+)))]
 static USER_ELF_ALIGNED: AlignedElfData<{ include_bytes!("hello.elf").len() }> =
     AlignedElfData(*include_bytes!("hello.elf"));
 
@@ -209,7 +214,12 @@ const PROCESS_NAME: &str = "syscall_test";
 const PROCESS_NAME: &str = "musl_test";
 #[cfg(feature = "clone_test")]
 const PROCESS_NAME: &str = "clone_test";
-#[cfg(not(any(feature = "shell", feature = "syscall_test", feature = "musl_test", feature = "clone_test")))]
+#[cfg(not(any(
+    feature = "shell",
+    feature = "syscall_test",
+    feature = "musl_test",
+    feature = "clone_test"
+)))]
 const PROCESS_NAME: &str = "hello";
 
 /// Run the Ring 3 test

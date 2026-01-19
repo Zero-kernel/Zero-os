@@ -7,9 +7,17 @@
 //! 就绪队列使用优先级分桶：BTreeMap<Priority, BTreeMap<Pid, PCB>>
 //! - 外层按优先级排序（数值越小优先级越高）
 //! - 内层按 PID 排序实现同优先级的 FIFO
+//!
+//! # R67-4 FIX: Per-CPU Scheduler State
+//!
+//! CURRENT_PROCESS and need_resched are now per-CPU to prevent cross-CPU races:
+//! - Each CPU tracks its own current process via CpuLocal
+//! - Reschedule flag uses cpu_local::current_cpu().need_resched
+//! - Ready queue remains global (per-CPU run queues are future work)
 
 use alloc::{collections::BTreeMap, sync::Arc};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::Ordering;
+use cpu_local::{current_cpu, CpuLocal};
 use kernel_core::process::{self, Priority, Process, ProcessId, ProcessState};
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -17,8 +25,8 @@ use x86_64::instructions::interrupts;
 
 // 导入arch模块的上下文切换功能
 use arch::Context as ArchContext;
-use arch::{default_kernel_stack_top, set_kernel_stack};
 use arch::{assert_kernel_context, enter_usermode, save_context, switch_context};
+use arch::{default_kernel_stack_top, set_kernel_stack};
 
 /// 调度器调试输出开关
 ///
@@ -46,19 +54,21 @@ pub type ProcessControlBlock = Arc<Mutex<Process>>;
 /// - 同优先级内按 PID 先入先出
 type ReadyQueues = BTreeMap<Priority, BTreeMap<Pid, ProcessControlBlock>>;
 
-/// 需要重新调度标志
-///
-/// 当定时器中断确定需要调度时设置此标志，但不在中断上下文中执行实际的调度/CR3切换。
-/// 真正的上下文切换应在受控路径（如系统调用返回）中执行。
-static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
-
 /// 用于首次调度的哑上下文（内核启动上下文的保存位置，无需恢复）
 static BOOTSTRAP_CONTEXT: Mutex<ArchContext> = Mutex::new(ArchContext::new());
 
+/// R67-4 FIX: Per-CPU current process tracking.
+///
+/// Each CPU tracks its own current process. This prevents races where
+/// multiple CPUs could believe they own the same process.
+static CURRENT_PROCESS: CpuLocal<Mutex<Option<Pid>>> = CpuLocal::new(|| Mutex::new(None));
+
 /// 全局就绪队列 - 按优先级分桶维护就绪进程
+///
+/// R67-4 NOTE: Ready queue remains global for now. Per-CPU run queues
+/// with load balancing is future work for Phase F.
 lazy_static! {
     pub static ref READY_QUEUE: Mutex<ReadyQueues> = Mutex::new(BTreeMap::new());
-    pub static ref CURRENT_PROCESS: Mutex<Option<Pid>> = Mutex::new(None);
     pub static ref SCHEDULER_STATS: Mutex<SchedulerStats> = Mutex::new(SchedulerStats::new());
 }
 
@@ -117,7 +127,12 @@ impl Scheduler {
         for (priority, bucket) in queue.iter() {
             for (&pid, pcb) in bucket.iter() {
                 let state = pcb.lock().state;
-                sched_debug!("[SCHED] queue: pid={}, priority={}, state={:?}", pid, priority, state);
+                sched_debug!(
+                    "[SCHED] queue: pid={}, priority={}, state={:?}",
+                    pid,
+                    priority,
+                    state
+                );
             }
         }
 
@@ -261,14 +276,19 @@ impl Scheduler {
     }
 
     /// 更新当前运行的进程
+    ///
+    /// R67-4 FIX: Uses per-CPU storage.
     pub fn set_current(pid: Option<Pid>) {
-        let mut current = CURRENT_PROCESS.lock();
-        *current = pid;
+        CURRENT_PROCESS.with(|current: &Mutex<Option<Pid>>| {
+            *current.lock() = pid;
+        });
     }
 
     /// 获取当前运行的进程
+    ///
+    /// R67-4 FIX: Reads from per-CPU storage.
     pub fn get_current() -> Option<Pid> {
-        *CURRENT_PROCESS.lock()
+        CURRENT_PROCESS.with(|current: &Mutex<Option<Pid>>| *current.lock())
     }
 
     /// 处理时钟中断 - 更新时间片并设置重调度标志
@@ -276,7 +296,7 @@ impl Scheduler {
     /// 锁顺序：CURRENT_PROCESS -> READY_QUEUE -> SCHEDULER_STATS
     /// 所有调度器函数必须遵循此顺序以避免死锁
     ///
-    /// **重要**: 此函数在中断上下文中运行，只设置 NEED_RESCHED 标志，
+    /// **重要**: 此函数在中断上下文中运行，只设置当前 CPU 的 need_resched 标志，
     /// 不执行实际的调度/CR3切换。这避免了在中断返回时运行在错误地址空间的问题。
     ///
     /// # R65-19 FIX: 饥饿防止
@@ -284,11 +304,15 @@ impl Scheduler {
     /// 每次tick时，遍历所有就绪进程，增加等待计数器，并在超过阈值时
     /// 提升其优先级。这确保了即使低优先级进程被高优先级进程持续抢占，
     /// 也能在合理时间内获得CPU时间。
+    ///
+    /// # R67-4 FIX: Per-CPU State
+    ///
+    /// Uses per-CPU CURRENT_PROCESS and need_resched to avoid cross-CPU races.
     pub fn on_clock_tick() {
         // 使用 without_interrupts 确保在持有锁期间不会被嵌套中断打断
         interrupts::without_interrupts(|| {
-            // 统一锁顺序：先获取 CURRENT_PROCESS
-            let current_pid = *CURRENT_PROCESS.lock();
+            // R67-4 FIX: Use per-CPU current process
+            let current_pid = Self::get_current();
 
             // 获取当前进程的 Arc 引用并更新时间片
             if let Some(pcb) = {
@@ -307,8 +331,8 @@ impl Scheduler {
                     proc.state = ProcessState::Ready;
                     proc.decrease_dynamic_priority(); // 惩罚 CPU 密集型进程
                     proc.reset_time_slice();
-                    // 设置重调度标志，不在中断上下文中直接切换
-                    NEED_RESCHED.store(true, Ordering::SeqCst);
+                    // R67-4 FIX: Set this CPU's reschedule flag
+                    current_cpu().set_need_resched();
                 }
             }
 
@@ -343,13 +367,17 @@ impl Scheduler {
     }
 
     /// 查询是否需要重新调度
+    ///
+    /// R67-4 FIX: Reads from per-CPU need_resched flag.
     pub fn need_resched() -> bool {
-        NEED_RESCHED.load(Ordering::SeqCst)
+        current_cpu().need_resched.load(Ordering::SeqCst)
     }
 
     /// 清除重调度标志
+    ///
+    /// R67-4 FIX: Clears this CPU's need_resched flag.
     pub fn clear_resched() {
-        NEED_RESCHED.store(false, Ordering::SeqCst);
+        current_cpu().need_resched.store(false, Ordering::SeqCst);
     }
 
     /// 执行调度 - 选择下一个进程并更新状态
@@ -360,14 +388,18 @@ impl Scheduler {
     /// CR3切换必须与完整的寄存器上下文切换（switch_context）配合执行。
     /// 当前内核尚未实现真正的进程切换，所有"进程"共享内核地址空间。
     ///
+    /// # R67-4 FIX: Per-CPU State
+    ///
+    /// Uses per-CPU CURRENT_PROCESS and need_resched to avoid cross-CPU races.
+    ///
     /// 返回值：如果发生进程切换，返回 (新进程PID, 新进程地址空间)
     pub fn schedule() -> Option<(Pid, usize)> {
         interrupts::without_interrupts(|| {
-            // 清除重调度标志
-            NEED_RESCHED.store(false, Ordering::SeqCst);
+            // R67-4 FIX: Clear this CPU's reschedule flag
+            current_cpu().need_resched.store(false, Ordering::SeqCst);
 
-            // 获取当前运行的进程
-            let current_pid = *CURRENT_PROCESS.lock();
+            // R67-4 FIX: Use per-CPU current process
+            let current_pid = Self::get_current();
             sched_debug!("[SCHED] schedule: current_pid={:?}", current_pid);
 
             // 在单次锁定中获取所需的所有引用
@@ -465,8 +497,8 @@ impl Scheduler {
     /// 在安全上下文中执行完整上下文切换（含 CR3）
     ///
     /// # Arguments
-    /// * `force` - true 无视 NEED_RESCHED 立即尝试切换（用于 sys_yield）
-    ///           - false 只有 NEED_RESCHED 置位时才切换（用于系统调用返回点）
+    /// * `force` - true 无视 need_resched 立即尝试切换（用于 sys_yield）
+    ///           - false 只有 need_resched 置位时才切换（用于系统调用返回点）
     ///
     /// 此函数是调度器的核心入口点，负责：
     /// 1. 检查是否需要调度
@@ -477,16 +509,20 @@ impl Scheduler {
     ///    - Ring 0：使用 switch_context 直接切换
     ///    - Ring 3：使用 save_context + enter_usermode (IRETQ)
     ///
+    /// # R67-4 FIX: Per-CPU State
+    ///
+    /// Uses per-CPU need_resched and CURRENT_PROCESS to avoid cross-CPU races.
+    ///
     /// **警告**: 此函数可能不会返回（如果发生上下文切换）
     pub fn reschedule_now(force: bool) {
         interrupts::without_interrupts(|| {
-            // 如果不是强制调度，检查 NEED_RESCHED 标志
-            if !force && !NEED_RESCHED.swap(false, Ordering::SeqCst) {
+            // R67-4 FIX: Check and clear this CPU's need_resched flag
+            if !force && !current_cpu().clear_need_resched() {
                 return;
             }
 
-            // 保存当前进程 PID
-            let old_pid = *CURRENT_PROCESS.lock();
+            // R67-4 FIX: Use per-CPU current process
+            let old_pid = Self::get_current();
 
             // 执行调度决策
             let sched_decision = Self::schedule();
@@ -539,7 +575,13 @@ impl Scheduler {
             };
 
             // 获取新进程的上下文指针、内核栈顶、CS（用于判断 Ring 3）和 FS/GS base（TLS）
-            let (new_ctx_ptr, next_kstack_top, next_cs, next_fs_base, next_gs_base): (*const ArchContext, u64, u64, u64, u64) = {
+            let (new_ctx_ptr, next_kstack_top, next_cs, next_fs_base, next_gs_base): (
+                *const ArchContext,
+                u64,
+                u64,
+                u64,
+                u64,
+            ) = {
                 let guard = next_pcb.lock();
                 let ctx = &guard.context as *const _ as *const ArchContext;
                 let kstack_top = guard.kernel_stack_top.as_u64();

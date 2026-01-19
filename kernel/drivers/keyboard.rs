@@ -192,29 +192,28 @@ impl KeyboardBuffer {
         // Layout: US QWERTY
         static SCANCODE_ASCII: [u8; 128] = [
             0, 0x1B, // 0x00: None, 0x01: Escape
-            b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', // 0x02-0x0B: Number row
-            b'-', b'=', 0x08, // 0x0C: -, 0x0D: =, 0x0E: Backspace
+            b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9',
+            b'0', // 0x02-0x0B: Number row
+            b'-', b'=', 0x08,  // 0x0C: -, 0x0D: =, 0x0E: Backspace
             b'\t', // 0x0F: Tab
-            b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', // 0x10-0x19: QWERTY row
+            b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o',
+            b'p', // 0x10-0x19: QWERTY row
             b'[', b']', b'\n', // 0x1A: [, 0x1B: ], 0x1C: Enter
-            0, // 0x1D: Left Ctrl (modifier)
+            0,     // 0x1D: Left Ctrl (modifier)
             b'a', b's', b'd', b'f', b'g', b'h', b'j', b'k', b'l', // 0x1E-0x26: ASDF row
             b';', b'\'', b'`', // 0x27: ;, 0x28: ', 0x29: `
-            0, // 0x2A: Left Shift (modifier)
+            0,    // 0x2A: Left Shift (modifier)
             b'\\', b'z', b'x', b'c', b'v', b'b', b'n', b'm', // 0x2B-0x32: ZXCV row
             b',', b'.', b'/', // 0x33: ,, 0x34: ., 0x35: /
-            0, // 0x36: Right Shift (modifier)
+            0,    // 0x36: Right Shift (modifier)
             b'*', // 0x37: Keypad *
-            0, // 0x38: Left Alt
+            0,    // 0x38: Left Alt
             b' ', // 0x39: Space
-            0, // 0x3A: Caps Lock (modifier)
+            0,    // 0x3A: Caps Lock (modifier)
             // 0x3B-0x44: F1-F10 (non-printable)
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            // 0x45-0x46: Num Lock, Scroll Lock
-            0, 0,
-            // 0x47-0x53: Keypad and arrows (non-printable in this simple impl)
-            0, 0, 0, b'-', 0, 0, 0, b'+', 0, 0, 0, 0, 0,
-            // Rest: not mapped
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x45-0x46: Num Lock, Scroll Lock
+            0, 0, // 0x47-0x53: Keypad and arrows (non-printable in this simple impl)
+            0, 0, 0, b'-', 0, 0, 0, b'+', 0, 0, 0, 0, 0, // Rest: not mapped
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
@@ -223,30 +222,28 @@ impl KeyboardBuffer {
         static SCANCODE_ASCII_SHIFT: [u8; 128] = [
             0, 0x1B, // 0x00: None, 0x01: Escape
             b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', // Shifted numbers
-            b'_', b'+', 0x08, // 0x0C: _, 0x0D: +, 0x0E: Backspace
+            b'_', b'+', 0x08,  // 0x0C: _, 0x0D: +, 0x0E: Backspace
             b'\t', // 0x0F: Tab
             b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', // Shifted QWERTY
             b'{', b'}', b'\n', // 0x1A: {, 0x1B: }, 0x1C: Enter
-            0, // 0x1D: Left Ctrl
+            0,     // 0x1D: Left Ctrl
             b'A', b'S', b'D', b'F', b'G', b'H', b'J', b'K', b'L', // Shifted ASDF
             b':', b'"', b'~', // 0x27: :, 0x28: ", 0x29: ~
-            0, // 0x2A: Left Shift
+            0,    // 0x2A: Left Shift
             b'|', b'Z', b'X', b'C', b'V', b'B', b'N', b'M', // Shifted ZXCV
             b'<', b'>', b'?', // 0x33: <, 0x34: >, 0x35: ?
-            0, // 0x36: Right Shift
+            0,    // 0x36: Right Shift
             b'*', // 0x37: Keypad *
-            0, // 0x38: Left Alt
+            0,    // 0x38: Left Alt
             b' ', // 0x39: Space
-            0, // 0x3A: Caps Lock
+            0,    // 0x3A: Caps Lock
             // 0x3B-0x44: F1-F10 (non-printable)
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            // 0x45-0x46: Num Lock, Scroll Lock
-            0, 0,
-            // 0x47-0x53: Keypad and arrows
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x45-0x46: Num Lock, Scroll Lock
+            0, 0, // 0x47-0x53: Keypad and arrows
             0, 0, 0, b'-', 0, 0, 0, b'+', 0, 0, 0, 0, 0,
             // 0x54-0x7F: Rest not mapped (44 elements)
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
 
         if scancode as usize >= SCANCODE_ASCII.len() {

@@ -464,9 +464,7 @@ pub fn copy_from_user_safe(dst: &mut [u8], src: *const u8) -> Result<(), ()> {
             }
 
             // Read one byte from user space
-            let byte = unsafe {
-                core::ptr::read_volatile(src.add(i))
-            };
+            let byte = unsafe { core::ptr::read_volatile(src.add(i)) };
 
             // Check again after the read
             if check_and_clear_fault() {
@@ -808,14 +806,16 @@ impl<T: Copy> UserPtr<T> {
     /// exceed user space bounds.
     pub fn offset(&self, count: isize) -> Result<Self, UsercopyError> {
         let elem_size = size_of::<T>();
-        let offset_bytes = (count as isize).checked_mul(elem_size as isize)
+        let offset_bytes = (count as isize)
+            .checked_mul(elem_size as isize)
             .ok_or(UsercopyError)?;
 
         let new_addr = if offset_bytes >= 0 {
             self.addr().checked_add(offset_bytes as usize)
         } else {
             self.addr().checked_sub((-offset_bytes) as usize)
-        }.ok_or(UsercopyError)?;
+        }
+        .ok_or(UsercopyError)?;
 
         Self::new(new_addr as *mut T)
     }
@@ -973,12 +973,9 @@ pub fn copy_from_user<T: Copy>(dst: &mut T, src: UserPtr<T>) -> Result<(), Userc
     }
 
     // SAFETY: dst is a valid kernel reference, size matches T
-    let dst_bytes = unsafe {
-        core::slice::from_raw_parts_mut(dst as *mut T as *mut u8, size)
-    };
+    let dst_bytes = unsafe { core::slice::from_raw_parts_mut(dst as *mut T as *mut u8, size) };
 
-    copy_from_user_safe(dst_bytes, src.as_ptr() as *const u8)
-        .map_err(|_| UsercopyError)
+    copy_from_user_safe(dst_bytes, src.as_ptr() as *const u8).map_err(|_| UsercopyError)
 }
 
 /// Copy a single typed value to user space
@@ -1008,12 +1005,9 @@ pub fn copy_to_user<T: Copy>(dst: UserPtr<T>, src: &T) -> Result<(), UsercopyErr
     }
 
     // SAFETY: src is a valid kernel reference, size matches T
-    let src_bytes = unsafe {
-        core::slice::from_raw_parts(src as *const T as *const u8, size)
-    };
+    let src_bytes = unsafe { core::slice::from_raw_parts(src as *const T as *const u8, size) };
 
-    copy_to_user_safe(dst.as_mut_ptr() as *mut u8, src_bytes)
-        .map_err(|_| UsercopyError)
+    copy_to_user_safe(dst.as_mut_ptr() as *mut u8, src_bytes).map_err(|_| UsercopyError)
 }
 
 /// Copy bytes from user space slice to kernel buffer
@@ -1144,7 +1138,8 @@ pub fn strncpy_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<usize, User
         copied += 1;
 
         USER_COPY_STATE.with(|s| {
-            s.remaining.store(max_copy.saturating_sub(i + 1), Ordering::SeqCst)
+            s.remaining
+                .store(max_copy.saturating_sub(i + 1), Ordering::SeqCst)
         });
     }
 

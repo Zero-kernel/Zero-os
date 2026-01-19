@@ -229,7 +229,7 @@ impl KernelLayout {
             // Section bounds - placeholders until linker symbol integration
             // TODO: Populate from linker symbols (__text_start, __text_end, etc.)
             text_start: KERNEL_VIRT_BASE + KERNEL_ENTRY_OFFSET,
-            text_size: 0,  // Unknown until linker symbols integrated
+            text_size: 0, // Unknown until linker symbols integrated
             rodata_start: 0,
             rodata_size: 0,
             data_start: 0,
@@ -989,17 +989,37 @@ pub fn init(boot_slide: Option<u64>) {
     set_kernel_layout(layout);
 
     // Report status
-    println!("  PCID: {}",
-        if pcid_enabled { "enabled" } else { "unsupported/disabled" });
-    println!("  KASLR: {} (slide: 0x{:x})",
-        if layout.kaslr_slide != 0 { "enabled" } else { "disabled" },
-        layout.kaslr_slide);
-    println!("  Kernel sections: text={:#x}..{:#x} ({} bytes)",
+    println!(
+        "  PCID: {}",
+        if pcid_enabled {
+            "enabled"
+        } else {
+            "unsupported/disabled"
+        }
+    );
+    println!(
+        "  KASLR: {} (slide: 0x{:x})",
+        if layout.kaslr_slide != 0 {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        layout.kaslr_slide
+    );
+    println!(
+        "  Kernel sections: text={:#x}..{:#x} ({} bytes)",
         layout.text_start,
         layout.text_start + layout.text_size,
-        layout.text_size);
-    println!("  KPTI: {} (stubs installed)",
-        if is_kpti_enabled() { "enabled" } else { "disabled" });
+        layout.text_size
+    );
+    println!(
+        "  KPTI: {} (stubs installed)",
+        if is_kpti_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 }
 
 // ============================================================================
@@ -1055,10 +1075,18 @@ mod tests {
         // Test that slides are properly aligned to 2 MiB
         for slot in 0..10 {
             let slide = slide_from_slot(slot);
-            assert_eq!(slide % KASLR_SLIDE_GRANULARITY, 0,
-                "Slide 0x{:x} should be 2 MiB aligned", slide);
-            assert!(slide <= KASLR_MAX_SLIDE,
-                "Slide 0x{:x} should be <= max 0x{:x}", slide, KASLR_MAX_SLIDE);
+            assert_eq!(
+                slide % KASLR_SLIDE_GRANULARITY,
+                0,
+                "Slide 0x{:x} should be 2 MiB aligned",
+                slide
+            );
+            assert!(
+                slide <= KASLR_MAX_SLIDE,
+                "Slide 0x{:x} should be <= max 0x{:x}",
+                slide,
+                KASLR_MAX_SLIDE
+            );
         }
     }
 
@@ -1067,10 +1095,17 @@ mod tests {
         // Test that slot values beyond max wrap correctly
         let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
         let slide = slide_from_slot(max_slots + 10);
-        assert!(slide <= KASLR_MAX_SLIDE,
-            "Wrapped slide 0x{:x} should be <= max 0x{:x}", slide, KASLR_MAX_SLIDE);
-        assert_eq!(slide % KASLR_SLIDE_GRANULARITY, 0,
-            "Wrapped slide should still be aligned");
+        assert!(
+            slide <= KASLR_MAX_SLIDE,
+            "Wrapped slide 0x{:x} should be <= max 0x{:x}",
+            slide,
+            KASLR_MAX_SLIDE
+        );
+        assert_eq!(
+            slide % KASLR_SLIDE_GRANULARITY,
+            0,
+            "Wrapped slide should still be aligned"
+        );
     }
 
     #[test]
@@ -1110,14 +1145,14 @@ mod tests {
 
         // Test MAX_PCID (4095)
         let (idx, mask) = pcid_index_and_mask(MAX_PCID);
-        assert_eq!(idx, 63);  // 4095 / 64 = 63
-        assert_eq!(mask, 1u64 << 63);  // 4095 % 64 = 63
+        assert_eq!(idx, 63); // 4095 / 64 = 63
+        assert_eq!(mask, 1u64 << 63); // 4095 % 64 = 63
     }
 
     #[test]
     fn test_pcid_bitmap_size() {
         // Verify bitmap has enough words for all PCIDs
-        assert_eq!(PCID_BITMAP_WORDS, 64);  // 4096 bits / 64 bits per word
+        assert_eq!(PCID_BITMAP_WORDS, 64); // 4096 bits / 64 bits per word
         assert!(PCID_BITMAP_WORDS * 64 >= (MAX_PCID as usize + 1));
     }
 

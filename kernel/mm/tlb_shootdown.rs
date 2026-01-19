@@ -8,31 +8,35 @@
 //! - R23-1: COW page table modifications need TLB shootdown on all CPUs
 //! - R23-3: munmap needs TLB shootdown before frame deallocation
 //!
-//! # Current Implementation (Single-Core)
+//! # IPI-Based Implementation (SMP)
 //!
-//! Currently, Zero-OS runs in single-core mode (`current_cpu_id()` always returns 0).
-//! All functions perform local TLB flushes only. This is safe because:
-//! - Only one CPU exists, so no stale TLB entries can exist on other CPUs
-//! - The local flush ensures the current CPU sees updated mappings
+//! When multiple CPUs are online, TLB shootdown works as follows:
+//! 1. Requesting CPU writes request to each target CPU's per-CPU mailbox
+//! 2. Requesting CPU sends TLB shootdown IPI (vector 0xFE) to all targets
+//! 3. Requesting CPU flushes its own TLB locally
+//! 4. Each target CPU's IPI handler reads mailbox, flushes TLB, writes ACK
+//! 5. Requesting CPU waits for all ACKs with bounded timeout
 //!
-//! # SMP Upgrade Path
+//! # Memory Ordering
 //!
-//! When SMP support is enabled, these functions must be updated to:
-//! 1. Send IPI (Inter-Processor Interrupt) to all CPUs running the affected address space
-//! 2. Wait for acknowledgment from all target CPUs
-//! 3. Only then return (and allow frame deallocation in munmap case)
-//!
-//! The interface is designed to support this transition:
-//! - `flush_current_as_all()`: Flush entire address space on all CPUs
-//! - `flush_current_as_range()`: Flush specific range on all CPUs (future optimization)
+//! - Requester: writes fields Relaxed, then `request_gen` Release
+//! - Handler: loads `request_gen` Acquire, reads fields Relaxed, writes `ack_gen` Release
+//! - Waiter: loads `ack_gen` Acquire to ensure flush completion is visible
 //!
 //! # Safety Guard
 //!
-//! A compile-time or runtime guard should be added before enabling SMP to ensure
-//! the IPI-based implementation is in place. See `assert_single_core_mode()`.
+//! The `assert_single_core_mode()` function panics if multiple CPUs are online
+//! but the IPI sender is not registered, ensuring we never silently skip shootdown.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+extern crate alloc;
+
+use alloc::vec::Vec;
+use core::hint::spin_loop;
+use core::mem;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use cpu_local::{current_cpu, current_cpu_id, lapic_id_for_cpu, max_cpus, TlbShootdownMailbox, PER_CPU_DATA};
 use x86_64::instructions::tlb;
+use x86_64::registers::control::Cr3;
 use x86_64::VirtAddr;
 
 /// Statistics for TLB shootdown operations (for debugging/profiling)
@@ -52,16 +56,45 @@ static STATS_FULL_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static STATS_RANGE_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static STATS_PAGES_FLUSHED: AtomicU64 = AtomicU64::new(0);
 
-/// SMP support flag - set to true when real IPI-based shootdown is implemented
-/// CRITICAL: This must remain false until IPI mechanism is complete
-static SMP_SHOOTDOWN_IMPLEMENTED: bool = false;
+/// SMP support flag - now true since IPI-based shootdown is implemented
+static SMP_SHOOTDOWN_IMPLEMENTED: bool = true;
 
 /// R24-7 fix: Track number of online CPUs
 /// This counter must be incremented by the SMP bring-up code when each CPU comes online.
 /// Starts at 1 (BSP is always online).
 static ONLINE_CPU_COUNT: AtomicU64 = AtomicU64::new(1);
 
-/// Register a CPU as online.
+/// Codex review fix: Per-CPU online bitmask for safe target selection.
+///
+/// Bit N is set when CPU N has fully initialized and can handle IPIs.
+/// This prevents sending IPIs to CPUs that have LAPIC IDs registered but
+/// haven't completed their initialization yet.
+///
+/// BSP (CPU 0) is marked online at init time. APs set their bit via
+/// `register_cpu_online_with_id()` after completing initialization.
+static ONLINE_CPU_MASK: AtomicU64 = AtomicU64::new(1); // BSP (bit 0) is always online
+
+/// Next generation number for TLB shootdown requests (monotonic, starts at 1)
+static NEXT_SHOOTDOWN_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// Registered function used to send the TLB shootdown IPI
+/// Stored as usize to avoid function pointer in static
+static TLB_IPI_SENDER: AtomicUsize = AtomicUsize::new(0);
+
+/// Spin iterations to wait for ACKs before timing out
+/// At ~2GHz, 1M iterations is roughly 0.5-1ms
+const IPI_ACK_TIMEOUT_SPINS: usize = 1_000_000;
+
+/// Page size used for alignment
+const PAGE_SIZE: u64 = 4096;
+
+/// If more than this many pages are affected, fall back to full flush
+const FULL_FLUSH_THRESHOLD: u64 = 16;
+
+/// Type alias for IPI sender function
+type TlbIpiSender = fn(usize);
+
+/// Register a CPU as online (legacy interface, uses current CPU ID).
 ///
 /// This function MUST be called by the SMP bring-up code when each AP (Application Processor)
 /// is initialized. The BSP (Boot Strap Processor) is already counted (initial value is 1).
@@ -71,7 +104,37 @@ static ONLINE_CPU_COUNT: AtomicU64 = AtomicU64::new(1);
 /// This function is safe to call from any context, but should only be called once per CPU
 /// during SMP initialization.
 pub fn register_cpu_online() {
+    let cpu_id = current_cpu_id();
+    register_cpu_online_with_id(cpu_id);
+}
+
+/// Register a specific CPU as online by its ID.
+///
+/// This is the preferred interface when the CPU ID is known (e.g., from AP trampoline data).
+/// Sets the corresponding bit in ONLINE_CPU_MASK with Release ordering.
+///
+/// # Arguments
+///
+/// * `cpu_id` - The logical CPU index (0 = BSP, 1+ = APs)
+pub fn register_cpu_online_with_id(cpu_id: usize) {
+    if cpu_id >= 64 {
+        return; // Can't represent in bitmask, ignore
+    }
+    let mask = 1u64 << cpu_id;
+    ONLINE_CPU_MASK.fetch_or(mask, Ordering::Release);
     ONLINE_CPU_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Check if a specific CPU is marked as online.
+///
+/// Uses Acquire ordering to synchronize with the Release in `register_cpu_online_with_id`.
+#[inline]
+fn is_cpu_online(cpu_id: usize) -> bool {
+    if cpu_id >= 64 {
+        return false;
+    }
+    let mask = ONLINE_CPU_MASK.load(Ordering::Acquire);
+    (mask & (1u64 << cpu_id)) != 0
 }
 
 /// Get the number of online CPUs.
@@ -81,46 +144,280 @@ pub fn online_cpu_count() -> u64 {
     ONLINE_CPU_COUNT.load(Ordering::SeqCst)
 }
 
-/// Assert that we're in single-core mode.
+/// Register the function used to send the TLB shootdown IPI.
+///
+/// This is called by the arch IPI layer to avoid a circular dependency from `mm` to `arch`.
+/// Must be called during early boot before any TLB shootdown operations with SMP.
+pub fn register_ipi_sender(sender: TlbIpiSender) {
+    TLB_IPI_SENDER.store(sender as usize, Ordering::Release);
+}
+
+/// Get the registered IPI sender function, if any.
+fn tlb_ipi_sender() -> Option<TlbIpiSender> {
+    let ptr = TLB_IPI_SENDER.load(Ordering::Acquire);
+    if ptr == 0 {
+        None
+    } else {
+        // Safety: pointer was written from a real function in register_ipi_sender()
+        Some(unsafe { mem::transmute(ptr) })
+    }
+}
+
+/// Assert that we're in single-core mode or have IPI sender registered.
 ///
 /// This function should be called at boot time or before any TLB shootdown
 /// operation to ensure we don't silently run with broken SMP support.
 ///
 /// # Panics
 ///
-/// Panics if multiple CPUs are online but SMP shootdown is not implemented.
-///
-/// # R24-7 Fix
-///
-/// Now checks both `ONLINE_CPU_COUNT` and current CPU ID. This prevents the case where
-/// SMP is enabled but the guard only checks cpu_id (which would pass on BSP even with
-/// multiple CPUs online).
+/// Panics if multiple CPUs are online but IPI sender is not registered.
 #[inline]
 fn assert_single_core_mode() {
-    // R24-7 fix: Check online CPU count first
-    // This catches the case where we're on BSP but APs have been brought online
     let cpu_count = ONLINE_CPU_COUNT.load(Ordering::SeqCst);
-    if cpu_count > 1 && !SMP_SHOOTDOWN_IMPLEMENTED {
+    if cpu_count > 1 && tlb_ipi_sender().is_none() {
         panic!(
-            "TLB shootdown called with {} CPUs online but SMP support not implemented! \
+            "TLB shootdown called with {} CPUs online but IPI sender not registered! \
              This is a critical bug - stale TLB entries may cause memory corruption. \
-             Implement IPI-based shootdown or disable SMP.",
+             Register the TLB IPI sender before enabling SMP.",
             cpu_count
         );
     }
 
     // Also check current CPU ID as a secondary guard
-    // cpu_local::current_cpu_id() returns 0 in single-core mode
-    // When SMP is enabled, this will return non-zero for secondary CPUs
-    let cpu_id = cpu_local::current_cpu_id();
-
-    // Guard: If we're on a non-boot CPU but SMP shootdown isn't implemented, panic
-    if cpu_id != 0 && !SMP_SHOOTDOWN_IMPLEMENTED {
+    let cpu_id = current_cpu_id();
+    if cpu_id != 0 && tlb_ipi_sender().is_none() {
         panic!(
-            "TLB shootdown called on CPU {} but SMP support not implemented! \
+            "TLB shootdown called on CPU {} but IPI sender not registered! \
              This is a critical bug - stale TLB entries may cause memory corruption.",
             cpu_id
         );
+    }
+}
+
+/// Get the current CR3 value (page table base)
+#[inline]
+fn current_cr3_value() -> u64 {
+    Cr3::read().0.start_address().as_u64()
+}
+
+/// Get a reference to a specific CPU's TLB shootdown mailbox
+fn mailbox_for_cpu(cpu_id: usize) -> Option<&'static TlbShootdownMailbox> {
+    PER_CPU_DATA.get_cpu(cpu_id).map(|data| data.tlb_mailbox())
+}
+
+/// Collect all online CPUs except self
+///
+/// Codex review fix: Now checks both LAPIC ID registration AND the ONLINE_CPU_MASK.
+/// This prevents sending IPIs to CPUs that have been registered in the LAPIC map
+/// but haven't completed their initialization yet.
+fn collect_target_cpus() -> Vec<usize> {
+    let mut targets = Vec::new();
+    let self_id = current_cpu_id();
+    for cpu in 0..max_cpus() {
+        if cpu == self_id {
+            continue;
+        }
+        // Check both: LAPIC ID is registered AND CPU is marked online
+        if lapic_id_for_cpu(cpu).is_some() && is_cpu_online(cpu) {
+            targets.push(cpu);
+        }
+    }
+    targets
+}
+
+/// Post shootdown requests to all target CPUs' mailboxes
+fn post_requests(targets: &[usize], cr3: u64, start: u64, len: u64, generation: u64) {
+    for &cpu in targets {
+        if let Some(mailbox) = mailbox_for_cpu(cpu) {
+            // Write request fields with Relaxed ordering
+            mailbox.target_cr3.store(cr3, Ordering::Relaxed);
+            mailbox.start.store(start, Ordering::Relaxed);
+            mailbox.len.store(len, Ordering::Relaxed);
+            // Write generation with Release to synchronize with handler's Acquire
+            mailbox.request_gen.store(generation, Ordering::Release);
+        }
+    }
+}
+
+/// Send TLB shootdown IPIs to all target CPUs
+fn send_ipis(targets: &[usize], sender: TlbIpiSender) {
+    for &cpu in targets {
+        sender(cpu);
+    }
+}
+
+/// Number of retry attempts for ACK timeout before panicking
+const ACK_TIMEOUT_RETRIES: usize = 3;
+
+/// Wait for all target CPUs to acknowledge the shootdown request
+///
+/// Returns true if all ACKs received, false on timeout.
+fn wait_for_acks(targets: &[usize], generation: u64) -> bool {
+    for _ in 0..IPI_ACK_TIMEOUT_SPINS {
+        let all_acked = targets.iter().all(|&cpu| {
+            mailbox_for_cpu(cpu)
+                .map(|m| m.ack_gen.load(Ordering::Acquire) >= generation)
+                .unwrap_or(true) // Missing CPU counts as acked
+        });
+        if all_acked {
+            return true;
+        }
+        spin_loop();
+    }
+    false
+}
+
+/// Get list of CPUs that haven't ACKed yet
+fn get_unacked_cpus(targets: &[usize], generation: u64) -> Vec<usize> {
+    targets
+        .iter()
+        .filter(|&&cpu| {
+            mailbox_for_cpu(cpu)
+                .map(|m| m.ack_gen.load(Ordering::Relaxed) < generation)
+                .unwrap_or(false)
+        })
+        .copied()
+        .collect()
+}
+
+/// Wait for ACKs with retry support
+///
+/// Codex review fix: On timeout, resends IPIs and retries before failing.
+/// After ACK_TIMEOUT_RETRIES attempts, panics in debug builds or warns in release.
+fn wait_for_acks_with_retry(
+    targets: &[usize],
+    generation: u64,
+    sender: TlbIpiSender,
+) -> bool {
+    for attempt in 0..=ACK_TIMEOUT_RETRIES {
+        if wait_for_acks(targets, generation) {
+            return true;
+        }
+
+        // Get unacked CPUs for retry/logging
+        let unacked = get_unacked_cpus(targets, generation);
+        if unacked.is_empty() {
+            return true; // All acked now
+        }
+
+        if attempt < ACK_TIMEOUT_RETRIES {
+            // Resend IPIs to unacked CPUs
+            for &cpu in &unacked {
+                sender(cpu);
+            }
+        } else {
+            // Final timeout - this is a critical error
+            drivers::println!(
+                "[CRITICAL] TLB shootdown gen {} failed after {} retries. CPUs not responding: {:?}",
+                generation,
+                ACK_TIMEOUT_RETRIES,
+                unacked
+            );
+
+            // In debug builds, panic to catch the issue early
+            #[cfg(debug_assertions)]
+            panic!(
+                "TLB shootdown timeout: CPUs {:?} not responding. \
+                 This is a critical SMP bug - stale TLB entries may cause memory corruption.",
+                unacked
+            );
+
+            // In release builds, continue with warning (safer than hard panic)
+            // The TLB may be stale on some CPUs, but panicking could cause worse issues
+            return false;
+        }
+    }
+    false
+}
+
+/// Warn about timeout waiting for ACKs (non-fatal, for debugging)
+fn warn_timeout(targets: &[usize], generation: u64) {
+    // Find which CPUs didn't ACK
+    let missing: Vec<usize> = targets
+        .iter()
+        .filter(|&&cpu| {
+            mailbox_for_cpu(cpu)
+                .map(|m| m.ack_gen.load(Ordering::Relaxed) < generation)
+                .unwrap_or(false)
+        })
+        .copied()
+        .collect();
+
+    drivers::println!(
+        "[WARN] TLB shootdown gen {} timed out waiting for ACK from CPUs {:?}",
+        generation,
+        missing
+    );
+}
+
+/// Dispatch a TLB shootdown to remote CPUs
+///
+/// Returns (targets, generation) if there are remote CPUs to notify,
+/// None if this is the only CPU.
+fn dispatch_shootdown(start: u64, len: u64) -> Option<(Vec<usize>, u64)> {
+    let targets = collect_target_cpus();
+    if targets.is_empty() {
+        return None;
+    }
+
+    let sender = tlb_ipi_sender().unwrap_or_else(|| {
+        panic!(
+            "TLB shootdown requested for CPUs {:?} but no IPI sender registered",
+            targets
+        )
+    });
+
+    let generation = NEXT_SHOOTDOWN_GEN.fetch_add(1, Ordering::SeqCst);
+    let cr3 = current_cr3_value();
+
+    // Post requests to all target mailboxes
+    post_requests(&targets, cr3, start, len, generation);
+
+    // Send IPIs to wake up targets
+    send_ipis(&targets, sender);
+
+    Some((targets, generation))
+}
+
+/// Range operation type for flush optimization
+enum RangeOp {
+    /// Full TLB flush
+    Full,
+    /// Range flush with specific pages
+    Pages { start: u64, len: u64, pages: u64 },
+}
+
+/// Normalize a virtual address range for TLB flushing
+fn normalize_range(start: VirtAddr, len: usize) -> RangeOp {
+    let start_aligned = start.align_down(PAGE_SIZE);
+    let end = match start.as_u64().checked_add(len as u64) {
+        Some(e) => e,
+        None => return RangeOp::Full, // Overflow: full flush
+    };
+
+    let end_aligned = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let bytes = end_aligned.saturating_sub(start_aligned.as_u64());
+    let pages = bytes / PAGE_SIZE;
+
+    if pages == 0 || pages > FULL_FLUSH_THRESHOLD {
+        RangeOp::Full
+    } else {
+        RangeOp::Pages {
+            start: start_aligned.as_u64(),
+            len: bytes,
+            pages,
+        }
+    }
+}
+
+/// Flush a range of pages locally
+fn flush_range_local(start: u64, len: u64) {
+    debug_assert!(len % PAGE_SIZE == 0);
+    let mut offset = 0;
+    while offset < len {
+        let addr = VirtAddr::new(start + offset);
+        tlb::flush(addr);
+        offset += PAGE_SIZE;
     }
 }
 
@@ -134,36 +431,34 @@ fn assert_single_core_mode() {
 /// Used in `copy_page_table_cow()` after marking parent PTEs as read-only.
 /// Ensures all CPUs (in SMP) see the updated COW mappings.
 ///
-/// # Current Behavior (Single-Core)
-///
-/// Performs local `flush_all()` only. Safe because only one CPU exists.
-///
-/// # SMP Behavior (Future)
-///
-/// Will send IPI to all CPUs running this address space (same CR3) and wait
-/// for acknowledgment before returning.
-///
 /// # Safety
 ///
 /// Safe to call from any context. In SMP mode, this may block waiting for
 /// IPI acknowledgments.
 #[inline]
 pub fn flush_current_as_all() {
-    // Safety guard: panic if SMP is enabled but shootdown not implemented
     assert_single_core_mode();
 
-    // R23-1/R23-3 fix: TLB shootdown placeholder
-    //
-    // CURRENT: Single-core mode - only local flush needed
-    // FUTURE (SMP): Replace with IPI-based shootdown:
-    //   1. Get set of CPUs running this address space (same CR3)
-    //   2. Send FLUSH_ALL IPI to all target CPUs
-    //   3. Wait for ACK from all targets
-    //   4. Return
+    // Dispatch to remote CPUs (if any)
+    let shoot = dispatch_shootdown(0, 0);
 
+    // Flush local TLB immediately
     tlb::flush_all();
 
-    // Update statistics (atomic for SMP-safety)
+    // Wait for remote ACKs with retry support
+    if let Some((targets, generation)) = shoot {
+        // Mark our own mailbox as processed (for symmetry)
+        current_cpu()
+            .tlb_mailbox()
+            .ack_gen
+            .store(generation, Ordering::Release);
+
+        // Get sender for retry
+        if let Some(sender) = tlb_ipi_sender() {
+            wait_for_acks_with_retry(&targets, generation, sender);
+        }
+    }
+
     STATS_FULL_FLUSHES.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -182,68 +477,44 @@ pub fn flush_current_as_all() {
 /// Used in `sys_munmap()` after unmapping pages but before freeing frames.
 /// Ensures no CPU (in SMP) retains stale TLB entries pointing to freed frames.
 ///
-/// # Current Behavior (Single-Core)
-///
-/// Performs local `invlpg` for each page in the range. For large ranges,
-/// falls back to `flush_all()` for efficiency.
-///
-/// # SMP Behavior (Future)
-///
-/// Will send IPI with the address range to all CPUs running this address space
-/// and wait for acknowledgment before returning. This is CRITICAL for safety:
-/// frames must NOT be freed until all CPUs have flushed their TLB entries.
-///
 /// # Safety
 ///
 /// Safe to call from any context. In SMP mode, this may block waiting for
 /// IPI acknowledgments.
 pub fn flush_current_as_range(start: VirtAddr, len: usize) {
-    // Safety guard: panic if SMP is enabled but shootdown not implemented
     assert_single_core_mode();
 
-    // R23-1/R23-3 fix: TLB shootdown placeholder
-    //
-    // CURRENT: Single-core mode - only local flush needed
-    // FUTURE (SMP): Replace with IPI-based shootdown:
-    //   1. Get set of CPUs running this address space (same CR3)
-    //   2. Send FLUSH_RANGE IPI with (start, len) to all target CPUs
-    //   3. Wait for ACK from all targets
-    //   4. Return
-
-    const PAGE_SIZE: u64 = 4096;
-    // Threshold: if flushing more than 16 pages, do full flush instead
-    const FULL_FLUSH_THRESHOLD: u64 = 16;
-
-    let start_aligned = start.align_down(PAGE_SIZE);
-
-    // Safe end calculation: use checked_add to prevent overflow
-    // If overflow occurs, fall back to full flush
-    let end = match start.as_u64().checked_add(len as u64) {
-        Some(e) => e,
-        None => {
-            // Overflow: fall back to full flush for safety
-            tlb::flush_all();
-            STATS_FULL_FLUSHES.fetch_add(1, Ordering::Relaxed);
-            return;
+    match normalize_range(start, len) {
+        RangeOp::Full => {
+            flush_current_as_all();
         }
-    };
+        RangeOp::Pages {
+            start: aligned_start,
+            len: aligned_len,
+            pages,
+        } => {
+            // Dispatch to remote CPUs
+            let shoot = dispatch_shootdown(aligned_start, aligned_len);
 
-    // Align end up to page boundary (safe, already checked for overflow)
-    let end_aligned = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let num_pages = (end_aligned - start_aligned.as_u64()) / PAGE_SIZE;
+            // Flush local TLB
+            flush_range_local(aligned_start, aligned_len);
 
-    if num_pages > FULL_FLUSH_THRESHOLD || num_pages == 0 {
-        // Large range or invalid: full flush is more efficient/safer
-        tlb::flush_all();
-        STATS_FULL_FLUSHES.fetch_add(1, Ordering::Relaxed);
-    } else {
-        // Small range: flush individual pages
-        for i in 0..num_pages {
-            let addr = VirtAddr::new(start_aligned.as_u64() + (i * PAGE_SIZE));
-            tlb::flush(addr);
+            // Wait for remote ACKs with retry support
+            if let Some((targets, generation)) = shoot {
+                current_cpu()
+                    .tlb_mailbox()
+                    .ack_gen
+                    .store(generation, Ordering::Release);
+
+                // Get sender for retry
+                if let Some(sender) = tlb_ipi_sender() {
+                    wait_for_acks_with_retry(&targets, generation, sender);
+                }
+            }
+
+            STATS_RANGE_FLUSHES.fetch_add(1, Ordering::Relaxed);
+            STATS_PAGES_FLUSHED.fetch_add(pages, Ordering::Relaxed);
         }
-        STATS_RANGE_FLUSHES.fetch_add(1, Ordering::Relaxed);
-        STATS_PAGES_FLUSHED.fetch_add(num_pages, Ordering::Relaxed);
     }
 }
 
@@ -270,49 +541,82 @@ pub fn get_stats() -> TlbShootdownStats {
     }
 }
 
-// ============================================================================
-// SMP Support Stubs (Future Implementation)
-// ============================================================================
-
-/// Marker for SMP-required functionality.
+/// Handle an incoming TLB shootdown IPI on the current CPU.
 ///
-/// When SMP is enabled, these will be replaced with real implementations.
-#[allow(dead_code)]
-mod smp_stubs {
-    /// IPI vector for TLB shootdown
-    pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xFE;
+/// This is called from the IPI handler (vector 0xFE) after receiving a
+/// TLB shootdown request. It:
+/// 1. Reads the request from this CPU's mailbox using seqlock-style protocol
+/// 2. Checks if the request targets this CPU's address space (CR3 match)
+/// 3. Performs the appropriate TLB flush
+/// 4. Writes ACK to allow the requester to proceed
+///
+/// # Seqlock Protocol (Codex review fix)
+///
+/// To prevent torn reads when a new request arrives while we're reading fields:
+/// 1. Load request_gen with Acquire
+/// 2. Read all fields with Relaxed
+/// 3. Re-read request_gen with Acquire
+/// 4. If it changed, retry from step 1
+/// 5. If stable, process the request and ACK
+///
+/// # Safety
+///
+/// Must be called from interrupt context with interrupts disabled.
+pub fn handle_shootdown_ipi() {
+    let mailbox = current_cpu().tlb_mailbox();
 
-    /// Maximum time to wait for IPI acknowledgment (in microseconds)
-    pub const IPI_ACK_TIMEOUT_US: u64 = 1000;
+    // Maximum retries to prevent infinite loop if constantly being overwritten
+    const MAX_RETRIES: usize = 10;
 
-    /// Pending TLB shootdown request (per-CPU in SMP)
-    pub struct TlbShootdownRequest {
-        /// Requesting CPU ID
-        pub from_cpu: usize,
-        /// Target address space (CR3)
-        pub target_cr3: u64,
-        /// Start address (0 for full flush)
-        pub start: u64,
-        /// Length in bytes (0 for full flush)
-        pub len: usize,
+    for _ in 0..MAX_RETRIES {
+        // Step 1: Load generation with Acquire to synchronize with requester's Release
+        let generation = mailbox.request_gen.load(Ordering::Acquire);
+        if generation == 0 {
+            return; // No request pending
+        }
+
+        let last_ack = mailbox.ack_gen.load(Ordering::Relaxed);
+        if last_ack >= generation {
+            return; // Already processed this request
+        }
+
+        // Step 2: Read request details (Relaxed is fine, synchronized by request_gen Acquire)
+        let target_cr3 = mailbox.target_cr3.load(Ordering::Relaxed);
+        let len = mailbox.len.load(Ordering::Relaxed);
+        let start = mailbox.start.load(Ordering::Relaxed);
+
+        // Step 3: Re-read generation to detect torn reads
+        let generation2 = mailbox.request_gen.load(Ordering::Acquire);
+        if generation != generation2 {
+            // Request was overwritten while reading, retry
+            continue;
+        }
+
+        // Step 4: Fields are consistent, process the request
+        let this_cr3 = current_cr3_value();
+
+        // Only flush if the CR3 matches (0 means unconditional flush)
+        if target_cr3 == 0 || target_cr3 == this_cr3 {
+            if len == 0 {
+                // Full TLB flush
+                tlb::flush_all();
+            } else {
+                // Range flush
+                flush_range_local(start, len);
+            }
+        }
+
+        // Step 5: Write ACK with Release to allow requester to proceed
+        mailbox.ack_gen.store(generation, Ordering::Release);
+        return;
     }
 
-    /// Send TLB shootdown IPI to target CPUs
-    ///
-    /// # Future Implementation
-    ///
-    /// 1. For each target CPU (those with matching CR3):
-    ///    a. Set pending request in target's per-CPU area
-    ///    b. Send IPI using APIC
-    /// 2. Wait for all targets to acknowledge
-    /// 3. Clear pending requests
-    /// 4. Return
-    pub fn send_tlb_shootdown_ipi(
-        _target_cr3: u64,
-        _start: u64,
-        _len: usize,
-    ) {
-        // TODO: Implement when SMP support is added
-        // For now, this is never called (single-core mode)
+    // If we exhausted retries, ACK the latest generation anyway to avoid deadlock
+    // This is a best-effort fallback - the requester will see the ACK and proceed
+    let final_gen = mailbox.request_gen.load(Ordering::Acquire);
+    if final_gen > 0 {
+        // Do a full flush to be safe since we couldn't read consistent parameters
+        tlb::flush_all();
+        mailbox.ack_gen.store(final_gen, Ordering::Release);
     }
 }

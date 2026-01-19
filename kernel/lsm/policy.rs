@@ -27,7 +27,7 @@ use core::fmt;
 
 use cap::{CapId, CapRights};
 
-use crate::{FileCtx, IpcCtx, NetCtx, NetControlCtx, OpenFlags, ProcessCtx, SignalCtx, SyscallCtx};
+use crate::{FileCtx, IpcCtx, NetControlCtx, NetCtx, OpenFlags, ProcessCtx, SignalCtx, SyscallCtx};
 
 // ============================================================================
 // LSM Result and Error Types
@@ -154,12 +154,24 @@ pub trait LsmPolicy: Send + Sync {
     }
 
     /// Called when a file is opened.
-    fn file_open(&self, task: &ProcessCtx, inode: u64, flags: OpenFlags, ctx: &FileCtx) -> LsmResult {
+    fn file_open(
+        &self,
+        task: &ProcessCtx,
+        inode: u64,
+        flags: OpenFlags,
+        ctx: &FileCtx,
+    ) -> LsmResult {
         Ok(())
     }
 
     /// Called when a file is created.
-    fn file_create(&self, task: &ProcessCtx, parent_inode: u64, name_hash: u64, mode: u32) -> LsmResult {
+    fn file_create(
+        &self,
+        task: &ProcessCtx,
+        parent_inode: u64,
+        name_hash: u64,
+        mode: u32,
+    ) -> LsmResult {
         Ok(())
     }
 
@@ -261,17 +273,35 @@ pub trait LsmPolicy: Send + Sync {
     }
 
     /// Called when a hard link is created.
-    fn file_link(&self, task: &ProcessCtx, inode: u64, new_parent: u64, name_hash: u64) -> LsmResult {
+    fn file_link(
+        &self,
+        task: &ProcessCtx,
+        inode: u64,
+        new_parent: u64,
+        name_hash: u64,
+    ) -> LsmResult {
         Ok(())
     }
 
     /// Called when a symbolic link is created.
-    fn file_symlink(&self, task: &ProcessCtx, parent_inode: u64, name_hash: u64, target_hash: u64) -> LsmResult {
+    fn file_symlink(
+        &self,
+        task: &ProcessCtx,
+        parent_inode: u64,
+        name_hash: u64,
+        target_hash: u64,
+    ) -> LsmResult {
         Ok(())
     }
 
     /// Called when a directory is created.
-    fn file_mkdir(&self, task: &ProcessCtx, parent_inode: u64, name_hash: u64, mode: u32) -> LsmResult {
+    fn file_mkdir(
+        &self,
+        task: &ProcessCtx,
+        parent_inode: u64,
+        name_hash: u64,
+        mode: u32,
+    ) -> LsmResult {
         Ok(())
     }
 
@@ -380,7 +410,13 @@ pub trait LsmPolicy: Send + Sync {
     }
 
     /// Called when setting socket options.
-    fn net_setsockopt(&self, task: &ProcessCtx, ctx: &NetCtx, level: i32, optname: i32) -> LsmResult {
+    fn net_setsockopt(
+        &self,
+        task: &ProcessCtx,
+        ctx: &NetCtx,
+        level: i32,
+        optname: i32,
+    ) -> LsmResult {
         Ok(())
     }
 
@@ -486,11 +522,23 @@ impl LsmPolicy for DenyAllPolicy {
         Err(LsmError::Denied)
     }
 
-    fn file_open(&self, _task: &ProcessCtx, _inode: u64, _flags: OpenFlags, _ctx: &FileCtx) -> LsmResult {
+    fn file_open(
+        &self,
+        _task: &ProcessCtx,
+        _inode: u64,
+        _flags: OpenFlags,
+        _ctx: &FileCtx,
+    ) -> LsmResult {
         Err(LsmError::Denied)
     }
 
-    fn file_create(&self, _task: &ProcessCtx, _parent_inode: u64, _name_hash: u64, _mode: u32) -> LsmResult {
+    fn file_create(
+        &self,
+        _task: &ProcessCtx,
+        _parent_inode: u64,
+        _name_hash: u64,
+        _mode: u32,
+    ) -> LsmResult {
         Err(LsmError::Denied)
     }
 
@@ -545,15 +593,33 @@ impl LsmPolicy for DenyAllPolicy {
         Err(LsmError::Denied)
     }
 
-    fn file_link(&self, _task: &ProcessCtx, _inode: u64, _new_parent: u64, _name_hash: u64) -> LsmResult {
+    fn file_link(
+        &self,
+        _task: &ProcessCtx,
+        _inode: u64,
+        _new_parent: u64,
+        _name_hash: u64,
+    ) -> LsmResult {
         Err(LsmError::Denied)
     }
 
-    fn file_symlink(&self, _task: &ProcessCtx, _parent_inode: u64, _name_hash: u64, _target_hash: u64) -> LsmResult {
+    fn file_symlink(
+        &self,
+        _task: &ProcessCtx,
+        _parent_inode: u64,
+        _name_hash: u64,
+        _target_hash: u64,
+    ) -> LsmResult {
         Err(LsmError::Denied)
     }
 
-    fn file_mkdir(&self, _task: &ProcessCtx, _parent_inode: u64, _name_hash: u64, _mode: u32) -> LsmResult {
+    fn file_mkdir(
+        &self,
+        _task: &ProcessCtx,
+        _parent_inode: u64,
+        _name_hash: u64,
+        _mode: u32,
+    ) -> LsmResult {
         Err(LsmError::Denied)
     }
 
@@ -601,7 +667,13 @@ impl LsmPolicy for DenyAllPolicy {
         Err(LsmError::Denied)
     }
 
-    fn ipc_shm(&self, _task: &ProcessCtx, _shm_id: u64, _size: usize, _rights: CapRights) -> LsmResult {
+    fn ipc_shm(
+        &self,
+        _task: &ProcessCtx,
+        _shm_id: u64,
+        _size: usize,
+        _rights: CapRights,
+    ) -> LsmResult {
         Err(LsmError::Denied)
     }
 
@@ -635,7 +707,13 @@ impl LsmPolicy for DenyAllPolicy {
         Err(LsmError::Denied)
     }
 
-    fn net_setsockopt(&self, _task: &ProcessCtx, _ctx: &NetCtx, _level: i32, _optname: i32) -> LsmResult {
+    fn net_setsockopt(
+        &self,
+        _task: &ProcessCtx,
+        _ctx: &NetCtx,
+        _level: i32,
+        _optname: i32,
+    ) -> LsmResult {
         Err(LsmError::Denied)
     }
 

@@ -191,7 +191,7 @@ struct LinuxDirent64 {
 // ============================================================================
 
 /// Socket type flags (Linux ABI)
-const SOCK_NONBLOCK: u32 = 0o4000;   // O_NONBLOCK
+const SOCK_NONBLOCK: u32 = 0o4000; // O_NONBLOCK
 const SOCK_CLOEXEC: u32 = 0o2000000; // O_CLOEXEC
 
 /// sendto/recvfrom flags we support
@@ -257,7 +257,11 @@ struct SocketFile {
 
 impl SocketFile {
     fn new(cap_id: cap::CapId, socket_id: u64, nonblocking: bool) -> Self {
-        Self { cap_id, socket_id, nonblocking }
+        Self {
+            cap_id,
+            socket_id,
+            nonblocking,
+        }
     }
 }
 
@@ -857,53 +861,53 @@ pub enum SyscallNumber {
 #[repr(i64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyscallError {
-    Success = 0,   // 成功
-    EPERM = -1,    // 操作不允许
-    ENOENT = -2,   // 文件或目录不存在
-    ESRCH = -3,    // 进程不存在
-    EINTR = -4,    // 系统调用被中断
-    EIO = -5,      // I/O错误
-    ENXIO = -6,    // 设备不存在
-    E2BIG = -7,    // 参数列表过长
-    ENOEXEC = -8,  // 执行格式错误
-    EBADF = -9,    // 文件描述符错误
-    ECHILD = -10,  // 没有子进程
-    EAGAIN = -11,  // 资源暂时不可用
-    ENOMEM = -12,  // 内存不足
-    EACCES = -13,  // 权限不足
-    EFAULT = -14,  // 地址错误
-    EBUSY = -16,   // 设备或资源忙
-    EEXIST = -17,  // 文件已存在
-    EXDEV = -18,   // 跨设备链接 (cross-device link)
-    ENOTDIR = -20, // 不是目录
-    EISDIR = -21,  // 是目录
-    EINVAL = -22,  // 无效参数
-    ENFILE = -23,  // 系统打开文件过多
-    EMFILE = -24,  // 进程打开文件过多
-    ENOTTY = -25,  // 不是终端设备
-    EPIPE = -32,   // 管道破裂
-    ERANGE = -34,  // 结果超出范围
-    ENOSYS = -38,  // 功能未实现
+    Success = 0,     // 成功
+    EPERM = -1,      // 操作不允许
+    ENOENT = -2,     // 文件或目录不存在
+    ESRCH = -3,      // 进程不存在
+    EINTR = -4,      // 系统调用被中断
+    EIO = -5,        // I/O错误
+    ENXIO = -6,      // 设备不存在
+    E2BIG = -7,      // 参数列表过长
+    ENOEXEC = -8,    // 执行格式错误
+    EBADF = -9,      // 文件描述符错误
+    ECHILD = -10,    // 没有子进程
+    EAGAIN = -11,    // 资源暂时不可用
+    ENOMEM = -12,    // 内存不足
+    EACCES = -13,    // 权限不足
+    EFAULT = -14,    // 地址错误
+    EBUSY = -16,     // 设备或资源忙
+    EEXIST = -17,    // 文件已存在
+    EXDEV = -18,     // 跨设备链接 (cross-device link)
+    ENOTDIR = -20,   // 不是目录
+    EISDIR = -21,    // 是目录
+    EINVAL = -22,    // 无效参数
+    ENFILE = -23,    // 系统打开文件过多
+    EMFILE = -24,    // 进程打开文件过多
+    ENOTTY = -25,    // 不是终端设备
+    EPIPE = -32,     // 管道破裂
+    ERANGE = -34,    // 结果超出范围
+    ENOSYS = -38,    // 功能未实现
     ENOTEMPTY = -39, // 目录非空
-    ELOOP = -40,   // 符号链接过多或禁止符号链接
+    ELOOP = -40,     // 符号链接过多或禁止符号链接
     // Socket-related errors (Linux ABI)
-    ENOTSOCK = -88,       // 套接字操作目标不是套接字
-    EDESTADDRREQ = -89,   // 需要目标地址
-    EMSGSIZE = -90,       // 消息太长
-    EPROTOTYPE = -91,     // 协议类型错误
+    ENOTSOCK = -88,        // 套接字操作目标不是套接字
+    EDESTADDRREQ = -89,    // 需要目标地址
+    EMSGSIZE = -90,        // 消息太长
+    EPROTOTYPE = -91,      // 协议类型错误
     EPROTONOSUPPORT = -93, // 协议不支持
-    EAFNOSUPPORT = -97,   // 地址族不支持
-    EADDRINUSE = -98,     // 地址已被使用
-    EADDRNOTAVAIL = -99,  // 无法分配请求的地址
-    ENETDOWN = -100,      // 网络不可用
-    ECONNREFUSED = -111,  // 连接被拒绝
-    EISCONN = -106,       // 套接字已连接
-    ENOTCONN = -107,      // 传输端点未连接
-    ETIMEDOUT = -110,     // R39-6 FIX: 操作超时
-    EALREADY = -114,      // 操作已经在进行
-    EINPROGRESS = -115,   // 操作正在进行
-    EOPNOTSUPP = -95,     // 操作不支持
-    ECONNABORTED = -103,  // R51-1: 连接被中止 (accept on closed listener)
+    EAFNOSUPPORT = -97,    // 地址族不支持
+    EADDRINUSE = -98,      // 地址已被使用
+    EADDRNOTAVAIL = -99,   // 无法分配请求的地址
+    ENETDOWN = -100,       // 网络不可用
+    ECONNREFUSED = -111,   // 连接被拒绝
+    EISCONN = -106,        // 套接字已连接
+    ENOTCONN = -107,       // 传输端点未连接
+    ETIMEDOUT = -110,      // R39-6 FIX: 操作超时
+    EALREADY = -114,       // 操作已经在进行
+    EINPROGRESS = -115,    // 操作正在进行
+    EOPNOTSUPP = -95,      // 操作不支持
+    ECONNABORTED = -103,   // R51-1: 连接被中止 (accept on closed listener)
 }
 
 impl SyscallError {
@@ -925,22 +929,22 @@ pub type SyscallResult = Result<usize, SyscallError>;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SyscallFrame {
-    pub rax: u64,  // 0x00: 系统调用号 / 返回值
-    pub rcx: u64,  // 0x08: 用户 RIP (syscall 保存)
-    pub rdx: u64,  // 0x10: arg2
-    pub rbx: u64,  // 0x18: callee-saved
-    pub rsp: u64,  // 0x20: 用户 RSP
-    pub rbp: u64,  // 0x28: callee-saved
-    pub rsi: u64,  // 0x30: arg1
-    pub rdi: u64,  // 0x38: arg0
-    pub r8: u64,   // 0x40: arg4
-    pub r9: u64,   // 0x48: arg5
-    pub r10: u64,  // 0x50: arg3
-    pub r11: u64,  // 0x58: 用户 RFLAGS (syscall 保存)
-    pub r12: u64,  // 0x60: callee-saved
-    pub r13: u64,  // 0x68: callee-saved
-    pub r14: u64,  // 0x70: callee-saved
-    pub r15: u64,  // 0x78: callee-saved
+    pub rax: u64, // 0x00: 系统调用号 / 返回值
+    pub rcx: u64, // 0x08: 用户 RIP (syscall 保存)
+    pub rdx: u64, // 0x10: arg2
+    pub rbx: u64, // 0x18: callee-saved
+    pub rsp: u64, // 0x20: 用户 RSP
+    pub rbp: u64, // 0x28: callee-saved
+    pub rsi: u64, // 0x30: arg1
+    pub rdi: u64, // 0x38: arg0
+    pub r8: u64,  // 0x40: arg4
+    pub r9: u64,  // 0x48: arg5
+    pub r10: u64, // 0x50: arg3
+    pub r11: u64, // 0x58: 用户 RFLAGS (syscall 保存)
+    pub r12: u64, // 0x60: callee-saved
+    pub r13: u64, // 0x68: callee-saved
+    pub r14: u64, // 0x70: callee-saved
+    pub r15: u64, // 0x78: callee-saved
 }
 
 /// 获取当前 syscall 帧的回调类型
@@ -1529,7 +1533,9 @@ fn socket_error_to_syscall(err: net::SocketError) -> SyscallError {
         net::SocketError::InvalidDomain => SyscallError::EAFNOSUPPORT,
         net::SocketError::InvalidType => SyscallError::EPROTOTYPE,
         net::SocketError::InvalidProtocol => SyscallError::EPROTONOSUPPORT,
-        net::SocketError::PermissionDenied | net::SocketError::PrivilegedPort => SyscallError::EACCES,
+        net::SocketError::PermissionDenied | net::SocketError::PrivilegedPort => {
+            SyscallError::EACCES
+        }
         net::SocketError::PortInUse => SyscallError::EADDRINUSE,
         net::SocketError::NoPorts => SyscallError::EAGAIN,
         net::SocketError::NotBound => SyscallError::EDESTADDRREQ,
@@ -1573,12 +1579,7 @@ fn lsm_process_ctx_from(proc: &crate::process::Process) -> lsm::ProcessCtx {
     // R39-3 FIX: 使用共享凭证读取 uid/gid/euid/egid
     let creds = proc.credentials.read();
     lsm::ProcessCtx::new(
-        proc.pid,
-        proc.tgid,
-        creds.uid,
-        creds.gid,
-        creds.euid,
-        creds.egid,
+        proc.pid, proc.tgid, creds.uid, creds.gid, creds.euid, creds.egid,
     )
 }
 
@@ -1651,12 +1652,8 @@ fn cap_allocate_with_lsm(
 
     // Emit audit event on success
     if let Some(ctx) = proc_ctx {
-        let subject = audit::AuditSubject::new(
-            ctx.pid as u32,
-            ctx.uid,
-            ctx.gid,
-            ctx.cap.map(|c| c.raw()),
-        );
+        let subject =
+            audit::AuditSubject::new(ctx.pid as u32, ctx.uid, ctx.gid, ctx.cap.map(|c| c.raw()));
         let timestamp = crate::time::get_ticks();
         let _ = audit::emit_capability_event(
             audit::AuditOutcome::Success,
@@ -1707,12 +1704,8 @@ fn cap_revoke_with_lsm(
 
     // Emit audit event on success
     if let Some(ctx) = proc_ctx {
-        let subject = audit::AuditSubject::new(
-            ctx.pid as u32,
-            ctx.uid,
-            ctx.gid,
-            ctx.cap.map(|c| c.raw()),
-        );
+        let subject =
+            audit::AuditSubject::new(ctx.pid as u32, ctx.uid, ctx.gid, ctx.cap.map(|c| c.raw()));
         let timestamp = crate::time::get_ticks();
         let _ = audit::emit_capability_event(
             audit::AuditOutcome::Success,
@@ -1865,7 +1858,13 @@ pub fn syscall_dispatcher(
 
     let result = match syscall_num {
         // 进程管理
-        56 => sys_clone(arg0, arg1 as *mut u8, arg2 as *mut i32, arg3 as *mut i32, arg4),
+        56 => sys_clone(
+            arg0,
+            arg1 as *mut u8,
+            arg2 as *mut i32,
+            arg3 as *mut i32,
+            arg4,
+        ),
         60 => sys_exit(arg0 as i32),
         231 => sys_exit_group(arg0 as i32),
         57 => sys_fork(),
@@ -1892,12 +1891,22 @@ pub fn syscall_dispatcher(
         1 => sys_write(arg0 as i32, arg1 as *const u8, arg2 as usize),
         2 => sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
         257 => sys_openat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as u32),
-        437 => sys_openat2(arg0 as i32, arg1 as *const u8, arg2 as *const OpenHow, arg3 as usize),
+        437 => sys_openat2(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as *const OpenHow,
+            arg3 as usize,
+        ),
         3 => sys_close(arg0 as i32),
         4 => sys_stat(arg0 as *const u8, arg1 as *mut VfsStat),
         5 => sys_fstat(arg0 as i32, arg1 as *mut VfsStat),
         6 => sys_lstat(arg0 as *const u8, arg1 as *mut VfsStat),
-        262 => sys_fstatat(arg0 as i32, arg1 as *const u8, arg2 as *mut VfsStat, arg3 as i32),
+        262 => sys_fstatat(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as *mut VfsStat,
+            arg3 as i32,
+        ),
         8 => sys_lseek(arg0 as i32, arg1 as i64, arg2 as i32),
         16 => sys_ioctl(arg0 as i32, arg1, arg2),
         20 => sys_writev(arg0 as i32, arg1 as *const Iovec, arg2 as usize),
@@ -2211,7 +2220,7 @@ fn sys_clone(
         parent_user_stack,
         parent_fs_base,
         parent_gs_base,
-        parent_credentials_arc,  // R39-3 FIX: 共享凭证 Arc
+        parent_credentials_arc, // R39-3 FIX: 共享凭证 Arc
         parent_umask,
         parent_seccomp_state,
         parent_pledge_state,
@@ -2237,7 +2246,7 @@ fn sys_clone(
             parent.user_stack,
             parent.fs_base,
             parent.gs_base,
-            parent.credentials.clone(),  // R39-3 FIX: 获取凭证 Arc
+            parent.credentials.clone(), // R39-3 FIX: 获取凭证 Arc
             parent.umask,
             parent.seccomp_state.clone(),
             parent.pledge_state.clone(),
@@ -2383,7 +2392,12 @@ fn sys_clone(
         // Debug: 打印子进程上下文关键寄存器
         println!(
             "[sys_clone] Child {} ctx: rax=0x{:x}, rip=0x{:x}, rsp=0x{:x}, r9=0x{:x}, rcx=0x{:x}",
-            child_pid, child.context.rax, child.context.rip, child.context.rsp, child.context.r9, child.context.rcx
+            child_pid,
+            child.context.rax,
+            child.context.rip,
+            child.context.rsp,
+            child.context.r9,
+            child.context.rcx
         );
 
         // 设置 TLS
@@ -3512,7 +3526,9 @@ fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
                 None => (audit::hash_path("."), path_hash),
             };
 
-            if let Err(err) = lsm::hook_file_create(&proc_ctx, parent_hash, name_hash, mode & 0o7777) {
+            if let Err(err) =
+                lsm::hook_file_create(&proc_ctx, parent_hash, name_hash, mode & 0o7777)
+            {
                 return Err(lsm_error_to_syscall(err));
             }
         }
@@ -3532,7 +3548,9 @@ fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
     // If denied, file_ops will be dropped (closed) automatically
     if let Some(proc_ctx) = lsm_current_process_ctx() {
         let file_ctx = lsm::FileCtx::new(path_hash, mode, path_hash);
-        if let Err(err) = lsm::hook_file_open(&proc_ctx, path_hash, lsm::OpenFlags(open_flags), &file_ctx) {
+        if let Err(err) =
+            lsm::hook_file_open(&proc_ctx, path_hash, lsm::OpenFlags(open_flags), &file_ctx)
+        {
             return Err(lsm_error_to_syscall(err));
         }
     }
@@ -4017,7 +4035,9 @@ fn sys_mmap(
 
     // R29-3 FIX: Call LSM hook for anonymous mmap operations
     if let Some(ctx) = lsm::ProcessCtx::from_current() {
-        if lsm::hook_memory_mmap(&ctx, addr as u64, length as u64, prot as u32, _flags as u32).is_err() {
+        if lsm::hook_memory_mmap(&ctx, addr as u64, length as u64, prot as u32, _flags as u32)
+            .is_err()
+        {
             return Err(SyscallError::EPERM);
         }
     }
@@ -4051,7 +4071,8 @@ fn sys_mmap(
     // 选择起始虚拟地址（使用 checked_add 防止溢出）
     // R65-11 FIX: Ensure auto-selected address is at least MMAP_MIN_ADDR
     let base = if addr == 0 {
-        let candidate = proc.next_mmap_addr
+        let candidate = proc
+            .next_mmap_addr
             .checked_add(0xfff)
             .ok_or(SyscallError::EINVAL)?
             & !0xfff;
@@ -4309,10 +4330,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     }
 
     // 对齐长度到页边界
-    let len_aligned = len
-        .checked_add(0xfff)
-        .ok_or(SyscallError::EINVAL)?
-        & !0xfff;
+    let len_aligned = len.checked_add(0xfff).ok_or(SyscallError::EINVAL)? & !0xfff;
 
     // R28-7 Fix: Validate that addr + len_aligned doesn't overflow or exceed user space
     let end = addr.checked_add(len_aligned).ok_or(SyscallError::EINVAL)?;
@@ -4525,9 +4543,8 @@ fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFil
 
     // Read instructions from userspace
     let mut raw_insns = vec![UserSeccompInsn::default(); len];
-    let raw_bytes = unsafe {
-        core::slice::from_raw_parts_mut(raw_insns.as_mut_ptr() as *mut u8, total)
-    };
+    let raw_bytes =
+        unsafe { core::slice::from_raw_parts_mut(raw_insns.as_mut_ptr() as *mut u8, total) };
     copy_from_user(raw_bytes, insn_ptr as *const u8)?;
 
     // Decode default action
@@ -4624,10 +4641,8 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             // - CLONE_THREAD siblings (same tgid) can be synchronized with TSYNC
             // - Pure CLONE_VM siblings (different tgid) cannot be synchronized with TSYNC
             let thread_count = crate::process::thread_group_size(proc.tgid);
-            let pure_vm_siblings = crate::process::non_thread_group_vm_share_count(
-                proc.memory_space,
-                proc.tgid,
-            );
+            let pure_vm_siblings =
+                crate::process::non_thread_group_vm_share_count(proc.memory_space, proc.tgid);
             let tsync_requested = flags & seccomp::SeccompFlags::TSYNC.bits() != 0;
 
             // Reject if multi-threaded without TSYNC (partial sandboxing)
@@ -5124,10 +5139,8 @@ fn sys_chdir(path: *const u8) -> SyscallResult {
     }
 
     // 复制路径
-    let path_bytes = crate::usercopy::copy_user_cstring(path)
-        .map_err(|_| SyscallError::EFAULT)?;
-    let path_str = core::str::from_utf8(&path_bytes)
-        .map_err(|_| SyscallError::EINVAL)?;
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
 
     // 通过回调获取stat并验证路径存在且是目录
     let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
@@ -5146,10 +5159,8 @@ fn sys_mkdir(path: *const u8, mode: u32) -> SyscallResult {
         return Err(SyscallError::EFAULT);
     }
 
-    let path_bytes = crate::usercopy::copy_user_cstring(path)
-        .map_err(|_| SyscallError::EFAULT)?;
-    let path_str = core::str::from_utf8(&path_bytes)
-        .map_err(|_| SyscallError::EINVAL)?;
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
 
     // LSM hook: check mkdir permission
     if let Some(proc_ctx) = lsm_current_process_ctx() {
@@ -5178,10 +5189,8 @@ fn sys_rmdir(path: *const u8) -> SyscallResult {
         return Err(SyscallError::EFAULT);
     }
 
-    let path_bytes = crate::usercopy::copy_user_cstring(path)
-        .map_err(|_| SyscallError::EFAULT)?;
-    let path_str = core::str::from_utf8(&path_bytes)
-        .map_err(|_| SyscallError::EINVAL)?;
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
 
     // 通过回调检查是否为目录
     let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
@@ -5217,10 +5226,8 @@ fn sys_unlink(path: *const u8) -> SyscallResult {
         return Err(SyscallError::EFAULT);
     }
 
-    let path_bytes = crate::usercopy::copy_user_cstring(path)
-        .map_err(|_| SyscallError::EFAULT)?;
-    let path_str = core::str::from_utf8(&path_bytes)
-        .map_err(|_| SyscallError::EINVAL)?;
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
 
     // 不允许删除目录 (应使用rmdir)
     let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
@@ -5259,10 +5266,8 @@ fn sys_access(path: *const u8, mode: i32) -> SyscallResult {
         return Err(SyscallError::EFAULT);
     }
 
-    let path_bytes = crate::usercopy::copy_user_cstring(path)
-        .map_err(|_| SyscallError::EFAULT)?;
-    let path_str = core::str::from_utf8(&path_bytes)
-        .map_err(|_| SyscallError::EINVAL)?;
+    let path_bytes = crate::usercopy::copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+    let path_str = core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?;
 
     // 通过回调获取文件状态
     let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
@@ -5476,7 +5481,8 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
                 None => (audit::hash_path("."), path_hash),
             };
 
-            if let Err(err) = lsm::hook_file_create(&proc_ctx, parent_hash, name_hash, mode & 0o7777)
+            if let Err(err) =
+                lsm::hook_file_create(&proc_ctx, parent_hash, name_hash, mode & 0o7777)
             {
                 return Err(lsm_error_to_syscall(err));
             }
@@ -5645,8 +5651,7 @@ fn sys_fchmod(_fd: i32, _mode: u32) -> SyscallResult {
 
 /// sys_umask - 设置文件创建掩码
 fn sys_umask(mask: u32) -> SyscallResult {
-    let old = crate::set_current_umask((mask & 0o777) as u16)
-        .ok_or(SyscallError::ESRCH)?;
+    let old = crate::set_current_umask((mask & 0o777) as u16).ok_or(SyscallError::ESRCH)?;
     Ok(old as usize)
 }
 
@@ -5675,9 +5680,9 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
         // resulting in an undersized buffer and subsequent memory corruption.
         let reclen = header_size
             .checked_add(name_bytes.len())
-            .and_then(|v| v.checked_add(1))  // +1 for NUL terminator
-            .and_then(|v| v.checked_add(7))  // +7 for alignment
-            .map(|v| v & !7)                 // 8-byte alignment (round down)
+            .and_then(|v| v.checked_add(1)) // +1 for NUL terminator
+            .and_then(|v| v.checked_add(7)) // +7 for alignment
+            .map(|v| v & !7) // 8-byte alignment (round down)
             .ok_or(SyscallError::EINVAL)?;
 
         // R42-2 FIX: Validate reclen fits in u16 (d_reclen field type)
@@ -5725,7 +5730,7 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
 
         // 复制到用户空间
         copy_to_user(unsafe { dirp.add(written) }, &buf)?;
-        written = next_written;  // R42-2 FIX: Use pre-computed checked value
+        written = next_written; // R42-2 FIX: Use pre-computed checked value
     }
 
     Ok(written)
@@ -5778,7 +5783,10 @@ fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> SyscallResult {
 
     // 如果提供了rem，设置为0
     if !rem.is_null() {
-        let zero = TimeSpec { tv_sec: 0, tv_nsec: 0 };
+        let zero = TimeSpec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
         let zero_bytes = unsafe {
             core::slice::from_raw_parts(
                 &zero as *const TimeSpec as *const u8,
@@ -5979,8 +5987,8 @@ fn resolve_socket(
 /// - Stores CapId in fd_table via SocketFile wrapper
 fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
     // Parse domain
-    let domain_val = net::SocketDomain::from_raw(domain as u32)
-        .ok_or(SyscallError::EAFNOSUPPORT)?;
+    let domain_val =
+        net::SocketDomain::from_raw(domain as u32).ok_or(SyscallError::EAFNOSUPPORT)?;
 
     // Parse type (handle SOCK_CLOEXEC/SOCK_NONBLOCK flags)
     let raw_ty = type_ as u32;
@@ -5990,8 +5998,8 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
     let ty = net::SocketType::from_raw(clean_ty).ok_or(SyscallError::EPROTOTYPE)?;
 
     // Parse protocol (infers default from socket type)
-    let proto = net::SocketProtocol::from_raw(protocol as u32, ty)
-        .ok_or(SyscallError::EPROTONOSUPPORT)?;
+    let proto =
+        net::SocketProtocol::from_raw(protocol as u32, ty).ok_or(SyscallError::EPROTONOSUPPORT)?;
 
     // Currently only support AF_INET
     if domain_val != net::SocketDomain::Inet4 {
@@ -6010,16 +6018,12 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
 
     // Create socket via socket_table (includes LSM hook_net_socket check)
     let socket = match (ty, proto) {
-        (net::SocketType::Dgram, net::SocketProtocol::Udp) => {
-            net::socket_table()
-                .create_udp_socket(label)
-                .map_err(socket_error_to_syscall)?
-        }
-        (net::SocketType::Stream, net::SocketProtocol::Tcp) => {
-            net::socket_table()
-                .create_tcp_socket(label)
-                .map_err(socket_error_to_syscall)?
-        }
+        (net::SocketType::Dgram, net::SocketProtocol::Udp) => net::socket_table()
+            .create_udp_socket(label)
+            .map_err(socket_error_to_syscall)?,
+        (net::SocketType::Stream, net::SocketProtocol::Tcp) => net::socket_table()
+            .create_tcp_socket(label)
+            .map_err(socket_error_to_syscall)?,
         _ => return Err(SyscallError::EPROTONOSUPPORT),
     };
 
@@ -6044,7 +6048,9 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
         let proc_ctx = lsm_process_ctx_from(&proc);
 
         // R65-13 FIX: LSM hook before capability allocation
-        if let Err(err) = lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE) {
+        if let Err(err) =
+            lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE)
+        {
             drop(proc);
             net::socket_table().close(socket.id);
             return Err(lsm_error_to_syscall(err));
@@ -6062,7 +6068,12 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
 
         // R65-13 FIX: Audit event for capability allocation
         {
-            let subject = audit::AuditSubject::new(proc_ctx.pid as u32, proc_ctx.uid, proc_ctx.gid, proc_ctx.cap.map(|c| c.raw()));
+            let subject = audit::AuditSubject::new(
+                proc_ctx.pid as u32,
+                proc_ctx.uid,
+                proc_ctx.gid,
+                proc_ctx.cap.map(|c| c.raw()),
+            );
             let timestamp = crate::time::get_ticks();
             let _ = audit::emit_capability_event(
                 audit::AuditOutcome::Success,
@@ -6083,7 +6094,12 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
                 // Release capability and close socket to prevent resource leak
                 // R65-13 FIX: Audit event for capability revocation (rollback)
                 {
-                    let subject = audit::AuditSubject::new(proc_ctx.pid as u32, proc_ctx.uid, proc_ctx.gid, proc_ctx.cap.map(|c| c.raw()));
+                    let subject = audit::AuditSubject::new(
+                        proc_ctx.pid as u32,
+                        proc_ctx.uid,
+                        proc_ctx.gid,
+                        proc_ctx.cap.map(|c| c.raw()),
+                    );
                     let timestamp = crate::time::get_ticks();
                     let _ = audit::emit_capability_event(
                         audit::AuditOutcome::Success,
@@ -6144,10 +6160,9 @@ fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
 
     // R49-3 FIX: Compute privileged port binding permission
     // Can bind to privileged ports if: root (euid == 0) OR has NET_BIND_SERVICE capability
-    let has_net_bind_cap = with_current_cap_table(|table| {
-        table.has_rights(cap::CapRights::NET_BIND_SERVICE)
-    })
-    .unwrap_or(false);
+    let has_net_bind_cap =
+        with_current_cap_table(|table| table.has_rights(cap::CapRights::NET_BIND_SERVICE))
+            .unwrap_or(false);
     let can_bind_privileged = ctx.euid == 0 || has_net_bind_cap;
 
     // Early check for privileged port access
@@ -6208,10 +6223,9 @@ fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
     let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
 
     // Compute privileged-port permission for auto-bind
-    let has_net_bind_cap = with_current_cap_table(|table| {
-        table.has_rights(cap::CapRights::NET_BIND_SERVICE)
-    })
-    .unwrap_or(false);
+    let has_net_bind_cap =
+        with_current_cap_table(|table| table.has_rights(cap::CapRights::NET_BIND_SERVICE))
+            .unwrap_or(false);
     let can_bind_privileged = ctx.euid == 0 || has_net_bind_cap;
 
     net::socket_table()
@@ -6302,7 +6316,8 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
             out.sin_port = rport.to_be();
             out.sin_addr = u32::from_le_bytes(rip).swap_bytes();
 
-            if let Err(e) = validate_user_ptr(addr as *const u8, core::mem::size_of::<SockAddrIn>()) {
+            if let Err(e) = validate_user_ptr(addr as *const u8, core::mem::size_of::<SockAddrIn>())
+            {
                 cleanup_child(&child);
                 return Err(e);
             }
@@ -6357,7 +6372,9 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
         let proc_ctx = lsm_process_ctx_from(&proc);
 
         // R65-13 FIX: LSM hook before capability allocation
-        if let Err(err) = lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE) {
+        if let Err(err) =
+            lsm::hook_task_cap_modify(&proc_ctx, cap::CapId::INVALID, lsm::cap_op::ALLOCATE)
+        {
             drop(proc);
             cleanup_child(&child);
             return Err(lsm_error_to_syscall(err));
@@ -6374,7 +6391,12 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
 
         // R65-13 FIX: Audit event for capability allocation
         {
-            let subject = audit::AuditSubject::new(proc_ctx.pid as u32, proc_ctx.uid, proc_ctx.gid, proc_ctx.cap.map(|c| c.raw()));
+            let subject = audit::AuditSubject::new(
+                proc_ctx.pid as u32,
+                proc_ctx.uid,
+                proc_ctx.gid,
+                proc_ctx.cap.map(|c| c.raw()),
+            );
             let timestamp = crate::time::get_ticks();
             let _ = audit::emit_capability_event(
                 audit::AuditOutcome::Success,
@@ -6394,7 +6416,12 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
                 // Rollback capability allocation
                 // R65-13 FIX: Audit event for capability revocation (rollback)
                 {
-                    let subject = audit::AuditSubject::new(proc_ctx.pid as u32, proc_ctx.uid, proc_ctx.gid, proc_ctx.cap.map(|c| c.raw()));
+                    let subject = audit::AuditSubject::new(
+                        proc_ctx.pid as u32,
+                        proc_ctx.uid,
+                        proc_ctx.gid,
+                        proc_ctx.cap.map(|c| c.raw()),
+                    );
                     let timestamp = crate::time::get_ticks();
                     let _ = audit::emit_capability_event(
                         audit::AuditOutcome::Success,
@@ -6613,8 +6640,7 @@ fn sys_sendto(
 
         // Transmit all TCP segments via network device
         for segment in segments {
-            net::transmit_tcp_segment(remote_ip, &segment)
-                .map_err(tx_error_to_syscall)?;
+            net::transmit_tcp_segment(remote_ip, &segment).map_err(tx_error_to_syscall)?;
         }
 
         return Ok(bytes_sent);
@@ -6668,8 +6694,7 @@ fn sys_sendto(
         .map_err(socket_error_to_syscall)?;
 
     // Transmit the UDP datagram via network device
-    net::transmit_udp_datagram(dst_ip, &datagram)
-        .map_err(tx_error_to_syscall)?;
+    net::transmit_udp_datagram(dst_ip, &datagram).map_err(tx_error_to_syscall)?;
 
     Ok(len)
 }

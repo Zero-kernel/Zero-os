@@ -44,19 +44,26 @@ use spin::{Mutex, Once};
 use crate::arp::{process_arp, ArpCache, ArpEntryKind, ArpError, ArpResult, ArpStats};
 use crate::buffer::NetBuf;
 use crate::device::TxError;
-use crate::ethernet::{parse_ethernet, build_ethernet_frame, EthAddr, EthHeader, ETHERTYPE_IPV4, ETHERTYPE_ARP};
+use crate::ethernet::{
+    build_ethernet_frame, parse_ethernet, EthAddr, EthHeader, ETHERTYPE_ARP, ETHERTYPE_IPV4,
+};
 use crate::firewall::{firewall_table, FirewallAction, FirewallPacket, FirewallVerdict};
-use crate::fragment::{process_fragment as reassemble_fragment, cleanup_expired_fragments, FragmentDropReason};
+use crate::fragment::{
+    cleanup_expired_fragments, process_fragment as reassemble_fragment, FragmentDropReason,
+};
 use crate::get_device;
-use crate::icmp::{build_dest_unreachable, build_echo_reply, parse_icmp, IcmpError, ICMP_CODE_PORT_UNREACHABLE, ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REQUEST};
+use crate::icmp::{
+    build_dest_unreachable, build_echo_reply, parse_icmp, IcmpError, ICMP_CODE_PORT_UNREACHABLE,
+    ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REQUEST,
+};
 use crate::ipv4::{
     build_ipv4_header, compute_checksum, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
     IPV4_HEADER_MIN_LEN,
 };
 use crate::socket::socket_table;
 use crate::tcp::{
-    parse_tcp_header, parse_tcp_options, verify_tcp_checksum, build_tcp_segment,
-    TcpError, TCP_HEADER_MIN_LEN, TCP_FLAG_ACK, TCP_FLAG_SYN, TCP_FLAG_FIN, TCP_FLAG_RST,
+    build_tcp_segment, parse_tcp_header, parse_tcp_options, verify_tcp_checksum, TcpError,
+    TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_HEADER_MIN_LEN,
 };
 use crate::udp::{parse_udp, UdpError, UdpResult, UdpStats};
 use crate::DEFAULT_MTU;
@@ -272,12 +279,17 @@ pub fn process_frame(
 
     // Route to protocol handler
     match eth_hdr.ethertype {
-        ETHERTYPE_IPV4 => {
-            process_ipv4(eth_payload, &eth_hdr, our_mac, our_ip, stats, now_ms)
-        }
+        ETHERTYPE_IPV4 => process_ipv4(eth_payload, &eth_hdr, our_mac, our_ip, stats, now_ms),
         ETHERTYPE_ARP => {
             // Process ARP packet
-            match process_arp(eth_payload, our_mac, our_ip, arp_cache, &stats.arp_stats, now_ms) {
+            match process_arp(
+                eth_payload,
+                our_mac,
+                our_ip,
+                arp_cache,
+                &stats.arp_stats,
+                now_ms,
+            ) {
                 ArpResult::Handled => ProcessResult::Handled,
                 ArpResult::Reply(frame) => ProcessResult::Reply(frame),
                 ArpResult::Dropped(e) => ProcessResult::Dropped(DropReason::ArpError(e)),
@@ -348,15 +360,38 @@ fn process_ipv4(
     match ip_hdr.proto() {
         Some(Ipv4Proto::Icmp) => {
             // Pass broadcast flag to ICMP handler for response suppression
-            process_icmp(&final_payload, &ip_hdr, eth_hdr, our_mac, our_ip, stats, now_ms, is_broadcast_dst)
+            process_icmp(
+                &final_payload,
+                &ip_hdr,
+                eth_hdr,
+                our_mac,
+                our_ip,
+                stats,
+                now_ms,
+                is_broadcast_dst,
+            )
         }
         Some(Ipv4Proto::Udp) => {
             // Process UDP packet
-            process_udp(&final_payload, &ip_hdr, eth_hdr, stats, is_broadcast_dst, now_ms)
+            process_udp(
+                &final_payload,
+                &ip_hdr,
+                eth_hdr,
+                stats,
+                is_broadcast_dst,
+                now_ms,
+            )
         }
         Some(Ipv4Proto::Tcp) => {
             // Process TCP packet
-            process_tcp(&final_payload, &ip_hdr, eth_hdr, stats, is_broadcast_dst, now_ms)
+            process_tcp(
+                &final_payload,
+                &ip_hdr,
+                eth_hdr,
+                stats,
+                is_broadcast_dst,
+                now_ms,
+            )
         }
         None => {
             stats.inc_unsupported_proto();
@@ -436,7 +471,9 @@ fn process_udp(
         ct_state: ct_result.as_ref().map(|r| r.decision),
     };
     let fw_verdict = firewall_table().evaluate(&fw_packet);
-    if let Some(result) = apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, payload, now_ms) {
+    if let Some(result) =
+        apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, payload, now_ms)
+    {
         return result;
     }
 
@@ -504,12 +541,14 @@ fn process_icmp(
         src_ip: ip_hdr.src,
         dst_ip: ip_hdr.dst,
         proto: Ipv4Proto::Icmp,
-        src_port: None,  // ICMP has no ports
+        src_port: None, // ICMP has no ports
         dst_port: None,
         ct_state: ct_result.as_ref().map(|r| r.decision),
     };
     let fw_verdict = firewall_table().evaluate(&fw_packet);
-    if let Some(result) = apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, packet, now_ms) {
+    if let Some(result) =
+        apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, packet, now_ms)
+    {
         return result;
     }
 
@@ -545,11 +584,11 @@ fn process_icmp(
 
         // Build IPv4 header (swap src/dst)
         let ip_reply = build_ipv4_header(
-            our_ip,          // Our IP as source
-            ip_hdr.src,      // Original source as destination
+            our_ip,     // Our IP as source
+            ip_hdr.src, // Original source as destination
             Ipv4Proto::Icmp,
             icmp_reply.len() as u16,
-            64,              // Default TTL
+            64, // Default TTL
         );
 
         // Combine IP header and ICMP reply
@@ -559,8 +598,8 @@ fn process_icmp(
 
         // Build Ethernet frame (swap src/dst MACs)
         let frame = build_ethernet_frame(
-            eth_hdr.src,     // Original source as destination
-            our_mac,         // Our MAC as source
+            eth_hdr.src, // Original source as destination
+            our_mac,     // Our MAC as source
             ETHERTYPE_IPV4,
             &ip_packet,
         );
@@ -647,7 +686,9 @@ fn process_tcp(
         ct_state: ct_result.as_ref().map(|r| r.decision),
     };
     let fw_verdict = firewall_table().evaluate(&fw_packet);
-    if let Some(result) = apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, payload, now_ms) {
+    if let Some(result) =
+        apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, payload, now_ms)
+    {
         return result;
     }
 
@@ -665,11 +706,11 @@ fn process_tcp(
     ) {
         // Build IPv4 header (swap src/dst)
         let ip_reply = build_ipv4_header(
-            ip_hdr.dst,      // Our IP as source
-            ip_hdr.src,      // Original source as destination
+            ip_hdr.dst, // Our IP as source
+            ip_hdr.src, // Original source as destination
             Ipv4Proto::Tcp,
             resp_seg.len() as u16,
-            64,              // Default TTL
+            64, // Default TTL
         );
 
         // Combine IP header and TCP segment
@@ -679,8 +720,8 @@ fn process_tcp(
 
         // Build Ethernet frame (swap MACs)
         let frame = build_ethernet_frame(
-            eth_hdr.src,     // Original source as destination
-            eth_hdr.dst,     // Our MAC as source
+            eth_hdr.src, // Original source as destination
+            eth_hdr.dst, // Our MAC as source
             ETHERTYPE_IPV4,
             &ip_packet,
         );
@@ -789,7 +830,12 @@ fn resolve_dst_mac(dst_ip: Ipv4Addr, cfg: &NetConfigSnapshot) -> EthAddr {
     let now_ms = 0;
 
     // Ensure gateway is always in cache
-    let _ = cache.insert(cfg.gateway_ip, cfg.gateway_mac, ArpEntryKind::Static, now_ms);
+    let _ = cache.insert(
+        cfg.gateway_ip,
+        cfg.gateway_mac,
+        ArpEntryKind::Static,
+        now_ms,
+    );
 
     // Try direct lookup first
     if let Some(mac) = cache.lookup(dst_ip, now_ms) {
@@ -801,7 +847,11 @@ fn resolve_dst_mac(dst_ip: Ipv4Addr, cfg: &NetConfigSnapshot) -> EthAddr {
 }
 
 /// Build complete Ethernet frame and transmit via network device.
-fn build_frame_and_transmit(proto: Ipv4Proto, dst_ip: Ipv4Addr, payload: &[u8]) -> Result<(), TxError> {
+fn build_frame_and_transmit(
+    proto: Ipv4Proto,
+    dst_ip: Ipv4Addr,
+    payload: &[u8],
+) -> Result<(), TxError> {
     if payload.is_empty() || payload.len() > DEFAULT_MTU {
         return Err(TxError::InvalidBuffer);
     }
@@ -826,8 +876,7 @@ fn build_frame_and_transmit(proto: Ipv4Proto, dst_ip: Ipv4Addr, payload: &[u8]) 
     let frame = build_ethernet_frame(dst_mac, cfg.our_mac, ETHERTYPE_IPV4, &ip_packet);
 
     // Allocate NetBuf and copy frame data
-    let frame_phys = mm::buddy_allocator::alloc_physical_pages(1)
-        .ok_or(TxError::InvalidBuffer)?;
+    let frame_phys = mm::buddy_allocator::alloc_physical_pages(1).ok_or(TxError::InvalidBuffer)?;
 
     let mut buf = match NetBuf::with_defaults(frame_phys) {
         Some(b) => b,
@@ -1004,15 +1053,15 @@ fn apply_firewall_verdict(
                         };
 
                         let rst_segment = build_tcp_segment(
-                            ip_hdr.dst,     // Our IP as source
-                            ip_hdr.src,     // Original source as destination
+                            ip_hdr.dst, // Our IP as source
+                            ip_hdr.src, // Original source as destination
                             tcp_hdr.dst_port,
                             tcp_hdr.src_port,
                             seq_num,
                             ack_num,
                             flags,
-                            0,              // Window size
-                            &[],            // No payload
+                            0,   // Window size
+                            &[], // No payload
                         );
 
                         let ip_reply = build_ipv4_header(
@@ -1055,12 +1104,7 @@ fn apply_firewall_verdict(
             ip_packet.extend_from_slice(&ip_reply);
             ip_packet.extend_from_slice(&icmp);
 
-            let frame = build_ethernet_frame(
-                eth_hdr.src,
-                eth_hdr.dst,
-                ETHERTYPE_IPV4,
-                &ip_packet,
-            );
+            let frame = build_ethernet_frame(eth_hdr.src, eth_hdr.dst, ETHERTYPE_IPV4, &ip_packet);
 
             Some(ProcessResult::Reply(frame))
         }

@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial clean
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -318,12 +318,35 @@ test: build
 	timeout 10 $(QEMU) $(QEMU_COMMON) \
 		-nographic || true
 
+# SMP测试模式 - 启用多核支持
+# 使用 -smp 指定CPU数量（默认2个）
+# ACPI MADT表会自动生成，使内核能够发现多核
+SMP_CPUS ?= 2
+run-smp: build disk-ext2.img
+	@echo "=== 启动内核（SMP模式 - $(SMP_CPUS)核）==="
+	@echo "磁盘: disk-ext2.img (64MB ext2)"
+	@echo "提示：按Ctrl+A然后按X退出QEMU"
+	$(QEMU) $(QEMU_COMMON) $(QEMU_BLK) $(QEMU_NET) \
+		-smp cpus=$(SMP_CPUS) \
+		-nographic
+
+# SMP调试模式 - 详细的APIC/IPI日志
+run-smp-debug: build disk-ext2.img
+	@echo "=== 启动内核（SMP调试模式 - $(SMP_CPUS)核）==="
+	@echo "磁盘: disk-ext2.img (64MB ext2)"
+	@echo "提示：中断日志记录到 qemu-smp.log"
+	$(QEMU) $(QEMU_COMMON) $(QEMU_BLK) $(QEMU_NET) \
+		-smp cpus=$(SMP_CPUS) \
+		-nographic \
+		-d int,cpu_reset \
+		-D qemu-smp.log
+
 clean:
 	cargo clean
 	rm -rf kernel-target
 	rm -rf bootloader-target
 	rm -rf esp
-	rm -f qemu-debug.log qemu-verbose.log disk-ext2.img
+	rm -f qemu-debug.log qemu-verbose.log qemu-smp.log disk-ext2.img
 
 # 用于连接到QEMU监视器
 monitor:
@@ -350,6 +373,11 @@ help:
 	@echo "  make debug        - GDB调试模式（等待GDB连接）"
 	@echo "  make test         - 测试模式（10秒后自动退出）"
 	@echo ""
+	@echo "SMP多核模式:"
+	@echo "  make run-smp      - 启用SMP多核模式（默认2核）"
+	@echo "  make run-smp SMP_CPUS=4 - 指定4核"
+	@echo "  make run-smp-debug - SMP调试模式（记录中断到qemu-smp.log）"
+	@echo ""
 	@echo "清理命令:"
 	@echo "  make clean        - 清理所有构建文件"
 	@echo ""
@@ -359,4 +387,5 @@ help:
 	@echo "  - Shell串口模式：使用终端输入输出，按Ctrl+A X退出"
 	@echo "  - Shell图形模式：使用PS/2键盘和VGA显示，Ctrl+Alt+G释放鼠标"
 	@echo "  - 调试模式会在qemu-debug.log中记录详细信息"
+	@echo "  - SMP模式会启动多个CPU核心，可用SMP_CPUS环境变量指定数量"
 	@echo "  - 按Ctrl+C可以随时停止QEMU"

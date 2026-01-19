@@ -119,14 +119,14 @@ pub const TCP_DEFAULT_WINDOW: u16 = 65535;
 /// common network paths from small MTU links to Ethernet. Window scaling
 /// information is not preserved in cookies (limitation of the protocol).
 pub const TCP_SYN_COOKIE_MSS_TABLE: [u16; 8] = [
-    256,               // Minimum practical MSS
-    TCP_DEFAULT_MSS,   // 536 - RFC 879 default
-    576,               // Common older networks
-    1024,              // Intermediate networks
-    1200,              // Conservative Ethernet estimate
-    1360,              // PPPoE/VPN overhead adjustment
-    1400,              // Common datacenter setting
-    TCP_ETHERNET_MSS,  // 1460 - Full Ethernet
+    256,              // Minimum practical MSS
+    TCP_DEFAULT_MSS,  // 536 - RFC 879 default
+    576,              // Common older networks
+    1024,             // Intermediate networks
+    1200,             // Conservative Ethernet estimate
+    1360,             // PPPoE/VPN overhead adjustment
+    1400,             // Common datacenter setting
+    TCP_ETHERNET_MSS, // 1460 - Full Ethernet
 ];
 
 /// Time granularity for SYN cookie timestamps (milliseconds).
@@ -337,19 +337,14 @@ pub enum TcpState {
 impl TcpState {
     /// Check if the connection is in an established or semi-established state
     pub fn can_send(&self) -> bool {
-        matches!(
-            self,
-            TcpState::Established | TcpState::CloseWait
-        )
+        matches!(self, TcpState::Established | TcpState::CloseWait)
     }
 
     /// Check if the connection can receive data
     pub fn can_receive(&self) -> bool {
         matches!(
             self,
-            TcpState::Established
-                | TcpState::FinWait1
-                | TcpState::FinWait2
+            TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
         )
     }
 
@@ -587,7 +582,7 @@ pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
             bytes
         }
         TcpOptionKind::WindowScale(scale) => vec![3, 3, scale], // kind=3, len=3, shift
-        TcpOptionKind::SackPermitted => vec![4, 2], // kind=4, len=2
+        TcpOptionKind::SackPermitted => vec![4, 2],             // kind=4, len=2
         TcpOptionKind::Timestamps { ts_val, ts_ecr } => {
             let mut bytes = Vec::with_capacity(10);
             bytes.extend_from_slice(&[8, 10]); // kind=8, len=10
@@ -930,13 +925,21 @@ impl TcpControlBlock {
     /// Get effective send window scale (0 if scaling not enabled).
     #[inline]
     pub fn effective_snd_wscale(&self) -> u8 {
-        if self.wscale_enabled() { self.snd_wscale } else { 0 }
+        if self.wscale_enabled() {
+            self.snd_wscale
+        } else {
+            0
+        }
     }
 
     /// Get effective receive window scale (0 if scaling not enabled).
     #[inline]
     pub fn effective_rcv_wscale(&self) -> u8 {
-        if self.wscale_enabled() { self.rcv_wscale } else { 0 }
+        if self.wscale_enabled() {
+            self.rcv_wscale
+        } else {
+            0
+        }
     }
 }
 
@@ -1081,13 +1084,13 @@ pub fn update_rtt(tcb: &mut TcpControlBlock, sample_us: u64) {
 
         // RTTVAR = (1 - β)×RTTVAR + β×|SRTT - R|
         // Using integer arithmetic: (3×RTTVAR + error) / 4
-        tcb.rttvar_us = ((RTT_BETA_DEN - RTT_BETA_NUM) * rttvar + RTT_BETA_NUM * rtt_err)
-            / RTT_BETA_DEN;
+        tcb.rttvar_us =
+            ((RTT_BETA_DEN - RTT_BETA_NUM) * rttvar + RTT_BETA_NUM * rtt_err) / RTT_BETA_DEN;
 
         // SRTT = (1 - α)×SRTT + α×R
         // Using integer arithmetic: (7×SRTT + sample) / 8
-        tcb.srtt_us = ((RTT_ALPHA_DEN - RTT_ALPHA_NUM) * srtt + RTT_ALPHA_NUM * sample_us)
-            / RTT_ALPHA_DEN;
+        tcb.srtt_us =
+            ((RTT_ALPHA_DEN - RTT_ALPHA_NUM) * srtt + RTT_ALPHA_NUM * sample_us) / RTT_ALPHA_DEN;
     }
 
     // RTO = SRTT + max(G, K×RTTVAR)
@@ -1247,7 +1250,8 @@ pub fn update_congestion_control(
                     // Partial ACK: some but not all FR data acknowledged
                     // Stay in fast recovery, deflate cwnd, retransmit next
                     // cwnd = ssthresh + 3*MSS - acked_bytes (deflate for acked data)
-                    tcb.cwnd = tcb.ssthresh
+                    tcb.cwnd = tcb
+                        .ssthresh
                         .saturating_add(3 * mss)
                         .saturating_sub(acked_bytes)
                         .max(mss);
@@ -1572,12 +1576,15 @@ pub fn parse_tcp_options(data: &[u8], header: &TcpHeader) -> TcpOptions {
 
     while i < opts_data.len() {
         match opts_data[i] {
-            0 => break, // End of Option List
+            0 => break,  // End of Option List
             1 => i += 1, // NOP
             2 => {
                 // MSS
                 if i + 4 <= opts_data.len() && opts_data[i + 1] == 4 {
-                    options.mss = Some(u16::from_be_bytes([opts_data[i + 2], opts_data[i + 3]]));
+                    let raw_mss = u16::from_be_bytes([opts_data[i + 2], opts_data[i + 3]]);
+                    // R66-1 FIX: Clamp to RFC 879 minimum of 536 bytes to prevent
+                    // tiny-MSS DoS attacks (CPU/memory amplification via micro-segments)
+                    options.mss = Some(raw_mss.max(TCP_DEFAULT_MSS));
                     i += 4;
                 } else {
                     break;
@@ -1586,7 +1593,9 @@ pub fn parse_tcp_options(data: &[u8], header: &TcpHeader) -> TcpOptions {
             3 => {
                 // Window Scale
                 if i + 3 <= opts_data.len() && opts_data[i + 1] == 3 {
-                    options.window_scale = Some(opts_data[i + 2]);
+                    // R66-2 FIX: RFC 7323 mandates maximum shift count of 14.
+                    // Values > 14 are treated as 14 to prevent overflow in window calculations.
+                    options.window_scale = Some(opts_data[i + 2].min(TCP_MAX_WINDOW_SCALE));
                     i += 3;
                 } else {
                     break;
@@ -1946,8 +1955,14 @@ pub fn generate_isn(
 
     // Pack 4-tuple into 64-bit values for mixing
     let tuple_ip = u64::from_be_bytes([
-        local_ip.0[0], local_ip.0[1], local_ip.0[2], local_ip.0[3],
-        remote_ip.0[0], remote_ip.0[1], remote_ip.0[2], remote_ip.0[3],
+        local_ip.0[0],
+        local_ip.0[1],
+        local_ip.0[2],
+        local_ip.0[3],
+        remote_ip.0[0],
+        remote_ip.0[1],
+        remote_ip.0[2],
+        remote_ip.0[3],
     ]);
     let tuple_port = ((local_port as u64) << 48) | ((remote_port as u64) << 32) | (counter as u64);
 
@@ -2105,8 +2120,14 @@ impl SynCookieMacParams {
         mss_index: u8,
     ) -> Self {
         let tuple_ip = u64::from_be_bytes([
-            local_ip.0[0], local_ip.0[1], local_ip.0[2], local_ip.0[3],
-            remote_ip.0[0], remote_ip.0[1], remote_ip.0[2], remote_ip.0[3],
+            local_ip.0[0],
+            local_ip.0[1],
+            local_ip.0[2],
+            local_ip.0[3],
+            remote_ip.0[0],
+            remote_ip.0[1],
+            remote_ip.0[2],
+            remote_ip.0[3],
         ]);
         let tuple_ports = ((local_port as u64) << 48) | ((remote_port as u64) << 32);
         Self {
@@ -2129,19 +2150,11 @@ impl SynCookieMacParams {
 #[inline]
 fn syn_cookie_compute_mac(secret: u64, params: &SynCookieMacParams) -> u32 {
     // Mix secret with parameters using SipHash-like rounds
-    let mut v0 = secret
-        .rotate_left(7)
-        ^ params.tuple_ip
-        ^ ((params.time_slot as u64) << 24);
-    let mut v1 = secret
-        .rotate_right(11)
-        ^ params.tuple_ports
-        ^ ((params.mss_index as u64) << 8);
+    let mut v0 = secret.rotate_left(7) ^ params.tuple_ip ^ ((params.time_slot as u64) << 24);
+    let mut v1 = secret.rotate_right(11) ^ params.tuple_ports ^ ((params.mss_index as u64) << 8);
 
     // Round 1
-    v0 = v0
-        .wrapping_add(v1 ^ 0x9E37_79B9_7F4A_7C15)
-        .rotate_left(17);
+    v0 = v0.wrapping_add(v1 ^ 0x9E37_79B9_7F4A_7C15).rotate_left(17);
     v1 ^= v0.rotate_right(19);
 
     // Round 2
@@ -2220,8 +2233,8 @@ pub fn generate_syn_cookie_isn(
     mss_index: u8,
 ) -> u32 {
     // Compute current time slot (wrapping within 6-bit range)
-    let time_slot = ((now_ms / TCP_SYN_COOKIE_TIME_GRANULARITY_MS) as u32)
-        & TCP_SYN_COOKIE_TIME_MASK;
+    let time_slot =
+        ((now_ms / TCP_SYN_COOKIE_TIME_GRANULARITY_MS) as u32) & TCP_SYN_COOKIE_TIME_MASK;
 
     // Build MAC parameters
     let params = SynCookieMacParams::new(
@@ -2243,8 +2256,7 @@ pub fn generate_syn_cookie_isn(
     let mac = syn_cookie_compute_mac(current_secret, &params);
 
     // Pack into ISN: [MAC (23 bits)][Time (6 bits)][MSS (3 bits)]
-    let data_bits = ((time_slot & TCP_SYN_COOKIE_TIME_MASK)
-        << TCP_SYN_COOKIE_MSS_BITS)
+    let data_bits = ((time_slot & TCP_SYN_COOKIE_TIME_MASK) << TCP_SYN_COOKIE_MSS_BITS)
         | (mss_index as u32 & TCP_SYN_COOKIE_MSS_MASK);
     (mac << (TCP_SYN_COOKIE_TIME_BITS + TCP_SYN_COOKIE_MSS_BITS)) | data_bits
 }
@@ -2295,8 +2307,8 @@ pub fn validate_syn_cookie(
     // a cookie from slot 63 validated at slot 1 would compute age_slots = 2 after
     // masking, incorrectly passing the age check despite being ~252 seconds old.
     // We reject any age >= half the range (32 slots = 128s) to detect wrap-around.
-    let now_slot = ((now_ms / TCP_SYN_COOKIE_TIME_GRANULARITY_MS) as u32)
-        & TCP_SYN_COOKIE_TIME_MASK;
+    let now_slot =
+        ((now_ms / TCP_SYN_COOKIE_TIME_GRANULARITY_MS) as u32) & TCP_SYN_COOKIE_TIME_MASK;
     let age_slots = now_slot.wrapping_sub(time_slot) & TCP_SYN_COOKIE_TIME_MASK;
     let half_range = 1u32 << (TCP_SYN_COOKIE_TIME_BITS - 1); // 32 slots = 128 seconds
     if age_slots > TCP_SYN_COOKIE_MAX_AGE_SLOTS || age_slots >= half_range {

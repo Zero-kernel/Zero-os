@@ -200,7 +200,10 @@ impl Inode for ProcRootInode {
         }
 
         // R31-1 FIX: List PIDs filtered by access control (self/root/same owner/gid)
-        let pids: Vec<u32> = list_pids().into_iter().filter(|&pid| can_access_pid(pid)).collect();
+        let pids: Vec<u32> = list_pids()
+            .into_iter()
+            .filter(|&pid| can_access_pid(pid))
+            .collect();
         let pid_offset = offset - static_entries.len();
 
         if pid_offset < pids.len() {
@@ -456,7 +459,10 @@ impl Inode for ProcPidStatusInode {
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
         // Return FileHandle so fd_read_callback can use inode.read_at()
-        let inode: Arc<dyn Inode> = Arc::new(ProcPidStatusInode { fs_id: self.fs_id, pid: self.pid });
+        let inode: Arc<dyn Inode> = Arc::new(ProcPidStatusInode {
+            fs_id: self.fs_id,
+            pid: self.pid,
+        });
         Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
@@ -515,7 +521,10 @@ impl Inode for ProcPidCmdlineInode {
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
         // Return FileHandle so fd_read_callback can use inode.read_at()
-        let inode: Arc<dyn Inode> = Arc::new(ProcPidCmdlineInode { fs_id: self.fs_id, pid: self.pid });
+        let inode: Arc<dyn Inode> = Arc::new(ProcPidCmdlineInode {
+            fs_id: self.fs_id,
+            pid: self.pid,
+        });
         Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
@@ -572,7 +581,10 @@ impl Inode for ProcPidStatInode {
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
         // Return FileHandle so fd_read_callback can use inode.read_at()
-        let inode: Arc<dyn Inode> = Arc::new(ProcPidStatInode { fs_id: self.fs_id, pid: self.pid });
+        let inode: Arc<dyn Inode> = Arc::new(ProcPidStatInode {
+            fs_id: self.fs_id,
+            pid: self.pid,
+        });
         Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
@@ -629,7 +641,10 @@ impl Inode for ProcPidMapsInode {
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileOps>, FsError> {
         // Return FileHandle so fd_read_callback can use inode.read_at()
-        let inode: Arc<dyn Inode> = Arc::new(ProcPidMapsInode { fs_id: self.fs_id, pid: self.pid });
+        let inode: Arc<dyn Inode> = Arc::new(ProcPidMapsInode {
+            fs_id: self.fs_id,
+            pid: self.pid,
+        });
         Ok(Box::new(FileHandle::new(inode, flags, true)))
     }
 
@@ -1248,12 +1263,19 @@ fn generate_status(pid: u32) -> String {
                  Threads:\t1\n",
                 p.name,
                 p.umask,
-                state_char, state_name,
+                state_char,
+                state_name,
                 p.tgid,
                 p.pid,
                 p.ppid,
-                creds.uid, creds.euid, creds.uid, creds.uid,  // real, effective, saved, fs
-                creds.gid, creds.egid, creds.gid, creds.gid,
+                creds.uid,
+                creds.euid,
+                creds.uid,
+                creds.uid, // real, effective, saved, fs
+                creds.gid,
+                creds.egid,
+                creds.gid,
+                creds.gid,
             )
         }
         _ => String::new(),
@@ -1370,11 +1392,11 @@ fn generate_meminfo() -> String {
         available_kb,
         buffers_kb,
         cached_kb,
-        0,  // SwapTotal - no swap
-        0,  // SwapFree - no swap
-        used_kb,  // Active = used pages
+        0,          // SwapTotal - no swap
+        0,          // SwapFree - no swap
+        used_kb,    // Active = used pages
         cached_kb,  // Inactive = cached pages
-        buffers_kb,  // Dirty = dirty pages in cache
+        buffers_kb, // Dirty = dirty pages in cache
         mem_stats.heap_used_bytes / 1024,
     )
 }
@@ -1410,5 +1432,8 @@ fn generate_uptime() -> String {
     let idle_secs = uptime_secs / 2; // Rough approximation
     let idle_frac = uptime_frac;
 
-    format!("{}.{:02} {}.{:02}\n", uptime_secs, uptime_frac, idle_secs, idle_frac)
+    format!(
+        "{}.{:02} {}.{:02}\n",
+        uptime_secs, uptime_frac, idle_secs, idle_frac
+    )
 }

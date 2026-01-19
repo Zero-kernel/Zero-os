@@ -243,9 +243,11 @@ bitflags::bitflags! {
         const BYPASS_DAC  = 1 << 30;
         const BYPASS_MAC  = 1 << 31;
 
-        // Audit/logging rights (bit 40)
+        // Audit/logging rights (bits 40-41)
         /// Permission to read/export audit logs via audit::snapshot()
         const AUDIT_READ  = 1 << 40;
+        /// R66-10 FIX: Permission to configure audit subsystem (e.g., set HMAC keys)
+        const AUDIT_WRITE = 1 << 41;
 
         // Convenience combinations
         const RW          = Self::READ.bits() | Self::WRITE.bits();
@@ -418,7 +420,11 @@ impl CapEntry {
     /// Create a new capability entry with explicit flags.
     #[inline]
     pub fn with_flags(object: CapObject, rights: CapRights, flags: CapFlags) -> Self {
-        Self { object, rights, flags }
+        Self {
+            object,
+            rights,
+            flags,
+        }
     }
 
     /// Check if this capability should be inherited across exec().

@@ -57,6 +57,8 @@ pub struct BootInfo {
     pub framebuffer: FramebufferInfo,
     /// R39-7 FIX: KASLR slide value (0 if KASLR disabled)
     pub kaslr_slide: u64,
+    /// ACPI RSDP physical address (from UEFI configuration table)
+    pub rsdp_address: u64,
 }
 
 /// UEFI 内存描述符（按 UEFI 规范布局）

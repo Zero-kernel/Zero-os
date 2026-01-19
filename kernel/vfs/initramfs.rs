@@ -170,7 +170,11 @@ impl Initramfs {
 
             // Strip trailing NUL and normalize path
             let trimmed = if let Some((&last, rest)) = name_bytes.split_last() {
-                if last == 0 { rest } else { name_bytes }
+                if last == 0 {
+                    rest
+                } else {
+                    name_bytes
+                }
             } else {
                 name_bytes
             };

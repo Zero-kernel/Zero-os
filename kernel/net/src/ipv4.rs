@@ -304,10 +304,7 @@ pub fn compute_checksum(data: &[u8], len: usize) -> u16 {
 }
 
 /// Calculate checksum for data where checksum field is at offset
-pub fn calculate_checksum_with_pseudo(
-    pseudo_header: &[u8],
-    data: &[u8],
-) -> u16 {
+pub fn calculate_checksum_with_pseudo(pseudo_header: &[u8], data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
 
     // Sum pseudo header
@@ -457,9 +454,9 @@ fn contains_source_routing(options: &[u8]) -> bool {
     while i < options.len() {
         let opt = options[i];
         match opt {
-            0 => break,       // End of options list
-            1 => i += 1,      // NOP (No Operation)
-            0x83 | 0x89 => return true,  // LSRR or SSRR - FORBIDDEN
+            0 => break,                 // End of options list
+            1 => i += 1,                // NOP (No Operation)
+            0x83 | 0x89 => return true, // LSRR or SSRR - FORBIDDEN
             _ => {
                 // Variable-length option
                 if i + 1 >= options.len() {
@@ -554,9 +551,8 @@ mod tests {
     fn test_checksum() {
         // Example from RFC 791
         let hdr = [
-            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00,
-            0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8, 0x00, 0x01,
-            0xc0, 0xa8, 0x00, 0xc7,
+            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8,
+            0x00, 0x01, 0xc0, 0xa8, 0x00, 0xc7,
         ];
         let csum = compute_checksum(&hdr, 20);
         // With zero checksum field, this gives the correct checksum

@@ -348,8 +348,7 @@ impl ArpCache {
 
     /// Clear all dynamic entries.
     pub fn clear_dynamic(&mut self) {
-        self.entries
-            .retain(|e| e.kind == ArpEntryKind::Static);
+        self.entries.retain(|e| e.kind == ArpEntryKind::Static);
     }
 }
 
@@ -651,10 +650,12 @@ pub fn build_gratuitous_arp(our_mac: EthAddr, our_ip: Ipv4Addr) -> Vec<u8> {
 // ============================================================================
 
 /// Global ARP rate limiter for RX processing.
-pub static ARP_RX_RATE_LIMITER: TokenBucket = TokenBucket::new(DEFAULT_RX_RATE_PPS, DEFAULT_RX_BURST);
+pub static ARP_RX_RATE_LIMITER: TokenBucket =
+    TokenBucket::new(DEFAULT_RX_RATE_PPS, DEFAULT_RX_BURST);
 
 /// Global ARP rate limiter for TX replies.
-pub static ARP_TX_RATE_LIMITER: TokenBucket = TokenBucket::new(DEFAULT_TX_RATE_PPS, DEFAULT_TX_BURST);
+pub static ARP_TX_RATE_LIMITER: TokenBucket =
+    TokenBucket::new(DEFAULT_TX_RATE_PPS, DEFAULT_TX_BURST);
 
 // ============================================================================
 // ARP Processing Result
@@ -750,10 +751,12 @@ pub fn process_arp(
     // This prevents injection of new malicious mappings while still allowing
     // legitimate refreshes from known hosts.
     let existing_mac = cache.lookup(pkt.sender_ip, now_ms);
-    let allow_gratuitous = is_gratuitous && (
-        pkt.sender_ip == our_ip ||                        // Our own announcement
-        existing_mac == Some(pkt.sender_hw)               // Same-MAC refresh only
-    );
+    let allow_gratuitous = is_gratuitous
+        && (
+            pkt.sender_ip == our_ip ||                        // Our own announcement
+        existing_mac == Some(pkt.sender_hw)
+            // Same-MAC refresh only
+        );
 
     // Security: Detect reflection attack attempt
     // If sender claims our IP but has different MAC, ignore completely
@@ -768,7 +771,10 @@ pub fn process_arp(
     // 2. Gratuitous announcements that pass the R48-2 check
     if pkt.op == ArpOp::Reply {
         // Reject replies with invalid target MAC (broadcast/multicast/zero)
-        if pkt.target_hw.is_broadcast() || pkt.target_hw.is_multicast() || pkt.target_hw == EthAddr::ZERO {
+        if pkt.target_hw.is_broadcast()
+            || pkt.target_hw.is_multicast()
+            || pkt.target_hw == EthAddr::ZERO
+        {
             stats.inc_rx_errors();
             return ArpResult::Dropped(ArpError::InvalidSender);
         }
@@ -786,7 +792,9 @@ pub fn process_arp(
         ArpOp::Reply => {
             // Learn from replies addressed to us or allowed gratuitous
             if for_us || allow_gratuitous {
-                if let Err(e) = cache.insert(pkt.sender_ip, pkt.sender_hw, ArpEntryKind::Dynamic, now_ms) {
+                if let Err(e) =
+                    cache.insert(pkt.sender_ip, pkt.sender_hw, ArpEntryKind::Dynamic, now_ms)
+                {
                     stats.inc_cache_conflicts();
                     return ArpResult::Dropped(e);
                 }
@@ -796,7 +804,9 @@ pub fn process_arp(
             // Only allow gratuitous/self-refresh to update cache; ignore other requests.
             // Normal requests should only trigger a reply, not learn the sender's mapping.
             if allow_gratuitous {
-                if let Err(e) = cache.insert(pkt.sender_ip, pkt.sender_hw, ArpEntryKind::Dynamic, now_ms) {
+                if let Err(e) =
+                    cache.insert(pkt.sender_ip, pkt.sender_hw, ArpEntryKind::Dynamic, now_ms)
+                {
                     stats.inc_cache_conflicts();
                     return ArpResult::Dropped(e);
                 }

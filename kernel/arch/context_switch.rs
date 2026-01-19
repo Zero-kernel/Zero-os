@@ -235,6 +235,13 @@ pub unsafe fn assert_kernel_context(ctx: *const Context) {
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const Context) {
     core::arch::naked_asm!(
+        // R67-10 FIX: Save RFLAGS and disable interrupts FIRST to protect FPU state
+        // during the entire context switch. This prevents IRQ handlers from clobbering
+        // FPU state between fxsave64 and fxrstor64.
+        "pushfq",
+        "pop qword ptr [rdi + 0x88]",  // Save RFLAGS to old_ctx before cli
+        "cli",                          // Disable interrupts during FPU operations
+
         // 保存当前 FPU/SIMD 状态到 old_ctx
         "fxsave64 [rdi + {fxoff}]",
 
@@ -269,10 +276,8 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         "mov rax, [rsp]",
         "mov [rdx + 0x80], rax",
 
-        // 保存rflags
-        "pushfq",
-        "pop rax",
-        "mov [rdx + 0x88], rax",
+        // R67-10 FIX: RFLAGS already saved at function entry (before cli)
+        // No need to save again here
 
         // 保存段寄存器
         "mov ax, cs",
@@ -301,14 +306,19 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         // 恢复rip (跳转地址)
         "push qword ptr [rcx + 0x80]",
 
-        // 恢复rflags
-        "push qword ptr [rcx + 0x88]",
-        "popfq",
-
-        // Z-5 fix: 最后恢复 rdi/rsi/rcx（caller-saved，内核线程为 0）
+        // Z-5 fix: 恢复 rdi/rsi（caller-saved，内核线程为 0）
+        // R67-10 FIX: 在 popfq 之前恢复这些寄存器，避免 IF=1 时的中断窗口
         "mov rdi, [rcx + 0x28]",   // 恢复rdi (内核线程: 0)
         "mov rsi, [rcx + 0x20]",   // 恢复rsi (内核线程: 0)
-        "mov rcx, [rcx + 0x10]",   // 恢复rcx（必须最后，因为 rcx 是基址）
+
+        // 将 RFLAGS 压栈（在恢复 rcx 之前）
+        "push qword ptr [rcx + 0x88]",
+
+        // 最后恢复 rcx（必须最后，因为 rcx 是基址）
+        "mov rcx, [rcx + 0x10]",
+
+        // R67-10 FIX: 恢复 rflags 紧接着 ret，最小化 IF=1 后的中断窗口
+        "popfq",
 
         // 返回到新进程
         "ret",
@@ -332,7 +342,12 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
 #[inline]
 pub unsafe fn save_context(ctx: *mut Context) {
     asm!(
+        // R67-10 FIX: Protect FXSAVE from interrupt corruption
+        // Save RFLAGS to stack, disable interrupts, do FXSAVE, restore RFLAGS
+        "pushfq",
+        "cli",
         "fxsave64 [{ctx} + {fxoff}]",
+        "popfq",                        // Restore original IF state
         "mov [{ctx} + 0x00], rax",
         "mov [{ctx} + 0x08], rbx",
         "mov [{ctx} + 0x10], rcx",
@@ -358,7 +373,6 @@ pub unsafe fn save_context(ctx: *mut Context) {
         "mov [{ctx} + 0x98], rax",
         ctx = in(reg) ctx,
         fxoff = const FXSAVE_OFFSET,
-        options(nostack)
     );
 }
 
@@ -370,7 +384,12 @@ pub unsafe fn save_context(ctx: *mut Context) {
 #[inline]
 pub unsafe fn restore_context(ctx: *const Context) {
     asm!(
+        // R67-10 FIX: Protect FXRSTOR from interrupt corruption
+        // Save RFLAGS to stack, disable interrupts, do FXRSTOR, restore RFLAGS
+        "pushfq",
+        "cli",
         "fxrstor64 [{ctx} + {fxoff}]",
+        "popfq",                        // Restore original IF state
         "mov rax, [{ctx} + 0x00]",
         "mov rbx, [{ctx} + 0x08]",
         "mov rcx, [{ctx} + 0x10]",
@@ -389,7 +408,6 @@ pub unsafe fn restore_context(ctx: *const Context) {
         "mov r15, [{ctx} + 0x78]",
         ctx = in(reg) ctx,
         fxoff = const FXSAVE_OFFSET,
-        options(nostack)
     );
 }
 

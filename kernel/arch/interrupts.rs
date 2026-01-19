@@ -9,78 +9,129 @@
 //!
 //! V-4 fix: 直接读取CR4而非使用全局缓存，确保SMP环境下每个CPU正确检测SMAP状态。
 //!
-//! # FPU/SSE 安全 (R65-18 fix)
+//! # FPU/SSE 安全 (R65-18 fix + R66-7 SMP fix)
 //!
 //! 硬件中断处理器必须保存/恢复 FPU/SSE 状态，因为：
 //! 1. x86-interrupt 调用约定不保存 FPU 寄存器
 //! 2. 中断处理器内的代码（如 println!, memcpy）可能使用 SSE 指令
 //! 3. 不保存会破坏被中断进程的 FPU 状态
+//!
+//! R66-7 fix: FPU save area is now per-CPU to support SMP. Each CPU has its
+//! own 512-byte aligned buffer, preventing FPU state corruption when multiple
+//! CPUs handle interrupts concurrently.
 
+use crate::apic;
 use crate::context_switch;
 use crate::gdt;
+use crate::ipi;
 use core::sync::atomic::{AtomicU64, Ordering};
+use cpu_local::CpuLocal;
 use kernel_core::on_scheduler_tick;
 use lazy_static::lazy_static;
+use mm::tlb_shootdown;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 // Serial port for debug output (0x3F8)
 const SERIAL_PORT: u16 = 0x3F8;
 
 // ============================================================================
-// R65-18 FIX: FPU/SSE State Save for Interrupt Handlers
+// R65-18 FIX + R66-7 SMP FIX: Per-CPU FPU/SSE State Save for Interrupt Handlers
 // ============================================================================
 
 /// FXSAVE 区域大小（512 字节）
 const FXSAVE_SIZE: usize = 512;
 
-/// R65-18 FIX: Per-CPU FPU save area for interrupt handlers.
+/// R66-7 FIX: Per-CPU FPU save area for interrupt handlers.
 ///
-/// This static buffer is used to save/restore FPU state in IRQ handlers
-/// to prevent corruption of user/kernel FPU state.
-///
-/// # Safety
-///
-/// Must be 16-byte aligned for FXSAVE/FXRSTOR instructions.
-/// On SMP systems, each CPU would need its own buffer (not implemented here).
+/// Each CPU has its own 64-byte aligned buffer for FXSAVE/FXRSTOR.
+/// This prevents FPU state corruption when multiple CPUs handle
+/// interrupts concurrently.
 #[repr(C, align(64))]
 struct IrqFpuSaveArea {
     data: [u8; FXSAVE_SIZE],
 }
 
-static mut IRQ_FPU_AREA: IrqFpuSaveArea = IrqFpuSaveArea {
-    data: [0; FXSAVE_SIZE],
-};
-
-/// R65-18 FIX: Save FPU/SSE state before IRQ handler work.
+/// R66-7 FIX: Per-CPU FPU save areas using CpuLocal.
 ///
-/// Must be called at the beginning of IRQ handlers that may use FPU/SSE.
-/// Pairs with `irq_restore_fpu()`.
+/// # Safety
+///
+/// Each CPU exclusively accesses its own FPU save area. The 64-byte
+/// alignment satisfies FXSAVE64/FXRSTOR64 requirements.
+static IRQ_FPU_AREAS: CpuLocal<IrqFpuSaveArea> = CpuLocal::new(|| IrqFpuSaveArea {
+    data: [0; FXSAVE_SIZE],
+});
+
+/// R67-7 FIX: Per-CPU nesting depth for IRQ FPU saves.
+///
+/// Tracks nesting to handle nested NMIs/double-faults correctly.
+/// Only the outermost save/restore pair actually performs FXSAVE/FXRSTOR.
+/// Uses AtomicU32 for thread-safety (required by CpuLocal).
+static IRQ_FPU_DEPTH: CpuLocal<core::sync::atomic::AtomicU32> =
+    CpuLocal::new(|| core::sync::atomic::AtomicU32::new(0));
+
+/// R65-18 FIX + R66-7 FIX + R67-7 FIX: Save FPU/SSE state before IRQ handler work.
+///
+/// Uses per-CPU storage to support SMP. Must be called at the beginning
+/// of IRQ handlers that may use FPU/SSE. Pairs with `irq_restore_fpu()`.
+///
+/// R67-7: Now handles nested interrupts (NMI/double-fault during IRQ).
+/// Only the first (outermost) save actually performs FXSAVE64.
 ///
 /// # Safety
 ///
 /// - Must be called with interrupts disabled (which they are in IRQ handlers)
-/// - The IRQ_FPU_AREA must not be used by nested interrupts (single CPU only)
+/// - Each CPU uses its own save area, so no cross-CPU corruption
 #[inline]
 unsafe fn irq_save_fpu() {
-    let ptr = &raw mut IRQ_FPU_AREA as *mut u8;
-    core::arch::asm!(
-        "fxsave64 [{}]",
-        in(reg) ptr,
-        options(nostack)
-    );
+    use core::sync::atomic::Ordering;
+    let depth = IRQ_FPU_DEPTH.with(|d| d.fetch_add(1, Ordering::Relaxed));
+    if depth > 0 {
+        // Already saved on this CPU - nested interrupt
+        return;
+    }
+    // Outermost save - actually perform FXSAVE
+    IRQ_FPU_AREAS.with(|area| {
+        let ptr = area.data.as_ptr() as *mut u8;
+        core::arch::asm!(
+            "fxsave64 [{}]",
+            in(reg) ptr,
+            options(nostack)
+        );
+    });
 }
 
-/// R65-18 FIX: Restore FPU/SSE state after IRQ handler work.
+/// R65-18 FIX + R66-7 FIX + R67-7 FIX: Restore FPU/SSE state after IRQ handler work.
 ///
-/// Must be called before returning from IRQ handlers that called `irq_save_fpu()`.
+/// Uses per-CPU storage to support SMP. Must be called before returning
+/// from IRQ handlers that called `irq_save_fpu()`.
+///
+/// R67-7: Only the last (outermost) restore actually performs FXRSTOR64.
 #[inline]
 unsafe fn irq_restore_fpu() {
-    let ptr = &raw const IRQ_FPU_AREA as *const u8;
-    core::arch::asm!(
-        "fxrstor64 [{}]",
-        in(reg) ptr,
-        options(nostack)
+    use core::sync::atomic::Ordering;
+    let prev_depth = IRQ_FPU_DEPTH.with(|d| d.fetch_sub(1, Ordering::Relaxed));
+
+    // R67-7 FIX: Debug assertion to catch mismatched save/restore pairs.
+    // If prev_depth is 0, we have an underflow (restore without matching save).
+    // This would wrap to u32::MAX, permanently breaking FPU handling on this CPU.
+    debug_assert!(
+        prev_depth > 0,
+        "irq_restore_fpu called without matching irq_save_fpu (depth underflow)"
     );
+
+    if prev_depth != 1 {
+        // Not the outermost - don't restore yet (or mismatched if 0)
+        return;
+    }
+    // Outermost restore - actually perform FXRSTOR
+    IRQ_FPU_AREAS.with(|area| {
+        let ptr = area.data.as_ptr();
+        core::arch::asm!(
+            "fxrstor64 [{}]",
+            in(reg) ptr,
+            options(nostack)
+        );
+    });
 }
 
 /// Clear Direction Flag and AC flag if SMAP is enabled (S-6 fix + V-4 SMP fix + R65-17 fix)
@@ -305,6 +356,9 @@ lazy_static! {
         idt[33].set_handler_fn(keyboard_interrupt_handler);   // IRQ 1: Keyboard
         idt[36].set_handler_fn(serial_interrupt_handler);     // IRQ 4: Serial COM1
 
+        // IPI handlers (high vectors)
+        idt[ipi::IPI_VECTOR_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_ipi_handler);
+
         idt
     };
 }
@@ -316,6 +370,10 @@ pub fn init() {
 
     // 初始化 FPU/SIMD 支持（必须在使用 FXSAVE/FXRSTOR 前）
     context_switch::init_fpu();
+
+    // 初始化 IPI 子系统（注册 TLB shootdown IPI 发送器）
+    // 必须在 SMP 启动前调用，以便 TLB shootdown 可以正常工作
+    ipi::init();
 
     // 初始化 8259 PIC，重映射 IRQ 向量避免与 CPU 异常冲突
     unsafe {
@@ -335,6 +393,19 @@ pub fn init() {
     println!("  Exception handlers: 20 (double fault uses IST)");
     println!("  Hardware interrupt handlers: 3 (Timer, Keyboard, Serial)");
     println!("  FPU/SIMD support enabled (FXSAVE/FXRSTOR ready)");
+}
+
+/// Load IDT on an Application Processor.
+///
+/// Called during AP bring-up to load the pre-built IDT.
+/// Does not reinitialize PIC or GDT - these are already set up by BSP.
+///
+/// # Safety
+///
+/// - Must only be called on APs during SMP bring-up
+/// - BSP must have already initialized the IDT
+pub unsafe fn load_idt_for_ap() {
+    IDT.load();
 }
 
 /// 初始化串口接收中断
@@ -750,7 +821,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
 
     // R65-18 FIX: Save FPU state before any code that might use SSE
     // This prevents corruption of user/kernel FPU state by IRQ handler code
-    unsafe { irq_save_fpu(); }
+    unsafe {
+        irq_save_fpu();
+    }
 
     INTERRUPT_STATS.timer.fetch_add(1, Ordering::Relaxed);
 
@@ -765,6 +838,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     // 必须在抢占之前发送，避免上下文切换后 IRQ0 长时间被屏蔽
     unsafe {
         core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
+        // Also ack the local APIC when running in ExtINT (LINT0) mode
+        // Without this, the LAPIC ISR stays set and blocks further PIC interrupts
+        apic::lapic_eoi();
     }
 
     // 检查是否即将返回用户态（RPL == 3）
@@ -781,7 +857,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     }
 
     // R65-18 FIX: Restore FPU state before returning from IRQ
-    unsafe { irq_restore_fpu(); }
+    unsafe {
+        irq_restore_fpu();
+    }
 }
 
 /// IRQ 1 - Keyboard Interrupt (键盘中断)
@@ -792,7 +870,9 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     clac_if_smap();
 
     // R65-18 FIX: Save FPU state
-    unsafe { irq_save_fpu(); }
+    unsafe {
+        irq_save_fpu();
+    }
 
     INTERRUPT_STATS.keyboard.fetch_add(1, Ordering::Relaxed);
 
@@ -815,10 +895,14 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     // 发送 EOI 到 PIC
     unsafe {
         core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
+        // Also ack LAPIC for ExtINT mode
+        apic::lapic_eoi();
     }
 
     // R65-18 FIX: Restore FPU state
-    unsafe { irq_restore_fpu(); }
+    unsafe {
+        irq_restore_fpu();
+    }
 }
 
 /// IRQ 4 - Serial COM1 Interrupt (串口中断)
@@ -834,7 +918,9 @@ extern "x86-interrupt" fn serial_interrupt_handler(_stack_frame: InterruptStackF
     clac_if_smap();
 
     // R65-18 FIX: Save FPU state
-    unsafe { irq_save_fpu(); }
+    unsafe {
+        irq_save_fpu();
+    }
 
     let mut received_any = false;
 
@@ -874,10 +960,14 @@ extern "x86-interrupt" fn serial_interrupt_handler(_stack_frame: InterruptStackF
     // 发送 EOI 到 PIC
     unsafe {
         core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
+        // Also ack LAPIC for ExtINT mode
+        apic::lapic_eoi();
     }
 
     // R65-18 FIX: Restore FPU state
-    unsafe { irq_restore_fpu(); }
+    unsafe {
+        irq_restore_fpu();
+    }
 }
 
 /// 触发断点异常（用于测试）
@@ -982,4 +1072,33 @@ pub unsafe fn pic_send_eoi(irq: u8) {
         core::arch::asm!("out dx, al", in("dx") PIC2_CMD, in("al") 0x20u8, options(nostack, nomem));
     }
     core::arch::asm!("out dx, al", in("dx") PIC1_CMD, in("al") 0x20u8, options(nostack, nomem));
+}
+
+// ============================================================================
+// IPI Handlers (Inter-Processor Interrupts for SMP)
+// ============================================================================
+
+/// TLB Shootdown IPI Handler (vector 0xFE)
+///
+/// Called when this CPU receives a TLB shootdown request from another CPU.
+/// This handler:
+/// 1. Clears SMAP if active (CLAC)
+/// 2. Delegates to mm::tlb_shootdown::handle_shootdown_ipi()
+/// 3. Sends LAPIC EOI to acknowledge the interrupt
+///
+/// # Safety
+///
+/// - Must be called with interrupts disabled (x86-interrupt calling convention)
+/// - Uses LAPIC EOI (not PIC) since this is an IPI
+extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStackFrame) {
+    // S-6 fix: Clear SMAP to prevent user-page access during handler
+    clac_if_smap();
+
+    // Delegate to the TLB shootdown module
+    tlb_shootdown::handle_shootdown_ipi();
+
+    // Send LAPIC EOI (not PIC - this is an IPI)
+    unsafe {
+        apic::lapic_eoi();
+    }
 }

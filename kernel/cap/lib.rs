@@ -7,6 +7,24 @@
 //! - **Fork/Exec Semantics**: CLOEXEC/CLOFORK flags control inheritance
 //! - **IRQ-Safe**: All operations use spinlocks with interrupt disable
 //!
+//! # Security Note (R66-9)
+//!
+//! The `CapTable` methods (`allocate`, `revoke`, `delegate`) are low-level APIs
+//! that do NOT call LSM hooks or emit audit events directly. This is intentional:
+//!
+//! 1. **Fork inheritance**: Capability duplication during fork must bypass policy checks
+//!    (the policy was already checked when the parent acquired the capability).
+//!
+//! 2. **Separation of concerns**: LSM and audit integration lives in the syscall layer
+//!    (`kernel_core/syscall.rs`), not in the capability table implementation.
+//!
+//! **Callers MUST:**
+//! - Call `lsm::hook_task_cap_modify()` BEFORE capability operations for user-initiated requests
+//! - Call `audit::emit_capability_event()` AFTER successful operations
+//!
+//! The syscall handlers (`sys_cap_allocate`, `sys_cap_revoke`, etc.) already do this.
+//! Internal kernel paths (fork, exec) are allowed to bypass these hooks.
+//!
 //! # Architecture
 //!
 //! ```text
@@ -56,7 +74,7 @@
 //!    `new_rights = old_rights & mask`
 //!
 //! 3. **Audit Integration**: All capability operations are logged to the audit
-//!    subsystem for security monitoring.
+//!    subsystem for security monitoring (via syscall layer hooks).
 
 #![no_std]
 
@@ -72,8 +90,8 @@ use x86_64::instructions::interrupts;
 pub mod types;
 
 pub use types::{
-    CapEntry, CapError, CapFlags, CapId, CapObject, CapRights,
-    EndpointId, FileOps, NamespaceId, ProcessId, Shm, Socket, Timer,
+    CapEntry, CapError, CapFlags, CapId, CapObject, CapRights, EndpointId, FileOps, NamespaceId,
+    ProcessId, Shm, Socket, Timer,
 };
 
 // ============================================================================
@@ -555,10 +573,7 @@ mod tests {
     fn test_cap_table_allocate_revoke() {
         let table = CapTable::new();
 
-        let entry = CapEntry::new(
-            CapObject::Process(1),
-            CapRights::SIGNAL,
-        );
+        let entry = CapEntry::new(CapObject::Process(1), CapRights::SIGNAL);
 
         let cap_id = table.allocate(entry).unwrap();
         assert!(cap_id.is_valid());

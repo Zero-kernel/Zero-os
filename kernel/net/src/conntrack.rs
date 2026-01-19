@@ -39,15 +39,15 @@ pub const CT_MAX_ENTRIES: usize = 65536;
 pub const CT_TCP_TIMEOUT_SYN_SENT_MS: u64 = 60_000;
 pub const CT_TCP_TIMEOUT_SYN_RECV_MS: u64 = 60_000;
 pub const CT_TCP_TIMEOUT_ESTABLISHED_MS: u64 = 300_000; // 5 minutes
-pub const CT_TCP_TIMEOUT_FIN_WAIT_MS: u64 = 120_000;    // 2 minutes
+pub const CT_TCP_TIMEOUT_FIN_WAIT_MS: u64 = 120_000; // 2 minutes
 pub const CT_TCP_TIMEOUT_CLOSE_WAIT_MS: u64 = 60_000;
 pub const CT_TCP_TIMEOUT_LAST_ACK_MS: u64 = 30_000;
-pub const CT_TCP_TIMEOUT_TIME_WAIT_MS: u64 = 120_000;   // 2*MSL
+pub const CT_TCP_TIMEOUT_TIME_WAIT_MS: u64 = 120_000; // 2*MSL
 pub const CT_TCP_TIMEOUT_CLOSE_MS: u64 = 10_000;
 
 /// UDP timeout values (milliseconds)
 pub const CT_UDP_TIMEOUT_UNREPLIED_MS: u64 = 30_000;
-pub const CT_UDP_TIMEOUT_REPLIED_MS: u64 = 180_000;     // 3 minutes
+pub const CT_UDP_TIMEOUT_REPLIED_MS: u64 = 180_000; // 3 minutes
 
 /// ICMP timeout values (milliseconds)
 pub const CT_ICMP_TIMEOUT_MS: u64 = 30_000;
@@ -289,7 +289,12 @@ impl ConntrackEntry {
     /// * `state` - Initial protocol state
     /// * `now_ms` - Current timestamp in milliseconds
     /// * `initiator_dir` - Direction of the first packet (true initiator)
-    pub fn new(key: FlowKey, state: CtProtoState, now_ms: u64, initiator_dir: ConntrackDir) -> Self {
+    pub fn new(
+        key: FlowKey,
+        state: CtProtoState,
+        now_ms: u64,
+        initiator_dir: ConntrackDir,
+    ) -> Self {
         Self {
             key,
             state,
@@ -371,7 +376,10 @@ pub struct L4Meta {
 
 impl L4Meta {
     pub fn new(tcp_flags: u8, payload_len: usize) -> Self {
-        Self { tcp_flags, payload_len }
+        Self {
+            tcp_flags,
+            payload_len,
+        }
     }
 
     /// Check if SYN flag is set.
@@ -489,7 +497,9 @@ impl ConntrackTable {
 
     /// R65-3 FIX: Allocate a fresh LRU generation value.
     fn next_lru_generation(&self) -> u64 {
-        self.lru_clock.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+        self.lru_clock
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
     }
 
     /// R65-3 FIX: Record the latest access for a flow in the LRU heap.
@@ -541,8 +551,14 @@ impl ConntrackTable {
                 let (new_state, decision) = self.transition_state(&entry, state_dir, proto, l4);
 
                 if decision == CtDecision::Invalid {
-                    self.stats.invalid_transitions.fetch_add(1, Ordering::Relaxed);
-                    return CtUpdateResult { decision, state: entry.state, dir };
+                    self.stats
+                        .invalid_transitions
+                        .fetch_add(1, Ordering::Relaxed);
+                    return CtUpdateResult {
+                        decision,
+                        state: entry.state,
+                        dir,
+                    };
                 }
 
                 entry.state = new_state;
@@ -584,7 +600,9 @@ impl ConntrackTable {
                     CtProtoState::Tcp(TcpCtState::SynSent)
                 } else {
                     // Non-SYN packet without existing entry - invalid
-                    self.stats.invalid_transitions.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .invalid_transitions
+                        .fetch_add(1, Ordering::Relaxed);
                     return CtUpdateResult {
                         decision: CtDecision::Invalid,
                         state: CtProtoState::Tcp(TcpCtState::None),
@@ -617,7 +635,9 @@ impl ConntrackTable {
             let (new_state, decision) = self.transition_state(&entry, state_dir, proto, l4);
 
             if decision == CtDecision::Invalid {
-                self.stats.invalid_transitions.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .invalid_transitions
+                    .fetch_add(1, Ordering::Relaxed);
                 return CtUpdateResult {
                     decision,
                     state: entry.state,
@@ -693,12 +713,8 @@ impl ConntrackTable {
         l4: &L4Meta,
     ) -> (CtProtoState, CtDecision) {
         match (proto, &entry.state) {
-            (IPPROTO_TCP, CtProtoState::Tcp(tcp_state)) => {
-                self.tcp_transition(*tcp_state, dir, l4)
-            }
-            (IPPROTO_UDP, CtProtoState::Udp(udp_state)) => {
-                self.udp_transition(*udp_state, dir)
-            }
+            (IPPROTO_TCP, CtProtoState::Tcp(tcp_state)) => self.tcp_transition(*tcp_state, dir, l4),
+            (IPPROTO_UDP, CtProtoState::Udp(udp_state)) => self.udp_transition(*udp_state, dir),
             (IPPROTO_ICMP, CtProtoState::Icmp(icmp_state)) => {
                 self.icmp_transition(*icmp_state, dir)
             }
@@ -715,7 +731,10 @@ impl ConntrackTable {
     ) -> (CtProtoState, CtDecision) {
         // Handle RST - always transitions to Close
         if l4.is_rst() {
-            return (CtProtoState::Tcp(TcpCtState::Close), CtDecision::Established);
+            return (
+                CtProtoState::Tcp(TcpCtState::Close),
+                CtDecision::Established,
+            );
         }
 
         let new_state = match (state, dir) {
@@ -728,27 +747,17 @@ impl ConntrackTable {
                 TcpCtState::Established
             }
             // Established - handle FIN
-            (TcpCtState::Established, _) if l4.is_fin() => {
-                match dir {
-                    ConntrackDir::Original => TcpCtState::FinWait,
-                    ConntrackDir::Reply => TcpCtState::CloseWait,
-                }
-            }
+            (TcpCtState::Established, _) if l4.is_fin() => match dir {
+                ConntrackDir::Original => TcpCtState::FinWait,
+                ConntrackDir::Reply => TcpCtState::CloseWait,
+            },
             // FIN wait - handle reply FIN or ACK
-            (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_fin() => {
-                TcpCtState::LastAck
-            }
-            (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_ack() => {
-                TcpCtState::TimeWait
-            }
+            (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_fin() => TcpCtState::LastAck,
+            (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_ack() => TcpCtState::TimeWait,
             // Close wait - handle FIN
-            (TcpCtState::CloseWait, ConntrackDir::Original) if l4.is_fin() => {
-                TcpCtState::LastAck
-            }
+            (TcpCtState::CloseWait, ConntrackDir::Original) if l4.is_fin() => TcpCtState::LastAck,
             // Last ACK - handle final ACK
-            (TcpCtState::LastAck, _) if l4.is_ack() => {
-                TcpCtState::TimeWait
-            }
+            (TcpCtState::LastAck, _) if l4.is_ack() => TcpCtState::TimeWait,
             // Stay in current state for other packets
             _ => state,
         };
@@ -757,11 +766,7 @@ impl ConntrackTable {
     }
 
     /// UDP state machine transition.
-    fn udp_transition(
-        &self,
-        state: UdpCtState,
-        dir: ConntrackDir,
-    ) -> (CtProtoState, CtDecision) {
+    fn udp_transition(&self, state: UdpCtState, dir: ConntrackDir) -> (CtProtoState, CtDecision) {
         let new_state = match (state, dir) {
             (UdpCtState::Unreplied, ConntrackDir::Reply) => UdpCtState::Replied,
             _ => state,
@@ -770,11 +775,7 @@ impl ConntrackTable {
     }
 
     /// ICMP state machine transition.
-    fn icmp_transition(
-        &self,
-        state: IcmpCtState,
-        dir: ConntrackDir,
-    ) -> (CtProtoState, CtDecision) {
+    fn icmp_transition(&self, state: IcmpCtState, dir: ConntrackDir) -> (CtProtoState, CtDecision) {
         let new_state = match (state, dir) {
             (IcmpCtState::EchoRequest, ConntrackDir::Reply) => IcmpCtState::EchoReply,
             _ => state,
@@ -809,10 +810,7 @@ impl ConntrackTable {
     ///
     /// # Returns
     /// `true` if an entry was evicted, `false` if table is empty.
-    fn evict_lru_locked(
-        &self,
-        entries: &mut BTreeMap<FlowKey, Mutex<ConntrackEntry>>,
-    ) -> bool {
+    fn evict_lru_locked(&self, entries: &mut BTreeMap<FlowKey, Mutex<ConntrackEntry>>) -> bool {
         // R65-3 FIX: Use heap for O(log n) eviction instead of O(n) linear scan
         loop {
             let candidate = {
@@ -936,15 +934,7 @@ pub fn ct_process_tcp(
     now_ms: u64,
 ) -> CtUpdateResult {
     let l4 = L4Meta::new(tcp_flags, payload_len);
-    conntrack_table().update_on_packet(
-        IPPROTO_TCP,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        &l4,
-        now_ms,
-    )
+    conntrack_table().update_on_packet(IPPROTO_TCP, src_ip, dst_ip, src_port, dst_port, &l4, now_ms)
 }
 
 /// Process a UDP packet through conntrack.
@@ -957,15 +947,7 @@ pub fn ct_process_udp(
     now_ms: u64,
 ) -> CtUpdateResult {
     let l4 = L4Meta::new(0, payload_len);
-    conntrack_table().update_on_packet(
-        IPPROTO_UDP,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        &l4,
-        now_ms,
-    )
+    conntrack_table().update_on_packet(IPPROTO_UDP, src_ip, dst_ip, src_port, dst_port, &l4, now_ms)
 }
 
 /// Process an ICMP packet through connection tracking.

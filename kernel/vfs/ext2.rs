@@ -21,7 +21,10 @@ use core::cmp;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::{FileOps, SyscallError, VfsStat};
-use mm::{buddy_allocator, page_cache, PageCacheEntry, PageState, PAGE_CACHE, PAGE_SIZE, PHYSICAL_MEMORY_OFFSET};
+use mm::{
+    buddy_allocator, page_cache, PageCacheEntry, PageState, PAGE_CACHE, PAGE_SIZE,
+    PHYSICAL_MEMORY_OFFSET,
+};
 use spin::{Mutex, RwLock};
 
 // ============================================================================
@@ -315,7 +318,8 @@ impl Ext2Fs {
 
         // Read BGDT
         let bgdt_size = groups_count as usize * size_of::<Ext2GroupDesc>();
-        let sectors_needed = (bgdt_size + dev.sector_size() as usize - 1) / dev.sector_size() as usize;
+        let sectors_needed =
+            (bgdt_size + dev.sector_size() as usize - 1) / dev.sector_size() as usize;
         let mut buf = alloc::vec![0u8; sectors_needed * dev.sector_size() as usize];
 
         let start_sector = bgdt_offset / dev.sector_size() as u64;
@@ -418,9 +422,8 @@ impl Ext2Fs {
         self.read_block(inode_block, &mut block_buf)?;
 
         // Parse inode
-        let inode: Ext2InodeRaw = unsafe {
-            core::ptr::read(block_buf[offset_in_block as usize..].as_ptr() as *const _)
-        };
+        let inode: Ext2InodeRaw =
+            unsafe { core::ptr::read(block_buf[offset_in_block as usize..].as_ptr() as *const _) };
 
         Ok(inode)
     }
@@ -476,9 +479,8 @@ impl Ext2Fs {
             return Err(FsError::Invalid);
         }
 
-        let raw_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(raw as *const _ as *const u8, copy_len)
-        };
+        let raw_bytes: &[u8] =
+            unsafe { core::slice::from_raw_parts(raw as *const _ as *const u8, copy_len) };
         block_buf[start..start + copy_len].copy_from_slice(raw_bytes);
         // Zero padding if inode_size > Ext2InodeRaw
         if self.inode_size as usize > copy_len {
@@ -578,7 +580,8 @@ impl Ext2Fs {
             // Calculate blocks in this group
             let group_blocks = cmp::min(
                 sb.blocks_per_group,
-                sb.blocks_count.saturating_sub(group as u32 * sb.blocks_per_group),
+                sb.blocks_count
+                    .saturating_sub(group as u32 * sb.blocks_per_group),
             );
             let group_start = sb.first_data_block + group as u32 * sb.blocks_per_group;
 
@@ -641,7 +644,8 @@ impl Ext2Fs {
         // Update block count if allocating a new block
         if old == 0 {
             let sectors_per_block = self.block_size / 512;
-            raw.blocks_lo = raw.blocks_lo
+            raw.blocks_lo = raw
+                .blocks_lo
                 .checked_add(sectors_per_block)
                 .ok_or(FsError::Invalid)?;
         }
@@ -711,8 +715,9 @@ impl Ext2Fs {
             let mut buf = alloc::vec![0u8; self.block_size as usize];
             self.read_block(ind_block, &mut buf)?;
 
-            let ptrs: &[u32] =
-                unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u32, ptrs_per_block as usize) };
+            let ptrs: &[u32] = unsafe {
+                core::slice::from_raw_parts(buf.as_ptr() as *const u32, ptrs_per_block as usize)
+            };
             // R28-5 Fix: Validate data block pointer
             return self.validate_block(ptrs[file_block as usize]);
         }
@@ -730,8 +735,9 @@ impl Ext2Fs {
             let mut buf = alloc::vec![0u8; self.block_size as usize];
             self.read_block(dind_block, &mut buf)?;
 
-            let ptrs: &[u32] =
-                unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u32, ptrs_per_block as usize) };
+            let ptrs: &[u32] = unsafe {
+                core::slice::from_raw_parts(buf.as_ptr() as *const u32, ptrs_per_block as usize)
+            };
 
             let ind_index = file_block / ptrs_per_block;
             // R28-5 Fix: Validate indirect block pointer from double indirect table
@@ -741,8 +747,9 @@ impl Ext2Fs {
             };
 
             self.read_block(ind_block, &mut buf)?;
-            let ptrs: &[u32] =
-                unsafe { core::slice::from_raw_parts(buf.as_ptr() as *const u32, ptrs_per_block as usize) };
+            let ptrs: &[u32] = unsafe {
+                core::slice::from_raw_parts(buf.as_ptr() as *const u32, ptrs_per_block as usize)
+            };
 
             let block_index = file_block % ptrs_per_block;
             // R28-5 Fix: Validate data block pointer
@@ -989,9 +996,8 @@ impl Ext2Inode {
 
             // Copy data from cached page to user buffer
             let page_virt = (page.physical_address() + PHYSICAL_MEMORY_OFFSET) as *const u8;
-            let src = unsafe {
-                core::slice::from_raw_parts(page_virt.add(offset_in_page), copy_len)
-            };
+            let src =
+                unsafe { core::slice::from_raw_parts(page_virt.add(offset_in_page), copy_len) };
             buf[bytes_read..bytes_read + copy_len].copy_from_slice(src);
 
             // R36-FIX: Balance the page cache refcount so shrink() can reclaim this page.

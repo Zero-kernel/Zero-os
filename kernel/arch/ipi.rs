@@ -35,7 +35,9 @@
 
 #![allow(dead_code)]
 
+use crate::apic;
 use core::sync::atomic::{AtomicU64, Ordering};
+use cpu_local::{current_cpu_id, lapic_id_for_cpu, max_cpus};
 
 // ============================================================================
 // IPI Vector Assignments
@@ -176,8 +178,20 @@ pub enum IpiTarget {
     Mask(u64),
 }
 
+/// Bump statistics for an IPI type
+#[inline]
+fn bump_stat(ipi_type: IpiType, count: u64) {
+    match ipi_type {
+        IpiType::Reschedule => STATS_RESCHEDULE.fetch_add(count, Ordering::Relaxed),
+        IpiType::TlbShootdown => STATS_TLB_SHOOTDOWN.fetch_add(count, Ordering::Relaxed),
+        IpiType::Halt => STATS_HALT.fetch_add(count, Ordering::Relaxed),
+        IpiType::Profile => STATS_PROFILE.fetch_add(count, Ordering::Relaxed),
+        IpiType::Panic => STATS_PANIC.fetch_add(count, Ordering::Relaxed),
+    };
+}
+
 // ============================================================================
-// IPI Send Functions (Stubs)
+// IPI Send Functions
 // ============================================================================
 
 /// Send an IPI to a specific CPU
@@ -187,31 +201,20 @@ pub enum IpiTarget {
 /// * `target_cpu` - CPU ID to send IPI to
 /// * `ipi_type` - Type of IPI to send
 ///
-/// # Current Implementation (Single-Core)
+/// # Implementation
 ///
-/// This is a no-op stub. Returns immediately without sending anything.
-///
-/// # SMP Implementation (Future)
-///
-/// Will use LAPIC ICR (Interrupt Command Register) to send the IPI:
-/// 1. Wait for ICR to be ready
-/// 2. Write destination CPU to ICR high
-/// 3. Write vector and delivery mode to ICR low
-/// 4. Update statistics
+/// Uses LAPIC ICR (Interrupt Command Register) to send the IPI:
+/// 1. Look up target CPU's LAPIC ID from cpu_local mapping
+/// 2. Call apic::send_ipi_raw with the vector and FIXED delivery mode
+/// 3. Update statistics
 #[inline]
 pub fn send_ipi(target_cpu: usize, ipi_type: IpiType) {
-    // Single-core stub: no-op
-    // When SMP is implemented, this will use LAPIC ICR
-    let _ = (target_cpu, ipi_type);
-
-    // Update statistics for the IPI type
-    match ipi_type {
-        IpiType::Reschedule => STATS_RESCHEDULE.fetch_add(1, Ordering::Relaxed),
-        IpiType::TlbShootdown => STATS_TLB_SHOOTDOWN.fetch_add(1, Ordering::Relaxed),
-        IpiType::Halt => STATS_HALT.fetch_add(1, Ordering::Relaxed),
-        IpiType::Profile => STATS_PROFILE.fetch_add(1, Ordering::Relaxed),
-        IpiType::Panic => STATS_PANIC.fetch_add(1, Ordering::Relaxed),
-    };
+    if let Some(dest_lapic) = lapic_id_for_cpu(target_cpu) {
+        unsafe {
+            apic::send_ipi_raw(dest_lapic, ipi_type.vector(), apic::icr_delivery::FIXED);
+        }
+        bump_stat(ipi_type, 1);
+    }
 }
 
 /// Send an IPI to multiple CPUs based on target specification
@@ -221,13 +224,45 @@ pub fn send_ipi(target_cpu: usize, ipi_type: IpiType) {
 /// * `target` - Target specification
 /// * `ipi_type` - Type of IPI to send
 ///
-/// # Current Implementation (Single-Core)
+/// # Implementation
 ///
-/// This is a no-op stub. Returns immediately without sending anything.
+/// Iterates over target CPUs and sends individual IPIs using `send_ipi()`.
+/// For AllExceptSelf, excludes the current CPU.
+/// For Mask, only sends to CPUs with corresponding bit set.
 #[inline]
 pub fn send_ipi_target(target: IpiTarget, ipi_type: IpiType) {
-    // Single-core stub: no-op
-    let _ = (target, ipi_type);
+    match target {
+        IpiTarget::Cpu(cpu) => send_ipi(cpu, ipi_type),
+        IpiTarget::AllExceptSelf => {
+            let self_id = current_cpu_id();
+            for cpu in 0..max_cpus() {
+                if cpu == self_id {
+                    continue;
+                }
+                if lapic_id_for_cpu(cpu).is_some() {
+                    send_ipi(cpu, ipi_type);
+                }
+            }
+        }
+        IpiTarget::All => {
+            for cpu in 0..max_cpus() {
+                if lapic_id_for_cpu(cpu).is_some() {
+                    send_ipi(cpu, ipi_type);
+                }
+            }
+        }
+        IpiTarget::Mask(mask) => {
+            let mut cpu = 0;
+            let mut bits = mask;
+            while bits != 0 {
+                if bits & 1 != 0 {
+                    send_ipi(cpu, ipi_type);
+                }
+                bits >>= 1;
+                cpu += 1;
+            }
+        }
+    }
 }
 
 /// Broadcast an IPI to all CPUs except self
@@ -335,11 +370,17 @@ pub mod lapic_regs {
 
 /// Initialize IPI subsystem
 ///
-/// Currently a no-op for single-core. In SMP mode, this will:
-/// 1. Detect and map LAPIC
-/// 2. Register IPI handlers in IDT
-/// 3. Enable LAPIC for IPI reception
+/// Registers the TLB shootdown IPI sender with the mm layer.
+/// Must be called after LAPIC is initialized but before SMP bring-up.
 pub fn init() {
-    // Single-core: nothing to do
-    // SMP: initialize LAPIC and register IDT handlers
+    // Register the TLB shootdown IPI sender to break circular dependency
+    // between arch (ipi) and mm (tlb_shootdown) crates
+    mm::tlb_shootdown::register_ipi_sender(send_tlb_shootdown_ipi);
+}
+
+/// Send a TLB shootdown IPI to a specific CPU
+///
+/// This is the callback registered with tlb_shootdown module.
+fn send_tlb_shootdown_ipi(target_cpu: usize) {
+    send_ipi(target_cpu, IpiType::TlbShootdown);
 }
