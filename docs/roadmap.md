@@ -540,6 +540,19 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 **Dependencies**: Phase A.6 (SMP-ready interfaces)
 **Status**: E.1/E.3 complete, AP bootstrap integrated in main.rs, APs park in HLT loop awaiting scheduler work
 
+**R67 SMP Security Blockers** (2026-01-18): **ALL FIXED ✅**
+- ~~R67-1 (CRITICAL): TLB shootdown ineffective~~ ✅
+- ~~R67-2 (HIGH): Shared trampoline data races~~ ✅
+- ~~R67-4 (HIGH): Scheduler globals not per-CPU~~ ✅
+- ~~R67-5 (HIGH): Page table mutations lack cross-CPU serialization~~ ✅
+- ~~R67-6 (HIGH): Fork/COW lacks per-MM lock~~ ✅
+- ~~R67-8 (HIGH): SYSCALL per-CPU arrays use slot 0 only~~ ✅
+- ~~R67-9 (HIGH): SYSRET path missing RFLAGS mask~~ ✅
+- ~~R67-11 (HIGH): Syscall scratch stack depth unchecked~~ ✅
+- ~~R67-3 (MEDIUM): LAPIC ID verification~~ ✅
+- ~~R67-7 (MEDIUM): IRQ FPU nesting~~ ✅
+- ~~R67-10 (MEDIUM): Context switch FPU interrupt safety~~ ✅
+
 #### E.1 Hardware Initialization
 
 - [x] LAPIC initialization (kernel/arch/apic.rs - init_lapic, lapic_eoi, lapic_id)
@@ -736,18 +749,19 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-15 | 63-64 | 12 | 11 | Conntrack direction fix, capacity bypass, LRU eviction, RST rate limit, timer monitoring, fragment count, firewall - **11 FIXED, 1 DOCUMENTED** |
 | 2026-01-16 | 65 | 26 | 17 | Comprehensive audit - CLD fix, COW race, context switch validation, rate limiter CAS, conntrack accounting - **17 FIXED, 9 OPEN** |
 | 2026-01-17 | 66 | 11 | 11 | TCP options validation (MSS/WS), VirtIO-blk ring init/jump detection/double-free, scheduler priority cap, fragment CAS, per-CPU FPU - **ALL FIXED** |
-| **Total** | **66** | **316** | **265 (83.9%)** | **51 open (R65 remaining + SMP + VirtIO IOMMU)** |
+| 2026-01-18 | 67 | 11 | 11 | **SMP SECURITY AUDIT** - TLB shootdown ✅, trampoline claim flag ✅, LAPIC verification ✅, scheduler per-CPU ✅, PT cross-CPU lock ✅, fork/COW lock ✅, FPU nesting ✅, syscall GS-relative ✅, SYSRET RFLAGS ✅, syscall depth ✅, context switch FPU ✅ - **ALL FIXED** |
+| **Total** | **67** | **327** | **276 (84.4%)** | **51 open (R65 SMP + VirtIO IOMMU deferred)** |
 
 ### Current Status
 
-- **Fixed**: 265 issues (83.9%)
-- **Open**: 51 issues (16.1%)
-  - R65 remaining issues (SMP-related, VirtIO IOMMU deferred)
-  - SMP-related issues deferred to Phase E
+- **Fixed**: 276 issues (84.4%)
+- **Open**: 51 issues (15.6%)
+  - R65 remaining issues (SMP-related, non-blocking)
   - R62-6 (VirtIO IOMMU) deferred to Phase F.3
-- **Phase E Progress**: LAPIC/IOAPIC initialized, PerCpuData implemented, AP bootstrap pending
+- **Phase E Progress**: LAPIC/IOAPIC initialized, PerCpuData implemented, GS-relative syscall per-CPU, **ALL R67 SMP BLOCKERS FIXED**
+- **SMP Ready**: All critical SMP security issues resolved, multi-core testing can proceed
 
-See [qa-2026-01-17.md](review/qa-2026-01-17.md) for latest audit report.
+See [qa-2026-01-18.md](review/qa-2026-01-18.md) for latest audit report.
 
 ---
 

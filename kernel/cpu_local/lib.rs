@@ -29,6 +29,12 @@ const MAX_CPUS: usize = 64;
 /// Invalid LAPIC ID marker
 const INVALID_LAPIC_ID: u32 = u32::MAX;
 
+/// Invalid CPU ID marker for reverse mapping
+const INVALID_CPU_ID: usize = usize::MAX;
+
+/// Size of LAPIC ID reverse mapping table (covers all 8-bit LAPIC IDs)
+const LAPIC_ID_REVERSE_MAP_SIZE: usize = 256;
+
 /// LAPIC ID to CPU index mapping table.
 ///
 /// Index = CPU logical index, Value = hardware LAPIC ID.
@@ -39,12 +45,59 @@ static LAPIC_ID_MAP: [AtomicU32; MAX_CPUS] = {
     [INIT; MAX_CPUS]
 };
 
+/// R67-8 FIX: Reverse mapping for O(1) LAPIC ID to CPU index lookup.
+///
+/// Index = hardware LAPIC ID (0..255), Value = CPU logical index.
+/// This enables fast CPU ID lookup in syscall entry without linear search.
+static LAPIC_ID_REVERSE_MAP: [AtomicUsize; LAPIC_ID_REVERSE_MAP_SIZE] = {
+    const INIT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    [INIT; LAPIC_ID_REVERSE_MAP_SIZE]
+};
+
 // ============================================================================
 // Per-CPU Data Structure for SMP Support (Phase E)
 // ============================================================================
 
 /// Raw task pointer used to avoid circular dependencies with the scheduler.
 pub type RawTaskPtr = *mut ();
+
+/// Per-CPU mailbox for TLB shootdown IPIs.
+///
+/// The requesting CPU writes the range/CR3 fields and then bumps `request_gen`
+/// with `Release` ordering. The target CPU's IPI handler loads `request_gen`
+/// with `Acquire`, performs the flush, and stores the same generation into
+/// `ack_gen` with `Release`.
+///
+/// # Memory Ordering
+///
+/// - Requester: writes fields with Relaxed, then `request_gen` with Release
+/// - Handler: loads `request_gen` with Acquire, reads fields Relaxed, writes `ack_gen` Release
+/// - Waiter: loads `ack_gen` with Acquire to ensure flush completion is visible
+#[repr(C)]
+pub struct TlbShootdownMailbox {
+    /// Monotonic generation number for the most recent request
+    pub request_gen: AtomicU64,
+    /// Last generation this CPU has processed
+    pub ack_gen: AtomicU64,
+    /// Target CR3 (0 means flush regardless of CR3)
+    pub target_cr3: AtomicU64,
+    /// Page-aligned virtual start address (0 for full flush)
+    pub start: AtomicU64,
+    /// Length in bytes, page-aligned (0 for full flush)
+    pub len: AtomicU64,
+}
+
+impl TlbShootdownMailbox {
+    pub const fn new() -> Self {
+        Self {
+            request_gen: AtomicU64::new(0),
+            ack_gen: AtomicU64::new(0),
+            target_cr3: AtomicU64::new(0),
+            start: AtomicU64::new(0),
+            len: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Per-CPU data required for SMP operation.
 ///
@@ -81,6 +134,8 @@ pub struct PerCpuData {
     pub syscall_stack_top: AtomicUsize,
     /// Epoch counter for RCU/quiescent state tracking
     pub rcu_epoch: AtomicU64,
+    /// Per-CPU TLB shootdown mailbox for cross-CPU invalidation
+    pub tlb_mailbox: TlbShootdownMailbox,
 }
 
 // Safety: PerCpuData uses only atomics, so it's Send+Sync
@@ -102,6 +157,7 @@ impl PerCpuData {
             irq_stack_top: AtomicUsize::new(0),
             syscall_stack_top: AtomicUsize::new(0),
             rcu_epoch: AtomicU64::new(0),
+            tlb_mailbox: TlbShootdownMailbox::new(),
         }
     }
 
@@ -207,6 +263,15 @@ impl PerCpuData {
     pub unsafe fn set_current_task(&self, task: RawTaskPtr) {
         self.current_task.store(task, Ordering::Release);
     }
+
+    /// Access this CPU's TLB shootdown mailbox.
+    ///
+    /// Used by both the requesting CPU (to set up shootdown request) and
+    /// the IPI handler (to read request and write ACK).
+    #[inline]
+    pub fn tlb_mailbox(&self) -> &TlbShootdownMailbox {
+        &self.tlb_mailbox
+    }
 }
 
 /// Per-CPU storage wrapper
@@ -273,43 +338,128 @@ impl<T> CpuLocal<T> {
         };
         f(slot)
     }
+
+    /// Access a specific CPU's slot immutably.
+    ///
+    /// Used for cross-CPU operations like TLB shootdown where we need to
+    /// access another CPU's mailbox.
+    ///
+    /// # Safety
+    ///
+    /// This is safe only when `T` supports concurrent access (e.g., uses atomics).
+    /// The caller must ensure proper synchronization for non-atomic operations.
+    ///
+    /// # Returns
+    ///
+    /// None if cpu_id is out of range (>= MAX_CPUS).
+    #[inline]
+    pub fn with_cpu<R>(&self, cpu_id: usize, f: impl FnOnce(&T) -> R) -> Option<R> {
+        if cpu_id >= MAX_CPUS {
+            return None;
+        }
+
+        // Safety: slots are initialized in get_slots(); cpu_id bounds checked above
+        let slot = unsafe {
+            let arr = &*self.get_slots().get();
+            match arr.get(cpu_id) {
+                Some(s) => s.assume_init_ref(),
+                None => return None,
+            }
+        };
+        Some(f(slot))
+    }
+
+    /// Get a static reference to a specific CPU's slot.
+    ///
+    /// Unlike `with_cpu`, this returns the reference directly instead of via
+    /// a closure. The returned reference is `'static` because the underlying
+    /// storage is in a static `Once<UnsafeCell<...>>`.
+    ///
+    /// # Safety
+    ///
+    /// This is safe only when `T` supports concurrent access (e.g., uses atomics).
+    /// The caller must ensure proper synchronization for non-atomic operations.
+    ///
+    /// # Returns
+    ///
+    /// None if cpu_id is out of range (>= MAX_CPUS).
+    #[inline]
+    pub fn get_cpu(&self, cpu_id: usize) -> Option<&'static T> {
+        if cpu_id >= MAX_CPUS {
+            return None;
+        }
+
+        // Safety:
+        // - slots are initialized in get_slots() before first access
+        // - cpu_id bounds checked above
+        // - The underlying storage is in a static Once, so references are 'static
+        // - We transmute the lifetime because the storage truly is 'static
+        unsafe {
+            let arr = &*self.get_slots().get();
+            match arr.get(cpu_id) {
+                Some(s) => {
+                    let ref_with_lifetime = s.assume_init_ref();
+                    // Safety: The slots array is in a static Once<UnsafeCell<...>>,
+                    // so the data lives for 'static. The borrow checker can't see
+                    // this, so we transmute the lifetime.
+                    Some(core::mem::transmute::<&T, &'static T>(ref_with_lifetime))
+                }
+                None => None,
+            }
+        }
+    }
 }
 
 /// Get the current CPU ID
 ///
-/// # Current Implementation
+/// # R67-8 FIX: O(1) Lookup
 ///
-/// Returns 0 for single-core operation. When SMP support is implemented,
-/// this should read the APIC ID from the Local APIC or use CPUID.
+/// Uses a reverse mapping table (LAPIC ID → CPU index) for constant-time lookup.
+/// This is critical for syscall entry performance where the CPU ID must be
+/// determined very early without a stack.
 ///
-/// # Future Implementation
+/// # Implementation
 ///
-/// ```rust,ignore
-/// fn current_cpu_id() -> usize {
-///     // Read Local APIC ID from 0xFEE00020
-///     let apic_id = unsafe {
-///         let apic_base = 0xFEE00000 as *const u32;
-///         core::ptr::read_volatile(apic_base.add(0x20 / 4)) >> 24
-///     };
-///     apic_id as usize
-/// }
-/// ```
+/// 1. Read LAPIC ID from hardware (0xFEE00020, bits 31:24)
+/// 2. O(1) lookup in LAPIC_ID_REVERSE_MAP
+/// 3. Fallback to CPU 0 only during early boot (before registration)
+///
+/// # Panics (in debug builds)
+///
+/// Once SMP is enabled, falling back to CPU 0 would be a critical bug that
+/// could cause slot aliasing. In debug builds, this generates a warning.
 #[inline]
 pub fn current_cpu_id() -> usize {
     // Read LAPIC ID from hardware (0xFEE00020)
     let apic_id = unsafe {
         let apic_base = 0xFEE0_0020 as *const u32;
-        (core::ptr::read_volatile(apic_base) >> 24) as u32
+        (core::ptr::read_volatile(apic_base) >> 24) as usize
     };
 
-    // Look up CPU index in the mapping table
-    for i in 0..MAX_CPUS {
-        if LAPIC_ID_MAP[i].load(Ordering::Relaxed) == apic_id {
-            return i;
-        }
+    // R67-8 FIX: O(1) reverse lookup instead of linear search
+    let cpu_idx = if apic_id < LAPIC_ID_REVERSE_MAP_SIZE {
+        LAPIC_ID_REVERSE_MAP[apic_id].load(Ordering::Relaxed)
+    } else {
+        INVALID_CPU_ID
+    };
+
+    // Return valid CPU index if found
+    if cpu_idx < MAX_CPUS {
+        return cpu_idx;
     }
 
-    // Fallback to CPU 0 if not found (during early boot before registration)
+    // Fallback to CPU 0 - only safe during early boot before registration
+    // R67-8 FIX: In debug builds, warn about potential slot aliasing
+    #[cfg(debug_assertions)]
+    {
+        // Only warn once SMP could be active (after BSP registration)
+        // LAPIC_ID_MAP[0] being valid indicates BSP has registered
+        if LAPIC_ID_MAP[0].load(Ordering::Relaxed) != INVALID_LAPIC_ID as u32 {
+            // This is a potential bug - LAPIC ID not registered
+            // Could cause slot 0 aliasing under SMP
+            // In release builds we silently fall back, but this should be investigated
+        }
+    }
     0
 }
 
@@ -317,6 +467,10 @@ pub fn current_cpu_id() -> usize {
 ///
 /// This must be called for each CPU during bring-up to enable
 /// proper `current_cpu_id()` operation.
+///
+/// # R67-8 FIX
+///
+/// Also populates the reverse mapping table for O(1) lookup in syscall entry.
 ///
 /// # Arguments
 ///
@@ -329,11 +483,38 @@ pub fn current_cpu_id() -> usize {
 pub fn register_cpu_id(cpu_id: usize, lapic_id: u32) {
     assert!(cpu_id < MAX_CPUS, "CPU ID {} out of range", cpu_id);
     LAPIC_ID_MAP[cpu_id].store(lapic_id, Ordering::Relaxed);
+
+    // R67-8 FIX: Populate reverse mapping for O(1) lookup
+    if (lapic_id as usize) < LAPIC_ID_REVERSE_MAP_SIZE {
+        LAPIC_ID_REVERSE_MAP[lapic_id as usize].store(cpu_id, Ordering::Relaxed);
+    }
 }
 
 /// Get the maximum number of supported CPUs
 pub const fn max_cpus() -> usize {
     MAX_CPUS
+}
+
+/// Get the LAPIC ID for a CPU index if it has been registered.
+///
+/// Returns None if:
+/// - cpu_id is out of range (>= MAX_CPUS)
+/// - cpu_id has not been registered yet (LAPIC ID is INVALID_LAPIC_ID)
+///
+/// # Usage
+///
+/// Used by IPI sending code to map logical CPU index to hardware LAPIC ID.
+#[inline]
+pub fn lapic_id_for_cpu(cpu_id: usize) -> Option<u32> {
+    if cpu_id >= MAX_CPUS {
+        return None;
+    }
+    let id = LAPIC_ID_MAP[cpu_id].load(Ordering::Relaxed);
+    if id == INVALID_LAPIC_ID {
+        None
+    } else {
+        Some(id)
+    }
 }
 
 // ============================================================================

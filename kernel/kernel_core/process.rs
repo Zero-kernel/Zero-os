@@ -732,8 +732,13 @@ lazy_static::lazy_static! {
     static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
 }
 
-/// 当前运行的进程ID
-static CURRENT_PID: Mutex<Option<ProcessId>> = Mutex::new(None);
+/// R67-4 FIX: Per-CPU storage for current process ID.
+///
+/// Each CPU tracks its own currently running process. This prevents race
+/// conditions where multiple CPUs could interfere with each other's
+/// current process state.
+static CURRENT_PID: cpu_local::CpuLocal<Mutex<Option<ProcessId>>> =
+    cpu_local::CpuLocal::new(|| Mutex::new(None));
 
 /// 下一个可用的PID
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
@@ -829,8 +834,10 @@ pub fn create_process(
 }
 
 /// 获取当前进程ID
+///
+/// R67-4 FIX: Reads from per-CPU storage to avoid cross-CPU races.
 pub fn current_pid() -> Option<ProcessId> {
-    *CURRENT_PID.lock()
+    CURRENT_PID.with(|pid| *pid.lock())
 }
 
 /// R25-6 FIX: Get the size of a thread group (number of tasks sharing the same tgid).
@@ -907,8 +914,12 @@ pub fn non_thread_group_vm_share_count(memory_space: usize, caller_tgid: Process
 }
 
 /// 设置当前进程ID
+///
+/// R67-4 FIX: Writes to per-CPU storage to avoid cross-CPU races.
 pub fn set_current_pid(pid: Option<ProcessId>) {
-    *CURRENT_PID.lock() = pid;
+    CURRENT_PID.with(|current| {
+        *current.lock() = pid;
+    });
 }
 
 // ========== 进程凭证访问 (DAC支持) ==========

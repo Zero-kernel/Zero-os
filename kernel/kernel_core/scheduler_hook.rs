@@ -6,6 +6,7 @@
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+use cpu_local::CpuLocal;
 use spin::Mutex;
 
 /// 定时器回调类型：在定时器中断时调用
@@ -24,7 +25,10 @@ static RESCHED_CB: Mutex<Option<ReschedCallback>> = Mutex::new(None);
 ///
 /// 在中断上下文中不能直接调用 switch_context（会导致栈和特权级问题），
 /// 只设置此标志，由安全路径（syscall 返回）消费
-static IRQ_RESCHED_PENDING: AtomicBool = AtomicBool::new(false);
+///
+/// R67-4 FIX: Now per-CPU to avoid cross-CPU races where one CPU
+/// sets the flag and another clears it.
+static IRQ_RESCHED_PENDING: CpuLocal<AtomicBool> = CpuLocal::new(|| AtomicBool::new(false));
 
 /// 注册定时器回调
 ///
@@ -81,6 +85,8 @@ pub fn on_scheduler_tick() {
 ///
 /// R65-6 FIX: Also drains any deferred TCP timer work that couldn't complete
 /// in IRQ context due to lock contention.
+///
+/// R67-4 FIX: Uses per-CPU IRQ_RESCHED_PENDING flag.
 #[inline]
 pub fn reschedule_if_needed() {
     // R65-6 FIX: Drain deferred TCP timer work before scheduling check
@@ -88,8 +94,8 @@ pub fn reschedule_if_needed() {
     // IRQ-time processing was blocked by lock contention.
     crate::time::drain_deferred_tcp_timers();
 
-    // 消费中断触发的抢占请求
-    let irq_pending = IRQ_RESCHED_PENDING.swap(false, Ordering::SeqCst);
+    // R67-4 FIX: Consume this CPU's IRQ-triggered reschedule request
+    let irq_pending = IRQ_RESCHED_PENDING.with(|flag| flag.swap(false, Ordering::SeqCst));
 
     if let Some(cb) = *RESCHED_CB.lock() {
         // 如果有中断请求，强制调度；否则由调度器检查 NEED_RESCHED
@@ -112,10 +118,12 @@ pub fn force_reschedule() {
 /// 仅设置标志，不执行实际的上下文切换。
 /// 实际切换在安全路径（syscall 返回或下一个调度点）执行。
 ///
+/// R67-4 FIX: Sets this CPU's IRQ_RESCHED_PENDING flag.
+///
 /// # Safety
 ///
 /// 此函数可从中断上下文安全调用
 #[inline]
 pub fn request_resched_from_irq() {
-    IRQ_RESCHED_PENDING.store(true, Ordering::SeqCst);
+    IRQ_RESCHED_PENDING.with(|flag| flag.store(true, Ordering::SeqCst));
 }

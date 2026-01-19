@@ -10,6 +10,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use mm::memory::FrameAllocator;
+use mm::page_table::with_pt_lock;
 use spin::RwLock;
 use x86_64::{
     instructions::interrupts,
@@ -299,6 +300,12 @@ fn cleanup_partial_child(child_pid: ProcessId) {
 /// 2. **预分配阶段**：预分配所有中间页表帧（若失败，父进程未被修改）
 /// 3. **应用阶段**：使用预分配帧应用所有 COW 修改（保证不会失败）
 ///
+/// # R67-6 FIX: Cross-CPU Serialization
+///
+/// Acquires the global page table lock (PT_LOCK) to prevent concurrent
+/// mmap/munmap/pagefault operations from racing with COW setup. This ensures
+/// no parent thread can modify the address space while fork is flipping flags.
+///
 /// # Safety
 ///
 /// 此函数直接操作页表，必须确保：
@@ -308,56 +315,60 @@ pub unsafe fn copy_page_table_cow(
     parent_page_table: usize,
     child_page_table: usize,
 ) -> Result<(), ForkError> {
-    let mut frame_alloc = FrameAllocator::new();
-    let parent_root: PhysFrame<Size4KiB> =
-        PhysFrame::containing_address(PhysAddr::new(parent_page_table as u64));
-    let child_root: PhysFrame<Size4KiB> =
-        PhysFrame::containing_address(PhysAddr::new(child_page_table as u64));
+    // R67-6 FIX: Hold PT_LOCK during entire COW setup to prevent concurrent
+    // mmap/munmap/pagefault from racing with parent PTE modifications.
+    with_pt_lock(|| {
+        let mut frame_alloc = FrameAllocator::new();
+        let parent_root: PhysFrame<Size4KiB> =
+            PhysFrame::containing_address(PhysAddr::new(parent_page_table as u64));
+        let child_root: PhysFrame<Size4KiB> =
+            PhysFrame::containing_address(PhysAddr::new(child_page_table as u64));
 
-    let parent_pml4 = phys_to_virt_table(parent_root.start_address());
-    let child_pml4 = phys_to_virt_table(child_root.start_address());
+        let parent_pml4 = phys_to_virt_table(parent_root.start_address());
+        let child_pml4 = phys_to_virt_table(child_root.start_address());
 
-    // 复制内核高半区映射（索引 256-511）
-    for i in 256..512 {
-        child_pml4[i] = parent_pml4[i].clone();
-    }
+        // 复制内核高半区映射（索引 256-511）
+        for i in 256..512 {
+            child_pml4[i] = parent_pml4[i].clone();
+        }
 
-    // Z-8 fix: 两阶段 COW
-    // 阶段 1: 规划 - 收集叶子修改计划和所需中间页表帧数量
-    let mut plan = CowClonePlan::new();
-    plan_clone_level(parent_pml4, 4, &mut plan)?;
+        // Z-8 fix: 两阶段 COW
+        // 阶段 1: 规划 - 收集叶子修改计划和所需中间页表帧数量
+        let mut plan = CowClonePlan::new();
+        plan_clone_level(parent_pml4, 4, &mut plan)?;
 
-    // 阶段 2: 预分配所有中间页表帧
-    // 若分配失败，此时父进程未被修改，直接返回错误即可
-    let table_frames = preallocate_table_frames(plan.tables_needed, &mut frame_alloc)?;
+        // 阶段 2: 预分配所有中间页表帧
+        // 若分配失败，此时父进程未被修改，直接返回错误即可
+        let table_frames = preallocate_table_frames(plan.tables_needed, &mut frame_alloc)?;
 
-    // 阶段 3: 应用所有 COW 修改（使用预分配帧，保证不会失败）
-    let mut leaf_cursor = 0usize;
-    let mut frame_iter = table_frames.into_iter();
-    apply_clone_level(
-        parent_pml4,
-        child_pml4,
-        &mut frame_iter,
-        &plan,
-        &mut leaf_cursor,
-        4,
-    )?;
-    debug_assert_eq!(leaf_cursor, plan.leaf_updates.len());
+        // 阶段 3: 应用所有 COW 修改（使用预分配帧，保证不会失败）
+        let mut leaf_cursor = 0usize;
+        let mut frame_iter = table_frames.into_iter();
+        apply_clone_level(
+            parent_pml4,
+            child_pml4,
+            &mut frame_iter,
+            &plan,
+            &mut leaf_cursor,
+            4,
+        )?;
+        debug_assert_eq!(leaf_cursor, plan.leaf_updates.len());
 
-    // R23-1 fix: 父进程页表被改成只读+BIT_9，需要刷新 TLB 才能生效
-    // 使用 TLB shootdown 机制，为 SMP 支持做准备
-    // 当前单核模式下，只做本地 flush
-    mm::flush_current_as_all();
+        // R23-1 fix: 父进程页表被改成只读+BIT_9，需要刷新 TLB 才能生效
+        // 使用 TLB shootdown 机制，为 SMP 支持做准备
+        // 当前单核模式下，只做本地 flush
+        mm::flush_current_as_all();
 
-    println!(
-        "COW page table copy: parent=0x{:x}, child=0x{:x}, leaves={}, tables={}",
-        parent_page_table,
-        child_page_table,
-        plan.leaf_updates.len(),
-        plan.tables_needed
-    );
+        println!(
+            "COW page table copy: parent=0x{:x}, child=0x{:x}, leaves={}, tables={}",
+            parent_page_table,
+            child_page_table,
+            plan.leaf_updates.len(),
+            plan.tables_needed
+        );
 
-    Ok(())
+        Ok(())
+    })
 }
 
 /// 处理写时复制的页错误

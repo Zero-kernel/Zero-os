@@ -12,4 +12,5 @@ lazy_static = { version = "1.4", features = ["spin_no_std"] }
 kernel_core = { path = "../kernel_core" }
 drivers = { path = "../drivers" }
 arch = { path = "../arch" }
+cpu_local = { path = "../cpu_local" }
 x86_64 = "0.15"

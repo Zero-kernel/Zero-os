@@ -412,6 +412,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         );
         println!("      ✓ BSP per-CPU data initialized");
 
+        // R67-8 FIX: Initialize per-CPU syscall metadata and GS base for BSP
+        unsafe {
+            arch::syscall::init_syscall_percpu(0);
+        }
+        println!("      ✓ BSP syscall per-CPU state initialized");
+
         // Attempt to bring up Application Processors (APs)
         // This will enumerate CPUs via ACPI MADT and send INIT-SIPI-SIPI
         let num_cpus = arch::start_aps();

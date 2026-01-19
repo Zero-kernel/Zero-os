@@ -28,6 +28,40 @@ pub const APIC_PHYS_ADDR: u64 = 0xfee0_0000;
 pub const APIC_MMIO_SIZE: usize = 0x1000;
 pub const APIC_VIRT_ADDR: u64 = 0xffff_ffff_fee0_0000; // PML4[511] unused slot
 
+/// R67-5 FIX: Global page table lock for cross-CPU serialization.
+///
+/// This lock ensures that page table modifications from different CPUs are serialized.
+/// Without this, concurrent calls to map_page/unmap_page from multiple CPUs could
+/// cause torn PTE updates, partially written flags (W^X bypass), or frame reuse
+/// while another CPU still has a stale TLB entry.
+///
+/// Long-term solution: Per-address-space locks + TLB shootdown with ACK.
+static PT_LOCK: Mutex<()> = Mutex::new(());
+
+/// R67-5 FIX: Public helper to acquire the global page table lock.
+///
+/// Use this when touching page tables directly (not via `with_current_manager`)
+/// to ensure modifications remain serialized across CPUs.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use mm::page_table::with_pt_lock;
+///
+/// with_pt_lock(|| {
+///     // Safe to modify page tables here
+///     recursive_pd(0, 0)[0].set_flags(...);
+/// });
+/// ```
+#[inline]
+pub fn with_pt_lock<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    let _guard = PT_LOCK.lock();
+    f()
+}
+
 #[inline]
 fn get_phys_offset() -> VirtAddr {
     VirtAddr::new(PHYSICAL_MEMORY_OFFSET)
@@ -63,10 +97,17 @@ pub struct PageTableManager {
 ///
 /// 此函数在执行期间禁用中断，防止上下文切换导致操作错误的地址空间。
 /// 这可以避免跨进程内存破坏漏洞。
+///
+/// # Security (R67-5 fix)
+///
+/// 此函数获取全局页表锁，防止多 CPU 并发修改页表导致的数据竞争。
 pub unsafe fn with_current_manager<T, F>(physical_memory_offset: VirtAddr, f: F) -> T
 where
     F: FnOnce(&mut PageTableManager) -> T,
 {
+    // R67-5 FIX: Acquire global page table lock to serialize cross-CPU modifications
+    let _pt_guard = PT_LOCK.lock();
+
     // R32-MM-1 FIX: Disable interrupts to prevent CR3 switch during page table operations
     interrupts::without_interrupts(|| {
         let _ = physical_memory_offset; // 调用方参数保持兼容，实际使用固定偏移
@@ -518,6 +559,10 @@ pub unsafe fn split_2m_entry(
 /// # Safety
 ///
 /// Caller must ensure the virtual address is valid and CR3 won't change during operation.
+///
+/// # Note
+///
+/// This is an internal helper. Callers must hold PT_LOCK (see ensure_pte_range).
 pub unsafe fn ensure_pte_level(
     page: Page<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
@@ -587,14 +632,13 @@ pub unsafe fn ensure_pte_level(
     Ok(())
 }
 
-/// Ensure a range is mapped at PTE granularity (4KB pages).
+/// R67-5 FIX: Internal lock-free version of ensure_pte_range.
 ///
 /// # Safety
 ///
-/// Caller must ensure addresses are valid and CR3 won't change.
-///
-/// R32-MM-2 FIX: Uses checked arithmetic to prevent integer overflow
-pub unsafe fn ensure_pte_range(
+/// - Caller must hold PT_LOCK
+/// - Caller must ensure addresses are valid and CR3 won't change
+unsafe fn ensure_pte_range_unlocked(
     start: VirtAddr,
     size: usize,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
@@ -616,6 +660,27 @@ pub unsafe fn ensure_pte_range(
     Ok(())
 }
 
+/// Ensure a range is mapped at PTE granularity (4KB pages).
+///
+/// # Safety
+///
+/// Caller must ensure addresses are valid and CR3 won't change.
+///
+/// R32-MM-2 FIX: Uses checked arithmetic to prevent integer overflow
+///
+/// # Security (R67-5 fix)
+///
+/// Acquires global PT_LOCK to serialize cross-CPU page table modifications.
+pub unsafe fn ensure_pte_range(
+    start: VirtAddr,
+    size: usize,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<(), MapError> {
+    // R67-5 FIX: Acquire global page table lock
+    let _pt_guard = PT_LOCK.lock();
+    ensure_pte_range_unlocked(start, size, frame_allocator)
+}
+
 /// Map or tighten an MMIO region with RW+NX+uncached flags.
 ///
 /// This function ensures the target pages are at 4KB granularity and applies
@@ -627,22 +692,36 @@ pub unsafe fn ensure_pte_range(
 /// - TLB will be flushed automatically
 ///
 /// R32-MM-2 FIX: Uses checked arithmetic to prevent integer overflow
+///
+/// # Security (R67-5 fix)
+///
+/// Acquires global PT_LOCK once to serialize all page table modifications,
+/// avoiding deadlock by using unlocked internal helpers.
 pub unsafe fn map_mmio(
     virt: VirtAddr,
     phys: PhysAddr,
     size: usize,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<(), MapError> {
+    // R67-5 FIX: Acquire global page table lock ONCE at top level
+    let _pt_guard = PT_LOCK.lock();
+
     // R32-MM-2 FIX: Pre-calculate page count with overflow checking
     let pages = size.checked_add(0xfff).ok_or(MapError::InvalidRange)? / 0x1000;
 
-    // First ensure all pages are at 4KB granularity
-    ensure_pte_range(virt, size, frame_allocator)?;
+    // R67-5 FIX: Keep CR3 stable and avoid preemption while the global lock is held.
+    // Combine PTE splitting and mapping under a single interrupt-disabled section
+    // to prevent CR3 switches while modifying page tables.
+    let result = interrupts::without_interrupts(|| {
+        // First ensure all pages are at 4KB granularity (use unlocked version)
+        ensure_pte_range_unlocked(virt, size, frame_allocator)?;
 
-    let flags = mmio_flags();
+        let flags = mmio_flags();
+        let phys_offset = get_phys_offset();
+        let level_4_table = active_level_4_table(phys_offset);
+        let mapper = OffsetPageTable::new(level_4_table, phys_offset);
+        let mut mgr = PageTableManager { mapper };
 
-    // Now map or update each page
-    with_current_manager(get_phys_offset(), |mgr| {
         for i in 0..pages {
             // R32-MM-2 FIX: Use checked arithmetic for offset calculation
             let offset = (i as u64)
@@ -683,7 +762,9 @@ pub unsafe fn map_mmio(
             }
         }
         Ok(())
-    })?;
+    });
+
+    result?;
 
     // Flush TLB for the mapped range
     // R32-MM-2 FIX: Reuse pre-calculated pages count

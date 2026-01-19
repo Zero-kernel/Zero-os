@@ -152,25 +152,71 @@ const _: () = {
 ///
 /// - 在中断禁用状态下使用（SFMASK 清除 IF），不会重入
 /// - 每个 CPU 只访问自己的 slot，通过 CPU ID 索引
-/// - 当前实现中 CPU ID = 0，总是使用 slot 0
 /// - 数组元素继承 AlignedStack 的 16 字节对齐属性
 #[no_mangle]
 static mut SYSCALL_SCRATCH_STACKS: [AlignedStack<SYSCALL_SCRATCH_SIZE>; SYSCALL_MAX_CPUS] =
     [AlignedStack([0; SYSCALL_SCRATCH_SIZE]); SYSCALL_MAX_CPUS];
 
-/// Per-CPU 用户 RSP 暂存数组
-///
-/// 每个 CPU 有独立的 u64 槽位，用于暂存用户态 RSP。
-/// 避免泄露用户栈指针或覆盖其他 CPU 的数据。
-#[no_mangle]
-static mut SYSCALL_USER_RSP_SHADOWS: [u64; SYSCALL_MAX_CPUS] = [0; SYSCALL_MAX_CPUS];
+// ============================================================================
+// R67-8 FIX: GS-based per-CPU syscall metadata
+// ============================================================================
+// Instead of using slot 0 for all CPUs, we use GS-relative addressing.
+// After SWAPGS, GS points to this CPU's SyscallPerCpu structure.
+// This avoids the race condition where multiple CPUs clobber slot 0.
 
-/// Per-CPU syscall 帧指针数组
+/// R67-8 FIX: Per-CPU syscall metadata accessible via GS segment.
 ///
-/// 在调用 syscall_dispatcher 前设置，指向内核栈上的 syscall frame。
-/// 用于 clone/fork 等需要访问调用者寄存器状态的系统调用。
+/// After SWAPGS in syscall entry, GS base points to this structure.
+/// The assembly uses `gs:[offset]` to access per-CPU data without
+/// needing to compute CPU ID.
+///
+/// R67-11 FIX: Added `syscall_active` field to detect nested syscalls.
+/// This prevents stack corruption when an interrupt handler attempts
+/// to execute a syscall while one is already in progress.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+pub struct SyscallPerCpu {
+    /// Top of this CPU's scratch stack (pre-computed for fast access)
+    pub scratch_top: u64,
+    /// User RSP shadow - saved on syscall entry, restored on exit
+    pub user_rsp_shadow: u64,
+    /// Pointer to current syscall frame on kernel stack
+    pub frame_ptr: u64,
+    /// R67-11 FIX: Per-CPU syscall active flag (0 = idle, 1 = active).
+    /// Accessed atomically via `lock cmpxchg` in assembly. Plain u64
+    /// (not AtomicU64) to maintain Copy trait for array initialization.
+    pub syscall_active: u64,
+}
+
+impl SyscallPerCpu {
+    const fn new() -> Self {
+        Self {
+            scratch_top: 0,
+            user_rsp_shadow: 0,
+            frame_ptr: 0,
+            syscall_active: 0,
+        }
+    }
+}
+
+/// Per-CPU syscall metadata array, indexed by CPU ID.
+/// Each entry is 64-byte aligned for cache line isolation.
 #[no_mangle]
-static mut SYSCALL_FRAME_PTRS: [u64; SYSCALL_MAX_CPUS] = [0; SYSCALL_MAX_CPUS];
+static mut SYSCALL_PERCPU: [SyscallPerCpu; SYSCALL_MAX_CPUS] =
+    [SyscallPerCpu::new(); SYSCALL_MAX_CPUS];
+
+/// Offset of scratch_top in SyscallPerCpu (for GS-relative addressing)
+const PERCPU_SCRATCH_TOP_OFFSET: usize = 0;
+/// Offset of user_rsp_shadow in SyscallPerCpu
+const PERCPU_USER_RSP_OFFSET: usize = 8;
+/// Offset of frame_ptr in SyscallPerCpu
+const PERCPU_FRAME_PTR_OFFSET: usize = 16;
+/// R67-11 FIX: Offset of syscall_active flag in SyscallPerCpu
+const PERCPU_SYSCALL_ACTIVE_OFFSET: usize = 24;
+
+/// R67-11 FIX: Error code for nested syscall rejection.
+/// Using -EBUSY (16) to indicate the syscall layer is busy.
+const SYSCALL_NESTED_ERROR: i64 = -16;
 
 // ============================================================================
 // MSR 操作
@@ -261,16 +307,11 @@ pub unsafe fn init_syscall_msr(syscall_entry: u64) {
         RFLAGS_IF | RFLAGS_TF | RFLAGS_DF | RFLAGS_AC | RFLAGS_IOPL | RFLAGS_NT | RFLAGS_RF;
     wrmsr(IA32_SFMASK, sfmask);
 
-    // CVE-2019-1125 SWAPGS 防护：初始化 GS 基址 MSR
-    //
-    // - IA32_KERNEL_GS_BASE: 内核 GS 基址（用于 per-CPU 数据）
-    //   单核模式设置为 0；SMP 时将指向 per-CPU 数据结构
-    // - IA32_GS_BASE: 用户态 GS 基址（初始化为 0）
-    //   用户态程序可通过 arch_prctl(ARCH_SET_GS) 设置
-    //
-    // SWAPGS 指令在 syscall 入口/出口原子交换这两个值
-    wrmsr(IA32_KERNEL_GS_BASE, 0);
-    wrmsr(IA32_GS_BASE, 0);
+    // R67-8 FIX: GS base initialization moved to init_syscall_percpu()
+    // which is called per-CPU after stack allocation. The kernel GS base
+    // will point to each CPU's SyscallPerCpu structure for GS-relative
+    // addressing in syscall entry/exit.
+    // Note: For BSP, init_syscall_percpu(0) must be called after this function.
 
     // 启用 EFER.SCE (System Call Extensions)
     let efer = rdmsr(IA32_EFER);
@@ -346,8 +387,13 @@ pub struct SyscallFrame {
 ///
 /// 返回 Some(&SyscallFrame) 如果在 syscall 上下文中，否则返回 None
 pub fn get_current_syscall_frame() -> Option<&'static kernel_core::SyscallFrame> {
+    // R67-8 FIX: Use current_cpu_id() instead of hardcoded slot 0
+    let cpu_id = cpu_local::current_cpu_id();
+    if cpu_id >= SYSCALL_MAX_CPUS {
+        return None;
+    }
     unsafe {
-        let ptr = SYSCALL_FRAME_PTRS[0]; // 当前只支持单核，使用 CPU 0
+        let ptr = SYSCALL_PERCPU[cpu_id].frame_ptr;
         if ptr == 0 {
             None
         } else {
@@ -362,6 +408,44 @@ pub fn get_current_syscall_frame() -> Option<&'static kernel_core::SyscallFrame>
 /// 在 syscall 初始化时调用，让 kernel_core 能访问当前 syscall 帧
 pub fn register_frame_callback() {
     kernel_core::register_syscall_frame_callback(get_current_syscall_frame);
+}
+
+/// R67-8 FIX: Initialize per-CPU syscall metadata and kernel GS base.
+///
+/// Must be called once per CPU after its scratch stacks are allocated.
+/// This sets up the GS-based per-CPU addressing used in syscall entry.
+///
+/// # Arguments
+///
+/// * `cpu_id` - Logical CPU index (0 = BSP, 1+ = APs)
+///
+/// # Safety
+///
+/// - Must be called with interrupts disabled
+/// - Must be called only once per CPU
+/// - Must be called after SYSCALL_SCRATCH_STACKS is initialized
+pub unsafe fn init_syscall_percpu(cpu_id: usize) {
+    assert!(
+        cpu_id < SYSCALL_MAX_CPUS,
+        "CPU ID {} out of range for syscall per-CPU init",
+        cpu_id
+    );
+
+    // Pre-compute scratch stack top for this CPU
+    let scratch_base = SYSCALL_SCRATCH_STACKS[cpu_id].0.as_ptr() as usize;
+    SYSCALL_PERCPU[cpu_id].scratch_top = (scratch_base + SYSCALL_SCRATCH_SIZE) as u64;
+    SYSCALL_PERCPU[cpu_id].user_rsp_shadow = 0;
+    SYSCALL_PERCPU[cpu_id].frame_ptr = 0;
+    // R67-11 FIX: Initialize syscall active flag to 0 (idle)
+    SYSCALL_PERCPU[cpu_id].syscall_active = 0;
+
+    // Program kernel GS base to point to this CPU's SyscallPerCpu
+    // After SWAPGS, GS:0 will point to SYSCALL_PERCPU[cpu_id]
+    let percpu_addr = &SYSCALL_PERCPU[cpu_id] as *const SyscallPerCpu as u64;
+    wrmsr(IA32_KERNEL_GS_BASE, percpu_addr);
+
+    // User GS base starts at 0 (user can set it via arch_prctl)
+    wrmsr(IA32_GS_BASE, 0);
 }
 
 // ============================================================================
@@ -433,14 +517,13 @@ extern "C" fn syscall_dispatcher_bridge(
 ///
 /// ## 已知限制
 ///
-/// 1. **Per-CPU 数据**：SYSCALL_SCRATCH_STACKS 和 SYSCALL_USER_RSP_SHADOWS
-///    已改为 per-CPU 数组（R23-2 fix）。当前 current_cpu_id() 总是返回 0，
-///    所以实际使用 slot 0。未来启用 SMP 时需要实现真正的 CPU ID 获取，
-///    并在汇编中根据 APIC ID 计算偏移。
+/// 1. **R67-8 FIX: Per-CPU 数据**：使用 GS-relative 寻址访问 per-CPU 数据。
+///    SWAPGS 后 GS 指向当前 CPU 的 SyscallPerCpu 结构，包含 scratch_top、
+///    user_rsp_shadow 和 frame_ptr。每个 CPU 必须调用 init_syscall_percpu()
+///    初始化其 GS base。
 ///
 /// 2. **FPU/SIMD 状态**：在分发器调用前后使用 FXSAVE64/FXRSTOR64 保存并
-///    恢复用户态 FPU/SIMD 状态。当前仍为单核实现，SMP 场景需要改为 per-CPU
-///    保存区。（Z-1 fix）
+///    恢复用户态 FPU/SIMD 状态。当前在内核栈上分配保存区。（Z-1 fix）
 ///
 /// # Safety
 ///
@@ -459,17 +542,19 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // CVE-2019-1125 SWAPGS 防护：
         // 立即执行 SWAPGS 切换到内核 GS 基址，然后使用 LFENCE 序列化
         // 以关闭推测执行窗口，防止攻击者利用 SWAPGS 推测泄露内核数据
+        // R67-8 FIX: After SWAPGS, GS points to this CPU's SyscallPerCpu structure
         "swapgs",
         "lfence",
 
-        // R23-2 fix: 使用 per-CPU 数组 slot 0（当前 CPU ID = 0）
-        "mov [{user_rsp_arr}], rsp",                // 保存用户 RSP 到 per-CPU 暂存区
+        // R67-8 FIX: Use GS-relative addressing instead of hardcoded slot 0
+        // GS:PERCPU_USER_RSP_OFFSET points to this CPU's user_rsp_shadow field
+        "mov qword ptr gs:[{percpu_user_rsp}], rsp",   // 保存用户 RSP 到 per-CPU 暂存区
 
         // ========================================
         // 阶段 2: 切换到临时栈
         // ========================================
-        // R23-2 fix: 使用 per-CPU scratch 栈数组 slot 0
-        "lea rsp, [{scratch_stacks} + {scratch_size}]",  // 使用 per-CPU 临时栈
+        // R67-8 FIX: Load this CPU's pre-computed scratch stack top via GS
+        "mov rsp, qword ptr gs:[{percpu_scratch_top}]", // 使用 per-CPU 临时栈
         "cld",                                      // 清除方向标志
 
         // ========================================
@@ -482,8 +567,8 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "mov [rsp + {off_rdx}], rdx",               // arg2
         "mov [rsp + {off_rbx}], rbx",               // callee-saved
 
-        // R23-2 fix: 从 per-CPU 数组获取保存的用户 RSP
-        "mov rax, [{user_rsp_arr}]",
+        // R67-8 FIX: 从 per-CPU GS 区读取保存的用户 RSP
+        "mov rax, qword ptr gs:[{percpu_user_rsp}]",
         "mov [rsp + {off_rsp}], rax",               // 用户 RSP
 
         "mov [rsp + {off_rbp}], rbp",               // callee-saved
@@ -502,6 +587,18 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "xor rax, rax",
         "mov dr7, rax",
         "mov dr6, rax",
+
+        // ========================================
+        // R67-11 FIX: 嵌套 syscall 检测
+        // ========================================
+        // 使用 lock cmpxchg 原子地检测并设置 syscall_active 标志。
+        // 如果标志已经是 1（说明已有 syscall 正在处理），则设置 r15 = 1 标记为嵌套。
+        // 后续会根据 r15 决定是否跳过 dispatcher 并返回错误。
+        "xor r15d, r15d",                           // r15 = 0（假设是首次进入）
+        "xor eax, eax",                             // 期望值 = 0（空闲状态）
+        "mov edx, 1",                               // 新值 = 1（占用状态）
+        "lock cmpxchg qword ptr gs:[{percpu_syscall_active}], rdx",
+        "setnz r15b",                               // 如果 cmpxchg 失败（已被占用），r15 = 1
 
         // ========================================
         // 阶段 4: 切换到内核栈
@@ -530,8 +627,16 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // Z-1 fix: 保存用户 FPU/SIMD 状态
         "fxsave64 [r13]",
 
-        // 保存 syscall 帧指针供 clone/fork 使用
-        "mov [{frame_ptr_arr}], r12",
+        // ========================================
+        // R67-11 FIX: 嵌套 syscall 快速失败
+        // ========================================
+        // 如果 r15 != 0，说明这是嵌套 syscall（之前的 cmpxchg 失败）。
+        // 跳过 dispatcher，直接返回 -EBUSY 错误。
+        "test r15b, r15b",
+        "jnz 3f",                                   // 嵌套 syscall -> 跳转到错误返回
+
+        // R67-8 FIX: 保存 syscall 帧指针供 clone/fork 使用 (via GS)
+        "mov qword ptr gs:[{percpu_frame_ptr}], r12",
 
         // ========================================
         // 阶段 5: 调用系统调用分发器
@@ -559,8 +664,22 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
 
         "add rsp, 16",                              // 清理栈参数 + 对齐填充
 
-        // 清除 syscall 帧指针（syscall 处理完成）
-        "mov qword ptr [{frame_ptr_arr}], 0",
+        // R67-8 FIX: 清除 syscall 帧指针（syscall 处理完成）(via GS)
+        "mov qword ptr gs:[{percpu_frame_ptr}], 0",
+
+        // R67-11 FIX: 正常路径跳转到公共退出
+        "jmp 4f",
+
+        // ========================================
+        // R67-11 FIX: 嵌套 syscall 错误返回
+        // ========================================
+        "3:",
+        "mov rax, {nested_err}",                    // 返回 -EBUSY 表示嵌套 syscall
+
+        // ========================================
+        // R67-11 FIX: 公共退出路径
+        // ========================================
+        "4:",
 
         // ========================================
         // 阶段 6: 恢复寄存器
@@ -569,6 +688,16 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
 
         // Z-1 fix: 恢复用户 FPU/SIMD 状态
         "fxrstor64 [r13]",
+
+        // ========================================
+        // R67-11 FIX: 释放 syscall_active 标志
+        // ========================================
+        // 只有在这次进入成功获取标志（r15 == 0）时才释放。
+        // 如果是嵌套 syscall（r15 == 1），不需要释放。
+        "test r15b, r15b",
+        "jnz 5f",                                   // 嵌套 syscall，跳过释放
+        "mov qword ptr gs:[{percpu_syscall_active}], 0",  // 释放标志
+        "5:",
 
         // SYSRET 安全检查：用户 RIP/RSP 必须是规范地址且在低半区
         // 这是防御 CVE-2014-4699/CVE-2014-9322 类漏洞的关键
@@ -601,7 +730,17 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "mov r8,  [r12 + {off_r8}]",
         "mov r9,  [r12 + {off_r9}]",
         "mov r10, [r12 + {off_r10}]",
+
+        // R67-9 FIX: Mask RFLAGS to remove privileged bits before SYSRET
+        // Clear: IOPL(12-13), NT(14), RF(16), VM(17), VIF(19), VIP(20)
+        // Set: IF(9) to enable interrupts in user mode
+        // Mask value: ~0x1D3000 = 0xFFFFFFFFFFE2CFFF
+        // Note: x86-64 AND r64,imm only accepts 32-bit sign-extended immediates,
+        // so we must load the mask into a register first (use r13 as scratch)
         "mov r11, [r12 + {off_r11}]",               // 用户 RFLAGS
+        "movabs r13, {rflags_user_mask}",           // R67-9: Load mask into scratch
+        "and r11, r13",                             // R67-9: Clear privileged bits
+        "or  r11, {rflags_if}",                     // R67-9: Ensure IF is set
         "mov r13, [r12 + {off_r13}]",
         "mov r14, [r12 + {off_r14}]",
         "mov r15, [r12 + {off_r15}]",
@@ -638,15 +777,24 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         "call {bad_return}",                        // syscall_bad_return() 不返回
 
         // 符号绑定
-        // R23-2 fix: 符号绑定 - 使用 per-CPU 数组（当前 CPU ID = 0，使用 slot 0）
-        // 未来 SMP 支持时，需要在汇编中根据 APIC ID 计算偏移
-        user_rsp_arr = sym SYSCALL_USER_RSP_SHADOWS,
-        scratch_stacks = sym SYSCALL_SCRATCH_STACKS,
-        frame_ptr_arr = sym SYSCALL_FRAME_PTRS,
-        scratch_size = const SYSCALL_SCRATCH_SIZE,
+        // R67-8 FIX: Use GS-relative offsets instead of hardcoded slot 0
+        percpu_user_rsp = const PERCPU_USER_RSP_OFFSET,
+        percpu_scratch_top = const PERCPU_SCRATCH_TOP_OFFSET,
+        percpu_frame_ptr = const PERCPU_FRAME_PTR_OFFSET,
+        // R67-11 FIX: Offset for nested syscall detection flag
+        percpu_syscall_active = const PERCPU_SYSCALL_ACTIVE_OFFSET,
+        // R67-11 FIX: Error code for nested syscall rejection (-EBUSY = -16)
+        nested_err = const SYSCALL_NESTED_ERROR,
         frame_size = const SYSCALL_FRAME_SIZE,
         frame_qwords = const SYSCALL_FRAME_QWORDS,
         fpu_save_size = const FPU_SAVE_AREA_SIZE,
+        // R67-9 FIX: RFLAGS mask to clear privileged bits
+        // Clear: IOPL(12-13), NT(14), RF(16), VM(17), VIF(19), VIP(20)
+        // Bit positions: 12,13,14,16,17,19,20 = 0x1D3000
+        // Full 64-bit mask: ~0x1D3000 = 0xFFFFFFFFFFE2CFFF
+        rflags_user_mask = const 0xFFFF_FFFF_FFE2_CFFFu64,
+        // Ensure IF is set for user mode
+        rflags_if = const 0x200u64,
         off_rax = const OFF_RAX,
         off_rcx = const OFF_RCX,
         off_rdx = const OFF_RDX,

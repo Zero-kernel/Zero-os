@@ -23,10 +23,12 @@
 use crate::apic;
 use crate::context_switch;
 use crate::gdt;
+use crate::ipi;
 use core::sync::atomic::{AtomicU64, Ordering};
 use cpu_local::CpuLocal;
 use kernel_core::on_scheduler_tick;
 use lazy_static::lazy_static;
+use mm::tlb_shootdown;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 // Serial port for debug output (0x3F8)
@@ -59,10 +61,21 @@ static IRQ_FPU_AREAS: CpuLocal<IrqFpuSaveArea> = CpuLocal::new(|| IrqFpuSaveArea
     data: [0; FXSAVE_SIZE],
 });
 
-/// R65-18 FIX + R66-7 FIX: Save FPU/SSE state before IRQ handler work.
+/// R67-7 FIX: Per-CPU nesting depth for IRQ FPU saves.
+///
+/// Tracks nesting to handle nested NMIs/double-faults correctly.
+/// Only the outermost save/restore pair actually performs FXSAVE/FXRSTOR.
+/// Uses AtomicU32 for thread-safety (required by CpuLocal).
+static IRQ_FPU_DEPTH: CpuLocal<core::sync::atomic::AtomicU32> =
+    CpuLocal::new(|| core::sync::atomic::AtomicU32::new(0));
+
+/// R65-18 FIX + R66-7 FIX + R67-7 FIX: Save FPU/SSE state before IRQ handler work.
 ///
 /// Uses per-CPU storage to support SMP. Must be called at the beginning
 /// of IRQ handlers that may use FPU/SSE. Pairs with `irq_restore_fpu()`.
+///
+/// R67-7: Now handles nested interrupts (NMI/double-fault during IRQ).
+/// Only the first (outermost) save actually performs FXSAVE64.
 ///
 /// # Safety
 ///
@@ -70,6 +83,13 @@ static IRQ_FPU_AREAS: CpuLocal<IrqFpuSaveArea> = CpuLocal::new(|| IrqFpuSaveArea
 /// - Each CPU uses its own save area, so no cross-CPU corruption
 #[inline]
 unsafe fn irq_save_fpu() {
+    use core::sync::atomic::Ordering;
+    let depth = IRQ_FPU_DEPTH.with(|d| d.fetch_add(1, Ordering::Relaxed));
+    if depth > 0 {
+        // Already saved on this CPU - nested interrupt
+        return;
+    }
+    // Outermost save - actually perform FXSAVE
     IRQ_FPU_AREAS.with(|area| {
         let ptr = area.data.as_ptr() as *mut u8;
         core::arch::asm!(
@@ -80,12 +100,30 @@ unsafe fn irq_save_fpu() {
     });
 }
 
-/// R65-18 FIX + R66-7 FIX: Restore FPU/SSE state after IRQ handler work.
+/// R65-18 FIX + R66-7 FIX + R67-7 FIX: Restore FPU/SSE state after IRQ handler work.
 ///
 /// Uses per-CPU storage to support SMP. Must be called before returning
 /// from IRQ handlers that called `irq_save_fpu()`.
+///
+/// R67-7: Only the last (outermost) restore actually performs FXRSTOR64.
 #[inline]
 unsafe fn irq_restore_fpu() {
+    use core::sync::atomic::Ordering;
+    let prev_depth = IRQ_FPU_DEPTH.with(|d| d.fetch_sub(1, Ordering::Relaxed));
+
+    // R67-7 FIX: Debug assertion to catch mismatched save/restore pairs.
+    // If prev_depth is 0, we have an underflow (restore without matching save).
+    // This would wrap to u32::MAX, permanently breaking FPU handling on this CPU.
+    debug_assert!(
+        prev_depth > 0,
+        "irq_restore_fpu called without matching irq_save_fpu (depth underflow)"
+    );
+
+    if prev_depth != 1 {
+        // Not the outermost - don't restore yet (or mismatched if 0)
+        return;
+    }
+    // Outermost restore - actually perform FXRSTOR
     IRQ_FPU_AREAS.with(|area| {
         let ptr = area.data.as_ptr();
         core::arch::asm!(
@@ -318,6 +356,9 @@ lazy_static! {
         idt[33].set_handler_fn(keyboard_interrupt_handler);   // IRQ 1: Keyboard
         idt[36].set_handler_fn(serial_interrupt_handler);     // IRQ 4: Serial COM1
 
+        // IPI handlers (high vectors)
+        idt[ipi::IPI_VECTOR_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_ipi_handler);
+
         idt
     };
 }
@@ -329,6 +370,10 @@ pub fn init() {
 
     // 初始化 FPU/SIMD 支持（必须在使用 FXSAVE/FXRSTOR 前）
     context_switch::init_fpu();
+
+    // 初始化 IPI 子系统（注册 TLB shootdown IPI 发送器）
+    // 必须在 SMP 启动前调用，以便 TLB shootdown 可以正常工作
+    ipi::init();
 
     // 初始化 8259 PIC，重映射 IRQ 向量避免与 CPU 异常冲突
     unsafe {
@@ -1027,4 +1072,33 @@ pub unsafe fn pic_send_eoi(irq: u8) {
         core::arch::asm!("out dx, al", in("dx") PIC2_CMD, in("al") 0x20u8, options(nostack, nomem));
     }
     core::arch::asm!("out dx, al", in("dx") PIC1_CMD, in("al") 0x20u8, options(nostack, nomem));
+}
+
+// ============================================================================
+// IPI Handlers (Inter-Processor Interrupts for SMP)
+// ============================================================================
+
+/// TLB Shootdown IPI Handler (vector 0xFE)
+///
+/// Called when this CPU receives a TLB shootdown request from another CPU.
+/// This handler:
+/// 1. Clears SMAP if active (CLAC)
+/// 2. Delegates to mm::tlb_shootdown::handle_shootdown_ipi()
+/// 3. Sends LAPIC EOI to acknowledge the interrupt
+///
+/// # Safety
+///
+/// - Must be called with interrupts disabled (x86-interrupt calling convention)
+/// - Uses LAPIC EOI (not PIC) since this is an IPI
+extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStackFrame) {
+    // S-6 fix: Clear SMAP to prevent user-page access during handler
+    clac_if_smap();
+
+    // Delegate to the TLB shootdown module
+    tlb_shootdown::handle_shootdown_ipi();
+
+    // Send LAPIC EOI (not PIC - this is an IPI)
+    unsafe {
+        apic::lapic_eoi();
+    }
 }

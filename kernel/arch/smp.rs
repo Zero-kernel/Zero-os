@@ -37,6 +37,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::apic;
 use crate::interrupts;
+use crate::syscall;
 use mm::page_table::recursive_pd;
 use x86_64::instructions::tlb;
 use x86_64::structures::paging::PageTableFlags;
@@ -83,6 +84,11 @@ const AP_READY_TIMEOUT: usize = 1_000_000;
 ///
 /// This is written by BSP and read by AP trampoline code.
 /// Located at a fixed offset within the trampoline.
+///
+/// # R67-2 FIX
+///
+/// Added `data_claimed` field - the AP sets this to 1 after reading all data,
+/// allowing BSP to safely move to the next AP without risking data corruption.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ApTrampolineData {
@@ -100,6 +106,8 @@ pub struct ApTrampolineData {
     pub efer: u64,
     /// CR4 value (for PAE, SMEP, SMAP, etc.)
     pub cr4: u64,
+    /// R67-2 FIX: Address of claim flag - AP writes 1 here after reading data
+    pub claim_flag_addr: u64,
 }
 
 // ============================================================================
@@ -120,6 +128,9 @@ const TRAMPOLINE_DATA_OFFSET: usize = 0x100;
 /// Size of the complete trampoline including data
 const TRAMPOLINE_SIZE: usize = 0x200;
 
+/// R67-2 FIX: Offset of claim_flag_addr within ApTrampolineData (byte 48)
+const CLAIM_FLAG_ADDR_OFFSET: u8 = 48;
+
 /// Generate the AP trampoline binary.
 /// Returns a fixed-size array that can be copied to low memory.
 ///
@@ -131,7 +142,7 @@ const TRAMPOLINE_SIZE: usize = 0x200;
 /// - 0x70-0x8F: GDT (4 entries * 8 bytes = 32 bytes)
 /// - 0x90-0xBF: 32-bit continuation code (CR4, CR3, EFER, enable paging)
 /// - 0xC0-0xFF: 64-bit long mode entry
-/// - 0x100-0x12F: ApTrampolineData structure
+/// - 0x100-0x137: ApTrampolineData structure (56 bytes, includes R67-2 claim_flag_addr)
 fn generate_trampoline() -> [u8; TRAMPOLINE_SIZE] {
     let mut code = [0u8; TRAMPOLINE_SIZE];
     let mut i = 0;
@@ -493,6 +504,17 @@ fn generate_trampoline() -> [u8; TRAMPOLINE_SIZE] {
     code[i + 3] = 16;
     i += 4;
 
+    // R67-2 FIX: Pass claim_flag_addr as fourth argument (rcx) so Rust can
+    // perform an atomic release store. This ensures proper memory ordering
+    // with BSP's acquire load and avoids mixing atomic/non-atomic accesses.
+    //
+    // mov rcx, [rbx+48] (claim_flag_addr - fourth arg in System V AMD64 ABI)
+    code[i] = 0x48;
+    code[i + 1] = 0x8B;
+    code[i + 2] = 0x4B;
+    code[i + 3] = CLAIM_FLAG_ADDR_OFFSET;
+    i += 4;
+
     // call rax
     code[i] = 0xFF;
     code[i + 1] = 0xD0;
@@ -515,6 +537,12 @@ fn generate_trampoline() -> [u8; TRAMPOLINE_SIZE] {
 
 /// Number of APs that have signaled ready
 static AP_ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// R67-2 FIX: Flag set by AP trampoline after it has read bootstrap data.
+///
+/// BSP must wait for this flag before overwriting trampoline data for the next AP.
+/// Without this, a slow AP could read the wrong data if BSP times out and moves on.
+static AP_DATA_CLAIMED: AtomicU64 = AtomicU64::new(0);
 
 /// Flag set when SMP bring-up is complete
 static SMP_INIT_DONE: AtomicBool = AtomicBool::new(false);
@@ -677,6 +705,10 @@ pub fn start_aps() -> usize {
     for (i, lapic_id) in ap_lapic_ids.iter().enumerate() {
         let cpu_index = i + 1; // BSP is CPU 0
 
+        // R67-2 FIX: Reset claim flag before setting up this AP's data.
+        // The AP will set this to 1 after reading all trampoline data.
+        AP_DATA_CLAIMED.store(0, Ordering::Release);
+
         // Allocate per-AP stack
         let stack_top = alloc_ap_stack();
 
@@ -691,6 +723,10 @@ pub fn start_aps() -> usize {
             (*data_ptr).lapic_id = *lapic_id;
             (*data_ptr).efer = efer;
             (*data_ptr).cr4 = cr4;
+            // R67-2 FIX: Provide address where AP signals it has read all data.
+            // We use the virtual address since the AP runs with paging enabled.
+            (*data_ptr).claim_flag_addr =
+                &AP_DATA_CLAIMED as *const AtomicU64 as u64;
         }
 
         // Send INIT-SIPI-SIPI sequence
@@ -709,13 +745,38 @@ pub fn start_aps() -> usize {
             apic::send_sipi(*lapic_id, TRAMPOLINE_VECTOR);
         }
 
-        // Wait for AP to signal ready
+        // R67-2 FIX: Wait for AP to claim (read) trampoline data before we can
+        // safely overwrite it for the next AP. This prevents data races where
+        // a slow AP reads the wrong cpu_index, stack, or lapic_id.
+        let mut claim_timeout = AP_READY_TIMEOUT;
+        while AP_DATA_CLAIMED.load(Ordering::Acquire) == 0 {
+            core::hint::spin_loop();
+            claim_timeout -= 1;
+            if claim_timeout == 0 {
+                // AP did not claim data - it may have failed during 16-bit/32-bit
+                // mode before reaching the claim code. We cannot safely continue
+                // to the next AP as this AP might still be running and could
+                // read corrupted data later.
+                drivers::println!(
+                    "[SMP] CRITICAL: CPU {} did not claim trampoline data - halting SMP init",
+                    cpu_index
+                );
+                // Return early with partial CPU count rather than risk data corruption
+                let partial_total = AP_ONLINE_COUNT.load(Ordering::Acquire) + 1;
+                TOTAL_CPUS.store(partial_total, Ordering::Release);
+                SMP_INIT_DONE.store(true, Ordering::Release);
+                make_trampoline_nonexecutable();
+                return partial_total;
+            }
+        }
+
+        // Wait for AP to signal ready (fully initialized)
         let mut timeout = AP_READY_TIMEOUT;
         while AP_ONLINE_COUNT.load(Ordering::Acquire) < cpu_index {
             core::hint::spin_loop();
             timeout -= 1;
             if timeout == 0 {
-                drivers::println!("[SMP] WARNING: CPU {} failed to respond!", cpu_index);
+                drivers::println!("[SMP] WARNING: CPU {} failed to complete init!", cpu_index);
                 break;
             }
         }
@@ -766,14 +827,49 @@ pub fn online_cpus() -> usize {
 /// * `cpu_index` - Logical CPU index (1, 2, 3, ...)
 /// * `lapic_id` - Hardware LAPIC ID
 /// * `stack_top` - Virtual address of stack top
+/// * `claim_flag_addr` - Kernel virtual address of AP_DATA_CLAIMED atomic
 ///
 /// # Safety
 ///
 /// This is called from assembly and must never return.
 #[no_mangle]
-pub extern "C" fn ap_rust_entry(cpu_index: u64, lapic_id: u64, stack_top: u64) -> ! {
+pub extern "C" fn ap_rust_entry(
+    cpu_index: u64,
+    lapic_id: u64,
+    stack_top: u64,
+    claim_flag_addr: u64,
+) -> ! {
+    // R67-2 FIX: Signal BSP that we have read all trampoline data BEFORE
+    // any other initialization. This allows BSP to safely reuse the
+    // trampoline buffer for the next AP. Use atomic Release store to
+    // ensure all our reads of trampoline data are visible.
+    //
+    // SAFETY: claim_flag_addr is a valid pointer to AP_DATA_CLAIMED static,
+    // passed from BSP via trampoline data. We're in long mode with the same
+    // page tables as BSP, so the kernel virtual address is valid.
+    unsafe {
+        let claim_flag = claim_flag_addr as *const AtomicU64;
+        (*claim_flag).store(1, Ordering::Release);
+    }
+
     let cpu_idx = cpu_index as usize;
-    let lapic = lapic_id as u32;
+
+    // R67-3 FIX: Verify hardware LAPIC ID matches trampoline data
+    // Prevents CPU spoofing via malformed MADT or misrouted SIPI
+    let lapic_expected = lapic_id as u32;
+    let lapic_actual = unsafe { apic::lapic_id() };
+    if lapic_actual != lapic_expected {
+        drivers::println!(
+            "[SMP] SECURITY: LAPIC ID mismatch (expected {}, found {}) - halting AP",
+            lapic_expected,
+            lapic_actual
+        );
+        // Critical security violation - halt this AP permanently
+        loop {
+            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); }
+        }
+    }
+    let lapic = lapic_actual;
 
     // CRITICAL: Load the kernel GDT first!
     // The AP is currently using the trampoline's minimal GDT which has:
@@ -805,6 +901,16 @@ pub extern "C" fn ap_rust_entry(cpu_index: u64, lapic_id: u64, stack_top: u64) -
         stack_top as usize, // IRQ stack (same for now)
         stack_top as usize, // Syscall stack (same for now)
     );
+
+    // R67-8 FIX: Initialize per-CPU syscall metadata and GS base for this AP
+    unsafe {
+        syscall::init_syscall_percpu(cpu_idx);
+    }
+
+    // R67-1 FIX: Register with TLB shootdown subsystem before signaling online
+    // This ensures the TLB shootdown guard (assert_single_core_mode) will correctly
+    // panic if SMP is enabled but IPI-based shootdown is not yet implemented.
+    mm::tlb_shootdown::register_cpu_online();
 
     // Signal that we're online
     AP_ONLINE_COUNT.fetch_add(1, Ordering::Release);
