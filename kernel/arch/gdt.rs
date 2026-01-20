@@ -6,8 +6,14 @@
 //! - GDT 包含内核/用户代码和数据段
 //! - TSS 提供特权级栈切换 (Ring 3 -> Ring 0)
 //! - IST (中断栈表) 为双重错误提供独立栈
+//!
+//! ## SMP Support (R70-3)
+//! - Each CPU has its own TSS (required because TSS is marked "busy" after LTR)
+//! - Each CPU has its own GDT (because TSS descriptor points to per-CPU TSS)
+//! - Segment selectors are identical across all CPUs
 
-use lazy_static::lazy_static;
+use core::sync::atomic::{AtomicBool, Ordering};
+use spin::Once;
 use x86_64::{
     instructions::tables::load_tss,
     registers::segmentation::{Segment, CS, DS, SS},
@@ -17,6 +23,9 @@ use x86_64::{
     },
     VirtAddr,
 };
+
+/// Maximum supported CPUs
+const MAX_CPUS: usize = 64;
 
 /// IST 索引：双重错误处理程序使用的栈
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
@@ -34,11 +43,11 @@ pub const DOUBLE_FAULT_STACK_SIZE: usize = 8 * 4096;
 #[repr(C, align(16))]
 struct AlignedStack<const SIZE: usize>([u8; SIZE]);
 
-/// 内核特权栈 (用于 syscall/中断时的栈切换)
-static mut KERNEL_STACK: AlignedStack<KERNEL_STACK_SIZE> = AlignedStack([0; KERNEL_STACK_SIZE]);
+/// BSP 内核特权栈 (用于 syscall/中断时的栈切换)
+static mut BSP_KERNEL_STACK: AlignedStack<KERNEL_STACK_SIZE> = AlignedStack([0; KERNEL_STACK_SIZE]);
 
-/// 双重错误独立栈 (防止栈溢出导致三重错误)
-static mut DOUBLE_FAULT_STACK: AlignedStack<DOUBLE_FAULT_STACK_SIZE> =
+/// BSP 双重错误独立栈 (防止栈溢出导致三重错误)
+static mut BSP_DOUBLE_FAULT_STACK: AlignedStack<DOUBLE_FAULT_STACK_SIZE> =
     AlignedStack([0; DOUBLE_FAULT_STACK_SIZE]);
 
 /// 段选择子集合
@@ -56,88 +65,151 @@ pub struct Selectors {
     pub tss: SegmentSelector,
 }
 
-lazy_static! {
-    /// 任务状态段
-    static ref TSS: TaskStateSegment = {
-        let mut tss = TaskStateSegment::new();
+// ============================================================================
+// Per-CPU TSS and GDT Storage (R70-3 FIX)
+// ============================================================================
 
-        // 设置特权级栈 0 (Ring 3 -> Ring 0 时使用)
-        tss.privilege_stack_table[KERNEL_PRIVILEGE_STACK_INDEX] = {
-            let stack_start = VirtAddr::from_ptr(unsafe { &raw const KERNEL_STACK.0 });
-            stack_start + KERNEL_STACK_SIZE as u64
-        };
+/// Per-CPU TSS storage.
+///
+/// Each CPU must have its own TSS because:
+/// 1. TSS is marked "busy" after LTR instruction
+/// 2. Each CPU needs its own RSP0 for privilege level transitions
+/// 3. Each CPU needs its own IST stacks for exception handling
+static mut PER_CPU_TSS: [TaskStateSegment; MAX_CPUS] = {
+    const INIT: TaskStateSegment = TaskStateSegment::new();
+    [INIT; MAX_CPUS]
+};
 
-        // 设置 IST 栈 0 (双重错误使用)
-        // 使用独立栈防止栈溢出导致的三重错误
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-            let stack_start = VirtAddr::from_ptr(unsafe { &raw const DOUBLE_FAULT_STACK.0 });
-            stack_start + DOUBLE_FAULT_STACK_SIZE as u64
-        };
+/// Per-CPU GDT storage.
+///
+/// Each CPU needs its own GDT because the TSS descriptor points to
+/// that CPU's specific TSS. All other segment descriptors are identical.
+static mut PER_CPU_GDT: [Option<(GlobalDescriptorTable, Selectors)>; MAX_CPUS] = {
+    const INIT: Option<(GlobalDescriptorTable, Selectors)> = None;
+    [INIT; MAX_CPUS]
+};
 
-        tss
+/// Initialization flags for per-CPU GDT
+static PER_CPU_INIT: [AtomicBool; MAX_CPUS] = {
+    const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; MAX_CPUS]
+};
+
+/// Global selectors cache (all CPUs use same selector values)
+static SELECTORS_CACHE: Once<Selectors> = Once::new();
+
+/// Initialize per-CPU TSS and GDT for a specific CPU.
+///
+/// # Safety
+///
+/// Must be called exactly once per CPU during initialization.
+/// The `kernel_stack_top` must be a valid stack address.
+unsafe fn init_per_cpu_gdt(cpu_id: usize, kernel_stack_top: u64, df_stack_top: u64) {
+    if cpu_id >= MAX_CPUS {
+        panic!("CPU ID {} exceeds MAX_CPUS {}", cpu_id, MAX_CPUS);
+    }
+
+    // Initialize this CPU's TSS
+    let tss = &mut PER_CPU_TSS[cpu_id];
+    tss.privilege_stack_table[KERNEL_PRIVILEGE_STACK_INDEX] = VirtAddr::new(kernel_stack_top);
+    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = VirtAddr::new(df_stack_top);
+
+    // Create this CPU's GDT with its TSS
+    let mut gdt = GlobalDescriptorTable::new();
+
+    // Add kernel segments (identical across all CPUs)
+    let kernel_code = gdt.append(Descriptor::kernel_code_segment());
+    let kernel_data = gdt.append(Descriptor::kernel_data_segment());
+
+    // Add user segments (identical across all CPUs)
+    let user_data = gdt.append(Descriptor::user_data_segment());
+    let user_code = gdt.append(Descriptor::user_code_segment());
+
+    // Add this CPU's TSS descriptor (points to per-CPU TSS)
+    let tss_selector = gdt.append(Descriptor::tss_segment(tss));
+
+    let selectors = Selectors {
+        kernel_code,
+        kernel_data,
+        user_code,
+        user_data,
+        tss: tss_selector,
     };
 
-    /// 全局描述符表和选择子
-    static ref GDT: (GlobalDescriptorTable, Selectors) = {
-        let mut gdt = GlobalDescriptorTable::new();
+    // Store in per-CPU array
+    PER_CPU_GDT[cpu_id] = Some((gdt, selectors));
 
-        // 添加内核段描述符
-        let kernel_code = gdt.append(Descriptor::kernel_code_segment());
-        let kernel_data = gdt.append(Descriptor::kernel_data_segment());
+    // Cache selectors on first init (all CPUs have same selector values)
+    SELECTORS_CACHE.call_once(|| selectors);
 
-        // 添加用户段描述符
-        let user_data = gdt.append(Descriptor::user_data_segment());
-        let user_code = gdt.append(Descriptor::user_code_segment());
-
-        // 添加 TSS 描述符
-        let tss = gdt.append(Descriptor::tss_segment(&TSS));
-
-        (
-            gdt,
-            Selectors {
-                kernel_code,
-                kernel_data,
-                user_code,
-                user_data,
-                tss,
-            },
-        )
-    };
+    // Mark as initialized
+    PER_CPU_INIT[cpu_id].store(true, Ordering::Release);
 }
 
-/// 初始化 GDT 和 TSS
+/// Load per-CPU GDT and TSS for the current CPU.
+///
+/// # Safety
+///
+/// Must be called after `init_per_cpu_gdt` for this CPU.
+unsafe fn load_per_cpu_gdt(cpu_id: usize) {
+    if !PER_CPU_INIT[cpu_id].load(Ordering::Acquire) {
+        panic!("Per-CPU GDT not initialized for CPU {}", cpu_id);
+    }
+
+    let (gdt, selectors) = PER_CPU_GDT[cpu_id].as_ref().unwrap();
+
+    // Load GDT
+    gdt.load();
+
+    // Set segment registers
+    CS::set_reg(selectors.kernel_code);
+    DS::set_reg(selectors.kernel_data);
+    SS::set_reg(selectors.kernel_data);
+
+    // Load TSS
+    load_tss(selectors.tss);
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// 初始化 GDT 和 TSS (BSP)
 ///
 /// 必须在启用中断前调用。加载 GDT、设置段寄存器、加载 TSS。
 pub fn init() {
-    // 加载 GDT
-    GDT.0.load();
+    // BSP uses CPU ID 0
+    let kernel_stack_top = {
+        let stack_start = VirtAddr::from_ptr(unsafe { &raw const BSP_KERNEL_STACK.0 });
+        (stack_start + KERNEL_STACK_SIZE as u64).as_u64()
+    };
+    let df_stack_top = {
+        let stack_start = VirtAddr::from_ptr(unsafe { &raw const BSP_DOUBLE_FAULT_STACK.0 });
+        (stack_start + DOUBLE_FAULT_STACK_SIZE as u64).as_u64()
+    };
 
-    // 设置段寄存器指向内核段
     unsafe {
-        CS::set_reg(GDT.1.kernel_code);
-        DS::set_reg(GDT.1.kernel_data);
-        SS::set_reg(GDT.1.kernel_data);
+        init_per_cpu_gdt(0, kernel_stack_top, df_stack_top);
+        load_per_cpu_gdt(0);
     }
 
-    // 加载 TSS
-    unsafe {
-        load_tss(GDT.1.tss);
-    }
-
-    println!("GDT initialized with TSS support");
-    println!("  Kernel CS: {:?}", GDT.1.kernel_code);
-    println!("  Kernel DS: {:?}", GDT.1.kernel_data);
-    println!("  User CS:   {:?}", GDT.1.user_code);
-    println!("  User DS:   {:?}", GDT.1.user_data);
-    println!("  TSS:       {:?}", GDT.1.tss);
+    let selectors = selectors();
+    println!("GDT initialized with per-CPU TSS support (R70-3)");
+    println!("  Kernel CS: {:?}", selectors.kernel_code);
+    println!("  Kernel DS: {:?}", selectors.kernel_data);
+    println!("  User CS:   {:?}", selectors.user_code);
+    println!("  User DS:   {:?}", selectors.user_data);
+    println!("  TSS:       {:?}", selectors.tss);
 }
 
 /// 获取段选择子
+///
+/// Returns cached selectors (identical across all CPUs).
 pub fn selectors() -> &'static Selectors {
-    &GDT.1
+    SELECTORS_CACHE.get().expect("GDT not initialized")
 }
 
-/// 更新 TSS 的 RSP0 (内核栈指针)
+/// 更新当前 CPU 的 TSS RSP0 (内核栈指针)
 ///
 /// 在切换到用户态进程前调用，设置从用户态返回内核态时使用的栈。
 ///
@@ -145,60 +217,90 @@ pub fn selectors() -> &'static Selectors {
 ///
 /// 调用者必须确保 `stack_top` 是有效的栈顶地址且正确对齐。
 pub unsafe fn set_kernel_stack(stack_top: u64) {
-    // 直接修改 TSS 的特权级栈表
-    // 注意：这里使用裸指针绕过 lazy_static 的不可变性
-    let tss_ptr = &*TSS as *const TaskStateSegment as *mut TaskStateSegment;
-    (*tss_ptr).privilege_stack_table[KERNEL_PRIVILEGE_STACK_INDEX] = VirtAddr::new(stack_top);
+    let cpu_id = cpu_local::current_cpu_id();
+    if cpu_id < MAX_CPUS {
+        PER_CPU_TSS[cpu_id].privilege_stack_table[KERNEL_PRIVILEGE_STACK_INDEX] =
+            VirtAddr::new(stack_top);
+    }
 }
 
-/// 获取当前内核栈指针 (RSP0)
+/// 获取当前 CPU 的内核栈指针 (RSP0)
 pub fn get_kernel_stack() -> VirtAddr {
-    TSS.privilege_stack_table[KERNEL_PRIVILEGE_STACK_INDEX]
+    let cpu_id = cpu_local::current_cpu_id();
+    if cpu_id < MAX_CPUS {
+        unsafe { PER_CPU_TSS[cpu_id].privilege_stack_table[KERNEL_PRIVILEGE_STACK_INDEX] }
+    } else {
+        VirtAddr::new(0)
+    }
 }
 
-/// 更新指定 IST 栈顶
+/// 更新当前 CPU 指定 IST 栈顶
 ///
 /// # Safety
 ///
 /// 调用者必须确保 `stack_top` 是有效的栈顶地址且正确对齐。
 pub unsafe fn set_ist_stack(index: usize, stack_top: VirtAddr) {
-    let tss_ptr = &*TSS as *const TaskStateSegment as *mut TaskStateSegment;
-    (*tss_ptr).interrupt_stack_table[index] = stack_top;
+    let cpu_id = cpu_local::current_cpu_id();
+    if cpu_id < MAX_CPUS && index < 7 {
+        PER_CPU_TSS[cpu_id].interrupt_stack_table[index] = stack_top;
+    }
 }
 
-/// 获取默认内核栈顶地址
+/// 获取当前 CPU 的默认内核栈顶地址
 ///
-/// 当进程没有分配专用内核栈时，可使用此默认栈。
-/// 返回 GDT 初始化时配置的 TSS.rsp0 默认值。
+/// R70-3 FIX: Returns the current CPU's kernel stack, not just BSP's.
+/// Each CPU has its own kernel stack set during initialization.
+/// When a process doesn't have a dedicated kernel stack, use the
+/// current CPU's default stack.
 pub fn default_kernel_stack_top() -> u64 {
-    let stack_start = VirtAddr::from_ptr(unsafe { &raw const KERNEL_STACK.0 });
-    (stack_start + KERNEL_STACK_SIZE as u64).as_u64()
+    let cpu_id = cpu_local::current_cpu_id();
+    if cpu_id < MAX_CPUS && PER_CPU_INIT[cpu_id].load(Ordering::Acquire) {
+        // Return this CPU's TSS RSP0 (set during init)
+        unsafe { PER_CPU_TSS[cpu_id].privilege_stack_table[KERNEL_PRIVILEGE_STACK_INDEX].as_u64() }
+    } else {
+        // Fallback for early boot (before per-CPU init)
+        let stack_start = VirtAddr::from_ptr(unsafe { &raw const BSP_KERNEL_STACK.0 });
+        (stack_start + KERNEL_STACK_SIZE as u64).as_u64()
+    }
 }
 
-/// Initialize GDT for an Application Processor (AP).
+/// Initialize GDT and TSS for an Application Processor (AP).
 ///
-/// APs share the same GDT with the BSP, but each AP needs to:
-/// 1. Load the GDT into GDTR
-/// 2. Set segment registers to point to kernel segments
-/// 3. Load the TSS (currently skipped - see note below)
+/// R70-3 FIX: Each AP gets its own TSS and GDT to enable proper
+/// privilege level transitions and interrupt handling.
+///
+/// # Arguments
+///
+/// * `cpu_id` - The logical CPU ID for this AP
+/// * `kernel_stack_top` - The kernel stack top address for this AP
 ///
 /// # Safety
 ///
 /// Must only be called once per AP during SMP bring-up, after the AP
 /// has switched to 64-bit mode but before any interrupt handling.
-pub unsafe fn init_for_ap() {
-    // Load the shared GDT
-    GDT.0.load();
+pub unsafe fn init_for_ap(cpu_id: usize, kernel_stack_top: u64) {
+    if cpu_id == 0 {
+        panic!("init_for_ap called for BSP (CPU 0)");
+    }
+    if cpu_id >= MAX_CPUS {
+        panic!("CPU ID {} exceeds MAX_CPUS {}", cpu_id, MAX_CPUS);
+    }
 
-    // Set segment registers to kernel segments
-    // This is critical: the AP was using trampoline's GDT with different selectors
-    CS::set_reg(GDT.1.kernel_code);
-    DS::set_reg(GDT.1.kernel_data);
-    SS::set_reg(GDT.1.kernel_data);
+    // APs use their kernel stack for double fault handling too
+    // (In production, each AP should have a dedicated DF stack)
+    let df_stack_top = kernel_stack_top;
 
-    // NOTE: TSS loading is skipped on APs
-    // Each CPU needs its own TSS for proper interrupt handling (RSP0/IST stacks).
-    // The BSP's TSS is marked "busy" and cannot be shared via LTR.
-    // TODO: Implement per-CPU TSS allocation for production SMP support.
-    // For now, APs run without a TSS - interrupts on APs will not work correctly.
+    init_per_cpu_gdt(cpu_id, kernel_stack_top, df_stack_top);
+    load_per_cpu_gdt(cpu_id);
+}
+
+/// Legacy init_for_ap without parameters (for backward compatibility).
+///
+/// # Safety
+///
+/// This function is deprecated. Use `init_for_ap(cpu_id, kernel_stack_top)` instead.
+#[deprecated(note = "Use init_for_ap(cpu_id, kernel_stack_top) instead")]
+pub unsafe fn init_for_ap_legacy() {
+    // This should not be called - panic to catch usage
+    panic!("init_for_ap_legacy is deprecated, use init_for_ap(cpu_id, kernel_stack_top)");
 }

@@ -134,7 +134,12 @@ fn fork_inner(
 
         // 复制 CPU 上下文（RAX 在下方置 0）
         child.context = parent.context;
+        // Lazy FPU: inherit parent's FPU usage flag
+        // If parent used FPU, the state in context.fx is valid and child inherits it
+        child.fpu_used = parent.fpu_used;
         child.user_stack = parent.user_stack;
+        // SMP: inherit CPU affinity from parent
+        child.allowed_cpus = parent.allowed_cpus;
 
         // 子进程使用自己的内核栈（由 create_process -> allocate_kernel_stack 分配）
         // 复制父进程内核栈内容以保持返回路径一致
@@ -419,7 +424,9 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
     // If COW flag is no longer set, the page has already been resolved - just flush TLB and return.
     if !flags.contains(cow_flag()) {
         // COW already resolved by another thread, just ensure TLB is consistent
-        x86_64::instructions::tlb::flush(virt);
+        // R68-4 FIX: Use cross-CPU shootdown to ensure all CPUs see the resolution.
+        // On SMP, other CPUs sharing this address space may have stale TLB entries.
+        mm::flush_current_as_page(virt);
         return Ok(());
     }
 
@@ -458,15 +465,20 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
         if let Err(_) = manager.map_page(page, new_frame, new_flags, &mut frame_alloc) {
             // Attempt to restore the old mapping
             let _ = manager.map_page(page, old_frame, flags, &mut frame_alloc);
-            // Flush TLB for this page to ensure old mapping is visible
-            x86_64::instructions::tlb::flush(virt);
+            // R68-4 FIX: Flush TLB on all CPUs sharing this address space.
+            // Use cross-CPU shootdown to ensure the restored mapping is visible.
+            mm::flush_current_as_page(virt);
             // Deallocate the new frame we allocated
             frame_alloc.deallocate_frame(new_frame);
             return Err(ForkError::PageTableCopyFailed);
         }
 
-        // H-35 fix: Flush TLB to ensure the new mapping with WRITABLE flag is effective
-        x86_64::instructions::tlb::flush(virt);
+        // H-35 & R68-4 FIX: Flush TLB on ALL CPUs to ensure the new writable mapping is effective.
+        //
+        // On SMP, other CPUs in the same address space may have the old COW (read-only) TLB
+        // entry cached. Without cross-CPU shootdown, they would continue to trigger COW faults
+        // or write to the old frame, causing memory corruption or use-after-free.
+        mm::flush_current_as_page(virt);
 
         // 减少原页引用计数
         let remaining = PAGE_REF_COUNT.decrement(old_phys.as_u64() as usize);

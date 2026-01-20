@@ -30,11 +30,16 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
 use core::mem;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use cpu_local::{current_cpu, current_cpu_id, lapic_id_for_cpu, max_cpus, TlbShootdownMailbox, PER_CPU_DATA};
+use cpu_local::{
+    current_cpu, current_cpu_id, lapic_id_for_cpu, max_cpus, CpuLocal, TlbShootdownMailbox,
+    PER_CPU_DATA,
+};
+use spin::RwLock;
 use x86_64::instructions::tlb;
 use x86_64::registers::control::Cr3;
 use x86_64::VirtAddr;
@@ -76,6 +81,42 @@ static ONLINE_CPU_MASK: AtomicU64 = AtomicU64::new(1); // BSP (bit 0) is always 
 
 /// Next generation number for TLB shootdown requests (monotonic, starts at 1)
 static NEXT_SHOOTDOWN_GEN: AtomicU64 = AtomicU64::new(1);
+
+// ============================================================================
+// Per-Address-Space TLB Tracking (R68 Architecture Improvement)
+// ============================================================================
+
+/// Per-CPU record of last loaded CR3 (0 = unknown/kernel shared).
+///
+/// Each CPU tracks its current CR3 so we can update ASID_CPU_MASKS on context switch.
+static CPU_ACTIVE_CR3: CpuLocal<AtomicU64> = CpuLocal::new(|| AtomicU64::new(0));
+
+/// CR3 -> CPU bitmask mapping for address spaces currently running.
+///
+/// Key: CR3 physical address (address space identifier)
+/// Value: Bitmask of CPUs currently running this address space
+///
+/// When a CPU switches CR3, it updates this map:
+/// - Removes itself from the old CR3's bitmask
+/// - Adds itself to the new CR3's bitmask
+///
+/// TLB shootdown uses this to target only CPUs with potentially cached TLB entries.
+/// If a CR3 is not in the map, we fall back to broadcast (safe but less efficient).
+static ASID_CPU_MASKS: RwLock<BTreeMap<u64, u64>> = RwLock::new(BTreeMap::new());
+
+/// Statistics for optimized TLB shootdowns
+static STATS_TARGETED_SHOOTDOWNS: AtomicU64 = AtomicU64::new(0);
+static STATS_BROADCAST_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+/// Convert CPU ID to bitmask bit, if within range.
+#[inline]
+fn cpu_bit(cpu_id: usize) -> Option<u64> {
+    if cpu_id < 64 {
+        Some(1u64 << cpu_id)
+    } else {
+        None
+    }
+}
 
 /// Registered function used to send the TLB shootdown IPI
 /// Stored as usize to avoid function pointer in static
@@ -128,8 +169,13 @@ pub fn register_cpu_online_with_id(cpu_id: usize) {
 /// Check if a specific CPU is marked as online.
 ///
 /// Uses Acquire ordering to synchronize with the Release in `register_cpu_online_with_id`.
+///
+/// # R68-6 FIX: Made public for IPI layer
+///
+/// The IPI layer needs to check online status before sending IPIs to avoid targeting
+/// CPUs that have LAPIC IDs registered but haven't completed initialization yet.
 #[inline]
-fn is_cpu_online(cpu_id: usize) -> bool {
+pub fn is_cpu_online(cpu_id: usize) -> bool {
     if cpu_id >= 64 {
         return false;
     }
@@ -142,6 +188,72 @@ fn is_cpu_online(cpu_id: usize) -> bool {
 /// Returns the current count of online CPUs. Useful for debugging and SMP validation.
 pub fn online_cpu_count() -> u64 {
     ONLINE_CPU_COUNT.load(Ordering::SeqCst)
+}
+
+// ============================================================================
+// CR3 Tracking for Optimized TLB Shootdown
+// ============================================================================
+
+/// Update CR3 -> CPU ownership tracking after a CR3 change on this CPU.
+///
+/// Called by `activate_memory_space()` whenever a context switch changes CR3.
+/// This allows TLB shootdown to target only CPUs that might have TLB entries
+/// for the affected address space, rather than broadcasting to all CPUs.
+///
+/// # Arguments
+///
+/// * `new_cr3` - The new CR3 value (physical address of PML4)
+///
+/// # Implementation
+///
+/// 1. Swap the current CPU's tracked CR3 with the new value
+/// 2. Remove this CPU's bit from the old CR3's mask (if tracked)
+/// 3. Add this CPU's bit to the new CR3's mask
+///
+/// # Thread Safety
+///
+/// Uses a RwLock for the global map. The per-CPU CR3 tracking uses atomics.
+/// CPUs with ID >= 64 fall back to broadcast shootdown (cannot be tracked in u64 mask).
+pub fn track_cr3_switch(new_cr3: u64) {
+    let cpu_id = current_cpu_id();
+    let bit = match cpu_bit(cpu_id) {
+        Some(b) => b,
+        None => {
+            // CPU ID >= 64: can't track in bitmask, just update local state
+            CPU_ACTIVE_CR3.with(|c| c.store(new_cr3, Ordering::SeqCst));
+            return;
+        }
+    };
+
+    // Atomically swap the CPU's tracked CR3
+    let prev = CPU_ACTIVE_CR3.with(|c| c.swap(new_cr3, Ordering::SeqCst));
+
+    // Update the global CR3 -> CPU mask mapping
+    let mut map = ASID_CPU_MASKS.write();
+
+    // Remove this CPU from the previous CR3's mask
+    if prev != 0 && prev != new_cr3 {
+        if let Some(mask) = map.get_mut(&prev) {
+            *mask &= !bit;
+            if *mask == 0 {
+                map.remove(&prev);
+            }
+        }
+    }
+
+    // Add this CPU to the new CR3's mask
+    if new_cr3 != 0 {
+        let entry = map.entry(new_cr3).or_insert(0);
+        *entry |= bit;
+    }
+}
+
+/// Get the current CPU's tracked CR3 value.
+///
+/// Returns 0 if no CR3 has been tracked for this CPU yet.
+#[inline]
+pub fn current_cpu_cr3() -> u64 {
+    CPU_ACTIVE_CR3.with(|c| c.load(Ordering::SeqCst))
 }
 
 /// Register the function used to send the TLB shootdown IPI.
@@ -205,14 +317,62 @@ fn mailbox_for_cpu(cpu_id: usize) -> Option<&'static TlbShootdownMailbox> {
     PER_CPU_DATA.get_cpu(cpu_id).map(|data| data.tlb_mailbox())
 }
 
-/// Collect all online CPUs except self
+/// Collect target CPUs for TLB shootdown based on address space tracking.
 ///
-/// Codex review fix: Now checks both LAPIC ID registration AND the ONLINE_CPU_MASK.
-/// This prevents sending IPIs to CPUs that have been registered in the LAPIC map
-/// but haven't completed their initialization yet.
-fn collect_target_cpus() -> Vec<usize> {
+/// R68 Architecture Improvement: Uses per-address-space tracking to target only
+/// CPUs that might have TLB entries for the affected address space.
+///
+/// # Arguments
+///
+/// * `target_cr3` - The CR3 of the address space being modified (0 = broadcast to all)
+///
+/// # Returns
+///
+/// Vector of CPU IDs that need to receive the TLB shootdown IPI.
+///
+/// # Fallback Behavior
+///
+/// If the CR3 is not in the tracking map, or if tracking indicates no CPUs,
+/// we fall back to broadcasting to all online CPUs (except self). This ensures
+/// correctness even if tracking becomes out of sync.
+fn collect_target_cpus(target_cr3: u64) -> Vec<usize> {
     let mut targets = Vec::new();
     let self_id = current_cpu_id();
+
+    // Try to use per-address-space tracking if CR3 is valid
+    if target_cr3 != 0 {
+        if let Some(mask) = ASID_CPU_MASKS.read().get(&target_cr3).copied() {
+            if mask != 0 {
+                // We found tracked CPUs for this address space
+                let online = ONLINE_CPU_MASK.load(Ordering::Acquire);
+                let tracked = mask & online; // Only consider online CPUs
+
+                // Convert bitmask to CPU list
+                let max_tracked = core::cmp::min(max_cpus(), 64);
+                for cpu in 0..max_tracked {
+                    if cpu == self_id {
+                        continue;
+                    }
+                    if let Some(bit) = cpu_bit(cpu) {
+                        if (tracked & bit) != 0 && lapic_id_for_cpu(cpu).is_some() {
+                            targets.push(cpu);
+                        }
+                    }
+                }
+
+                if !targets.is_empty() {
+                    // Successful targeted shootdown
+                    STATS_TARGETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
+                    return targets;
+                }
+            }
+        }
+    }
+
+    // Fallback: broadcast to all online CPUs except self
+    // This handles: CR3=0, CR3 not tracked, or empty tracked mask
+    STATS_BROADCAST_FALLBACK.fetch_add(1, Ordering::Relaxed);
+
     for cpu in 0..max_cpus() {
         if cpu == self_id {
             continue;
@@ -354,8 +514,16 @@ fn warn_timeout(targets: &[usize], generation: u64) {
 ///
 /// Returns (targets, generation) if there are remote CPUs to notify,
 /// None if this is the only CPU.
+///
+/// # R68 Architecture Improvement
+///
+/// Now uses per-address-space tracking to target only CPUs that might have
+/// TLB entries for the current CR3, reducing unnecessary IPI traffic.
 fn dispatch_shootdown(start: u64, len: u64) -> Option<(Vec<usize>, u64)> {
-    let targets = collect_target_cpus();
+    let cr3 = current_cr3_value();
+
+    // R68 optimization: Use per-address-space tracking to target only relevant CPUs
+    let targets = collect_target_cpus(cr3);
     if targets.is_empty() {
         return None;
     }
@@ -368,7 +536,6 @@ fn dispatch_shootdown(start: u64, len: u64) -> Option<(Vec<usize>, u64)> {
     });
 
     let generation = NEXT_SHOOTDOWN_GEN.fetch_add(1, Ordering::SeqCst);
-    let cr3 = current_cr3_value();
 
     // Post requests to all target mailboxes
     post_requests(&targets, cr3, start, len, generation);
@@ -455,7 +622,23 @@ pub fn flush_current_as_all() {
 
         // Get sender for retry
         if let Some(sender) = tlb_ipi_sender() {
-            wait_for_acks_with_retry(&targets, generation, sender);
+            // R68-5 FIX: TLB shootdown failure is FATAL - stale TLB entries are unacceptable.
+            //
+            // If any CPU fails to ACK, it may have stale TLB entries that point to:
+            // - Freed frames (use-after-free)
+            // - Wrong permissions (W^X bypass)
+            // - Other process's pages (isolation breach)
+            //
+            // We cannot safely continue. Previous behavior (warn + continue) allowed
+            // silent memory corruption in release builds.
+            if !wait_for_acks_with_retry(&targets, generation, sender) {
+                let unacked = get_unacked_cpus(&targets, generation);
+                panic!(
+                    "CRITICAL: TLB shootdown gen {} failed! CPUs {:?} did not ACK. \
+                     Cannot continue - stale TLB entries would cause memory corruption.",
+                    generation, unacked
+                );
+            }
         }
     }
 
@@ -508,7 +691,16 @@ pub fn flush_current_as_range(start: VirtAddr, len: usize) {
 
                 // Get sender for retry
                 if let Some(sender) = tlb_ipi_sender() {
-                    wait_for_acks_with_retry(&targets, generation, sender);
+                    // R68-5 FIX: Range flush ACK failure is also fatal.
+                    // Same reasoning as flush_current_as_all - cannot allow stale TLB.
+                    if !wait_for_acks_with_retry(&targets, generation, sender) {
+                        let unacked = get_unacked_cpus(&targets, generation);
+                        panic!(
+                            "CRITICAL: TLB shootdown gen {} (range 0x{:x}+0x{:x}) failed! \
+                             CPUs {:?} did not ACK. Cannot continue.",
+                            generation, aligned_start, aligned_len, unacked
+                        );
+                    }
                 }
             }
 

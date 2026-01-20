@@ -620,7 +620,13 @@ fn make_trampoline_nonexecutable() {
             let mut new_flags = flags;
             new_flags.insert(PageTableFlags::NO_EXECUTE);
             entry.set_addr(addr, new_flags);
-            tlb::flush_all();
+            // R68-2 FIX: Use cross-CPU TLB shootdown instead of local-only flush.
+            //
+            // After restoring NX on the trampoline page, ALL CPUs must invalidate
+            // their TLB entries for this page. Using local flush_all() leaves remote
+            // CPUs with stale executable mappings, creating a code injection vector
+            // where an attacker could place shellcode in the trampoline area.
+            mm::flush_current_as_all();
         }
     }
 }
@@ -876,8 +882,12 @@ pub extern "C" fn ap_rust_entry(
     // - Wrong segment selectors (0x08/0x10/0x18 vs kernel's layout)
     // - No TSS (required for interrupt handling)
     // This must be done before any other initialization that might trigger interrupts.
+    //
+    // R70-3 FIX: Each AP now gets its own TSS and GDT for proper privilege
+    // level transitions. The kernel_stack_top is used for both RSP0 (syscall/interrupt
+    // returns from Ring 3) and the double fault IST stack.
     unsafe {
-        crate::gdt::init_for_ap();
+        crate::gdt::init_for_ap(cpu_idx, stack_top);
     }
 
     // Register CPU in LAPIC ID map
@@ -907,19 +917,63 @@ pub extern "C" fn ap_rust_entry(
         syscall::init_syscall_percpu(cpu_idx);
     }
 
+    // R68-1 FIX: Enable interrupts BEFORE advertising this CPU as online.
+    //
+    // Critical for TLB shootdown correctness: If we mark ourselves online while
+    // interrupts are disabled, other CPUs will include us in TLB shootdown targets
+    // but we cannot receive or ACK the IPI. This causes either:
+    // - Shootdown timeout leading to stale TLB entries on this CPU
+    // - Deadlock if the requester blocks waiting for our ACK
+    //
+    // By enabling interrupts first, we guarantee that once we appear in the
+    // ONLINE_CPU_MASK, we can immediately service any IPIs sent to us.
+    //
+    // Note: The IDT and LAPIC are already initialized above, so it's safe to
+    // receive interrupts at this point.
+    x86_64::instructions::interrupts::enable();
+
     // R67-1 FIX: Register with TLB shootdown subsystem before signaling online
     // This ensures the TLB shootdown guard (assert_single_core_mode) will correctly
     // panic if SMP is enabled but IPI-based shootdown is not yet implemented.
     mm::tlb_shootdown::register_cpu_online();
 
+    // R70-2 FIX: Also update the cpu_local online count for scheduler's cpu_pool_size().
+    // This ensures num_online_cpus() returns the correct count for load balancing
+    // and kick_idle_cpus() iteration.
+    cpu_local::mark_cpu_online();
+
     // Signal that we're online
     AP_ONLINE_COUNT.fetch_add(1, Ordering::Release);
 
-    // Halt loop - APs are parked until scheduler assigns work
-    // In a full implementation, this would enter the scheduler idle loop
+    // R70-1: Enter scheduler-aware idle loop instead of dead HLT loop
+    // This allows APs to participate in scheduling and receive work via IPIs
+    ap_idle_loop();
+}
+
+/// Scheduler-aware idle path for APs.
+///
+/// R70-1: Breaks the old permanent HLT loop by allowing reschedule IPIs or
+/// timer events to trigger the scheduler callback. The AP will:
+/// 1. Check if there's pending work (reschedule flag set)
+/// 2. If work exists, run the scheduler to pick up tasks
+/// 3. If no work, HLT until the next interrupt (timer, IPI, etc.)
+///
+/// This enables true SMP scheduling where all CPUs participate in running
+/// user processes, not just the BSP.
+fn ap_idle_loop() -> ! {
     loop {
+        // Check if scheduler has work for us (set by timer tick or reschedule IPI)
+        kernel_core::reschedule_if_needed();
+
+        // Enable interrupts and halt until next interrupt
+        // When an interrupt arrives (timer tick, reschedule IPI, etc.),
+        // the CPU wakes up and loops back to check for work
         unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack));
+            core::arch::asm!(
+                "sti",   // Enable interrupts
+                "hlt",   // Halt until interrupt
+                options(nomem, nostack, preserves_flags)
+            );
         }
     }
 }

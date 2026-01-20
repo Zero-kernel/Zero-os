@@ -204,11 +204,24 @@ fn bump_stat(ipi_type: IpiType, count: u64) {
 /// # Implementation
 ///
 /// Uses LAPIC ICR (Interrupt Command Register) to send the IPI:
-/// 1. Look up target CPU's LAPIC ID from cpu_local mapping
-/// 2. Call apic::send_ipi_raw with the vector and FIXED delivery mode
-/// 3. Update statistics
+/// 1. Check if target CPU is fully online (R68-6 FIX)
+/// 2. Look up target CPU's LAPIC ID from cpu_local mapping
+/// 3. Call apic::send_ipi_raw with the vector and FIXED delivery mode
+/// 4. Update statistics
+///
+/// # R68-6 FIX: Online Check
+///
+/// Only sends IPI to CPUs that have completed initialization and are marked
+/// online in ONLINE_CPU_MASK. Sending to partially-initialized CPUs (which
+/// have LAPIC IDs but no IDT/handler) would cause lost IPIs.
 #[inline]
 pub fn send_ipi(target_cpu: usize, ipi_type: IpiType) {
+    // R68-6 FIX: Check online status before sending.
+    // A CPU with a registered LAPIC ID but not yet marked online is still
+    // in the initialization phase and cannot handle IPIs properly.
+    if !mm::tlb_shootdown::is_cpu_online(target_cpu) {
+        return;
+    }
     if let Some(dest_lapic) = lapic_id_for_cpu(target_cpu) {
         unsafe {
             apic::send_ipi_raw(dest_lapic, ipi_type.vector(), apic::icr_delivery::FIXED);

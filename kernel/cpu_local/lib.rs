@@ -35,6 +35,9 @@ const INVALID_CPU_ID: usize = usize::MAX;
 /// Size of LAPIC ID reverse mapping table (covers all 8-bit LAPIC IDs)
 const LAPIC_ID_REVERSE_MAP_SIZE: usize = 256;
 
+/// Marker for "no FPU owner" in per-CPU lazy FPU tracking
+pub const NO_FPU_OWNER: usize = usize::MAX;
+
 /// LAPIC ID to CPU index mapping table.
 ///
 /// Index = CPU logical index, Value = hardware LAPIC ID.
@@ -120,6 +123,11 @@ pub struct PerCpuData {
     pub preempt_count: AtomicU32,
     /// Interrupt disable nesting counter
     pub irq_count: AtomicU32,
+    /// Last task (PID) that owns the FPU on this CPU (NO_FPU_OWNER if none).
+    ///
+    /// Used for lazy FPU save/restore: when a #NM exception fires, we save
+    /// the previous owner's state before restoring the new owner's state.
+    pub fpu_owner: AtomicUsize,
     /// Set by scheduler/interrupts to trigger a reschedule
     pub need_resched: AtomicBool,
     /// Padding for alignment
@@ -150,6 +158,7 @@ impl PerCpuData {
             lapic_id: AtomicU32::new(0),
             preempt_count: AtomicU32::new(0),
             irq_count: AtomicU32::new(0),
+            fpu_owner: AtomicUsize::new(NO_FPU_OWNER),
             need_resched: AtomicBool::new(false),
             _pad: [0; 3],
             current_task: AtomicPtr::new(null_mut()),
@@ -189,6 +198,7 @@ impl PerCpuData {
             .store(syscall_stack_top, Ordering::Relaxed);
         self.preempt_count.store(0, Ordering::Relaxed);
         self.irq_count.store(0, Ordering::Relaxed);
+        self.fpu_owner.store(NO_FPU_OWNER, Ordering::Relaxed);
         self.rcu_epoch.store(0, Ordering::Relaxed);
     }
 
@@ -262,6 +272,37 @@ impl PerCpuData {
     #[inline]
     pub unsafe fn set_current_task(&self, task: RawTaskPtr) {
         self.current_task.store(task, Ordering::Release);
+    }
+
+    /// Get the FPU owner (PID) on this CPU.
+    ///
+    /// Returns NO_FPU_OWNER if no process owns the FPU state on this CPU.
+    #[inline]
+    pub fn get_fpu_owner(&self) -> usize {
+        self.fpu_owner.load(Ordering::Acquire)
+    }
+
+    /// Set the FPU owner on this CPU.
+    ///
+    /// Called by the #NM handler after restoring a process's FPU state.
+    #[inline]
+    pub fn set_fpu_owner(&self, pid: usize) {
+        self.fpu_owner.store(pid, Ordering::Release);
+    }
+
+    /// Clear the FPU owner if it matches the given PID.
+    ///
+    /// Called when a process exits to prevent #NM from trying to save
+    /// state to freed memory. Uses compare-exchange to handle races.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the owner was cleared, `false` if it was already different.
+    #[inline]
+    pub fn clear_fpu_owner_if(&self, pid: usize) -> bool {
+        self.fpu_owner
+            .compare_exchange(pid, NO_FPU_OWNER, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// Access this CPU's TLB shootdown mailbox.
@@ -627,12 +668,47 @@ pub fn init_ap(
     });
 }
 
+/// Counter for online CPUs.
+///
+/// This is incremented by `mark_cpu_online()` as APs come online.
+/// BSP (CPU 0) is counted at init time.
+static ONLINE_CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
+
 /// Get the number of online CPUs.
 ///
-/// Currently returns 1 for single-core operation.
-/// Will be updated when SMP AP startup is implemented.
+/// # R69-1 FIX: Accurate Online CPU Count
+///
+/// Returns the actual count of online CPUs tracked locally.
+/// This count is incremented by `mark_cpu_online()` as APs come online.
 #[inline]
 pub fn num_online_cpus() -> usize {
-    // TODO: Track online CPU count when APs are started
-    1
+    ONLINE_CPU_COUNT.load(Ordering::Acquire)
+}
+
+/// Mark a CPU as online (call this from AP initialization).
+///
+/// This increments the online CPU counter. Should be called once per AP
+/// after it has completed initialization.
+///
+/// # Safety
+///
+/// Should only be called once per CPU during SMP initialization.
+#[inline]
+pub fn mark_cpu_online() {
+    ONLINE_CPU_COUNT.fetch_add(1, Ordering::Release);
+}
+
+/// Clear FPU ownership for a process across all CPUs.
+///
+/// Called when a process exits to ensure no CPU holds a stale FPU owner
+/// reference that would cause #NM to save state to freed memory.
+///
+/// This function iterates all CPU slots and uses compare-exchange to
+/// atomically clear any slot that matches the given PID.
+pub fn clear_fpu_owner_all_cpus(pid: usize) {
+    for cpu_id in 0..MAX_CPUS {
+        if let Some(per_cpu) = PER_CPU_DATA.get_cpu(cpu_id) {
+            per_cpu.clear_fpu_owner_if(pid);
+        }
+    }
 }

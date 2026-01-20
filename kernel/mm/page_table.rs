@@ -610,12 +610,17 @@ pub unsafe fn ensure_pte_level(
     // Demote 2MB huge page to 4KB pages if needed
     if pde.flags().contains(PageTableFlags::HUGE_PAGE) {
         split_2m_entry(pde, frame_allocator)?;
-        // X-7 安全修复：拆分 2MB huge page 后必须刷新 TLB
+        // X-7 & R68-2 FIX: Flush the entire 2MB range on ALL CPUs.
         //
-        // CPU 可能缓存了原始 2MB 映射（通常带有 RWX 权限），如果不刷新，
-        // 后续对 4KB 页的权限修改（如 W^X 强制执行）将被绕过，直到 TLB
-        // 条目自然过期。这可能导致可写+可执行的窗口期。
-        x86_64::instructions::tlb::flush(page.start_address());
+        // After splitting a huge page, remote CPUs may still have the original
+        // 2MB TLB entry cached with (potentially) RWX permissions. If we only
+        // flush locally, those CPUs will bypass any 4KB-level permission changes
+        // (e.g., W^X enforcement) until the TLB entry naturally expires.
+        //
+        // We flush the entire 2MB region because TLB entries for huge pages
+        // cover the whole range, not individual 4KB pages.
+        let huge_base = page.start_address().as_u64() & !0x1f_ffffu64; // Align to 2MB
+        crate::tlb_shootdown::flush_current_as_range(VirtAddr::new(huge_base), 0x20_0000);
     } else if pde.is_unused() {
         // Allocate new PT
         let pt_frame = frame_allocator
@@ -766,18 +771,15 @@ pub unsafe fn map_mmio(
 
     result?;
 
-    // Flush TLB for the mapped range
-    // R32-MM-2 FIX: Reuse pre-calculated pages count
-    for i in 0..pages {
-        let offset = (i as u64)
-            .checked_mul(0x1000)
-            .ok_or(MapError::InvalidRange)?;
-        let addr_u64 = virt
-            .as_u64()
-            .checked_add(offset)
-            .ok_or(MapError::InvalidRange)?;
-        x86_64::instructions::tlb::flush(VirtAddr::new(addr_u64));
-    }
+    // R68-2 FIX: Propagate MMIO mapping/permission updates to ALL CPUs.
+    //
+    // MMIO mappings are typically shared across all CPUs (e.g., LAPIC, VGA buffer),
+    // so remote CPUs must also invalidate their TLB entries. Using local-only flush
+    // leaves stale entries on other CPUs, which could cause incorrect MMIO behavior
+    // or permission bypass if the update was to tighten access.
+    //
+    // flush_current_as_range handles large ranges efficiently (full flush fallback).
+    crate::tlb_shootdown::flush_current_as_range(virt, pages * 0x1000);
 
     Ok(())
 }
