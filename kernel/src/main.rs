@@ -401,6 +401,25 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         let bsp_lapic_id = arch::apic::bsp_lapic_id();
         println!("      ✓ BSP LAPIC initialized (ID: {})", bsp_lapic_id);
 
+        // Calibrate LAPIC timer using PIT channel 2 as reference
+        // This determines the correct initial count for ~1kHz ticks
+        unsafe {
+            match arch::apic::calibrate_lapic_timer() {
+                Ok(init_count) => {
+                    println!(
+                        "      ✓ LAPIC timer calibrated (init_count: {})",
+                        init_count
+                    );
+                }
+                Err(e) => {
+                    println!(
+                        "      ! LAPIC timer calibration failed: {}, using default",
+                        e
+                    );
+                }
+            }
+        }
+
         // Initialize BSP's per-CPU data
         // Get kernel stack top from GDT (set during arch::interrupts::init)
         let kernel_stack_top = arch::default_kernel_stack_top() as usize;

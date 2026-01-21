@@ -367,6 +367,14 @@ pub struct Process {
     /// CPU上下文
     pub context: Context,
 
+    /// Has this process ever used FPU/SIMD (lazy FPU tracking).
+    ///
+    /// When false, the FPU state in `context.fx` is default-initialized and
+    /// has never been saved from hardware. When true, the state was saved by
+    /// the #NM handler and should be restored on next FPU use.
+    /// This enables lazy FPU save/restore to skip processes that never use FPU.
+    pub fpu_used: bool,
+
     /// 内核栈指针（栈底）
     pub kernel_stack: VirtAddr,
 
@@ -423,6 +431,13 @@ pub struct Process {
     /// 调度器会提升进程的动态优先级，防止低优先级进程饥饿。
     /// 每次进程被调度运行时重置为0。
     pub wait_ticks: u64,
+
+    /// CPU亲和性位掩码（bit N = 允许在CPU N上运行）
+    ///
+    /// 用于SMP调度，限制进程可以运行的CPU集合。
+    /// 默认值：0xFFFFFFFFFFFFFFFF（允许在所有CPU上运行）
+    /// 位0对应CPU 0，位1对应CPU 1，以此类推。
+    pub allowed_cpus: u64,
 
     /// 创建时间戳
     pub created_at: u64,
@@ -513,6 +528,7 @@ impl Process {
             dynamic_priority: priority,
             time_slice: calculate_time_slice(priority),
             context: Context::default(),
+            fpu_used: false, // Lazy FPU: process hasn't used FPU yet
             kernel_stack: VirtAddr::new(0),
             kernel_stack_top: VirtAddr::new(0),
             user_stack: None,
@@ -527,6 +543,7 @@ impl Process {
             children: Vec::new(),
             cpu_time: 0,
             wait_ticks: 0, // R65-19 FIX: Initialize starvation counter
+            allowed_cpus: 0xFFFFFFFFFFFFFFFF, // SMP: Allow on all CPUs by default
             created_at: time::current_timestamp_ms(),
             // R39-3 FIX: 默认以root运行，使用共享凭证结构
             credentials: Arc::new(RwLock::new(Credentials {
@@ -1281,6 +1298,21 @@ pub fn activate_memory_space(memory_space: usize) {
     // 只有当目标页表与当前不同时才切换（避免不必要的 TLB 刷新）
     if target_frame != current_frame {
         unsafe { Cr3::write(target_frame, target_flags) };
+
+        // R68 Architecture Improvement: Update per-address-space TLB tracking.
+        //
+        // This allows TLB shootdown to target only CPUs that might have TLB entries
+        // for the affected address space, rather than broadcasting to all CPUs.
+        // The tracking is used by collect_target_cpus() in tlb_shootdown.rs.
+        //
+        // # Race Condition Safety
+        //
+        // There's a window between the CR3 write and map update where another CPU's
+        // shootdown for this CR3 could miss us. This is SAFE because:
+        // - Writing CR3 flushes all non-global TLB entries on this CPU
+        // - We have no stale entries to flush since our TLB is fresh
+        // - Any subsequent TLB entries will be populated after the shootdown
+        mm::tlb_shootdown::track_cr3_switch(target_frame.start_address().as_u64());
     }
 }
 
@@ -1394,6 +1426,11 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // This ensures policy can track ALL process exits, not just normal sys_exit
         let lsm_ctx = LsmProcessCtx::new(pid, tgid, lsm_uid, lsm_gid, lsm_euid, lsm_egid);
         let _ = lsm::hook_task_exit(&lsm_ctx, exit_code);
+
+        // R69-2 FIX: Clear FPU ownership on all CPUs to prevent use-after-free.
+        // If this process was the FPU owner on any CPU, its FPU state would be saved
+        // to the PCB which is about to be deallocated. Clear ownership now.
+        cpu_local::clear_fpu_owner_all_cpus(pid);
 
         println!("Process {} terminated with exit code {}", pid, exit_code);
 

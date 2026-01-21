@@ -24,11 +24,14 @@ use crate::apic;
 use crate::context_switch;
 use crate::gdt;
 use crate::ipi;
-use core::sync::atomic::{AtomicU64, Ordering};
-use cpu_local::CpuLocal;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use cpu_local::{current_cpu, CpuLocal, NO_FPU_OWNER};
 use kernel_core::on_scheduler_tick;
+use kernel_core::process::{current_pid, get_process};
 use lazy_static::lazy_static;
 use mm::tlb_shootdown;
+use x86_64::instructions::interrupts as x86_interrupts;
+use x86_64::registers::control::{Cr0, Cr0Flags};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 // Serial port for debug output (0x3F8)
@@ -69,6 +72,13 @@ static IRQ_FPU_AREAS: CpuLocal<IrqFpuSaveArea> = CpuLocal::new(|| IrqFpuSaveArea
 static IRQ_FPU_DEPTH: CpuLocal<core::sync::atomic::AtomicU32> =
     CpuLocal::new(|| core::sync::atomic::AtomicU32::new(0));
 
+/// R69-2: Track CR0.TS state for lazy FPU.
+///
+/// When entering an IRQ, if CR0.TS was set (lazy FPU mode), we must temporarily
+/// clear it so FXSAVE/FXRSTOR don't trigger #NM. After IRQ handling, we restore
+/// the original TS state so lazy FPU semantics continue for the user process.
+static IRQ_FPU_TS_WAS_SET: CpuLocal<AtomicBool> = CpuLocal::new(|| AtomicBool::new(false));
+
 /// R65-18 FIX + R66-7 FIX + R67-7 FIX: Save FPU/SSE state before IRQ handler work.
 ///
 /// Uses per-CPU storage to support SMP. Must be called at the beginning
@@ -81,14 +91,41 @@ static IRQ_FPU_DEPTH: CpuLocal<core::sync::atomic::AtomicU32> =
 ///
 /// - Must be called with interrupts disabled (which they are in IRQ handlers)
 /// - Each CPU uses its own save area, so no cross-CPU corruption
+///
+/// # R68-7 FIX: Checked Arithmetic
+///
+/// Uses `fetch_update` with `checked_add` to detect overflow. In release builds,
+/// unchecked `fetch_add` would silently wrap around, causing the nesting depth to
+/// reset and permanently skip FPU saves on subsequent interrupts. This could be
+/// exploited via interrupt storms to corrupt or leak FPU state between processes.
 #[inline]
 unsafe fn irq_save_fpu() {
     use core::sync::atomic::Ordering;
-    let depth = IRQ_FPU_DEPTH.with(|d| d.fetch_add(1, Ordering::Relaxed));
+    // R68-7 FIX: Use checked arithmetic to catch overflow
+    let depth = IRQ_FPU_DEPTH.with(|d| {
+        d.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+            .unwrap_or_else(|prev| {
+                panic!(
+                    "irq_save_fpu: nesting depth overflow! prev={} - interrupt storm attack?",
+                    prev
+                )
+            })
+    });
     if depth > 0 {
         // Already saved on this CPU - nested interrupt
         return;
     }
+
+    // R69-2: Preserve and clear CR0.TS before FXSAVE to avoid #NM recursion.
+    // Under lazy FPU, TS may be set - executing FXSAVE with TS set would trigger #NM.
+    let ts_was_set = Cr0::read().contains(Cr0Flags::TASK_SWITCHED);
+    IRQ_FPU_TS_WAS_SET.with(|flag| flag.store(ts_was_set, Ordering::Relaxed));
+    if ts_was_set {
+        let mut cr0 = Cr0::read();
+        cr0.remove(Cr0Flags::TASK_SWITCHED);
+        unsafe { Cr0::write(cr0) };
+    }
+
     // Outermost save - actually perform FXSAVE
     IRQ_FPU_AREAS.with(|area| {
         let ptr = area.data.as_ptr() as *mut u8;
@@ -106,21 +143,34 @@ unsafe fn irq_save_fpu() {
 /// from IRQ handlers that called `irq_save_fpu()`.
 ///
 /// R67-7: Only the last (outermost) restore actually performs FXRSTOR64.
+///
+/// # R68-7 FIX: Checked Arithmetic
+///
+/// Uses `fetch_update` with `checked_sub` to detect underflow. Underflow would
+/// indicate a mismatched save/restore pair - the depth would wrap to u32::MAX,
+/// permanently disabling FPU restoration on this CPU. This is a critical bug
+/// that must be caught immediately, not silently via debug_assert.
 #[inline]
 unsafe fn irq_restore_fpu() {
     use core::sync::atomic::Ordering;
-    let prev_depth = IRQ_FPU_DEPTH.with(|d| d.fetch_sub(1, Ordering::Relaxed));
+    // R68-7 FIX: Use checked arithmetic to catch underflow
+    let prev_depth = IRQ_FPU_DEPTH.with(|d| {
+        d.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+            .unwrap_or_else(|prev| {
+                panic!(
+                    "irq_restore_fpu: depth underflow! prev={} - mismatched save/restore pair",
+                    prev
+                )
+            })
+    });
 
-    // R67-7 FIX: Debug assertion to catch mismatched save/restore pairs.
-    // If prev_depth is 0, we have an underflow (restore without matching save).
-    // This would wrap to u32::MAX, permanently breaking FPU handling on this CPU.
-    debug_assert!(
-        prev_depth > 0,
-        "irq_restore_fpu called without matching irq_save_fpu (depth underflow)"
-    );
+    // prev_depth is the value BEFORE decrement, so:
+    // prev_depth == 1 means we just decremented to 0 (outermost restore)
+    // prev_depth > 1 means we're still nested
+    // prev_depth == 0 would have triggered the panic above
 
     if prev_depth != 1 {
-        // Not the outermost - don't restore yet (or mismatched if 0)
+        // Not the outermost - don't restore yet
         return;
     }
     // Outermost restore - actually perform FXRSTOR
@@ -131,6 +181,16 @@ unsafe fn irq_restore_fpu() {
             in(reg) ptr,
             options(nostack)
         );
+    });
+
+    // R69-2: Restore CR0.TS if it was set before IRQ entry (lazy FPU).
+    // This ensures lazy FPU semantics continue for the user process.
+    IRQ_FPU_TS_WAS_SET.with(|flag| {
+        if flag.swap(false, Ordering::Relaxed) {
+            let mut cr0 = Cr0::read();
+            cr0.insert(Cr0Flags::TASK_SWITCHED);
+            unsafe { Cr0::write(cr0) };
+        }
     });
 }
 
@@ -318,6 +378,13 @@ impl AtomicInterruptStats {
 /// 全局原子中断统计（避免中断处理程序中的锁争用）
 static INTERRUPT_STATS: AtomicInterruptStats = AtomicInterruptStats::new();
 
+/// Per-CPU flags to track first timer interrupt (for debug output)
+/// MAX_CPUS = 64 to match cpu_local
+static AP_TIMER_SEEN: [AtomicBool; 64] = {
+    const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; 64]
+};
+
 lazy_static! {
     /// 全局中断描述符表
     static ref IDT: InterruptDescriptorTable = {
@@ -357,6 +424,7 @@ lazy_static! {
         idt[36].set_handler_fn(serial_interrupt_handler);     // IRQ 4: Serial COM1
 
         // IPI handlers (high vectors)
+        idt[ipi::IPI_VECTOR_RESCHEDULE].set_handler_fn(reschedule_ipi_handler);
         idt[ipi::IPI_VECTOR_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_ipi_handler);
 
         idt
@@ -540,9 +608,83 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
 }
 
 /// #NM - Device Not Available (设备不可用)
+///
+/// R69-2: Lazy FPU save/restore implementation.
+///
+/// This handler is triggered when:
+/// 1. CR0.TS is set (by context switch) AND
+/// 2. An FPU/SSE/AVX instruction is executed
+///
+/// The handler:
+/// 1. Clears CR0.TS to allow FPU access
+/// 2. Saves previous owner's FPU state (if any) to their PCB
+/// 3. Restores current process's FPU state (or initializes if never used)
+/// 4. Marks current process as FPU owner on this CPU
+///
+/// This is more efficient than eager save/restore because many processes
+/// never use FPU between context switches.
 extern "x86-interrupt" fn device_not_available_handler(_stack_frame: InterruptStackFrame) {
     clac_if_smap();
-    panic!("FPU or SIMD device not available");
+
+    // Clear CR0.TS to allow FPU instructions in the handler
+    let cr0 = Cr0::read();
+    if cr0.contains(Cr0Flags::TASK_SWITCHED) {
+        let mut new_cr0 = cr0;
+        new_cr0.remove(Cr0Flags::TASK_SWITCHED);
+        unsafe { Cr0::write(new_cr0) };
+    }
+
+    // Get current process PID
+    let current = match current_pid() {
+        Some(pid) => pid,
+        None => {
+            // No current process (early boot or kernel thread).
+            // TS is cleared, so FPU will work. No state tracking needed.
+            return;
+        }
+    };
+
+    // Disable interrupts during FPU owner transition to prevent races
+    x86_interrupts::without_interrupts(|| {
+        let per_cpu = current_cpu();
+        let prev_owner = per_cpu.get_fpu_owner();
+
+        // Fast path: same process re-accessing FPU
+        if prev_owner == current {
+            // Already own the FPU, just ensure ownership is tracked
+            per_cpu.set_fpu_owner(current);
+            return;
+        }
+
+        // Save previous owner's FPU state if needed
+        if prev_owner != NO_FPU_OWNER {
+            if let Some(prev_proc) = get_process(prev_owner) {
+                let mut pcb = prev_proc.lock();
+                let fx_ptr = pcb.context.fx.data.as_mut_ptr();
+                unsafe {
+                    core::arch::asm!("fxsave64 [{}]", in(reg) fx_ptr, options(nostack));
+                }
+                pcb.fpu_used = true;
+            } else {
+                // Previous owner no longer exists, just clear ownership
+                per_cpu.clear_fpu_owner_if(prev_owner);
+            }
+        }
+
+        // Restore or initialize current process's FPU state
+        if let Some(cur_proc) = get_process(current) {
+            let mut pcb = cur_proc.lock();
+            let fx_ptr = pcb.context.fx.data.as_ptr();
+            unsafe {
+                core::arch::asm!("fxrstor64 [{}]", in(reg) fx_ptr, options(nostack));
+            }
+            pcb.fpu_used = true;
+            per_cpu.set_fpu_owner(current);
+        } else {
+            // Current process doesn't exist (shouldn't happen in normal operation)
+            per_cpu.set_fpu_owner(NO_FPU_OWNER);
+        }
+    });
 }
 
 /// #DF - Double Fault (双重错误)
@@ -812,12 +954,16 @@ extern "x86-interrupt" fn virtualization_handler(_stack_frame: InterruptStackFra
 /// 5. 如果从用户态返回且需要重调度，执行抢占
 ///
 /// R65-18 FIX: Saves/restores FPU state to prevent corruption when IRQ code uses SSE.
+/// R69-3 FIX: Uses irq_enter/irq_exit for proper IRQ context tracking on SMP.
 ///
 /// 注意：必须先发送 EOI 再执行抢占，避免上下文切换后 IRQ0 被屏蔽。
 /// 内核态中断不抢占，以避免持锁时发生调度。
 extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
+
+    // R69-3 FIX: Mark entering IRQ context for preemption tracking
+    current_cpu().irq_enter();
 
     // R65-18 FIX: Save FPU state before any code that might use SSE
     // This prevents corruption of user/kernel FPU state by IRQ handler code
@@ -827,19 +973,55 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
 
     INTERRUPT_STATS.timer.fetch_add(1, Ordering::Relaxed);
 
-    // 更新系统时钟计数器
-    kernel_core::on_timer_tick();
+    // Check if this is BSP (CPU 0) or an AP
+    // BSP receives PIT IRQ0 via 8259 PIC, APs receive LAPIC timer interrupts
+    let cpu_id = cpu_local::current_cpu_id();
+    let is_bsp = cpu_id == 0;
+
+    // Debug: Mark first timer interrupt on each AP via direct serial output (lock-free)
+    // This avoids console lock contention in IRQ context
+    if !is_bsp && cpu_id < 64 {
+        if !AP_TIMER_SEEN[cpu_id].swap(true, Ordering::Relaxed) {
+            // Write directly to serial port 0x3F8 without locking
+            // Format: "[T:X]" where X is CPU ID
+            unsafe {
+                let port = 0x3F8u16;
+                // Wait for transmit buffer empty
+                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'[');
+                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'T');
+                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b':');
+                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'0' + (cpu_id as u8));
+                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b']');
+                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'\n');
+            }
+        }
+    }
+
+    // Only BSP should increment global tick count to avoid time advancing N× faster
+    // APs get their own LAPIC timer interrupts but don't maintain wall-clock time
+    if is_bsp {
+        kernel_core::on_timer_tick();
+    }
 
     // 通过钩子调用调度器的时钟 tick 处理
     // 调度器会更新时间片并设置 NEED_RESCHED 标志（如需要）
+    // All CPUs need scheduler ticks for time slice management
     on_scheduler_tick();
 
-    // 先发送 EOI (End of Interrupt) 到 PIC
-    // 必须在抢占之前发送，避免上下文切换后 IRQ0 长时间被屏蔽
+    // EOI handling: BSP sends to both PIC and LAPIC, AP only to LAPIC
+    // Sending PIC EOI from AP could clear in-service bit while BSP handles real PIC IRQ
     unsafe {
-        core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
-        // Also ack the local APIC when running in ExtINT (LINT0) mode
-        // Without this, the LAPIC ISR stays set and blocks further PIC interrupts
+        if is_bsp {
+            // BSP: Send EOI to 8259 PIC (IRQ0 comes from PIT)
+            core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
+        }
+        // All CPUs: Send EOI to LAPIC
         apic::lapic_eoi();
     }
 
@@ -860,14 +1042,21 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     unsafe {
         irq_restore_fpu();
     }
+
+    // R69-3 FIX: Mark leaving IRQ context
+    current_cpu().irq_exit();
 }
 
 /// IRQ 1 - Keyboard Interrupt (键盘中断)
 ///
 /// R65-18 FIX: Saves/restores FPU state to prevent corruption.
+/// R69-3 FIX: Uses irq_enter/irq_exit for proper IRQ context tracking on SMP.
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
+
+    // R69-3 FIX: Mark entering IRQ context
+    current_cpu().irq_enter();
 
     // R65-18 FIX: Save FPU state
     unsafe {
@@ -903,6 +1092,9 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     unsafe {
         irq_restore_fpu();
     }
+
+    // R69-3 FIX: Mark leaving IRQ context
+    current_cpu().irq_exit();
 }
 
 /// IRQ 4 - Serial COM1 Interrupt (串口中断)
@@ -913,9 +1105,13 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 /// 否则如果 FIFO 未清空，可能不会触发新的中断。
 ///
 /// R65-18 FIX: Saves/restores FPU state to prevent corruption.
+/// R69-3 FIX: Uses irq_enter/irq_exit for proper IRQ context tracking on SMP.
 extern "x86-interrupt" fn serial_interrupt_handler(_stack_frame: InterruptStackFrame) {
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
+
+    // R69-3 FIX: Mark entering IRQ context
+    current_cpu().irq_enter();
 
     // R65-18 FIX: Save FPU state
     unsafe {
@@ -968,6 +1164,9 @@ extern "x86-interrupt" fn serial_interrupt_handler(_stack_frame: InterruptStackF
     unsafe {
         irq_restore_fpu();
     }
+
+    // R69-3 FIX: Mark leaving IRQ context
+    current_cpu().irq_exit();
 }
 
 /// 触发断点异常（用于测试）
@@ -1078,6 +1277,46 @@ pub unsafe fn pic_send_eoi(irq: u8) {
 // IPI Handlers (Inter-Processor Interrupts for SMP)
 // ============================================================================
 
+/// Reschedule IPI Handler (vector 0xFB)
+///
+/// Called when this CPU receives a reschedule request from another CPU.
+/// This handler:
+/// 1. Clears SMAP if active (CLAC)
+/// 2. Sets the need_resched flag on this CPU
+/// 3. Requests a reschedule from IRQ context
+/// 4. Sends LAPIC EOI to acknowledge the interrupt
+///
+/// The actual context switch will occur at the next safe scheduling point
+/// (e.g., syscall return or timer interrupt).
+///
+/// R69-3 FIX: Uses irq_enter/irq_exit for proper IRQ context tracking on SMP.
+///
+/// # Safety
+///
+/// - Must be called with interrupts disabled (x86-interrupt calling convention)
+/// - Uses LAPIC EOI (not PIC) since this is an IPI
+extern "x86-interrupt" fn reschedule_ipi_handler(_stack_frame: InterruptStackFrame) {
+    // S-6 fix: Clear SMAP to prevent user-page access during handler
+    clac_if_smap();
+
+    // R69-3 FIX: Mark entering IRQ context
+    current_cpu().irq_enter();
+
+    // Mark this CPU as needing a reschedule
+    current_cpu().set_need_resched();
+
+    // Request reschedule from IRQ context (sets IRQ_RESCHED_PENDING)
+    kernel_core::request_resched_from_irq();
+
+    // Send LAPIC EOI (not PIC - this is an IPI)
+    unsafe {
+        apic::lapic_eoi();
+    }
+
+    // R69-3 FIX: Mark leaving IRQ context
+    current_cpu().irq_exit();
+}
+
 /// TLB Shootdown IPI Handler (vector 0xFE)
 ///
 /// Called when this CPU receives a TLB shootdown request from another CPU.
@@ -1085,6 +1324,8 @@ pub unsafe fn pic_send_eoi(irq: u8) {
 /// 1. Clears SMAP if active (CLAC)
 /// 2. Delegates to mm::tlb_shootdown::handle_shootdown_ipi()
 /// 3. Sends LAPIC EOI to acknowledge the interrupt
+///
+/// R69-3 FIX: Uses irq_enter/irq_exit for proper IRQ context tracking on SMP.
 ///
 /// # Safety
 ///
@@ -1094,6 +1335,9 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStack
     // S-6 fix: Clear SMAP to prevent user-page access during handler
     clac_if_smap();
 
+    // R69-3 FIX: Mark entering IRQ context
+    current_cpu().irq_enter();
+
     // Delegate to the TLB shootdown module
     tlb_shootdown::handle_shootdown_ipi();
 
@@ -1101,4 +1345,7 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStack
     unsafe {
         apic::lapic_eoi();
     }
+
+    // R69-3 FIX: Mark leaving IRQ context
+    current_cpu().irq_exit();
 }

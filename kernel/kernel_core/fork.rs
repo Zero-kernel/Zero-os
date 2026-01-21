@@ -134,7 +134,12 @@ fn fork_inner(
 
         // 复制 CPU 上下文（RAX 在下方置 0）
         child.context = parent.context;
+        // Lazy FPU: inherit parent's FPU usage flag
+        // If parent used FPU, the state in context.fx is valid and child inherits it
+        child.fpu_used = parent.fpu_used;
         child.user_stack = parent.user_stack;
+        // SMP: inherit CPU affinity from parent
+        child.allowed_cpus = parent.allowed_cpus;
 
         // 子进程使用自己的内核栈（由 create_process -> allocate_kernel_stack 分配）
         // 复制父进程内核栈内容以保持返回路径一致
@@ -419,7 +424,9 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
     // If COW flag is no longer set, the page has already been resolved - just flush TLB and return.
     if !flags.contains(cow_flag()) {
         // COW already resolved by another thread, just ensure TLB is consistent
-        x86_64::instructions::tlb::flush(virt);
+        // R68-4 FIX: Use cross-CPU shootdown to ensure all CPUs see the resolution.
+        // On SMP, other CPUs sharing this address space may have stale TLB entries.
+        mm::flush_current_as_page(virt);
         return Ok(());
     }
 
@@ -458,15 +465,20 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
         if let Err(_) = manager.map_page(page, new_frame, new_flags, &mut frame_alloc) {
             // Attempt to restore the old mapping
             let _ = manager.map_page(page, old_frame, flags, &mut frame_alloc);
-            // Flush TLB for this page to ensure old mapping is visible
-            x86_64::instructions::tlb::flush(virt);
+            // R68-4 FIX: Flush TLB on all CPUs sharing this address space.
+            // Use cross-CPU shootdown to ensure the restored mapping is visible.
+            mm::flush_current_as_page(virt);
             // Deallocate the new frame we allocated
             frame_alloc.deallocate_frame(new_frame);
             return Err(ForkError::PageTableCopyFailed);
         }
 
-        // H-35 fix: Flush TLB to ensure the new mapping with WRITABLE flag is effective
-        x86_64::instructions::tlb::flush(virt);
+        // H-35 & R68-4 FIX: Flush TLB on ALL CPUs to ensure the new writable mapping is effective.
+        //
+        // On SMP, other CPUs in the same address space may have the old COW (read-only) TLB
+        // entry cached. Without cross-CPU shootdown, they would continue to trigger COW faults
+        // or write to the old frame, causing memory corruption or use-after-free.
+        mm::flush_current_as_page(virt);
 
         // 减少原页引用计数
         let remaining = PAGE_REF_COUNT.decrement(old_phys.as_u64() as usize);
@@ -525,36 +537,42 @@ impl PhysicalPageRefCount {
     /// 返回更新后的引用计数。如果为 0 则调用者可以释放该页。
     /// 使用 CAS 循环确保原子性。
     /// 【M-15 修复】当引用计数归零时，自动从映射中移除条目以防止内存泄漏
+    ///
+    /// # R69-1 FIX: Atomic Decrement + Removal
+    ///
+    /// Previous two-phase approach (read-lock CAS, then write-lock removal) had a TOCTOU
+    /// vulnerability: between releasing read lock and calling remove_entry(), a concurrent
+    /// increment() could resurrect the entry, causing use-after-free when caller frees
+    /// the frame based on the returned 0.
+    ///
+    /// Now uses a single write-lock section with interrupts disabled to ensure atomicity
+    /// of decrement + removal. This eliminates the ABA window at the cost of slightly
+    /// higher contention (all decrements now need write lock instead of read lock).
     pub fn decrement(&self, phys_addr: usize) -> u64 {
-        // 第一阶段：在读锁下进行CAS操作
-        let (should_remove, remaining) = {
-            let guard = self.ref_counts.read();
-            if let Some(count) = guard.get(&phys_addr) {
+        // R69-1 FIX: Single atomic section eliminates ABA race condition.
+        // By holding the write lock throughout decrement + removal, no concurrent
+        // increment can resurrect the entry after we observe count == 0.
+        interrupts::without_interrupts(|| {
+            let mut counts = self.ref_counts.write();
+            if let Some(count) = counts.get(&phys_addr) {
                 let mut prev = count.load(Ordering::SeqCst);
-                loop {
-                    if prev == 0 {
-                        break (false, 0); // 已经为0，不需要移除
-                    }
+                while prev > 0 {
                     match count.compare_exchange(prev, prev - 1, Ordering::SeqCst, Ordering::SeqCst)
                     {
                         Ok(_) => {
                             let new_val = prev - 1;
-                            break (new_val == 0, new_val); // CAS成功，返回是否需要移除和新值
+                            if new_val == 0 {
+                                // Remove entry immediately while still holding the lock
+                                counts.remove(&phys_addr);
+                            }
+                            return new_val;
                         }
                         Err(actual) => prev = actual,
                     }
                 }
-            } else {
-                (false, 0)
             }
-        }; // 读锁在这里释放
-
-        // 第二阶段：如果需要移除，在写锁下执行（读锁已释放，避免死锁）
-        if should_remove {
-            self.remove_entry(phys_addr);
-        }
-
-        remaining
+            0
+        })
     }
 
     /// 移除指定地址的引用计数条目（引用计数归零时调用）

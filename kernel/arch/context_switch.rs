@@ -235,15 +235,12 @@ pub unsafe fn assert_kernel_context(ctx: *const Context) {
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const Context) {
     core::arch::naked_asm!(
-        // R67-10 FIX: Save RFLAGS and disable interrupts FIRST to protect FPU state
-        // during the entire context switch. This prevents IRQ handlers from clobbering
-        // FPU state between fxsave64 and fxrstor64.
+        // R67-10 FIX: Save RFLAGS and disable interrupts FIRST to keep the switch atomic.
         "pushfq",
         "pop qword ptr [rdi + 0x88]",  // Save RFLAGS to old_ctx before cli
-        "cli",                          // Disable interrupts during FPU operations
+        "cli",                          // Disable interrupts during context switch
 
-        // 保存当前 FPU/SIMD 状态到 old_ctx
-        "fxsave64 [rdi + {fxoff}]",
+        // R69-2 Lazy FPU: Removed FXSAVE64 - FPU state saved on-demand by #NM handler
 
         // 先保存 rcx/rdx（在覆盖前使用 rdi 作为基址）
         "mov [rdi + 0x10], rcx",   // 保存rcx
@@ -285,8 +282,12 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         "mov ax, ss",
         "mov [rdx + 0x98], rax",
 
-        // 恢复新进程的 FPU/SIMD 状态
-        "fxrstor64 [rcx + {fxoff}]",
+        // R69-2 Lazy FPU: Set CR0.TS to trigger #NM on first FPU/SIMD use
+        // This defers FXSAVE/FXRSTOR until actually needed, saving overhead
+        // when processes don't use FPU between context switches
+        "mov rax, cr0",
+        "or rax, {cr0_ts}",
+        "mov cr0, rax",
 
         // 加载新上下文从 new_ctx (rcx)
         "mov rax, [rcx + 0x00]",   // 恢复rax
@@ -322,7 +323,7 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
 
         // 返回到新进程
         "ret",
-        fxoff = const FXSAVE_OFFSET,
+        cr0_ts = const 0x8u64,  // CR0.TS (Task Switched) bit
     )
 }
 

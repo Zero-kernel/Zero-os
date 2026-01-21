@@ -48,8 +48,10 @@
 //! The LAPIC is initialized but only for single-core timer and interrupt handling.
 //! I/O APIC and full SMP support will be added incrementally.
 
+use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use x86_64::instructions::port::{Port, PortWriteOnly};
 
 // ============================================================================
 // LAPIC Constants and Registers
@@ -121,6 +123,18 @@ pub mod lvt_bits {
     pub const TIMER_PERIODIC: u32 = 1 << 17;
     /// Timer Mode: TSC-Deadline
     pub const TIMER_TSC_DEADLINE: u32 = 2 << 17;
+}
+
+/// LAPIC Timer Divider values (for TIMER_DIVIDE register)
+pub mod timer_divide {
+    pub const DIV_1: u32 = 0b1011;   // Divide by 1
+    pub const DIV_2: u32 = 0b0000;   // Divide by 2
+    pub const DIV_4: u32 = 0b0001;   // Divide by 4
+    pub const DIV_8: u32 = 0b0010;   // Divide by 8
+    pub const DIV_16: u32 = 0b0011;  // Divide by 16
+    pub const DIV_32: u32 = 0b1000;  // Divide by 32
+    pub const DIV_64: u32 = 0b1001;  // Divide by 64
+    pub const DIV_128: u32 = 0b1010; // Divide by 128
 }
 
 /// ICR Delivery Mode
@@ -230,6 +244,42 @@ static IOAPIC_BASE: AtomicU32 = AtomicU32::new(IOAPIC_DEFAULT_BASE as u32);
 static BSP_LAPIC_ID: AtomicU32 = AtomicU32::new(0);
 
 // ============================================================================
+// LAPIC Timer Configuration
+// ============================================================================
+
+/// LAPIC timer interrupt vector (matches IRQ0/PIT on BSP for uniform handling)
+const LAPIC_TIMER_VECTOR: u32 = 32;
+
+/// Default LAPIC timer initial count (~1kHz with DIV_16 on typical CPUs)
+/// This is a conservative default; call `set_lapic_timer_init_count()` with
+/// a calibrated value for accurate timing.
+const LAPIC_TIMER_DEFAULT_INIT_COUNT: u32 = 0x10000;
+
+/// Shared LAPIC timer initial count (calibrated on BSP, used by all APs)
+static LAPIC_TIMER_INIT_COUNT: AtomicU32 = AtomicU32::new(LAPIC_TIMER_DEFAULT_INIT_COUNT);
+
+// ============================================================================
+// PIT Channel 2 Calibration Constants
+// ============================================================================
+
+/// PIT base frequency (Hz) used for LAPIC calibration
+const PIT_FREQUENCY_HZ: u32 = 1_193_182;
+/// PIT command port
+const PIT_COMMAND_PORT: u16 = 0x43;
+/// PIT channel 2 data port (used as gate timer)
+const PIT_CHANNEL2_DATA_PORT: u16 = 0x42;
+/// PIT channel 2 gate/speaker control port
+const PIT_CHANNEL2_GATE_PORT: u16 = 0x61;
+/// PIT channel 2 gate enable bit (port 0x61)
+const PIT_CHANNEL2_GATE_BIT: u8 = 1 << 0;
+/// PIT speaker enable bit (port 0x61) - keep cleared to avoid audible beep
+const PIT_CHANNEL2_SPEAKER_BIT: u8 = 1 << 1;
+/// PIT channel 2 OUT status bit (port 0x61)
+const PIT_CHANNEL2_OUT_BIT: u8 = 1 << 5;
+/// Calibration window length in milliseconds
+const LAPIC_CALIBRATION_WINDOW_MS: u32 = 10;
+
+// ============================================================================
 // LAPIC Operations
 // ============================================================================
 
@@ -278,6 +328,202 @@ pub unsafe fn lapic_id() -> u32 {
 #[inline]
 pub unsafe fn lapic_eoi() {
     lapic_write(lapic::EOI, 0);
+}
+
+// ============================================================================
+// LAPIC Timer Functions
+// ============================================================================
+
+/// Set the calibrated LAPIC timer initial count.
+///
+/// This value is shared across all CPUs. Call this on the BSP after
+/// calibrating against the PIT or another known time source, before
+/// starting APs.
+///
+/// # Arguments
+///
+/// * `count` - The timer initial count for ~1kHz ticks. If 0, uses default.
+pub fn set_lapic_timer_init_count(count: u32) {
+    let value = if count == 0 {
+        LAPIC_TIMER_DEFAULT_INIT_COUNT
+    } else {
+        count
+    };
+    LAPIC_TIMER_INIT_COUNT.store(value, Ordering::Relaxed);
+}
+
+/// Get the current LAPIC timer initial count setting.
+#[inline]
+pub fn get_lapic_timer_init_count() -> u32 {
+    LAPIC_TIMER_INIT_COUNT.load(Ordering::Relaxed)
+}
+
+/// Calibrate LAPIC timer against PIT channel 2.
+///
+/// Programs PIT channel 2 as a one-shot gate timer (using port 0x61 to toggle
+/// the gate) for a fixed window, measures the LAPIC timer decrement over that
+/// period, and derives an initial count that yields ~1kHz ticks with a
+/// divide-by-16 configuration.
+///
+/// Returns the calibrated initial count on success and leaves the shared
+/// `LAPIC_TIMER_INIT_COUNT` updated. On failure, the previous value is left
+/// intact and an error is returned.
+///
+/// # Safety
+///
+/// - LAPIC must be initialized
+/// - Should be called only on BSP before starting APs
+/// - Interrupts MUST be disabled during calibration (enforced by assertion)
+///
+/// # Panics
+///
+/// Panics if called with interrupts enabled.
+pub unsafe fn calibrate_lapic_timer() -> Result<u32, &'static str> {
+    // R70-7 FIX: Assert interrupts are disabled to prevent measurement skew.
+    // If an IRQ fires during calibration, the measured LAPIC frequency would
+    // be lower than actual, causing timer ticks to fire too slowly.
+    assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "calibrate_lapic_timer: interrupts must be disabled"
+    );
+
+    if !lapic_initialized() {
+        drivers::println!("[APIC] calibrate_lapic_timer: LAPIC not initialized");
+        return Err("lapic not initialized");
+    }
+
+    // Configure PIT channel 2 as a gated one-shot timer.
+    let mut pit_cmd = PortWriteOnly::<u8>::new(PIT_COMMAND_PORT);
+    let mut pit_ch2 = PortWriteOnly::<u8>::new(PIT_CHANNEL2_DATA_PORT);
+    let mut pit_gate = Port::<u8>::new(PIT_CHANNEL2_GATE_PORT);
+
+    let saved_gate = pit_gate.read();
+    // Hold gate low and disconnect speaker to avoid audible clicks.
+    pit_gate.write(saved_gate & !(PIT_CHANNEL2_GATE_BIT | PIT_CHANNEL2_SPEAKER_BIT));
+
+    // Calculate PIT reload value for the calibration window
+    let pit_reload = ((PIT_FREQUENCY_HZ as u64 * LAPIC_CALIBRATION_WINDOW_MS as u64) + 500) / 1000;
+    if pit_reload == 0 || pit_reload > u16::MAX as u64 {
+        drivers::println!(
+            "[APIC] calibrate_lapic_timer: invalid PIT reload value {}",
+            pit_reload
+        );
+        pit_gate.write(saved_gate);
+        return Err("invalid pit reload");
+    }
+
+    // Channel 2, lobyte/hibyte, mode 0 (one-shot), binary.
+    pit_cmd.write(0b1011_0000);
+    pit_ch2.write(pit_reload as u8);
+    pit_ch2.write((pit_reload >> 8) as u8);
+
+    // Prepare LAPIC timer in masked one-shot mode to avoid spurious IRQs.
+    lapic_write(
+        lapic::LVT_TIMER,
+        LAPIC_TIMER_VECTOR | lvt_bits::TIMER_ONESHOT | lvt_bits::MASKED,
+    );
+    lapic_write(lapic::TIMER_DIVIDE, timer_divide::DIV_16);
+
+    // Start PIT window and LAPIC countdown close together.
+    pit_gate.write((saved_gate & !PIT_CHANNEL2_SPEAKER_BIT) | PIT_CHANNEL2_GATE_BIT);
+    lapic_write(lapic::TIMER_INIT, u32::MAX);
+
+    // Wait for PIT terminal count signaled via OUT bit.
+    let mut polls: u32 = 0;
+    const MAX_PIT_POLLS: u32 = 50_000_000;
+    while pit_gate.read() & PIT_CHANNEL2_OUT_BIT == 0 {
+        polls = polls.wrapping_add(1);
+        if polls >= MAX_PIT_POLLS {
+            pit_gate.write(saved_gate);
+            lapic_write(lapic::TIMER_INIT, 0);
+            drivers::println!("[APIC] calibrate_lapic_timer: PIT wait timeout");
+            return Err("pit timeout");
+        }
+        spin_loop();
+    }
+
+    let elapsed = u32::MAX - lapic_read(lapic::TIMER_CURRENT);
+    // Stop LAPIC timer and restore speaker port state.
+    lapic_write(lapic::TIMER_INIT, 0);
+    pit_gate.write(saved_gate);
+
+    if elapsed == 0 {
+        drivers::println!("[APIC] calibrate_lapic_timer: LAPIC timer did not decrement");
+        return Err("lapic timer not running");
+    }
+
+    // Calculate ticks per millisecond and round
+    let per_ms = ((elapsed as u64) + (LAPIC_CALIBRATION_WINDOW_MS as u64 / 2))
+        / LAPIC_CALIBRATION_WINDOW_MS as u64;
+    let calibrated = per_ms.min(u32::MAX as u64) as u32;
+
+    if calibrated == 0 {
+        drivers::println!("[APIC] calibrate_lapic_timer: computed init count is zero");
+        return Err("calibration result zero");
+    }
+
+    LAPIC_TIMER_INIT_COUNT.store(calibrated, Ordering::Relaxed);
+    drivers::println!(
+        "[APIC] LAPIC timer calibrated: {} ticks in {} ms -> init_count={} (div=16, ~1kHz)",
+        elapsed,
+        LAPIC_CALIBRATION_WINDOW_MS,
+        calibrated
+    );
+    Ok(calibrated)
+}
+
+/// Start the LAPIC timer in periodic mode.
+///
+/// Configures the local APIC timer to fire at approximately 1kHz using
+/// the calibrated initial count. The timer uses vector 32 (same as BSP's
+/// PIT IRQ0) for uniform interrupt handling.
+///
+/// # Safety
+///
+/// - LAPIC must be enabled and properly mapped
+/// - IDT entry for vector 32 must be configured
+/// - Should be called after LAPIC initialization
+pub unsafe fn start_lapic_timer() {
+    let initial_count = LAPIC_TIMER_INIT_COUNT
+        .load(Ordering::Relaxed)
+        .max(1); // Ensure non-zero to actually start the timer
+
+    // Set divider to 16 for reasonable count range
+    lapic_write(lapic::TIMER_DIVIDE, timer_divide::DIV_16);
+
+    // Configure LVT Timer: vector 32, periodic mode, unmasked
+    lapic_write(
+        lapic::LVT_TIMER,
+        LAPIC_TIMER_VECTOR | lvt_bits::TIMER_PERIODIC,
+    );
+
+    // Writing initial count starts the timer
+    lapic_write(lapic::TIMER_INIT, initial_count);
+}
+
+/// Stop the LAPIC timer.
+///
+/// Masks the timer interrupt and clears the initial count.
+///
+/// # Safety
+///
+/// LAPIC must be enabled.
+pub unsafe fn stop_lapic_timer() {
+    // Mask the timer
+    lapic_write(lapic::LVT_TIMER, lvt_bits::MASKED);
+    // Clear initial count to stop
+    lapic_write(lapic::TIMER_INIT, 0);
+}
+
+/// Check if this CPU's LAPIC timer is running.
+///
+/// # Safety
+///
+/// LAPIC must be mapped.
+pub unsafe fn lapic_timer_running() -> bool {
+    let lvt = lapic_read(lapic::LVT_TIMER);
+    // Timer is running if not masked and has non-zero count
+    (lvt & lvt_bits::MASKED) == 0 && lapic_read(lapic::TIMER_CURRENT) > 0
 }
 
 /// Check if LAPIC is enabled in hardware
@@ -443,6 +689,10 @@ pub unsafe fn init_lapic_for_ap() {
 
     // Send EOI
     lapic_eoi();
+
+    // Start the LAPIC timer for this AP so it can receive scheduler ticks.
+    // Without this, AP would never get timer interrupts (PIT IRQ0 only goes to BSP).
+    start_lapic_timer();
 }
 
 /// Check if LAPIC is initialized

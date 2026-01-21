@@ -18,6 +18,8 @@
 //! ├── SCHEDULER_STATS
 //! │
 //! Level 4 (Memory Management)
+//! ├── COW_FAULT_LOCK (fork.rs:412) - serialize COW page fault handling
+//! ├── PT_LOCK (page_table.rs:39) - global page table operations
 //! ├── PAGE_TABLE_MANAGER
 //! ├── BUDDY_ALLOCATOR / FRAME_ALLOCATOR
 //! ├── HEAP_ALLOCATOR (global_alloc)
@@ -70,6 +72,8 @@
 //! |------|--------|-------|------|-------|
 //! | READY_QUEUE | sched/enhanced_scheduler.rs | 3 | Mutex<BTreeMap> | Per-CPU in SMP |
 //! | CURRENT_PROCESS | sched/enhanced_scheduler.rs | 3 | Mutex<Option<Pid>> | Per-CPU in SMP |
+//! | COW_FAULT_LOCK | kernel_core/fork.rs | 4a | Mutex<()> | Static, serialize COW faults |
+//! | PT_LOCK | mm/page_table.rs | 4b | Mutex<()> | Global page table ops |
 //! | PAGE_TABLE_MANAGER | mm/page_table.rs | 4 | Once<Mutex> | Global |
 //! | BUDDY_ALLOCATOR | mm/buddy_allocator.rs | 4 | Mutex | Global |
 //! | ALLOCATOR | mm/memory.rs | 4 | LockedHeap | Global |
@@ -80,6 +84,43 @@
 //! | SERIAL_PORT | drivers/serial.rs | 8 | Mutex | Global |
 //! | AUDIT_RING | audit/lib.rs | 9 | Mutex | Global |
 //! | RNG_STATE | security/rng.rs | 9 | Mutex | Global |
+//!
+//! # R69-5: COW_FAULT_LOCK and PT_LOCK Ordering
+//!
+//! **Critical Lock Ordering**: COW_FAULT_LOCK < PT_LOCK
+//!
+//! These two locks serialize page table operations during fork and COW fault handling:
+//!
+//! ```text
+//! COW_FAULT_LOCK (fork.rs:412)
+//!     └── PT_LOCK (page_table.rs:39, acquired via with_current_manager/with_pt_lock)
+//! ```
+//!
+//! ## Call Paths Analysis
+//!
+//! 1. **handle_cow_page_fault()** (fork.rs:404-495):
+//!    - Acquires COW_FAULT_LOCK first
+//!    - Then calls with_current_manager() which acquires PT_LOCK
+//!    - Order: COW_FAULT_LOCK → PT_LOCK ✓
+//!
+//! 2. **copy_page_table_cow()** (fork.rs:319-377):
+//!    - Calls with_pt_lock() which acquires PT_LOCK only
+//!    - Does NOT hold COW_FAULT_LOCK
+//!    - Order: PT_LOCK only ✓
+//!
+//! ## Why This Ordering Matters
+//!
+//! - If any code path acquired PT_LOCK then COW_FAULT_LOCK, it would deadlock
+//!   with handle_cow_page_fault() on SMP systems
+//! - Current code is safe because:
+//!   - fork() path uses PT_LOCK only (no nested COW fault possible during fork)
+//!   - COW fault path always acquires COW_FAULT_LOCK first
+//!
+//! ## Safety Rules
+//!
+//! 1. **Never acquire COW_FAULT_LOCK while holding PT_LOCK**
+//! 2. **Always acquire COW_FAULT_LOCK before PT_LOCK if both needed**
+//! 3. **COW_FAULT_LOCK is only needed in handle_cow_page_fault()**
 //!
 //! # SMP Migration Notes
 //!
