@@ -537,36 +537,42 @@ impl PhysicalPageRefCount {
     /// 返回更新后的引用计数。如果为 0 则调用者可以释放该页。
     /// 使用 CAS 循环确保原子性。
     /// 【M-15 修复】当引用计数归零时，自动从映射中移除条目以防止内存泄漏
+    ///
+    /// # R69-1 FIX: Atomic Decrement + Removal
+    ///
+    /// Previous two-phase approach (read-lock CAS, then write-lock removal) had a TOCTOU
+    /// vulnerability: between releasing read lock and calling remove_entry(), a concurrent
+    /// increment() could resurrect the entry, causing use-after-free when caller frees
+    /// the frame based on the returned 0.
+    ///
+    /// Now uses a single write-lock section with interrupts disabled to ensure atomicity
+    /// of decrement + removal. This eliminates the ABA window at the cost of slightly
+    /// higher contention (all decrements now need write lock instead of read lock).
     pub fn decrement(&self, phys_addr: usize) -> u64 {
-        // 第一阶段：在读锁下进行CAS操作
-        let (should_remove, remaining) = {
-            let guard = self.ref_counts.read();
-            if let Some(count) = guard.get(&phys_addr) {
+        // R69-1 FIX: Single atomic section eliminates ABA race condition.
+        // By holding the write lock throughout decrement + removal, no concurrent
+        // increment can resurrect the entry after we observe count == 0.
+        interrupts::without_interrupts(|| {
+            let mut counts = self.ref_counts.write();
+            if let Some(count) = counts.get(&phys_addr) {
                 let mut prev = count.load(Ordering::SeqCst);
-                loop {
-                    if prev == 0 {
-                        break (false, 0); // 已经为0，不需要移除
-                    }
+                while prev > 0 {
                     match count.compare_exchange(prev, prev - 1, Ordering::SeqCst, Ordering::SeqCst)
                     {
                         Ok(_) => {
                             let new_val = prev - 1;
-                            break (new_val == 0, new_val); // CAS成功，返回是否需要移除和新值
+                            if new_val == 0 {
+                                // Remove entry immediately while still holding the lock
+                                counts.remove(&phys_addr);
+                            }
+                            return new_val;
                         }
                         Err(actual) => prev = actual,
                     }
                 }
-            } else {
-                (false, 0)
             }
-        }; // 读锁在这里释放
-
-        // 第二阶段：如果需要移除，在写锁下执行（读锁已释放，避免死锁）
-        if should_remove {
-            self.remove_entry(phys_addr);
-        }
-
-        remaining
+            0
+        })
     }
 
     /// 移除指定地址的引用计数条目（引用计数归零时调用）

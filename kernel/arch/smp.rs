@@ -986,20 +986,49 @@ fn ap_idle_loop() -> ! {
 ///
 /// Returns the virtual address of the stack top (highest address).
 fn alloc_ap_stack() -> u64 {
-    // Use buddy allocator for contiguous physical pages
-    let frame = mm::buddy_allocator::alloc_physical_pages(AP_STACK_PAGES)
-        .expect("[SMP] Failed to allocate AP stack");
+    // R70-5 FIX: AP stack must be in low memory (<4GB) because the high-half
+    // direct map only covers the first MAX_PHYS_MAPPED bytes. If the buddy
+    // allocator returns a frame above 4GB, the computed virtual address
+    // would be unmapped, causing #PF → #DF when the AP handles interrupts.
+    //
+    // Try multiple allocations to find a low-memory frame.
+    const MAX_ALLOC_ATTEMPTS: usize = 16;
 
-    let phys = frame.start_address().as_u64();
-    let virt = PHYSICAL_MEMORY_OFFSET + phys;
+    for attempt in 0..MAX_ALLOC_ATTEMPTS {
+        let frame = mm::buddy_allocator::alloc_physical_pages(AP_STACK_PAGES)
+            .expect("[SMP] Failed to allocate AP stack");
 
-    // Zero the stack for security
-    unsafe {
-        ptr::write_bytes(virt as *mut u8, 0, AP_STACK_SIZE);
+        let phys = frame.start_address().as_u64();
+
+        // Check if frame is within direct-mapped range
+        if phys + AP_STACK_SIZE as u64 <= MAX_PHYS_MAPPED {
+            let virt = PHYSICAL_MEMORY_OFFSET + phys;
+
+            // Zero the stack for security
+            unsafe {
+                ptr::write_bytes(virt as *mut u8, 0, AP_STACK_SIZE);
+            }
+
+            // Return stack top (highest address), 16-byte aligned
+            return (virt + AP_STACK_SIZE as u64) & !0xFu64;
+        }
+
+        // Frame is above 4GB - cannot use for AP stack
+        // Free it and try again (buddy allocator may give different frame)
+        unsafe {
+            mm::buddy_allocator::free_physical_pages(frame, AP_STACK_PAGES);
+        }
+
+        if attempt > 0 {
+            println!("[SMP] AP stack allocation attempt {} got high frame 0x{:x}, retrying...",
+                     attempt + 1, phys);
+        }
     }
 
-    // Return stack top (highest address), 16-byte aligned
-    (virt + AP_STACK_SIZE as u64) & !0xFu64
+    // All attempts returned high memory - this is a configuration issue
+    // (system has very little RAM below 4GB)
+    panic!("[SMP] Cannot allocate AP stack in low memory (<4GB) after {} attempts. \
+            System may have insufficient low memory.", MAX_ALLOC_ATTEMPTS);
 }
 
 // ============================================================================

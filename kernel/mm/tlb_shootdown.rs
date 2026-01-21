@@ -34,7 +34,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
 use core::mem;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use cpu_local::{
     current_cpu, current_cpu_id, lapic_id_for_cpu, max_cpus, CpuLocal, TlbShootdownMailbox,
     PER_CPU_DATA,
@@ -103,6 +103,13 @@ static CPU_ACTIVE_CR3: CpuLocal<AtomicU64> = CpuLocal::new(|| AtomicU64::new(0))
 /// TLB shootdown uses this to target only CPUs with potentially cached TLB entries.
 /// If a CR3 is not in the map, we fall back to broadcast (safe but less efficient).
 static ASID_CPU_MASKS: RwLock<BTreeMap<u64, u64>> = RwLock::new(BTreeMap::new());
+
+/// R69-4 FIX: Writer-priority flag to prevent starvation.
+///
+/// When a writer (track_cr3_switch) needs the lock, it sets this flag.
+/// Readers (collect_target_cpus) check this flag and briefly yield to writers.
+/// This prevents heavy TLB shootdown traffic from starving context switches.
+static ASID_WRITER_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Statistics for optimized TLB shootdowns
 static STATS_TARGETED_SHOOTDOWNS: AtomicU64 = AtomicU64::new(0);
@@ -214,6 +221,12 @@ pub fn online_cpu_count() -> u64 {
 ///
 /// Uses a RwLock for the global map. The per-CPU CR3 tracking uses atomics.
 /// CPUs with ID >= 64 fall back to broadcast shootdown (cannot be tracked in u64 mask).
+///
+/// # R69-4 FIX: Write Priority
+///
+/// To prevent writer starvation under heavy TLB shootdown traffic, this function
+/// sets ASID_WRITER_PENDING before acquiring the write lock. Readers check this
+/// flag and briefly spin-wait, giving priority to context switches.
 pub fn track_cr3_switch(new_cr3: u64) {
     let cpu_id = current_cpu_id();
     let bit = match cpu_bit(cpu_id) {
@@ -228,8 +241,14 @@ pub fn track_cr3_switch(new_cr3: u64) {
     // Atomically swap the CPU's tracked CR3
     let prev = CPU_ACTIVE_CR3.with(|c| c.swap(new_cr3, Ordering::SeqCst));
 
+    // R69-4 FIX: Signal that a writer is waiting
+    ASID_WRITER_PENDING.store(true, Ordering::Release);
+
     // Update the global CR3 -> CPU mask mapping
     let mut map = ASID_CPU_MASKS.write();
+
+    // R69-4 FIX: Clear writer-pending flag once we have the lock
+    ASID_WRITER_PENDING.store(false, Ordering::Release);
 
     // Remove this CPU from the previous CR3's mask
     if prev != 0 && prev != new_cr3 {
@@ -335,9 +354,26 @@ fn mailbox_for_cpu(cpu_id: usize) -> Option<&'static TlbShootdownMailbox> {
 /// If the CR3 is not in the tracking map, or if tracking indicates no CPUs,
 /// we fall back to broadcasting to all online CPUs (except self). This ensures
 /// correctness even if tracking becomes out of sync.
+///
+/// # R69-4 FIX: Writer Priority
+///
+/// Before acquiring the read lock, this function checks if a writer (context switch)
+/// is pending. If so, it briefly spin-waits to give priority to the writer.
+/// This prevents heavy TLB shootdown traffic from starving context switches.
 fn collect_target_cpus(target_cr3: u64) -> Vec<usize> {
     let mut targets = Vec::new();
     let self_id = current_cpu_id();
+
+    // R69-4 FIX: Yield to pending writers before acquiring read lock.
+    // Writers (context switches) are time-critical and should not be starved
+    // by heavy TLB shootdown traffic. We spin-wait briefly if a writer is pending.
+    const WRITER_YIELD_SPINS: usize = 100;
+    for _ in 0..WRITER_YIELD_SPINS {
+        if !ASID_WRITER_PENDING.load(Ordering::Acquire) {
+            break;
+        }
+        spin_loop();
+    }
 
     // Try to use per-address-space tracking if CR3 is valid
     if target_cr3 != 0 {

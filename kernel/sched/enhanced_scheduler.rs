@@ -21,9 +21,10 @@
 //! scalability by eliminating the global queue lock as a bottleneck.
 
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use core::cell::UnsafeCell;
 use core::cmp;
 use core::sync::atomic::{AtomicU64, Ordering};
-use cpu_local::{current_cpu, current_cpu_id, max_cpus, num_online_cpus, CpuLocal};
+use cpu_local::{current_cpu, current_cpu_id, max_cpus, num_online_cpus, CpuLocal, NO_FPU_OWNER};
 use kernel_core::process::{self, Priority, Process, ProcessId, ProcessState};
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -67,6 +68,59 @@ pub type ProcessControlBlock = Arc<Mutex<Process>>;
 /// - 按优先级从低到高排序（优先级数值越小越优先）
 /// - 同优先级内按 PID 先入先出
 type ReadyQueues = BTreeMap<Priority, BTreeMap<Pid, ProcessControlBlock>>;
+
+/// R70-4 FIX: Shadow buffer for the next task's context.
+///
+/// Per-CPU storage to hold a copy of the target task's Context while the PCB
+/// lock is released. This prevents use-after-unlock when calling enter_usermode
+/// or switch_context, fixing the root cause of kick IPI double-fault.
+///
+/// Safety: Each CPU only mutates its own slot in reschedule_now() with
+/// interrupts disabled, so cross-CPU aliasing cannot occur.
+///
+/// Note: Uses kernel_core::process::Context which is ABI-compatible with
+/// arch::Context (same #[repr(C, align(64))] layout). Cast to ArchContext
+/// pointer when passing to context switch functions.
+struct ContextShadow {
+    buf: UnsafeCell<process::Context>,
+}
+
+unsafe impl Send for ContextShadow {}
+unsafe impl Sync for ContextShadow {}
+
+impl ContextShadow {
+    fn new() -> Self {
+        Self {
+            buf: UnsafeCell::new(process::Context::default()),
+        }
+    }
+
+    /// Copy the context into the shadow buffer and return a stable pointer.
+    ///
+    /// Must be called with interrupts disabled to prevent preemption.
+    /// Returns pointer cast to ArchContext for use with context switch functions.
+    #[inline]
+    fn store(&self, ctx: &process::Context) -> *const ArchContext {
+        // Safety: We have exclusive access (per-CPU, interrupts disabled)
+        // process::Context and arch::Context have identical ABI layout
+        unsafe {
+            *self.buf.get() = *ctx;
+            self.buf.get() as *const ArchContext
+        }
+    }
+}
+
+/// Per-CPU scratch space for staging the next task's Context before the PCB
+/// lock is released. Prevents use-after-unlock when calling enter_usermode.
+static NEXT_CONTEXT_SHADOW: CpuLocal<ContextShadow> = CpuLocal::new(ContextShadow::new);
+
+// Static assert: ensure process::Context and arch::Context have identical size/align
+// This guards against future drift between the two types which would cause UB.
+const _: () = {
+    use core::mem::{align_of, size_of};
+    assert!(size_of::<process::Context>() == size_of::<ArchContext>());
+    assert!(align_of::<process::Context>() == align_of::<ArchContext>());
+};
 
 /// 用于首次调度的哑上下文（内核启动上下文的保存位置，无需恢复）
 static BOOTSTRAP_CONTEXT: Mutex<ArchContext> = Mutex::new(ArchContext::new());
@@ -239,6 +293,9 @@ impl Scheduler {
     ///
     /// This wakes the CPU from its idle HLT loop, causing it to check for
     /// runnable work in its ready queue.
+    ///
+    /// R70-7: Re-enabled after R70-4 (context shadow buffer) and R70-5 (AP stack
+    /// allocation fix) resolved the double fault issue.
     #[inline]
     fn kick_cpu(cpu_id: usize) {
         send_ipi(cpu_id, IpiType::Reschedule);
@@ -253,19 +310,30 @@ impl Scheduler {
     ///
     /// This enables rapid work distribution when multiple idle CPUs exist.
     ///
-    /// R70-3 NOTE: Currently disabled pending investigation of a double fault
-    /// when AP tries to run user processes immediately after kick IPI.
-    /// APs will still pick up work on their next timer tick.
-    fn kick_idle_cpus(_allowed_cpus: u64) {
-        // TODO: Re-enable after fixing double fault issue with AP user mode execution
-        // The issue appears to be related to the IRETQ stack frame setup when
-        // AP wakes from reschedule IPI and tries to run a stolen user process.
-        // Symptoms: RIP=0, CS=0 after IRETQ
+    /// R70-4: Re-enabled after fixing use-after-unlock race in reschedule_now()
+    /// via per-CPU context shadow buffer.
+    fn kick_idle_cpus(allowed_cpus: u64) {
+        let self_cpu = current_cpu_id();
+        let total = Self::cpu_pool_size();
+        for cpu_id in 0..total {
+            if cpu_id == self_cpu {
+                continue;
+            }
+            // Skip CPUs not in affinity mask (0 means all allowed)
+            if allowed_cpus != 0 && !Self::cpu_allowed(cpu_id, allowed_cpus) {
+                continue;
+            }
+            // Only kick if queue is empty (CPU likely idle in HLT)
+            let queue_empty = Self::ready_queue_for_cpu(cpu_id)
+                .map(|q| q.lock().is_empty())
+                .unwrap_or(false);
+            if queue_empty {
+                Self::kick_cpu(cpu_id);
+            }
+        }
     }
 
-    /// Send a reschedule IPI to a specific CPU (currently disabled).
-    ///
-    /// R70-3 NOTE: Disabled along with kick_idle_cpus.
+    /// Send a reschedule IPI to a specific CPU.
     #[allow(dead_code)]
     fn kick_cpu_impl(cpu_id: usize) {
         send_ipi(cpu_id, IpiType::Reschedule);
@@ -499,6 +567,12 @@ impl Scheduler {
     }
 
     /// Migrate one ready process from source to destination CPU
+    ///
+    /// # R69-3 FIX: Respect CPU Affinity Mask
+    ///
+    /// Before migrating, checks if the destination CPU is in the task's allowed_cpus
+    /// mask. If not permitted, the task is put back in the source queue and migration
+    /// is skipped. This prevents violating user-configured CPU placement constraints.
     fn migrate_one_ready(src_cpu: usize, dst_cpu: usize) {
         let Some(src_queue) = Self::ready_queue_for_cpu(src_cpu) else {
             return;
@@ -510,11 +584,24 @@ impl Scheduler {
         };
 
         if let Some((pid, pcb, priority)) = candidate {
-            {
+            // R69-3 FIX: Check CPU affinity before migration
+            let allowed_cpus = {
                 let mut proc = pcb.lock();
                 proc.state = ProcessState::Ready;
                 proc.reset_wait_ticks();
+                proc.allowed_cpus
+            };
+
+            // Check if destination CPU is allowed
+            // allowed_cpus == 0 means "use default" (all CPUs allowed)
+            // allowed_cpus != 0 is a bitmask where bit N means CPU N is allowed
+            if allowed_cpus != 0 && (dst_cpu >= 64 || (allowed_cpus & (1u64 << dst_cpu)) == 0) {
+                // Destination CPU not in affinity mask, put task back
+                let mut src_guard = src_queue.lock();
+                src_guard.entry(priority).or_default().insert(pid, pcb);
+                return;
             }
+
             let target =
                 Self::ready_queue_for_cpu(dst_cpu).unwrap_or_else(|| Self::current_ready_queue());
             let mut dst_guard = target.lock();
@@ -607,7 +694,7 @@ impl Scheduler {
             Self::remove_from_all_queues(pid);
 
             // R70-2 FIX: Check if target CPU's queue was empty before enqueue
-            let _target_was_idle = Self::ready_queue_for_cpu(target_cpu)
+            let target_was_idle = Self::ready_queue_for_cpu(target_cpu)
                 .map(|q| q.lock().is_empty())
                 .unwrap_or(false);
 
@@ -619,14 +706,15 @@ impl Scheduler {
                 stats.processes_created += 1;
             }
 
-            // R70-3 NOTE: Kick mechanism disabled pending investigation
-            // APs will pick up work on next timer tick
-            // if target_was_idle && target_cpu != current_cpu_id()
-            //     && Self::cpu_allowed(target_cpu, allowed_cpus)
-            // {
-            //     Self::kick_cpu(target_cpu);
-            // }
-            // Self::kick_idle_cpus(allowed_cpus);
+            // R70-7: Kick target CPU to pick up new work immediately.
+            // Fixed: R70-4 (context shadow buffer) + R70-5 (AP stack allocation)
+            // resolved the double fault issue.
+            if target_was_idle
+                && target_cpu != current_cpu_id()
+                && Self::cpu_allowed(target_cpu, allowed_cpus)
+            {
+                Self::kick_cpu(target_cpu);
+            }
         });
     }
 
@@ -685,16 +773,15 @@ impl Scheduler {
 
                     Self::enqueue_on_cpu(pcb, priority, target_cpu);
 
-                    // R70-3 NOTE: Kick mechanism disabled pending investigation
-                    // of double fault when AP wakes from IPI and runs user process.
-                    // APs will pick up work on next timer tick instead.
-                    // if target_was_idle
-                    //     && target_cpu != current_cpu_id()
-                    //     && Self::cpu_allowed(target_cpu, allowed_cpus)
-                    // {
-                    //     Self::kick_cpu(target_cpu);
-                    // }
-                    // Self::kick_idle_cpus(allowed_cpus);
+                    // R70-7: Kick target CPU to pick up resumed work immediately.
+                    // Fixed: R70-4 (context shadow buffer) + R70-5 (AP stack allocation)
+                    // resolved the double fault issue.
+                    if target_was_idle
+                        && target_cpu != current_cpu_id()
+                        && Self::cpu_allowed(target_cpu, allowed_cpus)
+                    {
+                        Self::kick_cpu(target_cpu);
+                    }
 
                     return true;
                 }
@@ -1042,22 +1129,75 @@ impl Scheduler {
                 }
             };
 
+            // R69-2 FIX: Save lazy FPU state before context switch.
+            //
+            // The lazy FPU implementation tracks FPU owner per-CPU. When a task is
+            // switched out, we must save its FPU state and clear ownership to prevent:
+            // 1. Cross-CPU stale state: If task migrates to CPU1, CPU0 still thinks
+            //    it owns the task's FPU. New task on CPU0 would overwrite migrated
+            //    task's FPU state in its PCB.
+            // 2. State corruption: Migrated task's current FPU work on CPU1 would
+            //    be clobbered when next #NM occurs on CPU0.
+            //
+            // By saving and clearing before switch, each CPU starts fresh and
+            // migrations always restore from saved PCB state via #NM handler.
+            if let Some(opid) = old_pid {
+                let per_cpu = current_cpu();
+                let owner = per_cpu.get_fpu_owner();
+                if owner != NO_FPU_OWNER && owner == opid {
+                    if let Some(proc_arc) = process::get_process(opid) {
+                        let mut pcb = proc_arc.lock();
+                        // R69-2 FIX (codex review): Clear CR0.TS before fxsave64.
+                        //
+                        // Under lazy FPU, CR0.TS may be set if the task never touched
+                        // FPU since its last switch-in. Executing fxsave64 with TS=1
+                        // would trigger #NM fault inside reschedule_now (with IF=0),
+                        // causing re-entry into lazy-FPU handler and potential panic.
+                        //
+                        // By clearing TS first, we ensure fxsave64 can safely execute.
+                        // After the context switch, the next task will have TS set by
+                        // switch_context() to enable lazy FPU for the new task.
+                        unsafe {
+                            use x86_64::registers::control::{Cr0, Cr0Flags};
+                            let cr0 = Cr0::read();
+                            if cr0.contains(Cr0Flags::TASK_SWITCHED) {
+                                let mut new_cr0 = cr0;
+                                new_cr0.remove(Cr0Flags::TASK_SWITCHED);
+                                Cr0::write(new_cr0);
+                            }
+                        }
+                        // Save current FPU hardware state to PCB
+                        let fx_ptr = pcb.context.fx.data.as_mut_ptr();
+                        unsafe {
+                            core::arch::asm!("fxsave64 [{}]", in(reg) fx_ptr, options(nostack));
+                        }
+                        pcb.fpu_used = true;
+                    }
+                    // Clear ownership so this CPU doesn't claim stale state
+                    per_cpu.set_fpu_owner(NO_FPU_OWNER);
+                }
+            }
+
             // 获取新进程的上下文指针、内核栈顶、CS（用于判断 Ring 3）和 FS/GS base（TLS）
+            // R70-4 FIX: Copy context to per-CPU shadow buffer to prevent use-after-unlock.
+            // The PCB lock is released at the end of the closure, but we use the shadow
+            // buffer's stable pointer for enter_usermode/switch_context.
             let (new_ctx_ptr, next_kstack_top, next_cs, next_fs_base, next_gs_base): (
                 *const ArchContext,
                 u64,
                 u64,
                 u64,
                 u64,
-            ) = {
+            ) = NEXT_CONTEXT_SHADOW.with(|shadow| {
                 let guard = next_pcb.lock();
-                let ctx = &guard.context as *const _ as *const ArchContext;
+                // Copy full context (176 bytes + FPU) to per-CPU shadow while holding lock
+                let ctx_ptr = shadow.store(&guard.context);
                 let kstack_top = guard.kernel_stack_top.as_u64();
                 let cs = guard.context.cs;
                 let fs_base = guard.fs_base;
                 let gs_base = guard.gs_base;
-                (ctx, kstack_top, cs, fs_base, gs_base)
-            };
+                (ctx_ptr, kstack_top, cs, fs_base, gs_base)
+            });
 
             // 判断下一个进程是否为用户态进程（Ring 3）
             // CS 的低 2 位是 RPL（Request Privilege Level）

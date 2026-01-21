@@ -378,6 +378,13 @@ impl AtomicInterruptStats {
 /// 全局原子中断统计（避免中断处理程序中的锁争用）
 static INTERRUPT_STATS: AtomicInterruptStats = AtomicInterruptStats::new();
 
+/// Per-CPU flags to track first timer interrupt (for debug output)
+/// MAX_CPUS = 64 to match cpu_local
+static AP_TIMER_SEEN: [AtomicBool; 64] = {
+    const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; 64]
+};
+
 lazy_static! {
     /// 全局中断描述符表
     static ref IDT: InterruptDescriptorTable = {
@@ -966,19 +973,55 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
 
     INTERRUPT_STATS.timer.fetch_add(1, Ordering::Relaxed);
 
-    // 更新系统时钟计数器
-    kernel_core::on_timer_tick();
+    // Check if this is BSP (CPU 0) or an AP
+    // BSP receives PIT IRQ0 via 8259 PIC, APs receive LAPIC timer interrupts
+    let cpu_id = cpu_local::current_cpu_id();
+    let is_bsp = cpu_id == 0;
+
+    // Debug: Mark first timer interrupt on each AP via direct serial output (lock-free)
+    // This avoids console lock contention in IRQ context
+    if !is_bsp && cpu_id < 64 {
+        if !AP_TIMER_SEEN[cpu_id].swap(true, Ordering::Relaxed) {
+            // Write directly to serial port 0x3F8 without locking
+            // Format: "[T:X]" where X is CPU ID
+            unsafe {
+                let port = 0x3F8u16;
+                // Wait for transmit buffer empty
+                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'[');
+                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'T');
+                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b':');
+                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'0' + (cpu_id as u8));
+                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b']');
+                while (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) == 0 {}
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'\n');
+            }
+        }
+    }
+
+    // Only BSP should increment global tick count to avoid time advancing N× faster
+    // APs get their own LAPIC timer interrupts but don't maintain wall-clock time
+    if is_bsp {
+        kernel_core::on_timer_tick();
+    }
 
     // 通过钩子调用调度器的时钟 tick 处理
     // 调度器会更新时间片并设置 NEED_RESCHED 标志（如需要）
+    // All CPUs need scheduler ticks for time slice management
     on_scheduler_tick();
 
-    // 先发送 EOI (End of Interrupt) 到 PIC
-    // 必须在抢占之前发送，避免上下文切换后 IRQ0 长时间被屏蔽
+    // EOI handling: BSP sends to both PIC and LAPIC, AP only to LAPIC
+    // Sending PIC EOI from AP could clear in-service bit while BSP handles real PIC IRQ
     unsafe {
-        core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
-        // Also ack the local APIC when running in ExtINT (LINT0) mode
-        // Without this, the LAPIC ISR stays set and blocks further PIC interrupts
+        if is_bsp {
+            // BSP: Send EOI to 8259 PIC (IRQ0 comes from PIT)
+            core::arch::asm!("mov al, 0x20; out 0x20, al", options(nostack, nomem));
+        }
+        // All CPUs: Send EOI to LAPIC
         apic::lapic_eoi();
     }
 
