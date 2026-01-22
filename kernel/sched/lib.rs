@@ -1,6 +1,5 @@
 #![no_std]
 #![feature(abi_x86_interrupt)]
-#![feature(thread_local)]
 extern crate alloc;
 
 // 导入 drivers crate 的宏
@@ -16,6 +15,12 @@ pub use kernel_core::process;
 pub mod enhanced_scheduler;
 pub mod lock_ordering;
 pub mod scheduler;
+
+// Re-export Scheduler for runtime tests
+pub use enhanced_scheduler::Scheduler;
+
+// Re-export lockdep types for use by other modules
+pub use lock_ordering::{LockClassKey, LockdepMutex, LockLevel};
 
 pub fn init() {
     println!("Scheduler module initialized");

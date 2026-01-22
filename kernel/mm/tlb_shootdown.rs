@@ -44,6 +44,9 @@ use x86_64::instructions::tlb;
 use x86_64::registers::control::Cr3;
 use x86_64::VirtAddr;
 
+// INVPCID support for efficient TLB invalidation
+use tlb_ops::{invpcid_all_nonglobal, invpcid_supported};
+
 /// Statistics for TLB shootdown operations (for debugging/profiling)
 /// Uses atomics for SMP-safety (relaxed ordering is sufficient for stats)
 #[derive(Debug)]
@@ -141,6 +144,47 @@ const FULL_FLUSH_THRESHOLD: u64 = 16;
 
 /// Type alias for IPI sender function
 type TlbIpiSender = fn(usize);
+
+/// Cached INVPCID support flag (initialized once, never changes)
+///
+/// Using a static to cache the CPUID result avoids repeated CPUID calls
+/// in the hot path.
+static INVPCID_SUPPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Initialize INVPCID support flag.
+///
+/// Must be called once during boot before any TLB shootdown operations.
+/// After initialization, `is_invpcid_available()` returns the cached value.
+pub fn init_invpcid_support() {
+    let supported = invpcid_supported();
+    INVPCID_SUPPORTED.store(supported, Ordering::Release);
+    if supported {
+        drivers::println!("[TLB] INVPCID instruction available - using efficient flushes");
+    }
+}
+
+/// Check if INVPCID instruction is available (cached).
+///
+/// Uses Acquire ordering to pair with the Release store in init_invpcid_support().
+#[inline]
+fn is_invpcid_available() -> bool {
+    INVPCID_SUPPORTED.load(Ordering::Acquire)
+}
+
+/// Flush all non-global TLB entries locally, using INVPCID if available.
+///
+/// This is more efficient than CR3 reload when INVPCID type 2 is available,
+/// as it doesn't require reading/writing CR3.
+#[inline]
+fn flush_all_local() {
+    if is_invpcid_available() {
+        // INVPCID type 2: flush all non-global entries for all PCIDs
+        unsafe { invpcid_all_nonglobal() };
+    } else {
+        // Fallback: standard CR3 reload flush
+        tlb::flush_all();
+    }
+}
 
 /// Register a CPU as online (legacy interface, uses current CPU ID).
 ///
@@ -422,9 +466,66 @@ fn collect_target_cpus(target_cr3: u64) -> Vec<usize> {
 }
 
 /// Post shootdown requests to all target CPUs' mailboxes
+///
+/// # R70-2 FIX: Prevent mailbox overwrite before ACK
+///
+/// If two shootdowns are dispatched back-to-back, the second could overwrite
+/// the first's request in the mailbox before the target CPU processes it.
+/// The handler only processes the latest generation, so the first flush is
+/// dropped, leaving stale TLB entries.
+///
+/// Fix: Before posting, spin-wait for any previous request to be ACKed.
+/// If the wait times out, we panic because proceeding would cause stale TLB.
+/// This serializes per-CPU requests and ensures no flush is missed.
 fn post_requests(targets: &[usize], cr3: u64, start: u64, len: u64, generation: u64) {
+    /// Maximum spin iterations to wait for mailbox to be free
+    const MAILBOX_WAIT_SPINS: usize = 500_000;
+
     for &cpu in targets {
         if let Some(mailbox) = mailbox_for_cpu(cpu) {
+            // R70-2 FIX: Wait for previous request to be acknowledged before posting.
+            // This prevents overwriting an in-flight request.
+            let mut waited = false;
+            let mut prev_ack = 0u64;
+            let mut prev_req = 0u64;
+            for spin_count in 0..MAILBOX_WAIT_SPINS {
+                prev_req = mailbox.request_gen.load(Ordering::Acquire);
+                prev_ack = mailbox.ack_gen.load(Ordering::Acquire);
+                if prev_ack >= prev_req {
+                    if spin_count > 0 && spin_count % 100_000 == 0 {
+                        // Log significant contention for debugging
+                        drivers::println!(
+                            "[TLB] CPU {} mailbox wait: {} spins (prev_req={}, prev_ack={})",
+                            cpu,
+                            spin_count,
+                            prev_req,
+                            prev_ack
+                        );
+                    }
+                    break; // Previous request completed, safe to post
+                }
+                waited = true;
+                spin_loop();
+            }
+
+            // R70-2 HARDENING: After wait, verify previous request is ACKed.
+            // If not, this is a critical failure - cannot proceed without causing stale TLB.
+            if prev_ack < prev_req {
+                panic!(
+                    "CRITICAL: TLB shootdown mailbox for CPU {} still has unacked request \
+                     after {} spins (prev_req={}, prev_ack={}). Cannot proceed - would drop flush.",
+                    cpu, MAILBOX_WAIT_SPINS, prev_req, prev_ack
+                );
+            }
+
+            if waited {
+                // Log that we had to wait (for debugging TLB shootdown contention)
+                drivers::println!(
+                    "[TLB] CPU {} mailbox became free after waiting",
+                    cpu
+                );
+            }
+
             // Write request fields with Relaxed ordering
             mailbox.target_cr3.store(cr3, Ordering::Relaxed);
             mailbox.start.store(start, Ordering::Relaxed);
@@ -645,8 +746,8 @@ pub fn flush_current_as_all() {
     // Dispatch to remote CPUs (if any)
     let shoot = dispatch_shootdown(0, 0);
 
-    // Flush local TLB immediately
-    tlb::flush_all();
+    // Flush local TLB immediately using INVPCID if available
+    flush_all_local();
 
     // Wait for remote ACKs with retry support
     if let Some((targets, generation)) = shoot {
@@ -826,8 +927,8 @@ pub fn handle_shootdown_ipi() {
         // Only flush if the CR3 matches (0 means unconditional flush)
         if target_cr3 == 0 || target_cr3 == this_cr3 {
             if len == 0 {
-                // Full TLB flush
-                tlb::flush_all();
+                // Full TLB flush - use INVPCID if available
+                flush_all_local();
             } else {
                 // Range flush
                 flush_range_local(start, len);
@@ -844,7 +945,8 @@ pub fn handle_shootdown_ipi() {
     let final_gen = mailbox.request_gen.load(Ordering::Acquire);
     if final_gen > 0 {
         // Do a full flush to be safe since we couldn't read consistent parameters
-        tlb::flush_all();
+        // Use INVPCID if available for efficiency
+        flush_all_local();
         mailbox.ack_gen.store(final_gen, Ordering::Release);
     }
 }

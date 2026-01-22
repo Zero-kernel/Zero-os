@@ -23,6 +23,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::hint::spin_loop;
+use core::sync::atomic::Ordering;
 
 // ============================================================================
 // Test Result Types
@@ -1029,12 +1031,235 @@ impl RuntimeTest for SecuritySubsystemTest {
 }
 
 // ============================================================================
+// SMP Tests - Multi-core validation
+// ============================================================================
+
+/// Verify multiple CPUs are online for SMP testing
+struct SmpOnlineTest;
+
+impl RuntimeTest for SmpOnlineTest {
+    fn name(&self) -> &'static str {
+        "smp_online"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify more than one CPU is online for SMP tests"
+    }
+
+    fn run(&self) -> TestResult {
+        use arch::num_online_cpus;
+
+        let online = num_online_cpus();
+        if online > 1 {
+            TestResult::Pass
+        } else {
+            TestResult::Warning(String::from(
+                "Only 1 CPU online; SMP tests will be skipped",
+            ))
+        }
+    }
+}
+
+/// Send a reschedule IPI between CPUs and verify delivery
+struct IpiPingPongTest;
+
+impl RuntimeTest for IpiPingPongTest {
+    fn name(&self) -> &'static str {
+        "ipi_ping_pong"
+    }
+
+    fn description(&self) -> &'static str {
+        "Send IPI between CPUs and verify round-trip"
+    }
+
+    fn run(&self) -> TestResult {
+        use arch::ipi::{send_ipi, IpiType};
+        use arch::{current_cpu_id, max_cpus, num_online_cpus, PER_CPU_DATA};
+        use kernel_core::time::read_tsc;
+        use mm::tlb_shootdown::is_cpu_online;
+
+        if num_online_cpus() <= 1 {
+            return TestResult::Warning(String::from(
+                "Single-core system; skipping IPI ping-pong",
+            ));
+        }
+
+        let self_cpu = current_cpu_id();
+
+        // Find an online AP to send IPI to
+        let target = match (0..max_cpus()).find(|&id| id != self_cpu && is_cpu_online(id)) {
+            Some(id) => id,
+            None => return TestResult::Fail(String::from("No online AP found for IPI test")),
+        };
+
+        let per_cpu = match PER_CPU_DATA.get_cpu(target) {
+            Some(p) => p,
+            None => return TestResult::Fail(String::from("Per-CPU slot unavailable")),
+        };
+
+        // Clear any stale reschedule flag before sending the IPI
+        per_cpu.need_resched.store(false, Ordering::Release);
+
+        let start = read_tsc();
+        send_ipi(target, IpiType::Reschedule);
+
+        // Wait for the remote handler to set need_resched (bounded spin)
+        const MAX_SPINS: usize = 100_000;
+        for _ in 0..MAX_SPINS {
+            if per_cpu.need_resched.load(Ordering::Acquire) {
+                // Clear flag to restore CPU state
+                per_cpu.need_resched.store(false, Ordering::Release);
+                let cycles = read_tsc().saturating_sub(start);
+
+                // Warn if latency is suspiciously high (>10M cycles ~= several ms)
+                return if cycles > 10_000_000 {
+                    TestResult::Warning(alloc::format!(
+                        "High IPI latency: {} cycles to CPU {}",
+                        cycles, target
+                    ))
+                } else {
+                    TestResult::Pass
+                };
+            }
+            spin_loop();
+        }
+
+        TestResult::Fail(alloc::format!(
+            "Reschedule IPI to CPU {} not acknowledged within timeout",
+            target
+        ))
+    }
+}
+
+/// Ensure TLB shootdown reaches remote CPUs and is acknowledged
+struct TlbShootdownCoherencyTest;
+
+impl RuntimeTest for TlbShootdownCoherencyTest {
+    fn name(&self) -> &'static str {
+        "tlb_shootdown_coherency"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify TLB shootdown ACKs across CPUs"
+    }
+
+    fn run(&self) -> TestResult {
+        use arch::{current_cpu_id, max_cpus, num_online_cpus, PER_CPU_DATA};
+        use mm::tlb_shootdown::{flush_current_as_all, is_cpu_online};
+
+        if num_online_cpus() <= 1 {
+            return TestResult::Warning(String::from(
+                "Single-core system; skipping TLB coherency test",
+            ));
+        }
+
+        let self_cpu = current_cpu_id();
+
+        // Find an online AP
+        let target = match (0..max_cpus()).find(|&id| id != self_cpu && is_cpu_online(id)) {
+            Some(id) => id,
+            None => {
+                return TestResult::Fail(String::from("No online AP found for TLB shootdown test"))
+            }
+        };
+
+        let per_cpu = match PER_CPU_DATA.get_cpu(target) {
+            Some(p) => p,
+            None => return TestResult::Fail(String::from("Per-CPU slot unavailable")),
+        };
+
+        // Record ACK generation before shootdown
+        let ack_before = per_cpu.tlb_mailbox.ack_gen.load(Ordering::Acquire);
+
+        // Perform TLB shootdown (sends IPIs and waits for ACKs)
+        flush_current_as_all();
+
+        // Verify ACK generation incremented
+        let ack_after = per_cpu.tlb_mailbox.ack_gen.load(Ordering::Acquire);
+        if ack_after <= ack_before {
+            TestResult::Fail(alloc::format!(
+                "CPU {} did not acknowledge TLB shootdown (ack_gen: {} -> {})",
+                target, ack_before, ack_after
+            ))
+        } else {
+            TestResult::Pass
+        }
+    }
+}
+
+/// Verify CPU affinity masks are honored by the scheduler
+struct SchedulerAffinityTest;
+
+impl RuntimeTest for SchedulerAffinityTest {
+    fn name(&self) -> &'static str {
+        "scheduler_affinity"
+    }
+
+    fn description(&self) -> &'static str {
+        "Check that scheduler honors CPU affinity masks"
+    }
+
+    fn run(&self) -> TestResult {
+        use arch::{current_cpu_id, max_cpus, num_online_cpus};
+        use mm::tlb_shootdown::is_cpu_online;
+        use sched::Scheduler;
+
+        if num_online_cpus() <= 1 {
+            return TestResult::Warning(String::from(
+                "Single-core system; skipping affinity test",
+            ));
+        }
+
+        // Verify cpu_allowed() helper treats 0 as "all CPUs" (R70-3 fix)
+        // and correctly identifies allowed CPUs
+        let self_cpu = current_cpu_id();
+
+        // Find another online CPU
+        let target = match (0..max_cpus()).find(|&id| id != self_cpu && is_cpu_online(id)) {
+            Some(id) => id,
+            None => {
+                return TestResult::Fail(String::from("No online AP found for affinity test"))
+            }
+        };
+
+        // Test 1: allowed_cpus = 0 means all CPUs allowed
+        let mask_all = 0u64;
+        let allowed_self = Scheduler::cpu_allowed_for_test(self_cpu, mask_all);
+        let allowed_target = Scheduler::cpu_allowed_for_test(target, mask_all);
+        if !allowed_self || !allowed_target {
+            return TestResult::Fail(String::from(
+                "cpu_allowed() should return true for all CPUs when mask is 0",
+            ));
+        }
+
+        // Test 2: Specific mask only allows designated CPU
+        let mask_target_only = 1u64 << target;
+        let allowed_self_specific = Scheduler::cpu_allowed_for_test(self_cpu, mask_target_only);
+        let allowed_target_specific = Scheduler::cpu_allowed_for_test(target, mask_target_only);
+        if allowed_self_specific {
+            return TestResult::Fail(alloc::format!(
+                "CPU {} should NOT be allowed when mask is for CPU {} only",
+                self_cpu, target
+            ));
+        }
+        if !allowed_target_specific {
+            return TestResult::Fail(alloc::format!(
+                "CPU {} should be allowed when mask is for CPU {}",
+                target, target
+            ));
+        }
+
+        TestResult::Pass
+    }
+}
+
+// ============================================================================
 // Test Runner
 // ============================================================================
 
 /// Run all runtime tests and return a report
 pub fn run_all_runtime_tests() -> TestReport {
-    let tests: [&dyn RuntimeTest; 11] = [
+    let tests: [&dyn RuntimeTest; 15] = [
         &HeapAllocationTest,
         &BuddyAllocatorTest,
         &CapTableLifecycleTest,
@@ -1043,6 +1268,10 @@ pub fn run_all_runtime_tests() -> TestReport {
         &AuditHashChainTest,
         &NetworkParsingTest,
         &NetworkLoopbackTest,
+        &SmpOnlineTest,
+        &IpiPingPongTest,
+        &TlbShootdownCoherencyTest,
+        &SchedulerAffinityTest,
         &SchedulerStarvationTest,
         &ProcessCreationTest,
         &SecuritySubsystemTest,
@@ -1100,7 +1329,7 @@ pub fn run_all_runtime_tests() -> TestReport {
 
 /// Run a single test by name
 pub fn run_test(name: &str) -> Option<TestOutcome> {
-    let tests: [&dyn RuntimeTest; 11] = [
+    let tests: [&dyn RuntimeTest; 15] = [
         &HeapAllocationTest,
         &BuddyAllocatorTest,
         &CapTableLifecycleTest,
@@ -1109,6 +1338,10 @@ pub fn run_test(name: &str) -> Option<TestOutcome> {
         &AuditHashChainTest,
         &NetworkParsingTest,
         &NetworkLoopbackTest,
+        &SmpOnlineTest,
+        &IpiPingPongTest,
+        &TlbShootdownCoherencyTest,
+        &SchedulerAffinityTest,
         &SchedulerStarvationTest,
         &ProcessCreationTest,
         &SecuritySubsystemTest,

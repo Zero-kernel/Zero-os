@@ -952,26 +952,42 @@ pub extern "C" fn ap_rust_entry(
 
 /// Scheduler-aware idle path for APs.
 ///
-/// R70-1: Breaks the old permanent HLT loop by allowing reschedule IPIs or
-/// timer events to trigger the scheduler callback. The AP will:
-/// 1. Check if there's pending work (reschedule flag set)
-/// 2. If work exists, run the scheduler to pick up tasks
-/// 3. If no work, HLT until the next interrupt (timer, IPI, etc.)
+/// R70-1 FIX: Race-free idle loop.
+///
+/// The original implementation had a race condition:
+/// 1. Check reschedule_if_needed() -> returns (no work)
+/// 2. [IPI arrives, sets need_resched=true, handler runs and returns]
+/// 3. sti; hlt executes -> CPU halts with work pending!
+///
+/// Fix: Disable interrupts during the scheduling check, then use atomic
+/// sti;hlt sequence. On x86, STI enables interrupts starting with the
+/// NEXT instruction, so any pending interrupt will wake from HLT immediately.
 ///
 /// This enables true SMP scheduling where all CPUs participate in running
 /// user processes, not just the BSP.
 fn ap_idle_loop() -> ! {
     loop {
+        // R70-1 FIX: Disable interrupts during check to prevent race.
+        // This ensures no IPI can slip in between the check and HLT.
+        x86_64::instructions::interrupts::disable();
+
         // Check if scheduler has work for us (set by timer tick or reschedule IPI)
         kernel_core::reschedule_if_needed();
 
-        // Enable interrupts and halt until next interrupt
-        // When an interrupt arrives (timer tick, reschedule IPI, etc.),
-        // the CPU wakes up and loops back to check for work
+        // Check need_resched flag with interrupts disabled
+        if cpu_local::current_cpu().need_resched.load(Ordering::SeqCst) {
+            // Work is pending, enable interrupts and continue to next iteration
+            x86_64::instructions::interrupts::enable();
+            continue;
+        }
+
+        // No work pending - use atomic sti;hlt sequence.
+        // x86 guarantees that STI takes effect starting with the NEXT instruction,
+        // so if an IPI is pending, the CPU will wake from HLT immediately.
         unsafe {
             core::arch::asm!(
-                "sti",   // Enable interrupts
-                "hlt",   // Halt until interrupt
+                "sti",   // Enable interrupts (takes effect starting with HLT)
+                "hlt",   // Halt until interrupt - wakes immediately if interrupt pending
                 options(nomem, nostack, preserves_flags)
             );
         }

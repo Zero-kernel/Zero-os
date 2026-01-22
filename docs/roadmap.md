@@ -565,10 +565,10 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 
 #### E.2 TLB Shootdown
 
-- [ ] IPI-driven global/range invalidation
+- [x] IPI-driven global/range invalidation (kernel/mm/tlb_shootdown.rs - R70 fixes)
 - [ ] Batched shootdown
-- [ ] Online CPU count guard
-- [ ] PCID/ASID support (if available)
+- [x] Online CPU count guard (assert_single_core_mode, R70-2 mailbox serialization)
+- [x] PCID/ASID support (kernel/tlb_ops crate - INVPCID types 0-3, init_invpcid_support)
 
 #### E.3 Per-CPU Data
 
@@ -750,18 +750,21 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-16 | 65 | 26 | 17 | Comprehensive audit - CLD fix, COW race, context switch validation, rate limiter CAS, conntrack accounting - **17 FIXED, 9 OPEN** |
 | 2026-01-17 | 66 | 11 | 11 | TCP options validation (MSS/WS), VirtIO-blk ring init/jump detection/double-free, scheduler priority cap, fragment CAS, per-CPU FPU - **ALL FIXED** |
 | 2026-01-18 | 67 | 11 | 11 | **SMP SECURITY AUDIT** - TLB shootdown ✅, trampoline claim flag ✅, LAPIC verification ✅, scheduler per-CPU ✅, PT cross-CPU lock ✅, fork/COW lock ✅, FPU nesting ✅, syscall GS-relative ✅, SYSRET RFLAGS ✅, syscall depth ✅, context switch FPU ✅ - **ALL FIXED** |
-| **Total** | **67** | **327** | **276 (84.4%)** | **51 open (R65 SMP + VirtIO IOMMU deferred)** |
+| 2026-01-19 | 68 | 7 | 7 | TLB shootdown ACK timeout, COW TLB flush, FPU nesting safety - **ALL FIXED** |
+| 2026-01-20 | 69 | 5 | 5 | PhysicalPageRefCount ABA race, lazy FPU migration, load balancer affinity, ASID writer starvation, lock ordering docs - **ALL FIXED** |
+| 2026-01-21 | 70 | 3 | 3 | AP idle loop race, TLB mailbox overwrite, CPU affinity semantics - **ALL FIXED** |
+| **Total** | **70** | **342** | **291 (85.1%)** | **51 open (R65 SMP + VirtIO IOMMU deferred)** |
 
 ### Current Status
 
-- **Fixed**: 276 issues (84.4%)
-- **Open**: 51 issues (15.6%)
+- **Fixed**: 291 issues (85.1%)
+- **Open**: 51 issues (14.9%)
   - R65 remaining issues (SMP-related, non-blocking)
   - R62-6 (VirtIO IOMMU) deferred to Phase F.3
-- **Phase E Progress**: LAPIC/IOAPIC initialized, PerCpuData implemented, GS-relative syscall per-CPU, **ALL R67 SMP BLOCKERS FIXED**
+- **Phase E Progress**: LAPIC/IOAPIC initialized, PerCpuData implemented, GS-relative syscall per-CPU, AP idle loop race-free, TLB shootdown serialized, **ALL R67-R70 SMP ISSUES FIXED**
 - **SMP Ready**: All critical SMP security issues resolved, multi-core testing can proceed
 
-See [qa-2026-01-18.md](review/qa-2026-01-18.md) for latest audit report.
+See [qa-2026-01-21.md](review/qa-2026-01-21.md) for latest audit report.
 
 ---
 

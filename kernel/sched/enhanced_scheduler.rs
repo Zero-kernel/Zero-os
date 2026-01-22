@@ -195,10 +195,11 @@ impl Scheduler {
     /// # Arguments
     /// * `queue` - 就绪队列引用
     /// * `skip_pid` - 要跳过的进程 PID（用于 yield 时避免选中自己）
+    ///
+    /// # R70-3 FIX: Use cpu_allowed() for consistent affinity semantics
     fn select_next_locked(queue: &ReadyQueues, skip_pid: Option<Pid>) -> Option<Pid> {
         // Get current CPU ID for affinity check
         let cpu_id = current_cpu_id();
-        let cpu_mask = 1u64 << cpu_id;
 
         // Debug: print all processes in queue
         for (priority, bucket) in queue.iter() {
@@ -221,8 +222,11 @@ impl Scheduler {
                     continue;
                 }
                 let proc = pcb.lock();
-                // Check both state AND CPU affinity
-                if proc.state == ProcessState::Ready && (proc.allowed_cpus & cpu_mask) != 0 {
+                // R70-3 FIX: Check both state AND CPU affinity using cpu_allowed()
+                // This handles allowed_cpus == 0 correctly as "all CPUs allowed"
+                if proc.state == ProcessState::Ready
+                    && Self::cpu_allowed(cpu_id, proc.allowed_cpus)
+                {
                     sched_debug!("[SCHED] selected pid={}", pid);
                     return Some(pid);
                 }
@@ -233,7 +237,10 @@ impl Scheduler {
         if let Some(skip) = skip_pid {
             if let Some(pcb) = Self::find_pcb(queue, skip) {
                 let proc = pcb.lock();
-                if proc.state == ProcessState::Ready && (proc.allowed_cpus & cpu_mask) != 0 {
+                // R70-3 FIX: Use cpu_allowed() for consistent semantics
+                if proc.state == ProcessState::Ready
+                    && Self::cpu_allowed(cpu_id, proc.allowed_cpus)
+                {
                     sched_debug!("[SCHED] fallback to skipped pid={}", skip);
                     return Some(skip);
                 }
@@ -283,10 +290,30 @@ impl Scheduler {
 
     /// Check whether a CPU is permitted by the affinity mask (bit N = CPU N).
     ///
+    /// # R70-3 FIX: Consistent "allowed_cpus == 0" semantics
+    ///
+    /// Throughout the scheduler, `allowed_cpus == 0` is used to mean "no restriction"
+    /// (all CPUs allowed). However, `select_next_locked` was using a direct bitmask
+    /// check `(allowed_cpus & cpu_mask) != 0` which returns false when allowed_cpus == 0,
+    /// making those tasks unschedulable.
+    ///
+    /// Fix: Treat `allowed_cpus == 0` as "allowed on all CPUs".
+    ///
     /// Guards against CPU IDs >= 64 to avoid undefined behavior from shift overflow.
     #[inline]
     fn cpu_allowed(cpu_id: usize, allowed_cpus: u64) -> bool {
-        cpu_id < 64 && (allowed_cpus & (1u64 << cpu_id)) != 0
+        // allowed_cpus == 0 means "no restriction" (all CPUs allowed)
+        // Otherwise, check if the bit for this CPU is set
+        allowed_cpus == 0 || (cpu_id < 64 && (allowed_cpus & (1u64 << cpu_id)) != 0)
+    }
+
+    /// Public wrapper for `cpu_allowed()` used by runtime tests.
+    ///
+    /// This allows testing the CPU affinity logic (R70-3 fix) without exposing
+    /// internal scheduler implementation details.
+    #[inline]
+    pub fn cpu_allowed_for_test(cpu_id: usize, allowed_cpus: u64) -> bool {
+        Self::cpu_allowed(cpu_id, allowed_cpus)
     }
 
     /// Send a reschedule IPI to the target CPU.
