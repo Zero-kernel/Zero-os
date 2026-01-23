@@ -58,6 +58,12 @@ const MAX_TIMER_CALLBACKS: usize = 4;
 /// Use fixed-size stack array instead of Vec::clone() to avoid heap
 /// allocation in IRQ context. MAX_TIMER_CALLBACKS limits the number
 /// of callbacks (typically just scheduler tick + waitqueue timeout).
+///
+/// # E.4 RCU Integration
+///
+/// Marks a quiescent state after processing callbacks. The timer tick
+/// is a natural quiescent point since no RCU readers should be active
+/// in IRQ context.
 #[inline]
 pub fn on_scheduler_tick() {
     // Copy callbacks to fixed stack array (no heap allocation in IRQ context)
@@ -77,6 +83,11 @@ pub fn on_scheduler_tick() {
             f();
         }
     }
+
+    // R72: Use rcu_timer_tick() instead of just rcu_quiescent_state().
+    // This not only marks quiescent state but also tries to advance
+    // COMPLETED_EPOCH, enabling callback progress on idle CPUs.
+    crate::rcu::rcu_timer_tick();
 }
 
 /// 检查并执行重调度（如果需要）
@@ -87,12 +98,21 @@ pub fn on_scheduler_tick() {
 /// in IRQ context due to lock contention.
 ///
 /// R67-4 FIX: Uses per-CPU IRQ_RESCHED_PENDING flag.
+///
+/// # E.4 RCU Integration
+///
+/// Drains RCU callbacks whose grace period has completed. This is the main
+/// process-context path where deferred destruction work gets done.
 #[inline]
 pub fn reschedule_if_needed() {
     // R65-6 FIX: Drain deferred TCP timer work before scheduling check
     // This ensures timer work is completed in safe (non-IRQ) context when
     // IRQ-time processing was blocked by lock contention.
     crate::time::drain_deferred_tcp_timers();
+
+    // E.4 RCU: Drain callbacks in process context.
+    // This runs deferred destruction work for RCU-protected data.
+    crate::rcu::poll();
 
     // R67-4 FIX: Consume this CPU's IRQ-triggered reschedule request
     let irq_pending = IRQ_RESCHED_PENDING.with(|flag| flag.swap(false, Ordering::SeqCst));

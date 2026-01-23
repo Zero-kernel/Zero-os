@@ -10,7 +10,9 @@ pub mod apic;
 pub mod context_switch;
 pub mod cpu_protection;
 pub mod gdt;
+pub mod hpet;
 pub mod interrupts;
+pub mod invpcid;
 pub mod ipi;
 pub mod smp;
 pub mod syscall;
@@ -41,6 +43,12 @@ pub use cpu_local::{
 
 // Re-export SMP bring-up functions
 pub use smp::{ap_rust_entry, online_cpus, set_rsdp_address, smp_initialized, start_aps};
+
+// Re-export INVPCID instruction wrappers
+pub use invpcid::{
+    flush_address, flush_all_nonglobal, flush_pcid, invpcid_address, invpcid_all_global,
+    invpcid_all_nonglobal, invpcid_single_context, invpcid_supported,
+};
 
 pub fn init() {
     gdt::init();

@@ -30,6 +30,9 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
+// E.5 Cpuset: Import cpuset module for effective CPU mask computation
+use crate::cpuset::{self, CpusetId};
+
 // 导入arch模块的上下文切换功能
 use arch::ipi::{send_ipi, IpiType};
 use arch::Context as ArchContext;
@@ -195,10 +198,11 @@ impl Scheduler {
     /// # Arguments
     /// * `queue` - 就绪队列引用
     /// * `skip_pid` - 要跳过的进程 PID（用于 yield 时避免选中自己）
+    ///
+    /// # R70-3 FIX: Use cpu_allowed() for consistent affinity semantics
     fn select_next_locked(queue: &ReadyQueues, skip_pid: Option<Pid>) -> Option<Pid> {
         // Get current CPU ID for affinity check
         let cpu_id = current_cpu_id();
-        let cpu_mask = 1u64 << cpu_id;
 
         // Debug: print all processes in queue
         for (priority, bucket) in queue.iter() {
@@ -221,8 +225,12 @@ impl Scheduler {
                     continue;
                 }
                 let proc = pcb.lock();
-                // Check both state AND CPU affinity
-                if proc.state == ProcessState::Ready && (proc.allowed_cpus & cpu_mask) != 0 {
+                // R70-3 FIX: Check both state AND CPU affinity using cpu_allowed()
+                // E.5: Use effective_allowed_cpus for cpuset-aware scheduling
+                let effective_mask = Self::effective_allowed_cpus(&proc);
+                if proc.state == ProcessState::Ready
+                    && Self::cpu_allowed(cpu_id, effective_mask)
+                {
                     sched_debug!("[SCHED] selected pid={}", pid);
                     return Some(pid);
                 }
@@ -233,7 +241,12 @@ impl Scheduler {
         if let Some(skip) = skip_pid {
             if let Some(pcb) = Self::find_pcb(queue, skip) {
                 let proc = pcb.lock();
-                if proc.state == ProcessState::Ready && (proc.allowed_cpus & cpu_mask) != 0 {
+                // R70-3 FIX: Use cpu_allowed() for consistent semantics
+                // E.5: Use effective_allowed_cpus for cpuset-aware scheduling
+                let effective_mask = Self::effective_allowed_cpus(&proc);
+                if proc.state == ProcessState::Ready
+                    && Self::cpu_allowed(cpu_id, effective_mask)
+                {
                     sched_debug!("[SCHED] fallback to skipped pid={}", skip);
                     return Some(skip);
                 }
@@ -281,12 +294,42 @@ impl Scheduler {
     // immediately rather than waiting for the next timer tick.
     // ========================================================================
 
+    /// E.5 Cpuset: Compute effective affinity: online CPUs ∩ cpuset mask ∩ task affinity.
+    ///
+    /// This function combines the process's cpuset membership with its personal
+    /// CPU affinity mask to determine which CPUs the task can actually run on.
+    /// The result respects both CPU isolation (cpuset) and user-set affinity.
+    #[inline]
+    fn effective_allowed_cpus(proc: &process::Process) -> u64 {
+        cpuset::effective_cpus(CpusetId(proc.cpuset_id), proc.allowed_cpus)
+    }
+
     /// Check whether a CPU is permitted by the affinity mask (bit N = CPU N).
+    ///
+    /// # R70-3 FIX: Consistent "allowed_cpus == 0" semantics
+    ///
+    /// Throughout the scheduler, `allowed_cpus == 0` is used to mean "no restriction"
+    /// (all CPUs allowed). However, `select_next_locked` was using a direct bitmask
+    /// check `(allowed_cpus & cpu_mask) != 0` which returns false when allowed_cpus == 0,
+    /// making those tasks unschedulable.
+    ///
+    /// Fix: Treat `allowed_cpus == 0` as "allowed on all CPUs".
     ///
     /// Guards against CPU IDs >= 64 to avoid undefined behavior from shift overflow.
     #[inline]
     fn cpu_allowed(cpu_id: usize, allowed_cpus: u64) -> bool {
-        cpu_id < 64 && (allowed_cpus & (1u64 << cpu_id)) != 0
+        // allowed_cpus == 0 means "no restriction" (all CPUs allowed)
+        // Otherwise, check if the bit for this CPU is set
+        allowed_cpus == 0 || (cpu_id < 64 && (allowed_cpus & (1u64 << cpu_id)) != 0)
+    }
+
+    /// Public wrapper for `cpu_allowed()` used by runtime tests.
+    ///
+    /// This allows testing the CPU affinity logic (R70-3 fix) without exposing
+    /// internal scheduler implementation details.
+    #[inline]
+    pub fn cpu_allowed_for_test(cpu_id: usize, allowed_cpus: u64) -> bool {
+        Self::cpu_allowed(cpu_id, allowed_cpus)
     }
 
     /// Send a reschedule IPI to the target CPU.
@@ -570,9 +613,9 @@ impl Scheduler {
     ///
     /// # R69-3 FIX: Respect CPU Affinity Mask
     ///
-    /// Before migrating, checks if the destination CPU is in the task's allowed_cpus
-    /// mask. If not permitted, the task is put back in the source queue and migration
-    /// is skipped. This prevents violating user-configured CPU placement constraints.
+    /// Before migrating, checks if the destination CPU is in the task's effective affinity
+    /// mask (cpuset ∩ task affinity). If not permitted, the task is put back in the source
+    /// queue and migration is skipped. This prevents violating CPU isolation constraints.
     fn migrate_one_ready(src_cpu: usize, dst_cpu: usize) {
         let Some(src_queue) = Self::ready_queue_for_cpu(src_cpu) else {
             return;
@@ -585,17 +628,16 @@ impl Scheduler {
 
         if let Some((pid, pcb, priority)) = candidate {
             // R69-3 FIX: Check CPU affinity before migration
+            // E.5: Use effective_allowed_cpus for cpuset-aware migration
             let allowed_cpus = {
                 let mut proc = pcb.lock();
                 proc.state = ProcessState::Ready;
                 proc.reset_wait_ticks();
-                proc.allowed_cpus
+                Self::effective_allowed_cpus(&proc)
             };
 
-            // Check if destination CPU is allowed
-            // allowed_cpus == 0 means "use default" (all CPUs allowed)
-            // allowed_cpus != 0 is a bitmask where bit N means CPU N is allowed
-            if allowed_cpus != 0 && (dst_cpu >= 64 || (allowed_cpus & (1u64 << dst_cpu)) == 0) {
+            // Check if destination CPU is allowed by effective mask
+            if !Self::cpu_allowed(dst_cpu, allowed_cpus) {
                 // Destination CPU not in affinity mask, put task back
                 let mut src_guard = src_queue.lock();
                 src_guard.entry(priority).or_default().insert(pid, pcb);
@@ -673,13 +715,20 @@ impl Scheduler {
     /// R70-2 FIX: Kicks idle CPUs when new work is added so they can pick it up
     /// immediately rather than waiting for the next timer tick.
     ///
+    /// E.5: Uses effective_allowed_cpus for cpuset-aware CPU placement.
+    ///
     /// 锁顺序：READY_QUEUE -> SCHEDULER_STATS
     pub fn add_process(pcb: ProcessControlBlock) {
         interrupts::without_interrupts(|| {
+            // E.5: Use effective_allowed_cpus for cpuset-aware scheduling
             let (pid, priority, allowed_cpus) = {
                 let mut proc = pcb.lock();
                 proc.state = ProcessState::Ready;
-                (proc.pid, proc.dynamic_priority, proc.allowed_cpus)
+                (
+                    proc.pid,
+                    proc.dynamic_priority,
+                    Self::effective_allowed_cpus(&proc),
+                )
             };
             // R70-2 FIX: Pass affinity mask to target selection
             let target_cpu = Self::target_cpu_for_new_work(current_cpu_id(), allowed_cpus);
@@ -746,16 +795,23 @@ impl Scheduler {
     /// # Returns
     ///
     /// 如果进程被成功恢复则返回 true
+    ///
+    /// E.5: Uses effective_allowed_cpus for cpuset-aware CPU placement.
     pub fn resume_stopped(pid: Pid) -> bool {
         use process::get_process;
 
         interrupts::without_interrupts(|| {
             if let Some(pcb) = get_process(pid) {
+                // E.5: Use effective_allowed_cpus for cpuset-aware scheduling
                 let (should_add, priority, allowed_cpus) = {
                     let mut proc = pcb.lock();
                     if proc.state == ProcessState::Stopped {
                         proc.state = ProcessState::Ready;
-                        (true, proc.dynamic_priority, proc.allowed_cpus)
+                        (
+                            true,
+                            proc.dynamic_priority,
+                            Self::effective_allowed_cpus(&proc),
+                        )
                     } else {
                         (false, 0, 0)
                     }

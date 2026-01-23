@@ -9,9 +9,10 @@
 
 use crate::fork::PAGE_REF_COUNT;
 use crate::process::{
-    cleanup_zombie, create_process, current_pid, get_process, terminate_process,
-    with_current_cap_table, ProcessId, ProcessState,
+    cleanup_zombie, create_process, create_process_in_namespace, current_pid, get_process,
+    terminate_process, with_current_cap_table, ProcessId, ProcessState,
 };
+use cpu_local::{current_cpu, current_cpu_id, max_cpus};
 use crate::usercopy::UserAccessGuard;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -908,6 +909,8 @@ pub enum SyscallError {
     EINPROGRESS = -115,    // 操作正在进行
     EOPNOTSUPP = -95,      // 操作不支持
     ECONNABORTED = -103,   // R51-1: 连接被中止 (accept on closed listener)
+    // E.4 PI: Robust futex error
+    EOWNERDEAD = -130,     // E.4 PI: Robust futex - 锁持有者已退出
 }
 
 impl SyscallError {
@@ -1885,6 +1888,8 @@ pub fn syscall_dispatcher(
         218 => sys_set_tid_address(arg0 as *mut i32),
         273 => sys_set_robust_list(arg0 as *const u8, arg1 as usize),
         62 => sys_kill(arg0 as ProcessId, arg1 as i32),
+        // F.1: Namespace unshare
+        272 => sys_unshare(arg0 as u64),
 
         // 文件I/O
         0 => sys_read(arg0 as i32, arg1 as *mut u8, arg2 as usize),
@@ -1962,6 +1967,10 @@ pub fn syscall_dispatcher(
         // 其他
         24 => sys_yield(),
         318 => sys_getrandom(arg0 as *mut u8, arg1 as usize, arg2 as u32),
+
+        // CPU Affinity (E.5 SMP Scheduler - syscalls 203/204)
+        203 => sys_sched_setaffinity(arg0 as i32, arg1 as usize, arg2 as *const u8),
+        204 => sys_sched_getaffinity(arg0 as i32, arg1 as usize, arg2 as *mut u8),
 
         // 套接字 (Socket syscalls - Linux x86_64 ABI)
         41 => sys_socket(arg0 as i32, arg1 as i32, arg2 as i32),
@@ -2072,13 +2081,29 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
 /// sys_fork - 创建子进程
 fn sys_fork() -> SyscallResult {
     let parent_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let parent_arc = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
 
     // 调用真正的 fork 实现（包含 COW 支持）
     match crate::fork::sys_fork() {
         Ok(child_pid) => {
             // LSM hook: check if policy allows this fork
             enforce_lsm_task_fork(parent_pid, child_pid)?;
-            Ok(child_pid)
+
+            // F.1 PID Namespace: Translate child's global PID to parent's namespace view
+            //
+            // Linux semantics: fork() returns the child's PID as seen from the parent's
+            // namespace. This is the same PID used by wait(), kill(), etc.
+            let parent_view_pid = {
+                let parent = parent_arc.lock();
+                let owning_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain);
+                if let Some(ns) = owning_ns {
+                    crate::pid_namespace::pid_in_namespace(&ns, child_pid).unwrap_or(child_pid)
+                } else {
+                    child_pid
+                }
+            };
+
+            Ok(parent_view_pid)
         }
         Err(_) => Err(SyscallError::ENOMEM),
     }
@@ -2106,6 +2131,8 @@ const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
 const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 /// 在子进程写入 TID
 const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+/// F.1: Create a new PID namespace for the child
+const CLONE_NEWPID: u64 = 0x2000_0000;
 
 /// sys_clone - 创建线程/轻量级进程
 ///
@@ -2147,7 +2174,8 @@ fn sys_clone(
         | CLONE_SETTLS
         | CLONE_PARENT_SETTID
         | CLONE_CHILD_CLEARTID
-        | CLONE_CHILD_SETTID;
+        | CLONE_CHILD_SETTID
+        | CLONE_NEWPID; // F.1: PID namespace support
 
     // 检查不支持的 flags
     // 返回 EINVAL 而不是 ENOSYS，因为这是参数验证失败而非功能未实现
@@ -2172,6 +2200,13 @@ fn sys_clone(
             );
             return Err(SyscallError::EINVAL);
         }
+    }
+
+    // F.1: CLONE_NEWPID cannot be combined with CLONE_THREAD
+    // Creating a thread in a new PID namespace makes no sense - threads share PID space
+    if flags & CLONE_NEWPID != 0 && flags & CLONE_THREAD != 0 {
+        println!("[sys_clone] CLONE_NEWPID cannot be combined with CLONE_THREAD");
+        return Err(SyscallError::EINVAL);
     }
 
     // 验证 parent_tid 指针
@@ -2225,6 +2260,7 @@ fn sys_clone(
         parent_seccomp_state,
         parent_pledge_state,
         parent_seccomp_installing,
+        parent_pid_ns_for_children, // F.1: PID namespace for children
     ) = {
         let mut parent = parent_arc.lock();
         // 始终从 MSR 同步 fs_base 到 PCB
@@ -2251,6 +2287,7 @@ fn sys_clone(
             parent.seccomp_state.clone(),
             parent.pledge_state.clone(),
             parent.seccomp_installing,
+            parent.pid_ns_for_children.clone(), // F.1: PID namespace
         )
     };
 
@@ -2265,7 +2302,18 @@ fn sys_clone(
                 // fork 成功，执行 LSM 检查
                 // 这种情况很少见（clone 不带 CLONE_VM 通常就是 fork）
                 enforce_lsm_task_fork(parent_pid, child_pid)?;
-                return Ok(child_pid);
+
+                // F.1: Translate to parent's namespace view before returning
+                let parent_view_pid = {
+                    let parent = parent_arc.lock();
+                    let owning_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain);
+                    if let Some(ns) = owning_ns {
+                        crate::pid_namespace::pid_in_namespace(&ns, child_pid).unwrap_or(child_pid)
+                    } else {
+                        child_pid
+                    }
+                };
+                return Ok(parent_view_pid);
             }
             Err(_) => return Err(SyscallError::ENOMEM),
         }
@@ -2278,9 +2326,30 @@ fn sys_clone(
         alloc::format!("{}-clone", parent_name)
     };
 
-    // 创建新进程/线程
-    let child_pid = create_process(child_name, parent_pid, parent_priority)
-        .map_err(|_| SyscallError::ENOMEM)?;
+    // F.1: Handle CLONE_NEWPID - create child in new PID namespace
+    let child_pid = if flags & CLONE_NEWPID != 0 {
+        // Create a new child PID namespace
+        let new_ns = crate::pid_namespace::PidNamespace::new_child(parent_pid_ns_for_children)
+            .map_err(|e| {
+                println!("[sys_clone] Failed to create PID namespace: {:?}", e);
+                match e {
+                    crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => SyscallError::EAGAIN,
+                    _ => SyscallError::ENOMEM,
+                }
+            })?;
+        println!(
+            "[sys_clone] Created new PID namespace: id={}, level={}",
+            new_ns.id().raw(),
+            new_ns.level()
+        );
+        // Create process in the new namespace
+        create_process_in_namespace(child_name, parent_pid, parent_priority, new_ns)
+            .map_err(|_| SyscallError::ENOMEM)?
+    } else {
+        // Regular process creation - inherits parent's pid_ns_for_children
+        create_process(child_name, parent_pid, parent_priority)
+            .map_err(|_| SyscallError::ENOMEM)?
+    };
 
     let child_arc = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
 
@@ -2487,15 +2556,49 @@ fn sys_clone(
         child.state = ProcessState::Ready;
     }
 
-    // 写入 parent_tid
+    // F.1 PID Namespace: Translate child's global PID to parent's namespace view
+    //
+    // Linux semantics: clone() returns the child's PID as seen from the parent's
+    // namespace. This is the same PID the parent will use for kill(), waitpid(), etc.
+    //
+    // For processes in the root namespace, this is the same as the global PID.
+    // For processes in child namespaces, the parent sees a different PID.
+    let parent_view_pid = {
+        let parent = parent_arc.lock();
+        let owning_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain);
+        if let Some(ns) = owning_ns {
+            crate::pid_namespace::pid_in_namespace(&ns, child_pid).unwrap_or(child_pid)
+        } else {
+            // No namespace chain (shouldn't happen), fall back to global PID
+            child_pid
+        }
+    };
+
+    // F.1 PID Namespace: Get child's own namespace-local PID for CLONE_CHILD_SETTID
+    //
+    // CLONE_CHILD_SETTID writes the TID the child sees for itself.
+    // This is the child's PID in its owning namespace (the deepest namespace).
+    // With CLONE_NEWPID, the child's owning namespace is a new child namespace,
+    // where it is PID 1 (the init process of that namespace).
+    let child_view_pid = {
+        let child = child_arc.lock();
+        crate::pid_namespace::pid_in_owning_namespace(&child.pid_ns_chain).unwrap_or(child_pid)
+    };
+
+    // 写入 parent_tid (F.1: use parent's view of child's PID)
     if flags & CLONE_PARENT_SETTID != 0 {
-        let tid_bytes = (child_pid as i32).to_ne_bytes();
+        let tid_bytes = (parent_view_pid as i32).to_ne_bytes();
         copy_to_user(parent_tid as *mut u8, &tid_bytes)?;
     }
 
-    // 写入 child_tid（在父进程的地址空间中，因为共享）
+    // 写入 child_tid（在共享地址空间中，子进程会看到此值）
+    // F.1: use child's own namespace-local PID (not parent's view)
+    //
+    // With CLONE_NEWPID, parent sees child as e.g. PID 5, but child sees itself as PID 1.
+    // The child uses this value for futex operations, robust_list, etc., so it must match
+    // what gettid() returns to the child.
     if flags & CLONE_CHILD_SETTID != 0 {
-        let tid_bytes = (child_pid as i32).to_ne_bytes();
+        let tid_bytes = (child_view_pid as i32).to_ne_bytes();
         copy_to_user(child_tid as *mut u8, &tid_bytes)?;
     }
 
@@ -2509,14 +2612,17 @@ fn sys_clone(
     }
 
     println!(
-        "sys_clone: parent={}, child={}, flags=0x{:x}, is_thread={}",
+        "sys_clone: parent={}, child={} (parent_view={}, child_view={}), flags=0x{:x}, is_thread={}",
         parent_pid,
         child_pid,
+        parent_view_pid,
+        child_view_pid,
         flags,
         flags & CLONE_THREAD != 0
     );
 
-    Ok(child_pid)
+    // F.1: Return namespace-local PID to parent (Linux semantics)
+    Ok(parent_view_pid)
 }
 
 /// sys_exec - 执行新程序
@@ -2932,7 +3038,8 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
         };
 
         // 查找已终止的僵尸子进程
-        let mut zombie_child: Option<(ProcessId, i32)> = None;
+        // F.1 PID Namespace: Also capture the child's namespace chain to derive ns-local PID
+        let mut zombie_child: Option<(ProcessId, i32, Vec<crate::pid_namespace::PidNamespaceMembership>)> = None;
         let mut stale_pids: vec::Vec<ProcessId> = vec::Vec::new();
 
         for child_pid in child_list.iter() {
@@ -2940,7 +3047,11 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
                 Some(child_proc) => {
                     let child = child_proc.lock();
                     if child.state == ProcessState::Zombie {
-                        zombie_child = Some((*child_pid, child.exit_code.unwrap_or(0)));
+                        zombie_child = Some((
+                            *child_pid,
+                            child.exit_code.unwrap_or(0),
+                            child.pid_ns_chain.clone(), // Capture ns chain before cleanup
+                        ));
                         break;
                     }
                 }
@@ -2952,12 +3063,38 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
         }
 
         // 如果找到僵尸子进程，收割并返回
-        if let Some((child_pid, exit_code)) = zombie_child {
+        if let Some((child_pid, exit_code, child_ns_chain)) = zombie_child {
             // 将退出码写入用户空间（如果提供了 status 指针）
             if !status.is_null() {
                 let bytes = exit_code.to_ne_bytes();
                 copy_to_user(status as *mut u8, &bytes)?;
             }
+
+            // F.1 PID Namespace: Translate child's global PID to parent's namespace view
+            //
+            // Linux semantics: wait() returns the PID as seen from the caller's namespace.
+            //
+            // CRITICAL: We CANNOT use pid_in_namespace() here because terminate_process()
+            // already called detach_pid_chain() which removed the child from namespace maps.
+            // Instead, we derive the ns-local PID from the child's stored pid_ns_chain.
+            //
+            // The child's pid_ns_chain contains entries for all namespaces from root to
+            // its owning namespace. We find the entry that matches the parent's owning
+            // namespace to get the PID as the parent sees it.
+            let parent_view_pid = {
+                let proc = parent.lock();
+                let parent_owning_ns = crate::pid_namespace::owning_namespace(&proc.pid_ns_chain);
+                if let Some(ref parent_ns) = parent_owning_ns {
+                    // Find the child's PID in the parent's owning namespace
+                    child_ns_chain
+                        .iter()
+                        .find(|m| Arc::ptr_eq(&m.ns, parent_ns))
+                        .map(|m| m.pid)
+                        .unwrap_or(child_pid) // Fallback if not visible (shouldn't happen)
+                } else {
+                    child_pid // Root namespace: use global PID
+                }
+            };
 
             // 从父进程的子进程列表中移除，并恢复 Ready 状态
             {
@@ -2971,10 +3108,11 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
             cleanup_zombie(child_pid);
 
             println!(
-                "sys_wait: reaped child {} with exit code {}",
-                child_pid, exit_code
+                "sys_wait: reaped child {} (ns_pid={}) with exit code {}",
+                child_pid, parent_view_pid, exit_code
             );
-            return Ok(child_pid);
+            // F.1: Return namespace-local PID to parent (Linux semantics)
+            return Ok(parent_view_pid);
         }
 
         // 清理过期的子进程 PID
@@ -3000,25 +3138,57 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
 }
 
 /// sys_getpid - 获取当前进程ID
+///
+/// F.1 PID Namespace: Returns the PID as seen from the process's owning namespace,
+/// not the global (kernel internal) PID. For processes in the root namespace,
+/// these are the same.
 fn sys_getpid() -> SyscallResult {
-    if let Some(pid) = current_pid() {
-        Ok(pid)
-    } else {
-        Err(SyscallError::ESRCH)
-    }
+    let global_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(global_pid).ok_or(SyscallError::ESRCH)?;
+
+    let ns_pid = {
+        let proc = proc_arc.lock();
+        // F.1: Return the PID from the owning (leaf) namespace
+        // The last entry in pid_ns_chain is the owning namespace
+        crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain).unwrap_or(global_pid)
+    };
+
+    Ok(ns_pid)
 }
 
 /// sys_getppid - 获取父进程ID
+///
+/// F.1 PID Namespace: Returns the parent's PID as seen from the current process's
+/// owning namespace. If the parent is not visible in the namespace (e.g., parent
+/// is in an ancestor namespace), returns 0 (orphan/adopted by namespace init).
 fn sys_getppid() -> SyscallResult {
-    if let Some(pid) = current_pid() {
-        if let Some(process) = get_process(pid) {
-            let proc = process.lock();
-            Ok(proc.ppid)
-        } else {
-            Err(SyscallError::ESRCH)
+    let global_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(global_pid).ok_or(SyscallError::ESRCH)?;
+
+    let proc = proc_arc.lock();
+    let parent_global_pid = proc.ppid;
+
+    // F.1: Get owning namespace for translation
+    let owning_ns = crate::pid_namespace::owning_namespace(&proc.pid_ns_chain);
+    drop(proc); // Release lock before looking up parent
+
+    // If parent_pid is 0, the process has no parent (init)
+    if parent_global_pid == 0 {
+        return Ok(0);
+    }
+
+    // Try to translate parent's global PID to namespace-local PID
+    if let Some(ns) = owning_ns {
+        // Look up parent's PID in our namespace
+        if let Some(ns_ppid) = ns.lookup_ns_pid(parent_global_pid) {
+            return Ok(ns_ppid);
         }
+        // Parent not visible in our namespace - return 0 (orphan semantics)
+        // This happens when parent is in an ancestor namespace
+        Ok(0)
     } else {
-        Err(SyscallError::ESRCH)
+        // No namespace chain - return global PID (root namespace)
+        Ok(parent_global_pid)
     }
 }
 
@@ -3026,11 +3196,17 @@ fn sys_getppid() -> SyscallResult {
 ///
 /// 返回当前线程的 TID。对于主线程，TID == PID == TGID。
 /// 对于子线程，TID 是线程的唯一标识，TGID 是所属进程组。
+///
+/// F.1 PID Namespace: Returns the TID as seen from the thread's owning namespace.
 fn sys_gettid() -> SyscallResult {
-    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let global_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(global_pid).ok_or(SyscallError::ESRCH)?;
     let proc = process.lock();
-    Ok(proc.tid)
+
+    // F.1: Return the TID from the owning namespace (TID == namespace-local PID)
+    let ns_tid =
+        crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain).unwrap_or(proc.tid);
+    Ok(ns_tid)
 }
 
 /// sys_set_tid_address - 设置 clear_child_tid 指针
@@ -3045,9 +3221,11 @@ fn sys_gettid() -> SyscallResult {
 /// # Returns
 ///
 /// 返回调用进程的 TID（当前等于 PID）
+///
+/// F.1 PID Namespace: Returns the namespace-local TID.
 fn sys_set_tid_address(tidptr: *mut i32) -> SyscallResult {
-    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let global_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(global_pid).ok_or(SyscallError::ESRCH)?;
 
     // 验证用户指针（如果非空）
     if !tidptr.is_null() {
@@ -3056,13 +3234,15 @@ fn sys_set_tid_address(tidptr: *mut i32) -> SyscallResult {
     }
 
     // 保存指针到进程控制块
-    {
+    let ns_tid = {
         let mut proc = process.lock();
         proc.clear_child_tid = tidptr as u64;
-    }
+        // F.1: Return the TID from the owning namespace
+        crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain).unwrap_or(proc.tid)
+    };
 
-    // 返回当前 TID
-    Ok(pid)
+    // 返回当前 TID (namespace-local)
+    Ok(ns_tid)
 }
 
 /// sys_set_robust_list - 注册 robust_list 头指针
@@ -3119,7 +3299,7 @@ fn sys_set_robust_list(head: *const u8, len: usize) -> SyscallResult {
 ///
 /// # Arguments
 ///
-/// * `pid` - 目标进程 ID
+/// * `pid` - 目标进程 ID (namespace-local PID as seen by caller)
 /// * `sig` - 信号编号（1-64）
 ///
 /// # Returns
@@ -3134,53 +3314,153 @@ fn sys_set_robust_list(head: *const u8, len: usize) -> SyscallResult {
 /// - sender.uid == target.uid
 /// - sender.euid == target.uid
 /// - PID 1 (init) 受保护，只有自己能向自己发信号
+///
+/// F.1 PID Namespace: The pid parameter is interpreted as a namespace-local PID.
+/// It is translated to a global PID using the caller's owning namespace.
 fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
     use crate::signal::{send_signal, signal_name, Signal};
 
+    let self_global_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+
+    // F.1: Translate namespace-local PID to global PID
+    let target_global_pid = {
+        let self_proc = get_process(self_global_pid).ok_or(SyscallError::ESRCH)?;
+        let owning_ns = {
+            let proc = self_proc.lock();
+            crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
+        };
+        if let Some(ns) = owning_ns {
+            // Translate using caller's namespace
+            crate::pid_namespace::resolve_pid_in_namespace(&ns, pid).ok_or(SyscallError::ESRCH)?
+        } else {
+            // No namespace (root or early boot) - use PID directly
+            pid
+        }
+    };
+
     // 【安全修复 Z-9】POSIX 权限检查（防御深度）
     // send_signal 也会进行相同检查，这里提前拒绝以提供更清晰的错误
-    if let Some(self_pid) = current_pid() {
-        // PID 1 保护：只有 init 自己能向自己发信号
-        if pid == 1 && self_pid != 1 {
+
+    // PID 1 保护：只有 init 自己能向自己发信号
+    // Note: This checks the target's global PID, so namespace PID 1 is protected
+    // within that namespace, but global PID 1 is specially protected.
+    if target_global_pid == 1 && self_global_pid != 1 {
+        return Err(SyscallError::EPERM);
+    }
+
+    // 非自己的进程需要进行 POSIX 权限检查
+    if self_global_pid != target_global_pid {
+        // 获取发送者凭证
+        let sender_creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+
+        // 获取目标进程凭证
+        // R39-3 FIX: 使用共享凭证读取目标进程 uid
+        let target = get_process(target_global_pid).ok_or(SyscallError::ESRCH)?;
+        let target_uid = target.lock().credentials.read().uid;
+
+        // POSIX 权限检查：
+        // 1. Root (euid == 0) 可以发信号给任何进程
+        // 2. sender.uid == target.uid
+        // 3. sender.euid == target.uid
+        let has_permission = sender_creds.euid == 0
+            || sender_creds.uid == target_uid
+            || sender_creds.euid == target_uid;
+
+        if !has_permission {
             return Err(SyscallError::EPERM);
-        }
-
-        // 非自己的进程需要进行 POSIX 权限检查
-        if self_pid != pid {
-            // 获取发送者凭证
-            let sender_creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-
-            // 获取目标进程凭证
-            // R39-3 FIX: 使用共享凭证读取目标进程 uid
-            let target = get_process(pid).ok_or(SyscallError::ESRCH)?;
-            let target_uid = target.lock().credentials.read().uid;
-
-            // POSIX 权限检查：
-            // 1. Root (euid == 0) 可以发信号给任何进程
-            // 2. sender.uid == target.uid
-            // 3. sender.euid == target.uid
-            let has_permission = sender_creds.euid == 0
-                || sender_creds.uid == target_uid
-                || sender_creds.euid == target_uid;
-
-            if !has_permission {
-                return Err(SyscallError::EPERM);
-            }
         }
     }
 
     // 验证信号编号
     let signal = Signal::from_raw(sig)?;
 
-    // 发送信号
-    let action = send_signal(pid, signal)?;
+    // 发送信号 (using global PID)
+    let action = send_signal(target_global_pid, signal)?;
 
     println!(
-        "sys_kill: sent {} to PID {} (action: {:?})",
+        "sys_kill: sent {} to PID {} (global={}, action: {:?})",
         signal_name(signal),
         pid,
+        target_global_pid,
         action
     );
+
+    Ok(0)
+}
+
+/// sys_unshare - Unshare namespaces for the current process
+///
+/// F.1 PID Namespace: When CLONE_NEWPID is specified, the calling process's
+/// pid_ns_for_children is set to a new child namespace. The process itself
+/// remains in its original namespace, but its future children will be created
+/// in the new namespace.
+///
+/// # Arguments
+///
+/// * `flags` - Namespace flags to unshare (CLONE_NEWPID, etc.)
+///
+/// # Returns
+///
+/// 0 on success, -EINVAL for unsupported flags, -ENOMEM on allocation failure
+///
+/// # Linux Semantics
+///
+/// Unlike clone(), unshare() affects only the namespace for children, not the
+/// caller's own namespace membership (for PID namespace).
+fn sys_unshare(flags: u64) -> SyscallResult {
+    // F.1: Currently only CLONE_NEWPID is supported
+    let supported = CLONE_NEWPID;
+    let unsupported = flags & !supported;
+
+    if unsupported != 0 {
+        println!(
+            "[sys_unshare] Unsupported flags: 0x{:x} (supported: CLONE_NEWPID)",
+            unsupported
+        );
+        return Err(SyscallError::EINVAL);
+    }
+
+    if flags == 0 {
+        // No flags specified - nothing to do
+        return Ok(0);
+    }
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    if flags & CLONE_NEWPID != 0 {
+        // Create a new child PID namespace
+        let current_ns_for_children = {
+            let proc = proc_arc.lock();
+            proc.pid_ns_for_children.clone()
+        };
+
+        let new_ns =
+            crate::pid_namespace::PidNamespace::new_child(current_ns_for_children).map_err(
+                |e| {
+                    println!("[sys_unshare] Failed to create PID namespace: {:?}", e);
+                    match e {
+                        crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => {
+                            SyscallError::EAGAIN
+                        }
+                        _ => SyscallError::ENOMEM,
+                    }
+                },
+            )?;
+
+        // Update the process's pid_ns_for_children
+        {
+            let mut proc = proc_arc.lock();
+            proc.pid_ns_for_children = new_ns.clone();
+        }
+
+        println!(
+            "[sys_unshare] Process {} unshared PID namespace, children will use ns_id={}, level={}",
+            pid,
+            new_ns.id().raw(),
+            new_ns.level()
+        );
+    }
 
     Ok(0)
 }
@@ -4922,10 +5202,14 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
 /// * FUTEX_WAIT: 成功阻塞并被唤醒返回 0，值不匹配返回 EAGAIN
 /// * FUTEX_WAIT_TIMEOUT: 同上，超时返回 ETIMEDOUT
 /// * FUTEX_WAKE: 返回实际唤醒的进程数量
+/// * FUTEX_LOCK_PI: E.4 PI - 带优先级继承的互斥锁加锁
+/// * FUTEX_UNLOCK_PI: E.4 PI - 带优先级继承的互斥锁解锁
 fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: usize) -> SyscallResult {
     const FUTEX_WAIT: i32 = 0;
     const FUTEX_WAKE: i32 = 1;
     const FUTEX_WAIT_TIMEOUT: i32 = 2;
+    const FUTEX_LOCK_PI: i32 = 3;
+    const FUTEX_UNLOCK_PI: i32 = 4;
 
     // 验证用户指针
     if uaddr == 0 {
@@ -4938,10 +5222,11 @@ fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: usize) -> SyscallResu
     }
 
     // 验证用户内存可访问
+    // E.4 PI: FUTEX_LOCK_PI 也需要读取用户内存
     verify_user_memory(
         uaddr as *const u8,
         core::mem::size_of::<u32>(),
-        op == FUTEX_WAIT || op == FUTEX_WAIT_TIMEOUT,
+        op == FUTEX_WAIT || op == FUTEX_WAIT_TIMEOUT || op == FUTEX_LOCK_PI,
     )?;
 
     // 获取回调函数
@@ -4950,14 +5235,14 @@ fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: usize) -> SyscallResu
         *callback.as_ref().ok_or(SyscallError::ENOSYS)?
     };
 
-    // 对于 FUTEX_WAIT/FUTEX_WAIT_TIMEOUT，需要先读取当前值
-    let current_value = if op == FUTEX_WAIT || op == FUTEX_WAIT_TIMEOUT {
+    // 对于 FUTEX_WAIT/FUTEX_WAIT_TIMEOUT/FUTEX_LOCK_PI，需要先读取当前值
+    let current_value = if op == FUTEX_WAIT || op == FUTEX_WAIT_TIMEOUT || op == FUTEX_LOCK_PI {
         // 读取 futex 字（安全：已验证用户内存）
         let mut value_bytes = [0u8; 4];
         copy_from_user(&mut value_bytes, uaddr as *const u8)?;
         u32::from_ne_bytes(value_bytes)
     } else {
-        0 // FUTEX_WAKE 不需要当前值
+        0 // FUTEX_WAKE/FUTEX_UNLOCK_PI 不需要当前值
     };
 
     // R39-6 FIX: 解析可选超时（纳秒）
@@ -5016,6 +5301,243 @@ fn sys_yield() -> SyscallResult {
     crate::force_reschedule();
 
     Ok(0)
+}
+
+// ============================================================================
+// CPU Affinity Syscalls (E.5 SMP Scheduler)
+// ============================================================================
+
+/// Debug macro for scheduler-related syscalls (defined early for use in functions below)
+macro_rules! sched_affinity_debug {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "sched_debug")]
+        {
+            drivers::println!($($arg)*);
+        }
+    };
+}
+
+/// Check whether the calling task may SET another task's CPU affinity.
+///
+/// Per Linux semantics, sched_setaffinity requires:
+/// - Target is self (always allowed)
+/// - OR caller has CAP_SYS_NICE (using ADMIN as closest equivalent)
+/// - OR caller is root (euid == 0)
+///
+/// # Returns
+/// - Ok(true) if allowed
+/// - Ok(false) if not allowed (caller should return EPERM)
+/// - Err if process lookup fails
+#[inline]
+fn can_set_affinity(target_pid: ProcessId) -> Result<bool, SyscallError> {
+    let caller = current_pid().ok_or(SyscallError::ESRCH)?;
+    if caller == target_pid {
+        return Ok(true);
+    }
+
+    // Check for CAP_SYS_NICE (using ADMIN capability as closest match)
+    let has_cap = with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    if has_cap {
+        return Ok(true);
+    }
+
+    // Check if caller is root
+    if let Some(proc_arc) = get_process(caller) {
+        let proc = proc_arc.lock();
+        let creds = proc.credentials.read();
+        if creds.euid == 0 {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Check whether the calling task may GET another task's CPU affinity.
+///
+/// Per Linux semantics, sched_getaffinity is more permissive:
+/// - Target is self (always allowed)
+/// - Target is in same thread group (same tgid)
+/// - OR caller has CAP_SYS_NICE/root
+///
+/// For now, we allow reading affinity of any process for simplicity,
+/// matching older Linux behavior. Stricter checks can be added later.
+#[inline]
+fn can_get_affinity(target_pid: ProcessId) -> Result<bool, SyscallError> {
+    // Linux is permissive about reading affinity - allow for all processes
+    // This matches common Linux distributions' behavior
+    if get_process(target_pid).is_none() {
+        return Err(SyscallError::ESRCH);
+    }
+    Ok(true)
+}
+
+/// Get the mask of usable CPUs (online CPUs capped at max_cpus).
+///
+/// This returns a bitmask where bit N is set if CPU N is available.
+/// Used for normalizing affinity masks and for returning "all CPUs"
+/// when allowed_cpus == 0.
+#[inline]
+fn usable_cpu_mask() -> u64 {
+    let cpu_count = max_cpus();
+    if cpu_count >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << cpu_count).saturating_sub(1)
+    }
+}
+
+/// Normalize affinity mask: mask off CPUs beyond max_cpus and reject empty masks.
+///
+/// # Returns
+/// - Ok(mask) - Normalized mask with only valid CPU bits set
+/// - Err(EINVAL) - If the normalized mask is empty (no valid CPUs)
+#[inline]
+fn normalize_affinity_mask(mask: u64) -> Result<u64, SyscallError> {
+    let normalized = mask & usable_cpu_mask();
+    if normalized == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    Ok(normalized)
+}
+
+/// sys_sched_setaffinity - Set CPU affinity mask for a process
+///
+/// # Arguments
+/// * `pid` - Target process ID (0 = calling process)
+/// * `cpusetsize` - Size of the CPU mask in bytes (must be >= 8)
+/// * `mask` - User pointer to the affinity mask (u64 bitmask, bit N = CPU N)
+///
+/// # Returns
+/// * `Ok(0)` - Success
+/// * `Err(ESRCH)` - No process with the given PID
+/// * `Err(EPERM)` - Caller lacks permission to modify target's affinity
+/// * `Err(EINVAL)` - Invalid cpusetsize or empty mask after normalization
+/// * `Err(EFAULT)` - Invalid user pointer
+///
+/// # E.5 Implementation Notes
+/// If the target process is currently running on a CPU not in the new mask,
+/// a reschedule is triggered to migrate it to an allowed CPU.
+fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> SyscallResult {
+    use core::mem::size_of;
+
+    // Validate parameters
+    if mask.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    if cpusetsize < size_of::<u64>() {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Resolve target PID
+    let caller_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let target_pid = if pid == 0 { caller_pid } else { pid as ProcessId };
+
+    // Permission check (uses can_set_affinity which requires privilege for other processes)
+    if !can_set_affinity(target_pid)? {
+        return Err(SyscallError::EPERM);
+    }
+
+    // Copy mask from userspace
+    let _guard = UserAccessGuard::new();
+    let mut mask_bytes = [0u8; 8];
+    crate::usercopy::copy_from_user_safe(&mut mask_bytes, mask).map_err(|_| SyscallError::EFAULT)?;
+    let new_mask = normalize_affinity_mask(u64::from_ne_bytes(mask_bytes))?;
+
+    // Update PCB and get info needed for reschedule decision
+    let proc_arc = get_process(target_pid).ok_or(SyscallError::ESRCH)?;
+    let mut proc = proc_arc.lock();
+    let old_mask = proc.allowed_cpus;
+    proc.allowed_cpus = new_mask;
+    let is_running = proc.state == ProcessState::Running;
+    // Note: We don't track which CPU a process is running on in the PCB currently,
+    // so for cross-CPU migration we rely on the scheduler's periodic load balancing.
+    // For self-migration, we can check current_cpu_id().
+    drop(proc);
+
+    // If the caller changed its own affinity and current CPU is now disallowed,
+    // trigger immediate reschedule
+    if target_pid == caller_pid && is_running {
+        let cpu_id = current_cpu_id();
+        // new_mask is never 0 here (normalize_affinity_mask rejects it)
+        let cpu_still_allowed = cpu_id < 64 && (new_mask & (1u64 << cpu_id)) != 0;
+        if !cpu_still_allowed {
+            current_cpu().set_need_resched();
+        }
+    }
+
+    // Log if mask changed (for debugging)
+    if old_mask != new_mask {
+        sched_affinity_debug!(
+            "[AFFINITY] pid={} mask changed: 0x{:016x} -> 0x{:016x}",
+            target_pid, old_mask, new_mask
+        );
+    }
+
+    Ok(0)
+}
+
+/// sys_sched_getaffinity - Get CPU affinity mask for a process
+///
+/// # Arguments
+/// * `pid` - Target process ID (0 = calling process)
+/// * `cpusetsize` - Size of the CPU mask buffer in bytes (must be >= 8)
+/// * `mask` - User pointer to receive the affinity mask
+///
+/// # Returns
+/// * `Ok(8)` - Success, returns number of bytes written
+/// * `Err(ESRCH)` - No process with the given PID
+/// * `Err(EINVAL)` - Invalid cpusetsize
+/// * `Err(EFAULT)` - Invalid user pointer
+///
+/// # Notes
+/// - If allowed_cpus == 0 in the PCB, this means "no restriction" (all CPUs).
+///   In that case, we return a mask with all usable CPUs set.
+/// - The returned mask is always normalized to the system's CPU count.
+/// - Linux is permissive about reading affinity (no EPERM for other processes).
+fn sys_sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> SyscallResult {
+    use core::mem::size_of;
+
+    // Validate parameters
+    if mask.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    if cpusetsize < size_of::<u64>() {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Resolve target PID
+    let caller_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let target_pid = if pid == 0 { caller_pid } else { pid as ProcessId };
+
+    // Permission check (permissive - just verify process exists)
+    can_get_affinity(target_pid)?;
+
+    // Get the affinity mask from PCB
+    let proc_arc = get_process(target_pid).ok_or(SyscallError::ESRCH)?;
+    let proc = proc_arc.lock();
+    let mut affinity = proc.allowed_cpus;
+    drop(proc);
+
+    // Normalize the mask to the system's usable CPUs
+    let usable = usable_cpu_mask();
+
+    // If allowed_cpus == 0, it means "all CPUs allowed"
+    // Return a mask with all usable CPUs set
+    if affinity == 0 {
+        affinity = usable;
+    } else {
+        // Normalize: mask off any bits beyond max_cpus
+        affinity &= usable;
+    }
+
+    // Copy mask to userspace
+    let mask_bytes = affinity.to_ne_bytes();
+    let _guard = UserAccessGuard::new();
+    crate::usercopy::copy_to_user_safe(mask, &mask_bytes).map_err(|_| SyscallError::EFAULT)?;
+
+    // Return number of bytes written (Linux returns the cpumask size)
+    Ok(size_of::<u64>())
 }
 
 /// sys_getrandom - 获取随机字节

@@ -4,13 +4,16 @@
 //! - FUTEX_WAIT: 如果 *uaddr == val，阻塞当前进程；否则返回 EAGAIN
 //! - FUTEX_WAIT_TIMEOUT: 同上，但支持超时（R39-6 FIX）
 //! - FUTEX_WAKE: 唤醒最多 n 个在 uaddr 上等待的进程
+//! - FUTEX_LOCK_PI: 互斥锁加锁（带优先级继承）- E.4 PI
+//! - FUTEX_UNLOCK_PI: 互斥锁解锁（带优先级继承）- E.4 PI
 //!
 //! 使用全局 FutexTable，以 (pid, vaddr) 为键索引等待队列。
 //! 进程退出时自动清理其所有 futex 等待队列。
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
-use kernel_core::process::{self, ProcessId};
+use kernel_core::process::{self, FutexKey, Priority, ProcessId};
+use kernel_core::request_resched_from_irq;
 use spin::Mutex;
 
 use crate::sync::{WaitOutcome, WaitQueue};
@@ -20,6 +23,10 @@ pub const FUTEX_WAIT: i32 = 0;
 pub const FUTEX_WAKE: i32 = 1;
 /// R39-6 FIX: 带超时的等待
 pub const FUTEX_WAIT_TIMEOUT: i32 = 2;
+/// E.4 PI: 互斥锁加锁（带优先级继承）
+pub const FUTEX_LOCK_PI: i32 = 3;
+/// E.4 PI: 互斥锁解锁（带优先级继承）
+pub const FUTEX_UNLOCK_PI: i32 = 4;
 
 /// Futex 错误类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,13 +41,9 @@ pub enum FutexError {
     NoProcess,
     /// R39-6 FIX: 等待超时
     TimedOut,
+    /// E.4 PI: Robust futex - 锁持有者已退出
+    OwnerDied,
 }
-
-/// Futex 键：(线程组ID, 虚拟地址)
-/// 使用 TGID 确保同一线程组内的线程共享同一个 futex 键，
-/// 保持 POSIX/pthread 语义的向后兼容性。
-/// R37-2 FIX: 修改为使用 TGID 而非 PID
-type FutexKey = (ProcessId, usize);
 
 /// 单个 futex 地址的等待状态
 struct FutexBucket {
@@ -48,6 +51,12 @@ struct FutexBucket {
     queue: Arc<WaitQueue>,
     /// 活跃等待者计数（用于判断是否可以清理）
     waiter_count: usize,
+    /// E.4 PI: 当前持有者（线程ID），FUTEX_LOCK_PI 使用
+    owner: Option<ProcessId>,
+    /// E.4 PI: 持有者已经死亡（robust futex 语义）
+    owner_dead: bool,
+    /// E.4 PI: PI 等待者列表 (pid -> priority)，用于找出最高优先级的等待者
+    pi_waiters: BTreeMap<ProcessId, Priority>,
 }
 
 impl FutexBucket {
@@ -55,6 +64,9 @@ impl FutexBucket {
         FutexBucket {
             queue: Arc::new(WaitQueue::new()),
             waiter_count: 0,
+            owner: None,
+            owner_dead: false,
+            pi_waiters: BTreeMap::new(),
         }
     }
 }
@@ -248,6 +260,243 @@ pub fn futex_wake(tgid: ProcessId, uaddr: usize, n: usize) -> usize {
     woken
 }
 
+/// E.4 PI: FUTEX_LOCK_PI 操作（带优先级继承的互斥锁加锁）
+///
+/// # 语义
+///
+/// - 如果未被持有，当前线程成为 owner，返回 Ok(0)
+/// - 如果被其他线程持有，当前线程加入等待队列，并将自身优先级捐赠给 owner（链式传播）
+/// - 如果 owner 已经死亡（robust futex），新的持有者获得锁并返回 OwnerDied
+/// - 如果自己已经持有该锁，返回 InvalidOperation（防止死锁）
+///
+/// # Arguments
+///
+/// * `tgid` - 线程组 ID
+/// * `uaddr` - 用户空间 futex 地址
+/// * `_current_value` - 当前从用户空间读取的值（用于验证）
+///
+/// # Returns
+///
+/// 成功获取锁返回 Ok(0)，锁持有者死亡返回 Err(OwnerDied)
+pub fn futex_lock_pi(
+    tgid: ProcessId,
+    uaddr: usize,
+    _current_value: u32,
+) -> Result<usize, FutexError> {
+    let pid = process::current_pid().ok_or(FutexError::NoProcess)?;
+    let key: FutexKey = (tgid, uaddr);
+
+    // 获取当前等待者的优先级
+    let waiter_priority = {
+        let proc_arc = process::get_process(pid).ok_or(FutexError::NoProcess)?;
+        let proc = proc_arc.lock();
+        proc.dynamic_priority
+    };
+
+    let bucket = get_or_create_bucket(key);
+
+    // 快路径：尝试直接获取所有权
+    {
+        let mut b = bucket.lock();
+
+        // 清理已死亡的 owner（robust futex）
+        if let Some(owner) = b.owner {
+            if process::get_process(owner).is_none() {
+                b.owner = None;
+                b.owner_dead = true;
+            }
+        }
+
+        if b.owner.is_none() {
+            // 锁空闲，直接获取
+            let owner_died = b.owner_dead;
+            b.owner = Some(pid);
+            b.owner_dead = false;
+            b.pi_waiters.remove(&pid);
+            return if owner_died {
+                Err(FutexError::OwnerDied)
+            } else {
+                Ok(0)
+            };
+        }
+
+        if b.owner == Some(pid) {
+            // 自己已经持有，防止死锁
+            return Err(FutexError::InvalidOperation);
+        }
+
+        // 需要等待：增加计数但暂不记录 pi_waiters（避免 race）
+        b.waiter_count += 1;
+    }
+
+    // 记录阻塞的 futex key（用于链式 PI）
+    if let Some(proc) = process::get_process(pid) {
+        proc.lock().set_waiting_on_futex(Some(key));
+    }
+
+    // CRITICAL FIX: 先加入 WaitQueue，再记录 pi_waiters
+    // 这避免了 unlock_pi 在 waiter 入队前就尝试 wake_specific 的 race
+    let queue = { bucket.lock().queue.clone() };
+    if !queue.prepare_to_wait() {
+        // 入队失败（队列已关闭或无当前进程），回滚
+        let mut b = bucket.lock();
+        if b.waiter_count > 0 {
+            b.waiter_count -= 1;
+        }
+        if let Some(proc) = process::get_process(pid) {
+            proc.lock().set_waiting_on_futex(None);
+        }
+        return Err(FutexError::NoProcess);
+    }
+
+    // 现在 waiter 已在队列中，安全地记录 pi_waiters
+    {
+        let mut b = bucket.lock();
+        b.pi_waiters.insert(pid, waiter_priority);
+    }
+
+    // 触发 PI 传播到当前 owner
+    recompute_pi_state(key, &bucket);
+
+    // 完成等待（实际阻塞）
+    queue.finish_wait();
+
+    // 检查是否因超时或关闭被唤醒（此处没有超时，所以只处理正常唤醒和关闭）
+    // Note: finish_wait 不返回 outcome，需要通过其他方式判断
+    // 我们使用 Woken 作为默认，因为 PI futex 不支持超时（目前）
+
+    // 出队并更新 PI 状态
+    let mut owner_died = false;
+    {
+        let mut b = bucket.lock();
+        if b.waiter_count > 0 {
+            b.waiter_count -= 1;
+        }
+        b.pi_waiters.remove(&pid);
+        owner_died = b.owner_dead;
+
+        // CRITICAL FIX: 检查是否已被 unlock_pi 设置为 owner
+        // 如果已经是 owner，就不需要再竞争
+        if b.owner == Some(pid) {
+            // 已经被 unlock_pi 转移了所有权
+            drop(b);
+            if let Some(proc) = process::get_process(pid) {
+                proc.lock().set_waiting_on_futex(None);
+            }
+            recompute_pi_state(key, &bucket);
+            cleanup_empty_bucket(key, &bucket);
+            return if owner_died {
+                Err(FutexError::OwnerDied)
+            } else {
+                Ok(0)
+            };
+        }
+
+        // 如果 owner 已经被清空（owner 死亡且未被 unlock_pi 处理），尝试接管锁
+        if b.owner.is_none() {
+            b.owner = Some(pid);
+            b.owner_dead = false;
+        }
+    }
+
+    // 清除等待标记
+    if let Some(proc) = process::get_process(pid) {
+        proc.lock().set_waiting_on_futex(None);
+    }
+
+    // 等待者离开后重新计算 PI
+    recompute_pi_state(key, &bucket);
+    cleanup_empty_bucket(key, &bucket);
+
+    if owner_died {
+        Err(FutexError::OwnerDied)
+    } else {
+        Ok(0)
+    }
+}
+
+/// E.4 PI: FUTEX_UNLOCK_PI 操作（带优先级继承的互斥锁解锁）
+///
+/// # 语义
+///
+/// - 仅持有者可以解锁
+/// - 将锁直接转移给最高优先级的等待者
+/// - 根据剩余等待者更新 PI 状态
+///
+/// # Arguments
+///
+/// * `tgid` - 线程组 ID
+/// * `uaddr` - 用户空间 futex 地址
+///
+/// # Returns
+///
+/// 成功解锁返回 Ok(0)，不是持有者返回 Err(InvalidOperation)
+pub fn futex_unlock_pi(tgid: ProcessId, uaddr: usize) -> Result<usize, FutexError> {
+    let pid = process::current_pid().ok_or(FutexError::NoProcess)?;
+    let key: FutexKey = (tgid, uaddr);
+
+    let bucket = {
+        let table = FUTEX_TABLE.lock();
+        table.get(&key).cloned()
+    }
+    .ok_or(FutexError::InvalidOperation)?;
+
+    let (queue, next_owner, remaining_boost) = {
+        let mut b = bucket.lock();
+        if b.owner != Some(pid) {
+            return Err(FutexError::InvalidOperation);
+        }
+
+        // 移除已退出的等待者，避免唤醒僵尸
+        b.pi_waiters
+            .retain(|waiter, _| process::get_process(*waiter).is_some());
+
+        let queue = b.queue.clone();
+        let next = select_highest_waiter(&b.pi_waiters);
+
+        if let Some((next_pid, _prio)) = next {
+            // 直接移除并转移所有权
+            b.pi_waiters.remove(&next_pid);
+            b.owner = Some(next_pid);
+            b.owner_dead = false;
+        } else {
+            b.owner = None;
+            b.owner_dead = false;
+        }
+
+        let donation = highest_waiter_priority(&b);
+        (queue, next.map(|(p, _)| p), donation)
+    };
+
+    // 当前持有者清除自己的 PI 提升
+    if let Some(proc) = process::get_process(pid) {
+        let changed = proc.lock().clear_pi_boost(&key);
+        if changed {
+            request_resched_from_irq();
+        }
+    }
+
+    if let Some(new_owner) = next_owner {
+        // 传递剩余等待者的捐赠到新的 owner，并链式传播
+        {
+            let mut visited = BTreeSet::new();
+            visited.insert(key);
+            apply_pi_and_propagate(key, new_owner, remaining_boost, &mut visited);
+        }
+
+        // 清理等待标记并唤醒新的 owner
+        if let Some(proc) = process::get_process(new_owner) {
+            proc.lock().set_waiting_on_futex(None);
+        }
+        queue.wake_specific(new_owner);
+    } else {
+        // 无等待者，尝试清理桶
+        cleanup_empty_bucket(key, &bucket);
+    }
+
+    Ok(0)
+}
+
 /// 清理进程的所有 futex 等待队列
 ///
 /// 进程/线程退出时调用，唤醒所有等待者并移除该进程的所有 futex 条目。
@@ -255,15 +504,69 @@ pub fn futex_wake(tgid: ProcessId, uaddr: usize, n: usize) -> usize {
 /// R37-2 FIX: 如果退出的线程还有 CLONE_THREAD 兄弟线程存活，则保留 TGID 的
 /// futex 桶，避免清除正在使用的 futex。这保持了 pthread 语义。
 ///
+/// E.4 PI: 如果退出的线程持有 PI futex，标记为 owner_dead 并选择
+/// 最高优先级等待者作为继任者（robust futex 语义）。只唤醒继任者以保持互斥。
+///
 /// R37-2 FIX (Codex review): Accept TGID directly from caller to avoid deadlock.
 /// The caller (free_process_resources) already holds the process lock, so we must
 /// not try to lock the process again.
-pub fn cleanup_process_futexes(_pid: ProcessId, tgid: ProcessId) {
+pub fn cleanup_process_futexes(pid: ProcessId, tgid: ProcessId) {
     // R37-2 FIX (Codex review): Use TGID provided by caller, not from process lock.
     // Check thread group size without locking the current process.
     let group_size = process::thread_group_size(tgid);
 
-    // 如果线程组还有其他活跃线程，不清理 futex
+    // E.4 PI: 先标记由退出线程持有的 futex（robust 语义）
+    {
+        let table = FUTEX_TABLE.lock();
+        let owned: alloc::vec::Vec<(FutexKey, Arc<Mutex<FutexBucket>>)> = table
+            .iter()
+            .filter(|(k, _)| k.0 == tgid)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        drop(table);
+
+        for (key, bucket) in owned {
+            let (queue, next_owner) = {
+                let mut b = bucket.lock();
+                if b.owner != Some(pid) {
+                    continue;
+                }
+
+                // 标记 owner 死亡
+                b.owner_dead = true;
+
+                // CRITICAL FIX: 选择最高优先级等待者作为继任者，而非唤醒全部
+                // 这保持了互斥语义
+                let queue = b.queue.clone();
+                let next = select_highest_waiter(&b.pi_waiters);
+
+                if let Some((next_pid, _prio)) = next {
+                    // 转移所有权给继任者
+                    b.pi_waiters.remove(&next_pid);
+                    b.owner = Some(next_pid);
+                    // 保持 owner_dead = true 以便继任者知道前任已死亡
+                } else {
+                    // 无等待者，清除所有权
+                    b.owner = None;
+                }
+
+                (queue, next.map(|(p, _)| p))
+            };
+
+            if let Some(new_owner) = next_owner {
+                // 清除继任者的等待标记并唤醒
+                if let Some(proc) = process::get_process(new_owner) {
+                    proc.lock().set_waiting_on_futex(None);
+                }
+                queue.wake_specific(new_owner);
+            }
+
+            // 重新计算 PI（owner 已变更）
+            recompute_pi_state(key, &bucket);
+        }
+    }
+
+    // 如果线程组还有其他活跃线程，只做 owner_dead 标记，不移除桶
     if group_size > 1 {
         return;
     }
@@ -296,9 +599,12 @@ fn get_or_create_bucket(key: FutexKey) -> Arc<Mutex<FutexBucket>> {
 }
 
 /// 清理空的等待桶（无等待者时移除）
+///
+/// E.4 PI: 额外检查 owner 和 pi_waiters 是否为空
 fn cleanup_empty_bucket(key: FutexKey, bucket: &Arc<Mutex<FutexBucket>>) {
     let b = bucket.lock();
-    if b.waiter_count == 0 && b.queue.is_empty() {
+    // E.4 PI: 只有当 owner、等待者、队列都为空时才清理
+    if b.waiter_count == 0 && b.queue.is_empty() && b.owner.is_none() && b.pi_waiters.is_empty() {
         drop(b);
 
         // 重新获取 table 锁进行移除
@@ -308,7 +614,11 @@ fn cleanup_empty_bucket(key: FutexKey, bucket: &Arc<Mutex<FutexBucket>>) {
             if Arc::ptr_eq(existing, bucket) {
                 // 再次检查是否为空
                 let b = existing.lock();
-                if b.waiter_count == 0 && b.queue.is_empty() {
+                if b.waiter_count == 0
+                    && b.queue.is_empty()
+                    && b.owner.is_none()
+                    && b.pi_waiters.is_empty()
+                {
                     drop(b);
                     table.remove(&key);
                 }
@@ -324,3 +634,88 @@ pub fn active_futex_count() -> usize {
 
 /// FutexTable 类型别名（向后兼容）
 pub type FutexTable = ();
+
+// ============================================================================
+// E.4 PI: 内部辅助函数（优先级继承支持）
+// ============================================================================
+
+/// E.4 PI: 选择最高优先级（数值最小）的等待者
+fn select_highest_waiter(waiters: &BTreeMap<ProcessId, Priority>) -> Option<(ProcessId, Priority)> {
+    waiters
+        .iter()
+        .min_by_key(|(_, prio)| *prio)
+        .map(|(pid, prio)| (*pid, *prio))
+}
+
+/// E.4 PI: 获取当前最高优先级等待者的优先级（仅优先级值）
+fn highest_waiter_priority(bucket: &FutexBucket) -> Option<Priority> {
+    bucket.pi_waiters.values().min().copied()
+}
+
+/// E.4 PI: 将优先级捐赠应用于 owner 并沿等待链路传播（A -> B -> C）
+///
+/// 支持链式优先级继承：如果 owner 也在等待其他 futex，则继续向上传播
+fn apply_pi_and_propagate(
+    key: FutexKey,
+    owner: ProcessId,
+    donated: Option<Priority>,
+    visited: &mut BTreeSet<FutexKey>,
+) {
+    if let Some(proc) = process::get_process(owner) {
+        let (changed, next_wait, effective_prio) = {
+            let mut p = proc.lock();
+            let changed = match donated {
+                Some(prio) => p.apply_pi_boost(key, prio),
+                None => p.clear_pi_boost(&key),
+            };
+            let next = p.get_waiting_on_futex();
+            let eff = p.dynamic_priority;
+            (changed, next, eff)
+        };
+
+        if changed {
+            // 通知调度器重新评估优先级
+            request_resched_from_irq();
+        }
+
+        // 链式传播（如果 owner 也在等待其他 futex）
+        if let Some(next_key) = next_wait {
+            if visited.insert(next_key) {
+                propagate_pi(next_key, effective_prio, visited);
+            }
+        }
+    }
+}
+
+/// E.4 PI: 从等待链路继续向上传播 PI
+fn propagate_pi(key: FutexKey, donation: Priority, visited: &mut BTreeSet<FutexKey>) {
+    let owner = {
+        let table = FUTEX_TABLE.lock();
+        table.get(&key).and_then(|b| b.lock().owner)
+    };
+
+    if let Some(owner_pid) = owner {
+        apply_pi_and_propagate(key, owner_pid, Some(donation), visited);
+    }
+}
+
+/// E.4 PI: 根据当前等待者重新计算 owner 的 PI，并处理链式传播/清除
+fn recompute_pi_state(key: FutexKey, bucket: &Arc<Mutex<FutexBucket>>) {
+    let (owner, donation) = {
+        let mut b = bucket.lock();
+        // 清理已退出的 owner
+        if let Some(owner_pid) = b.owner {
+            if process::get_process(owner_pid).is_none() {
+                b.owner = None;
+                b.owner_dead = true;
+            }
+        }
+        (b.owner, highest_waiter_priority(&b))
+    };
+
+    if let Some(owner_pid) = owner {
+        let mut visited = BTreeSet::new();
+        visited.insert(key);
+        apply_pi_and_propagate(key, owner_pid, donation, &mut visited);
+    }
+}

@@ -952,26 +952,42 @@ pub extern "C" fn ap_rust_entry(
 
 /// Scheduler-aware idle path for APs.
 ///
-/// R70-1: Breaks the old permanent HLT loop by allowing reschedule IPIs or
-/// timer events to trigger the scheduler callback. The AP will:
-/// 1. Check if there's pending work (reschedule flag set)
-/// 2. If work exists, run the scheduler to pick up tasks
-/// 3. If no work, HLT until the next interrupt (timer, IPI, etc.)
+/// R70-1 FIX: Race-free idle loop.
+///
+/// The original implementation had a race condition:
+/// 1. Check reschedule_if_needed() -> returns (no work)
+/// 2. [IPI arrives, sets need_resched=true, handler runs and returns]
+/// 3. sti; hlt executes -> CPU halts with work pending!
+///
+/// Fix: Disable interrupts during the scheduling check, then use atomic
+/// sti;hlt sequence. On x86, STI enables interrupts starting with the
+/// NEXT instruction, so any pending interrupt will wake from HLT immediately.
 ///
 /// This enables true SMP scheduling where all CPUs participate in running
 /// user processes, not just the BSP.
 fn ap_idle_loop() -> ! {
     loop {
+        // R70-1 FIX: Disable interrupts during check to prevent race.
+        // This ensures no IPI can slip in between the check and HLT.
+        x86_64::instructions::interrupts::disable();
+
         // Check if scheduler has work for us (set by timer tick or reschedule IPI)
         kernel_core::reschedule_if_needed();
 
-        // Enable interrupts and halt until next interrupt
-        // When an interrupt arrives (timer tick, reschedule IPI, etc.),
-        // the CPU wakes up and loops back to check for work
+        // Check need_resched flag with interrupts disabled
+        if cpu_local::current_cpu().need_resched.load(Ordering::SeqCst) {
+            // Work is pending, enable interrupts and continue to next iteration
+            x86_64::instructions::interrupts::enable();
+            continue;
+        }
+
+        // No work pending - use atomic sti;hlt sequence.
+        // x86 guarantees that STI takes effect starting with the NEXT instruction,
+        // so if an IPI is pending, the CPU will wake from HLT immediately.
         unsafe {
             core::arch::asm!(
-                "sti",   // Enable interrupts
-                "hlt",   // Halt until interrupt
+                "sti",   // Enable interrupts (takes effect starting with HLT)
+                "hlt",   // Halt until interrupt - wakes immediately if interrupt pending
                 options(nomem, nostack, preserves_flags)
             );
         }
@@ -1074,17 +1090,20 @@ struct RsdpV2 {
 }
 
 /// ACPI SDT header
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can access ACPI table parsing.
 #[repr(C, packed)]
-struct SdtHeader {
-    signature: [u8; 4],
-    length: u32,
-    revision: u8,
-    checksum: u8,
-    oemid: [u8; 6],
-    oemtableid: [u8; 8],
-    oem_revision: u32,
-    creator_id: u32,
-    creator_rev: u32,
+#[derive(Clone, Copy)]
+pub(crate) struct SdtHeader {
+    pub signature: [u8; 4],
+    pub length: u32,
+    pub revision: u8,
+    pub checksum: u8,
+    pub oemid: [u8; 6],
+    pub oemtableid: [u8; 8],
+    pub oem_revision: u32,
+    pub creator_id: u32,
+    pub creator_rev: u32,
 }
 
 /// MADT header
@@ -1165,7 +1184,9 @@ unsafe fn parse_madt() -> Option<Vec<u32>> {
 ///
 /// For UEFI systems, the bootloader provides the RSDP address from the
 /// EFI Configuration Table. For legacy BIOS systems, we scan 0xE0000-0x100000.
-unsafe fn find_rsdp() -> Option<(u64, u64)> {
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can locate ACPI tables.
+pub(crate) unsafe fn find_rsdp() -> Option<(u64, u64)> {
     // First try bootloader-provided RSDP address (UEFI path)
     let rsdp_phys = RSDP_PHYS_ADDR.load(Ordering::Acquire);
     if rsdp_phys != 0 {
@@ -1227,7 +1248,9 @@ unsafe fn validate_rsdp_at(phys: u64) -> Option<(u64, u64)> {
 }
 
 /// Find a table in RSDT by signature.
-unsafe fn find_table_rsdt(rsdt_phys: u64, sig: &[u8; 4]) -> Option<u64> {
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can locate ACPI tables.
+pub(crate) unsafe fn find_table_rsdt(rsdt_phys: u64, sig: &[u8; 4]) -> Option<u64> {
     let header = read_sdt_header(rsdt_phys)?;
     if &header.signature != b"RSDT" {
         return None;
@@ -1251,7 +1274,9 @@ unsafe fn find_table_rsdt(rsdt_phys: u64, sig: &[u8; 4]) -> Option<u64> {
 }
 
 /// Find a table in XSDT by signature.
-unsafe fn find_table_xsdt(xsdt_phys: u64, sig: &[u8; 4]) -> Option<u64> {
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can locate ACPI tables.
+pub(crate) unsafe fn find_table_xsdt(xsdt_phys: u64, sig: &[u8; 4]) -> Option<u64> {
     let header = read_sdt_header(xsdt_phys)?;
     if &header.signature != b"XSDT" {
         return None;
@@ -1275,13 +1300,17 @@ unsafe fn find_table_xsdt(xsdt_phys: u64, sig: &[u8; 4]) -> Option<u64> {
 }
 
 /// Read an SDT header from physical memory.
-fn read_sdt_header(phys: u64) -> Option<SdtHeader> {
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can parse ACPI tables.
+pub(crate) fn read_sdt_header(phys: u64) -> Option<SdtHeader> {
     let slice = phys_slice(phys, core::mem::size_of::<SdtHeader>())?;
     Some(unsafe { ptr::read_unaligned(slice.as_ptr() as *const SdtHeader) })
 }
 
 /// Get a slice of physical memory via high-half mapping.
-fn phys_slice(phys: u64, len: usize) -> Option<&'static [u8]> {
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can read ACPI table data.
+pub(crate) fn phys_slice(phys: u64, len: usize) -> Option<&'static [u8]> {
     if phys == 0 || phys + len as u64 > MAX_PHYS_MAPPED {
         return None;
     }
@@ -1290,7 +1319,9 @@ fn phys_slice(phys: u64, len: usize) -> Option<&'static [u8]> {
 }
 
 /// Validate ACPI checksum (sum of all bytes must be 0).
-fn validate_checksum(data: &[u8]) -> bool {
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can validate ACPI tables.
+pub(crate) fn validate_checksum(data: &[u8]) -> bool {
     data.iter().fold(0u8, |acc, b| acc.wrapping_add(*b)) == 0
 }
 

@@ -299,6 +299,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // R39-7 FIX: Pass KASLR slide from bootloader to kernel
     println!("[2.65/3] Initializing KASLR/KPTI/PCID...");
     security::init_kaslr(boot_info.map(|info| info.kaslr_slide));
+    // Cache INVPCID capability for TLB shootdowns (uses CPUID + PCID state)
+    mm::tlb_shootdown::init_invpcid_support();
 
     // CPU 硬件保护特性启用 (SMEP/SMAP/UMIP)
     println!("[2.7/3] Enabling CPU protection features...");
@@ -401,7 +403,22 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         let bsp_lapic_id = arch::apic::bsp_lapic_id();
         println!("      ✓ BSP LAPIC initialized (ID: {})", bsp_lapic_id);
 
-        // Calibrate LAPIC timer using PIT channel 2 as reference
+        // E.1: Initialize HPET (High Precision Event Timer) if available
+        // HPET provides a high-resolution counter for precise timing and
+        // can be used as an alternative reference for LAPIC calibration.
+        match arch::hpet::init() {
+            Ok(info) => {
+                println!(
+                    "      ✓ HPET initialized (freq={} Hz, timers={}, 64-bit={})",
+                    info.frequency_hz, info.comparator_count, info.counter_64bit
+                );
+            }
+            Err(e) => {
+                println!("      ! HPET unavailable: {:?} (using PIT for calibration)", e);
+            }
+        }
+
+        // Calibrate LAPIC timer using HPET (preferred) or PIT channel 2 as reference
         // This determines the correct initial count for ~1kHz ticks
         unsafe {
             match arch::apic::calibrate_lapic_timer() {
@@ -450,6 +467,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     println!("[6/8] Initializing scheduler...");
     sched::enhanced_scheduler::init(); // 注册定时器和重调度回调
     println!("      ✓ Enhanced scheduler initialized");
+
+    // E.5: Initialize cpuset subsystem after CPU enumeration
+    sched::cpuset::init();
+    println!("      ✓ Cpuset CPU isolation initialized");
 
     println!("[7/8] Initializing IPC...");
     ipc::init(); // 初始化IPC子系统并注册清理回调

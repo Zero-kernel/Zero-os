@@ -29,6 +29,12 @@ pub type ProcessId = usize;
 /// 进程优先级（0-139，数值越小优先级越高）
 pub type Priority = u8;
 
+/// E.4 Priority Inheritance: Futex 键 (tgid, uaddr)
+///
+/// Used for tracking which futex a task is waiting on (for transitive PI)
+/// and as keys in the PI boost map.
+pub type FutexKey = (ProcessId, usize);
+
 /// mmap 默认起始地址
 const DEFAULT_MMAP_BASE: usize = 0x4000_0000;
 
@@ -66,6 +72,18 @@ pub type SchedulerAddCallback = fn(Arc<Mutex<Process>>);
 /// 线程退出时调用，唤醒等待在 clear_child_tid 地址上的进程
 /// 参数: (tgid, uaddr, max_wake_count) -> 实际唤醒数量
 pub type FutexWakeCallback = fn(ProcessId, usize, usize) -> usize;
+
+/// E.5 Cpuset: Callback for task joining a cpuset
+///
+/// Called when a new process is created (fork/clone) to update cpuset task count.
+/// Parameter: cpuset_id (u32)
+pub type CpusetTaskJoinedCallback = fn(u32);
+
+/// E.5 Cpuset: Callback for task leaving a cpuset
+///
+/// Called when a process exits to update cpuset task count.
+/// Parameter: cpuset_id (u32)
+pub type CpusetTaskLeftCallback = fn(u32);
 
 /// 最大文件描述符数量（每进程）
 pub const MAX_FD: i32 = 256;
@@ -128,6 +146,8 @@ pub enum ProcessCreateError {
     KernelStackAllocFailed(KernelStackError),
     /// R29-5 FIX: PID 空间耗尽（内核栈地址空间溢出）
     PidExhausted,
+    /// F.1: PID namespace chain assignment failed
+    NamespaceError,
 }
 
 /// R29-5 FIX: Maximum PID before kernel stack address overflow
@@ -361,6 +381,26 @@ pub struct Process {
     /// 动态优先级（用于调度）
     pub dynamic_priority: Priority,
 
+    /// E.4 Priority Inheritance: 未应用 PI 的动态优先级基线
+    ///
+    /// When priority inheritance is active, `dynamic_priority` becomes the effective
+    /// priority (min of base and all PI boosts). This field stores the original
+    /// priority before any PI modifications were applied.
+    pub base_dynamic_priority: Priority,
+
+    /// E.4 Priority Inheritance: 当前的 futex PI 捐赠 (key -> 最高等待者优先级)
+    ///
+    /// When this task holds a futex and high-priority waiters are blocked on it,
+    /// those waiters' priorities are recorded here. The effective priority is
+    /// computed as min(base_dynamic_priority, min(all pi_boosts values)).
+    pub pi_boosts: BTreeMap<FutexKey, Priority>,
+
+    /// E.4 Priority Inheritance: 如果阻塞在 futex 上，记录等待的 futex key
+    ///
+    /// Used for transitive priority inheritance: if A waits on B, and B waits on C,
+    /// then A's priority should propagate through to C.
+    pub waiting_on_futex: Option<FutexKey>,
+
     /// 时间片（剩余时间片，单位：毫秒）
     pub time_slice: u32,
 
@@ -439,6 +479,13 @@ pub struct Process {
     /// 位0对应CPU 0，位1对应CPU 1，以此类推。
     pub allowed_cpus: u64,
 
+    /// Cpuset ID for CPU isolation.
+    ///
+    /// Tasks are restricted to CPUs in their cpuset's mask.
+    /// Effective affinity = online_mask ∩ cpuset_mask ∩ allowed_cpus.
+    /// Default: CpusetId(0) = root cpuset (all CPUs).
+    pub cpuset_id: u32,
+
     /// 创建时间戳
     pub created_at: u64,
 
@@ -496,6 +543,20 @@ pub struct Process {
     /// robust_list 长度
     pub robust_list_len: usize,
 
+    // ========== F.1: PID Namespace Support ==========
+    /// PID namespace membership chain (root -> owning namespace)
+    ///
+    /// Each entry contains the namespace and the PID as seen from that namespace.
+    /// The last entry is the owning (leaf) namespace where the process was created.
+    /// Root namespace (level 0) uses global PID directly.
+    pub pid_ns_chain: Vec<crate::pid_namespace::PidNamespaceMembership>,
+
+    /// PID namespace for children
+    ///
+    /// When CLONE_NEWPID is used, children are created in a new child namespace.
+    /// Otherwise, children inherit this namespace (same as parent's owning namespace).
+    pub pid_ns_for_children: Arc<crate::pid_namespace::PidNamespace>,
+
     // ========== Seccomp/Pledge 沙箱 ==========
     /// Seccomp 过滤器状态
     /// 包含 BPF 过滤器栈和 no_new_privs 标志
@@ -526,6 +587,9 @@ impl Process {
             pending_signals: PendingSignals::new(),
             priority,
             dynamic_priority: priority,
+            base_dynamic_priority: priority, // E.4 PI: starts same as dynamic_priority
+            pi_boosts: BTreeMap::new(),       // E.4 PI: no boosts initially
+            waiting_on_futex: None,           // E.4 PI: not waiting on any futex
             time_slice: calculate_time_slice(priority),
             context: Context::default(),
             fpu_used: false, // Lazy FPU: process hasn't used FPU yet
@@ -544,6 +608,7 @@ impl Process {
             cpu_time: 0,
             wait_ticks: 0, // R65-19 FIX: Initialize starvation counter
             allowed_cpus: 0xFFFFFFFFFFFFFFFF, // SMP: Allow on all CPUs by default
+            cpuset_id: 0, // Root cpuset (all CPUs)
             created_at: time::current_timestamp_ms(),
             // R39-3 FIX: 默认以root运行，使用共享凭证结构
             credentials: Arc::new(RwLock::new(Credentials {
@@ -568,6 +633,10 @@ impl Process {
             set_child_tid: 0,
             robust_list_head: 0,
             robust_list_len: 0,
+            // F.1: PID namespace - default to root namespace
+            // The actual chain will be assigned by create_process after PID allocation
+            pid_ns_chain: Vec::new(),
+            pid_ns_for_children: crate::pid_namespace::ROOT_PID_NAMESPACE.clone(),
             // Seccomp/Pledge 沙箱 (默认无限制)
             seccomp_state: SeccompState::new(),
             pledge_state: None,
@@ -652,18 +721,86 @@ impl Process {
         self.time_slice = calculate_time_slice(self.dynamic_priority);
     }
 
+    // ========================================================================
+    // E.4 Priority Inheritance (PI) Methods
+    // ========================================================================
+
+    /// E.4 PI: 重新计算包含 PI 的有效优先级
+    ///
+    /// `dynamic_priority` = min(base_dynamic_priority, min(all pi_boosts))
+    /// Returns true if the effective priority changed.
+    pub fn recompute_effective_priority(&mut self) -> bool {
+        let inherited = self.pi_boosts.values().min().copied();
+        let base = self.base_dynamic_priority;
+        let effective = inherited.map_or(base, |p| core::cmp::min(p, base));
+        if effective != self.dynamic_priority {
+            self.dynamic_priority = effective;
+            self.time_slice = calculate_time_slice(self.dynamic_priority);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// E.4 PI: 应用一次 PI 提升（如果提升更高则更新）
+    ///
+    /// Called when a high-priority waiter blocks on a futex held by this task.
+    /// Returns true if the effective priority changed.
+    pub fn apply_pi_boost(&mut self, key: FutexKey, donated: Priority) -> bool {
+        let should_update = match self.pi_boosts.get(&key) {
+            Some(&existing) => donated < existing, // Lower priority number = higher priority
+            None => true,
+        };
+        if should_update {
+            self.pi_boosts.insert(key, donated);
+            return self.recompute_effective_priority();
+        }
+        false
+    }
+
+    /// E.4 PI: 清除指定 futex 的 PI 提升
+    ///
+    /// Called when the futex is released or all waiters leave.
+    /// Returns true if the effective priority changed.
+    pub fn clear_pi_boost(&mut self, key: &FutexKey) -> bool {
+        if self.pi_boosts.remove(key).is_some() {
+            return self.recompute_effective_priority();
+        }
+        false
+    }
+
+    /// E.4 PI: 记录 / 清除当前等待的 futex（用于链式 PI）
+    pub fn set_waiting_on_futex(&mut self, key: Option<FutexKey>) {
+        self.waiting_on_futex = key;
+    }
+
+    /// E.4 PI: 获取当前等待的 futex key（用于链式 PI）
+    pub fn get_waiting_on_futex(&self) -> Option<FutexKey> {
+        self.waiting_on_futex
+    }
+
+    // ========================================================================
+    // Standard Priority Methods (updated for PI awareness)
+    // ========================================================================
+
     /// 更新动态优先级（用于公平调度）
+    ///
+    /// E.4 PI: Now operates on base_dynamic_priority and recomputes effective.
     pub fn update_dynamic_priority(&mut self) {
         // 简单的优先级提升策略
-        if self.dynamic_priority > 0 {
-            self.dynamic_priority -= 1;
+        if self.base_dynamic_priority > 0 {
+            self.base_dynamic_priority -= 1;
+            self.recompute_effective_priority();
         }
     }
 
     /// 降低动态优先级（惩罚CPU密集型进程）
+    ///
+    /// E.4 PI: Now operates on base_dynamic_priority and recomputes effective.
     pub fn decrease_dynamic_priority(&mut self) {
-        if self.dynamic_priority < 139 {
-            self.dynamic_priority += 1;
+        if self.base_dynamic_priority < 139 {
+            self.base_dynamic_priority += 1;
+            self.recompute_effective_priority();
         }
     }
 
@@ -688,15 +825,21 @@ impl Process {
     /// Previously, dynamic_priority could be boosted below static priority,
     /// allowing low-priority processes to gain higher priority than intended.
     /// Now capped at static priority to prevent priority inversion abuse.
+    ///
+    /// # E.4 PI: Updated for priority inheritance
+    ///
+    /// Now operates on base_dynamic_priority and recomputes effective priority.
     pub fn check_and_boost_starved(&mut self) {
         // 饥饿阈值：100个tick（约100ms，假设1ms/tick）
         const STARVATION_THRESHOLD: u64 = 100;
 
         if self.wait_ticks >= STARVATION_THRESHOLD {
-            // R66-4 FIX: Only boost if dynamic > static (never boost beyond static)
+            // R66-4 FIX: Only boost if base > static (never boost beyond static)
             // This prevents low-priority processes from gaining realtime priority
-            if self.dynamic_priority > self.priority {
-                self.dynamic_priority -= 1;
+            // E.4 PI: Now operates on base_dynamic_priority
+            if self.base_dynamic_priority > self.priority {
+                self.base_dynamic_priority -= 1;
+                self.recompute_effective_priority();
             }
             // 重置等待计数器
             self.wait_ticks = 0;
@@ -716,8 +859,11 @@ impl Process {
     }
 
     /// 恢复静态优先级
+    ///
+    /// E.4 PI: Now resets base_dynamic_priority and recomputes effective priority.
     pub fn restore_static_priority(&mut self) {
-        self.dynamic_priority = self.priority;
+        self.base_dynamic_priority = self.priority;
+        self.recompute_effective_priority();
     }
 }
 
@@ -745,6 +891,10 @@ lazy_static::lazy_static! {
     static ref SCHEDULER_ADD: Mutex<Option<SchedulerAddCallback>> = Mutex::new(None);
     /// Futex 唤醒回调（用于 clear_child_tid）
     static ref FUTEX_WAKE: Mutex<Option<FutexWakeCallback>> = Mutex::new(None);
+    /// E.5 Cpuset: Task joined callback (for fork/clone)
+    static ref CPUSET_TASK_JOINED: Mutex<Option<CpusetTaskJoinedCallback>> = Mutex::new(None);
+    /// E.5 Cpuset: Task left callback (for process exit)
+    static ref CPUSET_TASK_LEFT: Mutex<Option<CpusetTaskLeftCallback>> = Mutex::new(None);
     /// 缓存引导时的 CR3 值，用于内核进程或 memory_space == 0 的情况
     static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
 }
@@ -824,6 +974,42 @@ pub fn create_process(
         proc.kernel_stack_top = stack_top;
     }
 
+    // F.1 PID Namespace: Assign namespace chain for the new process
+    //
+    // For kernel-created processes (ppid == 0), use root namespace.
+    // For forked/cloned processes, the caller (fork.rs/sys_clone) will handle
+    // namespace inheritance from the parent.
+    {
+        let target_ns = if ppid == 0 {
+            // Kernel thread: use root namespace
+            crate::pid_namespace::ROOT_PID_NAMESPACE.clone()
+        } else {
+            // Child process: inherit from parent's pid_ns_for_children
+            // Note: For now, default to root. Fork/clone will override this.
+            let table = PROCESS_TABLE.lock();
+            if let Some(Some(parent)) = table.get(ppid) {
+                parent.lock().pid_ns_for_children.clone()
+            } else {
+                crate::pid_namespace::ROOT_PID_NAMESPACE.clone()
+            }
+        };
+
+        // Assign PID chain from root namespace down to target
+        match crate::pid_namespace::assign_pid_chain(target_ns.clone(), pid) {
+            Ok(chain) => {
+                let mut proc = process.lock();
+                proc.pid_ns_chain = chain;
+                proc.pid_ns_for_children = target_ns;
+            }
+            Err(e) => {
+                // Namespace chain assignment failed, clean up
+                println!("Error: Failed to assign PID namespace chain: {:?}", e);
+                free_kernel_stack(pid, stack_base);
+                return Err(ProcessCreateError::NamespaceError);
+            }
+        }
+    }
+
     let mut table = PROCESS_TABLE.lock();
 
     // 确保进程表有足够的空间存储新进程
@@ -842,9 +1028,113 @@ pub fn create_process(
         }
     }
 
+    // E.5 Cpuset: count kernel-created tasks (ppid == 0) so root cpuset reflects live tasks.
+    // Fork path handles task counting separately via fork.rs which also copies cpuset_id.
+    if ppid == 0 {
+        let cpuset_id = process.lock().cpuset_id;
+        notify_cpuset_task_joined(cpuset_id);
+    }
+
     println!(
         "Created process: PID={}, Name={}, Priority={}",
         pid, name, priority
+    );
+
+    Ok(pid)
+}
+
+/// F.1 PID Namespace: Create a process in a specific namespace.
+///
+/// This is used by sys_clone with CLONE_NEWPID to create processes
+/// in a new namespace instead of inheriting from parent.
+///
+/// # Arguments
+///
+/// * `name` - Process name
+/// * `ppid` - Parent process ID
+/// * `priority` - Process priority
+/// * `target_ns` - The PID namespace to create the process in
+///
+/// # Returns
+///
+/// The new process's global PID on success
+pub fn create_process_in_namespace(
+    name: String,
+    ppid: ProcessId,
+    priority: Priority,
+    target_ns: Arc<crate::pid_namespace::PidNamespace>,
+) -> Result<ProcessId, ProcessCreateError> {
+    // Allocate PID and kernel stack (same as create_process)
+    let mut next_pid_guard = NEXT_PID.lock();
+    let pid = *next_pid_guard;
+
+    if pid > MAX_PID {
+        println!(
+            "Error: PID space exhausted (pid {} > MAX_PID {})",
+            pid, MAX_PID
+        );
+        return Err(ProcessCreateError::PidExhausted);
+    }
+
+    let (stack_base, stack_top) = match allocate_kernel_stack(pid) {
+        Ok((base, top)) => (base, top),
+        Err(e) => {
+            println!(
+                "Error: Failed to allocate kernel stack for PID {}: {:?}",
+                pid, e
+            );
+            return Err(ProcessCreateError::KernelStackAllocFailed(e));
+        }
+    };
+
+    *next_pid_guard += 1;
+    drop(next_pid_guard);
+
+    let process = Arc::new(Mutex::new(Process::new(pid, ppid, name.clone(), priority)));
+
+    // Set up kernel stack
+    {
+        let mut proc = process.lock();
+        proc.kernel_stack = stack_base;
+        proc.kernel_stack_top = stack_top;
+    }
+
+    // Assign PID namespace chain using the specified target namespace
+    match crate::pid_namespace::assign_pid_chain(target_ns.clone(), pid) {
+        Ok(chain) => {
+            let mut proc = process.lock();
+            proc.pid_ns_chain = chain;
+            proc.pid_ns_for_children = target_ns;
+        }
+        Err(e) => {
+            println!("Error: Failed to assign PID namespace chain: {:?}", e);
+            free_kernel_stack(pid, stack_base);
+            return Err(ProcessCreateError::NamespaceError);
+        }
+    }
+
+    let mut table = PROCESS_TABLE.lock();
+
+    while table.len() <= pid {
+        table.push(None);
+    }
+
+    table[pid] = Some(process.clone());
+
+    if ppid > 0 {
+        if let Some(Some(parent)) = table.get(ppid) {
+            parent.lock().children.push(pid);
+        }
+    }
+
+    if ppid == 0 {
+        let cpuset_id = process.lock().cpuset_id;
+        notify_cpuset_task_joined(cpuset_id);
+    }
+
+    println!(
+        "Created process in namespace: PID={}, Name={}, Priority={}, NS={}",
+        pid, name, priority, process.lock().pid_ns_for_children.id().raw()
     );
 
     Ok(pid)
@@ -1387,6 +1677,40 @@ fn notify_futex_wake(tgid: ProcessId, uaddr: usize, max_wake: usize) -> usize {
     }
 }
 
+/// E.5 Cpuset: Register callback for task joining a cpuset
+///
+/// Called by sched::cpuset during initialization to register its task_joined function.
+pub fn register_cpuset_task_joined(callback: CpusetTaskJoinedCallback) {
+    *CPUSET_TASK_JOINED.lock() = Some(callback);
+}
+
+/// E.5 Cpuset: Register callback for task leaving a cpuset
+///
+/// Called by sched::cpuset during initialization to register its task_left function.
+pub fn register_cpuset_task_left(callback: CpusetTaskLeftCallback) {
+    *CPUSET_TASK_LEFT.lock() = Some(callback);
+}
+
+/// E.5 Cpuset: Notify that a task joined a cpuset
+///
+/// Called when a new process is created via fork/clone.
+pub fn notify_cpuset_task_joined(cpuset_id: u32) {
+    let callback = *CPUSET_TASK_JOINED.lock();
+    if let Some(cb) = callback {
+        cb(cpuset_id);
+    }
+}
+
+/// E.5 Cpuset: Notify that a task left a cpuset
+///
+/// Called when a process exits.
+pub fn notify_cpuset_task_left(cpuset_id: u32) {
+    let callback = *CPUSET_TASK_LEFT.lock();
+    if let Some(cb) = callback {
+        cb(cpuset_id);
+    }
+}
+
 /// 终止进程
 pub fn terminate_process(pid: ProcessId, exit_code: i32) {
     if let Some(process) = get_process(pid) {
@@ -1400,6 +1724,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         let lsm_gid: u32;
         let lsm_euid: u32;
         let lsm_egid: u32;
+        // F.1: Save namespace info for cleanup
+        let pid_ns_chain: Vec<crate::pid_namespace::PidNamespaceMembership>;
 
         {
             let mut proc = process.lock();
@@ -1420,6 +1746,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             lsm_gid = creds.gid;
             lsm_euid = creds.euid;
             lsm_egid = creds.egid;
+            // F.1: Copy namespace chain for cleanup
+            pid_ns_chain = proc.pid_ns_chain.clone();
         }
 
         // R25-7 FIX: Call LSM task_exit hook for forced terminations (kill/seccomp paths)
@@ -1433,6 +1761,15 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         cpu_local::clear_fpu_owner_all_cpus(pid);
 
         println!("Process {} terminated with exit code {}", pid, exit_code);
+
+        // F.1 PID Namespace: Handle init death cascade
+        //
+        // If this process is the init (PID 1) of any namespace, all other processes
+        // in that namespace must be killed (SIGKILL). This is Linux semantics.
+        handle_namespace_init_death(pid, &pid_ns_chain);
+
+        // F.1: Detach from all namespaces
+        crate::pid_namespace::detach_pid_chain(&pid_ns_chain, pid);
 
         // 处理 clear_child_tid (CLONE_CHILD_CLEARTID)
         // 线程退出时将 clear_child_tid 地址处的值设为 0 并唤醒 futex
@@ -1504,35 +1841,120 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
     }
 }
 
-/// 将孤儿进程重新分配给 init 进程 (PID 1)
+/// F.1 PID Namespace: 将孤儿进程重新分配给正确的 init 进程
+///
+/// Orphans are reparented to the init process of their owning PID namespace,
+/// not necessarily global PID 1. This ensures getppid() returns a valid PID
+/// that is visible within the process's namespace.
 fn reparent_orphans(orphans: &[ProcessId]) {
-    const INIT_PID: ProcessId = 1;
+    const ROOT_INIT_PID: ProcessId = 1;
 
-    // 获取 init 进程
-    if let Some(init_process) = get_process(INIT_PID) {
-        let mut init_proc = init_process.lock();
+    for &child_pid in orphans {
+        // Determine the init process of the child's owning PID namespace
+        let adopt_pid = if let Some(child_proc) = get_process(child_pid) {
+            let ns_init = {
+                let child = child_proc.lock();
+                crate::pid_namespace::owning_namespace(&child.pid_ns_chain)
+                    .and_then(|ns| ns.init_global_pid())
+            };
+            // If namespace has an init, use it; otherwise fall back to root init
+            ns_init.unwrap_or(ROOT_INIT_PID)
+        } else {
+            ROOT_INIT_PID
+        };
 
-        for &child_pid in orphans {
-            // 更新子进程的 ppid
-            if let Some(child_process) = get_process(child_pid) {
-                let mut child = child_process.lock();
-                child.ppid = INIT_PID;
-            }
-
-            // 将子进程添加到 init 的 children 列表
-            if !init_proc.children.contains(&child_pid) {
-                init_proc.children.push(child_pid);
-            }
+        // Update child's recorded parent
+        if let Some(child_process) = get_process(child_pid) {
+            let mut child = child_process.lock();
+            child.ppid = adopt_pid;
         }
 
-        if !orphans.is_empty() {
-            println!(
-                "Reparented {} orphan process(es) to init (PID 1)",
-                orphans.len()
-            );
+        // Add to adopter's children list if the adopter exists
+        if let Some(adopter) = get_process(adopt_pid) {
+            let mut adopter_proc = adopter.lock();
+            if !adopter_proc.children.contains(&child_pid) {
+                adopter_proc.children.push(child_pid);
+            }
         }
-    } else {
-        // init 进程不存在（早期启动阶段），静默忽略
+    }
+
+    if !orphans.is_empty() {
+        println!("Reparented {} orphan process(es)", orphans.len());
+    }
+}
+
+/// F.1 PID Namespace: Handle cascade killing when a namespace init dies
+///
+/// When the init process (PID 1) of a namespace exits, all other processes
+/// in that namespace receive SIGKILL. This is Linux semantics to ensure
+/// proper namespace teardown.
+///
+/// # Arguments
+///
+/// * `dying_pid` - The global PID of the exiting process
+/// * `pid_ns_chain` - The namespace membership chain of the exiting process
+fn handle_namespace_init_death(
+    dying_pid: ProcessId,
+    pid_ns_chain: &[crate::pid_namespace::PidNamespaceMembership],
+) {
+    use crate::signal::{send_signal, Signal};
+
+    // Check each namespace in the chain (except root, which has no cascade)
+    for membership in pid_ns_chain.iter() {
+        // Skip root namespace - global PID 1 death is handled elsewhere
+        if membership.ns.is_root() {
+            continue;
+        }
+
+        // Check if this process is the init of this namespace
+        if membership.ns.is_init(dying_pid) {
+            // Mark namespace as shutting down
+            if membership.ns.mark_shutting_down() {
+                println!(
+                    "[PID NS] Init death cascade: namespace {} is shutting down (init pid={})",
+                    membership.ns.id().raw(),
+                    dying_pid
+                );
+
+                // Get all processes to kill (excluding the dying init itself)
+                let victims = crate::pid_namespace::get_cascade_kill_pids(&membership.ns);
+
+                if !victims.is_empty() {
+                    println!(
+                        "[PID NS] Sending SIGKILL to {} processes in namespace {}",
+                        victims.len(),
+                        membership.ns.id().raw()
+                    );
+
+                    for victim_pid in victims {
+                        // Skip if victim is the dying process itself
+                        if victim_pid == dying_pid {
+                            continue;
+                        }
+
+                        // Send SIGKILL (uncatchable) to each process
+                        match send_signal(victim_pid, Signal::SIGKILL) {
+                            Ok(_) => {
+                                println!(
+                                    "[PID NS]   SIGKILL sent to PID {} (namespace cascade)",
+                                    victim_pid
+                                );
+                            }
+                            Err(e) => {
+                                // Process may have already exited, ignore errors
+                                println!(
+                                    "[PID NS]   Failed to send SIGKILL to PID {}: {:?}",
+                                    victim_pid, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // Only one namespace can have this process as init
+            // (processes are init only in their owning namespace)
+            break;
+        }
     }
 }
 
@@ -1697,6 +2119,9 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
     // 通知 IPC 子系统清理进程端点（通过回调避免循环依赖）
     // R37-2 FIX (Codex review): Pass TGID to avoid deadlock from re-locking this process
     notify_ipc_process_cleanup(proc.pid, proc.tgid);
+
+    // E.5 Cpuset: decrement task count when process exits
+    notify_cpuset_task_left(proc.cpuset_id);
 
     if region_count > 0 {
         println!(

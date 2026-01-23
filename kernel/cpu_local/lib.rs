@@ -64,30 +64,79 @@ static LAPIC_ID_REVERSE_MAP: [AtomicUsize; LAPIC_ID_REVERSE_MAP_SIZE] = {
 /// Raw task pointer used to avoid circular dependencies with the scheduler.
 pub type RawTaskPtr = *mut ();
 
-/// Per-CPU mailbox for TLB shootdown IPIs.
+/// Depth of the per-CPU TLB shootdown queue.
 ///
-/// The requesting CPU writes the range/CR3 fields and then bumps `request_gen`
-/// with `Release` ordering. The target CPU's IPI handler loads `request_gen`
-/// with `Acquire`, performs the flush, and stores the same generation into
-/// `ack_gen` with `Release`.
+/// This allows batching multiple TLB shootdown requests without
+/// serializing on a single slot. A depth of 4 is sufficient for
+/// most workloads while keeping memory overhead low.
+pub const TLB_SHOOTDOWN_QUEUE_LEN: usize = 4;
+
+/// A single TLB shootdown request stored in the per-CPU queue.
 ///
-/// # Memory Ordering
-///
-/// - Requester: writes fields with Relaxed, then `request_gen` with Release
-/// - Handler: loads `request_gen` with Acquire, reads fields Relaxed, writes `ack_gen` Release
-/// - Waiter: loads `ack_gen` with Acquire to ensure flush completion is visible
+/// Each entry represents a pending TLB invalidation request that
+/// the IPI handler will process in FIFO order.
 #[repr(C)]
-pub struct TlbShootdownMailbox {
-    /// Monotonic generation number for the most recent request
-    pub request_gen: AtomicU64,
-    /// Last generation this CPU has processed
-    pub ack_gen: AtomicU64,
+pub struct TlbShootdownEntry {
+    /// Request generation (0 = empty/processed slot)
+    pub generation: AtomicU64,
     /// Target CR3 (0 means flush regardless of CR3)
-    pub target_cr3: AtomicU64,
+    pub cr3: AtomicU64,
     /// Page-aligned virtual start address (0 for full flush)
     pub start: AtomicU64,
     /// Length in bytes, page-aligned (0 for full flush)
     pub len: AtomicU64,
+}
+
+impl TlbShootdownEntry {
+    pub const fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            cr3: AtomicU64::new(0),
+            start: AtomicU64::new(0),
+            len: AtomicU64::new(0),
+        }
+    }
+}
+
+// Manual Clone impl since AtomicU64 doesn't implement Clone
+impl Clone for TlbShootdownEntry {
+    fn clone(&self) -> Self {
+        Self {
+            generation: AtomicU64::new(self.generation.load(Ordering::Relaxed)),
+            cr3: AtomicU64::new(self.cr3.load(Ordering::Relaxed)),
+            start: AtomicU64::new(self.start.load(Ordering::Relaxed)),
+            len: AtomicU64::new(self.len.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// Per-CPU mailbox for TLB shootdown IPIs (small FIFO queue).
+///
+/// # R72: Queue-Based Design
+///
+/// Instead of a single-slot mailbox that requires serialization before posting,
+/// this uses a bounded ring buffer (depth 4) allowing multiple requests to be
+/// queued. This reduces contention and IPI overhead for high-frequency shootdowns.
+///
+/// # Memory Ordering
+///
+/// - Requester: writes entry fields Relaxed, then publishes entry.generation with Release,
+///   then updates request_gen with Release
+/// - Handler: loads entry.generation with Acquire, reads fields Relaxed, acks via ack_gen Release,
+///   then clears entry.generation with Release and advances head
+/// - Waiter: loads ack_gen with Acquire to ensure flush completion is visible
+#[repr(C)]
+pub struct TlbShootdownMailbox {
+    /// Monotonic generation number for the most recent request (for compat/fast path)
+    pub request_gen: AtomicU64,
+    /// Last generation this CPU has processed
+    pub ack_gen: AtomicU64,
+    /// Queue head (next entry to consume), wraps via modulo
+    pub head: AtomicU64,
+    /// Queue tail (next slot to publish), wraps via modulo
+    pub tail: AtomicU64,
+    /// Fixed-size ring buffer of pending shootdown requests
+    pub entries: [TlbShootdownEntry; TLB_SHOOTDOWN_QUEUE_LEN],
 }
 
 impl TlbShootdownMailbox {
@@ -95,9 +144,14 @@ impl TlbShootdownMailbox {
         Self {
             request_gen: AtomicU64::new(0),
             ack_gen: AtomicU64::new(0),
-            target_cr3: AtomicU64::new(0),
-            start: AtomicU64::new(0),
-            len: AtomicU64::new(0),
+            head: AtomicU64::new(0),
+            tail: AtomicU64::new(0),
+            entries: [
+                TlbShootdownEntry::new(),
+                TlbShootdownEntry::new(),
+                TlbShootdownEntry::new(),
+                TlbShootdownEntry::new(),
+            ],
         }
     }
 }

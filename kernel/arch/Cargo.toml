@@ -11,6 +11,7 @@ kernel_core = { path = "../kernel_core" }
 drivers = { path = "../drivers" }
 cpu_local = { path = "../cpu_local" }
 mm = { path = "../mm" }
+tlb_ops = { path = "../tlb_ops" }
 x86_64 = "0.15"
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }

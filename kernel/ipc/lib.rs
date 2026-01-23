@@ -30,8 +30,9 @@ pub use pipe::{
 };
 
 pub use futex::{
-    active_futex_count, cleanup_process_futexes, futex_wait, futex_wake, FutexError, FutexTable,
-    FUTEX_WAIT, FUTEX_WAIT_TIMEOUT, FUTEX_WAKE,
+    active_futex_count, cleanup_process_futexes, futex_lock_pi, futex_unlock_pi, futex_wait,
+    futex_wake, FutexError, FutexTable, FUTEX_LOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT,
+    FUTEX_WAIT_TIMEOUT, FUTEX_WAKE,
 };
 
 // ============================================================================
@@ -303,9 +304,30 @@ fn futex_callback(
                 FutexError::NoProcess => SyscallError::ESRCH,
                 FutexError::InvalidOperation => SyscallError::EINVAL,
                 FutexError::TimedOut => SyscallError::ETIMEDOUT,
+                FutexError::OwnerDied => SyscallError::EOWNERDEAD,
             })
         }
         futex::FUTEX_WAKE => Ok(futex_wake(tgid, uaddr, val as usize)),
+        // E.4 PI: FUTEX_LOCK_PI - 带优先级继承的互斥锁加锁
+        futex::FUTEX_LOCK_PI => {
+            futex_lock_pi(tgid, uaddr, current_value).map_err(|e| match e {
+                FutexError::WouldBlock => SyscallError::EAGAIN,
+                FutexError::Fault => SyscallError::EFAULT,
+                FutexError::NoProcess => SyscallError::ESRCH,
+                FutexError::InvalidOperation => SyscallError::EINVAL,
+                FutexError::TimedOut => SyscallError::ETIMEDOUT,
+                FutexError::OwnerDied => SyscallError::EOWNERDEAD,
+            })
+        }
+        // E.4 PI: FUTEX_UNLOCK_PI - 带优先级继承的互斥锁解锁
+        futex::FUTEX_UNLOCK_PI => futex_unlock_pi(tgid, uaddr).map_err(|e| match e {
+            FutexError::WouldBlock => SyscallError::EAGAIN,
+            FutexError::Fault => SyscallError::EFAULT,
+            FutexError::NoProcess => SyscallError::ESRCH,
+            FutexError::InvalidOperation => SyscallError::EINVAL,
+            FutexError::TimedOut => SyscallError::ETIMEDOUT,
+            FutexError::OwnerDied => SyscallError::EOWNERDEAD,
+        }),
         _ => Err(SyscallError::EINVAL),
     }
 }
