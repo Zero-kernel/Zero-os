@@ -141,6 +141,10 @@ fn fork_inner(
         // SMP: inherit CPU affinity from parent
         child.allowed_cpus = parent.allowed_cpus;
 
+        // E.5 Cpuset: inherit cpuset from parent and update task count
+        child.cpuset_id = parent.cpuset_id;
+        crate::process::notify_cpuset_task_joined(parent.cpuset_id);
+
         // 子进程使用自己的内核栈（由 create_process -> allocate_kernel_stack 分配）
         // 复制父进程内核栈内容以保持返回路径一致
         let parent_top = parent.kernel_stack_top.as_u64();
@@ -201,6 +205,14 @@ fn fork_inner(
 
         child.time_slice = parent.time_slice;
         child.cpu_time = 0;
+
+        // E.4 Priority Inheritance: 继承基础动态优先级
+        //
+        // 子进程继承父进程的 base_dynamic_priority（未应用 PI 的优先级基线）。
+        // 但不继承 pi_boosts（父进程持有的 futex 相关），子进程从空开始。
+        // waiting_on_futex 也不继承（子进程未阻塞在任何 futex 上）。
+        child.base_dynamic_priority = parent.base_dynamic_priority;
+        // pi_boosts 和 waiting_on_futex 在 Process::new() 中已初始化为空
 
         // R39-3 FIX: 继承父进程的凭证（fork 创建独立副本）
         //

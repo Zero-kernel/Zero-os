@@ -358,12 +358,14 @@ pub fn get_lapic_timer_init_count() -> u32 {
     LAPIC_TIMER_INIT_COUNT.load(Ordering::Relaxed)
 }
 
-/// Calibrate LAPIC timer against PIT channel 2.
+/// Calibrate LAPIC timer against PIT channel 2 or HPET (if available).
 ///
-/// Programs PIT channel 2 as a one-shot gate timer (using port 0x61 to toggle
-/// the gate) for a fixed window, measures the LAPIC timer decrement over that
-/// period, and derives an initial count that yields ~1kHz ticks with a
-/// divide-by-16 configuration.
+/// E.1 HPET: First attempts HPET-based calibration for higher precision.
+/// Falls back to PIT channel 2 calibration if HPET is unavailable.
+///
+/// Programs the reference timer for a fixed window, measures the LAPIC timer
+/// decrement over that period, and derives an initial count that yields
+/// ~1kHz ticks with a divide-by-16 configuration.
 ///
 /// Returns the calibrated initial count on success and leaves the shared
 /// `LAPIC_TIMER_INIT_COUNT` updated. On failure, the previous value is left
@@ -392,7 +394,107 @@ pub unsafe fn calibrate_lapic_timer() -> Result<u32, &'static str> {
         return Err("lapic not initialized");
     }
 
-    // Configure PIT channel 2 as a gated one-shot timer.
+    // E.1 HPET: Prefer HPET-based calibration for higher precision
+    if let Some(result) = calibrate_with_hpet() {
+        return Ok(result);
+    }
+
+    // Fallback to PIT-based calibration
+    calibrate_with_pit()
+}
+
+/// E.1 HPET: Calibrate LAPIC timer using HPET as the reference clock.
+///
+/// HPET typically runs at ~14.318 MHz (compared to PIT's ~1.193 MHz),
+/// providing more accurate calibration results.
+///
+/// # Returns
+///
+/// - `Some(init_count)` on successful calibration
+/// - `None` if HPET is not available or calibration fails
+///
+/// # Safety
+///
+/// LAPIC must be initialized and interrupts must be disabled.
+unsafe fn calibrate_with_hpet() -> Option<u32> {
+    use crate::hpet;
+
+    // Check if HPET is initialized
+    let info = hpet::info()?;
+
+    // Calculate the number of HPET ticks for the calibration window
+    let window_ms = LAPIC_CALIBRATION_WINDOW_MS as u64;
+    let window_ticks = info.frequency_hz.saturating_mul(window_ms) / 1000;
+    if window_ticks == 0 {
+        return None;
+    }
+
+    // Configure LAPIC timer in masked one-shot mode
+    lapic_write(
+        lapic::LVT_TIMER,
+        LAPIC_TIMER_VECTOR | lvt_bits::TIMER_ONESHOT | lvt_bits::MASKED,
+    );
+    lapic_write(lapic::TIMER_DIVIDE, timer_divide::DIV_16);
+
+    // Start LAPIC countdown
+    let hpet_start = hpet::read_main_counter()?;
+    lapic_write(lapic::TIMER_INIT, u32::MAX);
+
+    // Wait for HPET window to elapse
+    const MAX_HPET_POLLS: u64 = 200_000_000;
+    let mut polls: u64 = 0;
+    loop {
+        let hpet_now = hpet::read_main_counter()?;
+        if hpet_now.wrapping_sub(hpet_start) >= window_ticks {
+            break;
+        }
+        polls = polls.wrapping_add(1);
+        if polls >= MAX_HPET_POLLS {
+            lapic_write(lapic::TIMER_INIT, 0);
+            drivers::println!("[APIC] calibrate_with_hpet: HPET wait timeout");
+            return None;
+        }
+        spin_loop();
+    }
+
+    // Read LAPIC timer and stop it
+    let elapsed = u32::MAX - lapic_read(lapic::TIMER_CURRENT);
+    lapic_write(lapic::TIMER_INIT, 0);
+
+    if elapsed == 0 {
+        drivers::println!("[APIC] calibrate_with_hpet: LAPIC timer did not decrement");
+        return None;
+    }
+
+    // Calculate ticks per millisecond with rounding
+    let per_ms = ((elapsed as u64) + (window_ms / 2)) / window_ms;
+    let calibrated = per_ms.min(u32::MAX as u64) as u32;
+
+    if calibrated == 0 {
+        drivers::println!("[APIC] calibrate_with_hpet: computed init count is zero");
+        return None;
+    }
+
+    LAPIC_TIMER_INIT_COUNT.store(calibrated, Ordering::Relaxed);
+    drivers::println!(
+        "[APIC] LAPIC timer calibrated via HPET: {} ticks in {} ms -> init_count={} (div=16, ~1kHz)",
+        elapsed,
+        window_ms,
+        calibrated
+    );
+    Some(calibrated)
+}
+
+/// Calibrate LAPIC timer using PIT channel 2 as the reference clock.
+///
+/// Programs PIT channel 2 as a one-shot gate timer (using port 0x61 to toggle
+/// the gate) for a fixed window, measures the LAPIC timer decrement over that
+/// period, and derives an initial count that yields ~1kHz ticks.
+///
+/// # Safety
+///
+/// LAPIC must be initialized and interrupts must be disabled.
+unsafe fn calibrate_with_pit() -> Result<u32, &'static str> {
     let mut pit_cmd = PortWriteOnly::<u8>::new(PIT_COMMAND_PORT);
     let mut pit_ch2 = PortWriteOnly::<u8>::new(PIT_CHANNEL2_DATA_PORT);
     let mut pit_gate = Port::<u8>::new(PIT_CHANNEL2_GATE_PORT);

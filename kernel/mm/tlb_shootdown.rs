@@ -37,7 +37,7 @@ use core::mem;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use cpu_local::{
     current_cpu, current_cpu_id, lapic_id_for_cpu, max_cpus, CpuLocal, TlbShootdownMailbox,
-    PER_CPU_DATA,
+    PER_CPU_DATA, TLB_SHOOTDOWN_QUEUE_LEN,
 };
 use spin::RwLock;
 use x86_64::instructions::tlb;
@@ -465,73 +465,91 @@ fn collect_target_cpus(target_cr3: u64) -> Vec<usize> {
     targets
 }
 
+/// Enqueue a TLB shootdown request into a CPU's mailbox queue.
+///
+/// # R72: Queue-Based Mailbox
+///
+/// Instead of spin-waiting for the previous request to be ACKed before posting,
+/// this enqueues the request into a bounded ring buffer. The queue allows multiple
+/// requests to be batched, reducing serialization and IPI overhead.
+///
+/// # Backpressure
+///
+/// If the queue is full (4 outstanding requests), we spin-wait for space.
+/// This should be rare in practice since IPIs are fast.
+fn enqueue_mailbox(
+    mailbox: &TlbShootdownMailbox,
+    cr3: u64,
+    start: u64,
+    len: u64,
+    generation: u64,
+) {
+    const MAILBOX_WAIT_SPINS: usize = 500_000;
+    let mut spins = 0usize;
+
+    loop {
+        let head = mailbox.head.load(Ordering::Acquire);
+        let tail = mailbox.tail.load(Ordering::Acquire);
+
+        // Check if queue has space: tail - head < queue_len
+        if tail.wrapping_sub(head) < TLB_SHOOTDOWN_QUEUE_LEN as u64 {
+            // Try to claim a slot with CAS on tail
+            if mailbox
+                .tail
+                .compare_exchange_weak(tail, tail + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                // Successfully claimed slot, write entry
+                let slot = (tail as usize) % TLB_SHOOTDOWN_QUEUE_LEN;
+                let entry = &mailbox.entries[slot];
+
+                // Write entry fields with Relaxed ordering
+                entry.cr3.store(cr3, Ordering::Relaxed);
+                entry.start.store(start, Ordering::Relaxed);
+                entry.len.store(len, Ordering::Relaxed);
+
+                // Publish entry by storing generation with Release
+                entry.generation.store(generation, Ordering::Release);
+
+                // Also update request_gen for compatibility with ACK waiting
+                mailbox.request_gen.store(generation, Ordering::Release);
+                return;
+            }
+            // CAS failed, retry
+        } else {
+            // Queue is full, need to wait
+            spins += 1;
+            if spins % 100_000 == 0 {
+                drivers::println!(
+                    "[TLB] CPU shootdown queue full, waiting (head={}, tail={}, spins={})",
+                    head,
+                    tail,
+                    spins
+                );
+            }
+            if spins >= MAILBOX_WAIT_SPINS {
+                panic!(
+                    "CRITICAL: TLB shootdown queue saturated (head={}, tail={}) \
+                     after {} spins. Cannot proceed without risking stale TLB.",
+                    head, tail, MAILBOX_WAIT_SPINS
+                );
+            }
+        }
+
+        spin_loop();
+    }
+}
+
 /// Post shootdown requests to all target CPUs' mailboxes
 ///
-/// # R70-2 FIX: Prevent mailbox overwrite before ACK
+/// # R72: Queue-Based Approach
 ///
-/// If two shootdowns are dispatched back-to-back, the second could overwrite
-/// the first's request in the mailbox before the target CPU processes it.
-/// The handler only processes the latest generation, so the first flush is
-/// dropped, leaving stale TLB entries.
-///
-/// Fix: Before posting, spin-wait for any previous request to be ACKed.
-/// If the wait times out, we panic because proceeding would cause stale TLB.
-/// This serializes per-CPU requests and ensures no flush is missed.
+/// Uses `enqueue_mailbox` to add requests to each CPU's queue, allowing
+/// multiple requests to be batched without full serialization.
 fn post_requests(targets: &[usize], cr3: u64, start: u64, len: u64, generation: u64) {
-    /// Maximum spin iterations to wait for mailbox to be free
-    const MAILBOX_WAIT_SPINS: usize = 500_000;
-
     for &cpu in targets {
         if let Some(mailbox) = mailbox_for_cpu(cpu) {
-            // R70-2 FIX: Wait for previous request to be acknowledged before posting.
-            // This prevents overwriting an in-flight request.
-            let mut waited = false;
-            let mut prev_ack = 0u64;
-            let mut prev_req = 0u64;
-            for spin_count in 0..MAILBOX_WAIT_SPINS {
-                prev_req = mailbox.request_gen.load(Ordering::Acquire);
-                prev_ack = mailbox.ack_gen.load(Ordering::Acquire);
-                if prev_ack >= prev_req {
-                    if spin_count > 0 && spin_count % 100_000 == 0 {
-                        // Log significant contention for debugging
-                        drivers::println!(
-                            "[TLB] CPU {} mailbox wait: {} spins (prev_req={}, prev_ack={})",
-                            cpu,
-                            spin_count,
-                            prev_req,
-                            prev_ack
-                        );
-                    }
-                    break; // Previous request completed, safe to post
-                }
-                waited = true;
-                spin_loop();
-            }
-
-            // R70-2 HARDENING: After wait, verify previous request is ACKed.
-            // If not, this is a critical failure - cannot proceed without causing stale TLB.
-            if prev_ack < prev_req {
-                panic!(
-                    "CRITICAL: TLB shootdown mailbox for CPU {} still has unacked request \
-                     after {} spins (prev_req={}, prev_ack={}). Cannot proceed - would drop flush.",
-                    cpu, MAILBOX_WAIT_SPINS, prev_req, prev_ack
-                );
-            }
-
-            if waited {
-                // Log that we had to wait (for debugging TLB shootdown contention)
-                drivers::println!(
-                    "[TLB] CPU {} mailbox became free after waiting",
-                    cpu
-                );
-            }
-
-            // Write request fields with Relaxed ordering
-            mailbox.target_cr3.store(cr3, Ordering::Relaxed);
-            mailbox.start.store(start, Ordering::Relaxed);
-            mailbox.len.store(len, Ordering::Relaxed);
-            // Write generation with Release to synchronize with handler's Acquire
-            mailbox.request_gen.store(generation, Ordering::Release);
+            enqueue_mailbox(mailbox, cr3, start, len, generation);
         }
     }
 }
@@ -751,11 +769,16 @@ pub fn flush_current_as_all() {
 
     // Wait for remote ACKs with retry support
     if let Some((targets, generation)) = shoot {
-        // Mark our own mailbox as processed (for symmetry)
-        current_cpu()
-            .tlb_mailbox()
-            .ack_gen
-            .store(generation, Ordering::Release);
+        // R71-4 FIX: Only self-ACK if this was actually our request.
+        // The initiating CPU is filtered from targets by collect_target_cpus(),
+        // so normally we don't need to ACK our own mailbox. But if another CPU
+        // sent us a shootdown request with a lower generation, unconditionally
+        // writing our generation could accidentally ACK that foreign request.
+        // Only ACK if the request_gen matches our generation.
+        let mailbox = current_cpu().tlb_mailbox();
+        if mailbox.request_gen.load(Ordering::Acquire) == generation {
+            mailbox.ack_gen.store(generation, Ordering::Release);
+        }
 
         // Get sender for retry
         if let Some(sender) = tlb_ipi_sender() {
@@ -821,10 +844,13 @@ pub fn flush_current_as_range(start: VirtAddr, len: usize) {
 
             // Wait for remote ACKs with retry support
             if let Some((targets, generation)) = shoot {
-                current_cpu()
-                    .tlb_mailbox()
-                    .ack_gen
-                    .store(generation, Ordering::Release);
+                // R71-4 FIX: Same self-ACK protection as flush_current_as_all.
+                // Only ACK if the request_gen matches to avoid accidentally
+                // acknowledging a foreign request.
+                let mailbox = current_cpu().tlb_mailbox();
+                if mailbox.request_gen.load(Ordering::Acquire) == generation {
+                    mailbox.ack_gen.store(generation, Ordering::Release);
+                }
 
                 // Get sender for retry
                 if let Some(sender) = tlb_ipi_sender() {
@@ -872,59 +898,52 @@ pub fn get_stats() -> TlbShootdownStats {
 
 /// Handle an incoming TLB shootdown IPI on the current CPU.
 ///
-/// This is called from the IPI handler (vector 0xFE) after receiving a
-/// TLB shootdown request. It:
-/// 1. Reads the request from this CPU's mailbox using seqlock-style protocol
-/// 2. Checks if the request targets this CPU's address space (CR3 match)
-/// 3. Performs the appropriate TLB flush
-/// 4. Writes ACK to allow the requester to proceed
+/// # R72: Queue-Based Draining
 ///
-/// # Seqlock Protocol (Codex review fix)
+/// Drains the per-CPU mailbox queue in FIFO order. For each entry:
+/// 1. Loads the entry generation with Acquire
+/// 2. Reads flush parameters (CR3, start, len)
+/// 3. Performs the appropriate TLB flush if CR3 matches
+/// 4. ACKs the generation and clears the entry
+/// 5. Advances the queue head
 ///
-/// To prevent torn reads when a new request arrives while we're reading fields:
-/// 1. Load request_gen with Acquire
-/// 2. Read all fields with Relaxed
-/// 3. Re-read request_gen with Acquire
-/// 4. If it changed, retry from step 1
-/// 5. If stable, process the request and ACK
+/// This processes all pending requests, not just the latest, ensuring
+/// no flush is dropped.
 ///
 /// # Safety
 ///
 /// Must be called from interrupt context with interrupts disabled.
 pub fn handle_shootdown_ipi() {
     let mailbox = current_cpu().tlb_mailbox();
+    let this_cr3 = current_cr3_value();
 
-    // Maximum retries to prevent infinite loop if constantly being overwritten
-    const MAX_RETRIES: usize = 10;
+    // Drain all pending requests from the queue
+    loop {
+        let head = mailbox.head.load(Ordering::Acquire);
+        let tail = mailbox.tail.load(Ordering::Acquire);
 
-    for _ in 0..MAX_RETRIES {
-        // Step 1: Load generation with Acquire to synchronize with requester's Release
-        let generation = mailbox.request_gen.load(Ordering::Acquire);
+        // Check if queue is empty
+        if head >= tail {
+            return; // No more entries to process
+        }
+
+        let slot = (head as usize) % TLB_SHOOTDOWN_QUEUE_LEN;
+        let entry = &mailbox.entries[slot];
+
+        // Load generation with Acquire to synchronize with producer's Release
+        let generation = entry.generation.load(Ordering::Acquire);
         if generation == 0 {
-            return; // No request pending
-        }
-
-        let last_ack = mailbox.ack_gen.load(Ordering::Relaxed);
-        if last_ack >= generation {
-            return; // Already processed this request
-        }
-
-        // Step 2: Read request details (Relaxed is fine, synchronized by request_gen Acquire)
-        let target_cr3 = mailbox.target_cr3.load(Ordering::Relaxed);
-        let len = mailbox.len.load(Ordering::Relaxed);
-        let start = mailbox.start.load(Ordering::Relaxed);
-
-        // Step 3: Re-read generation to detect torn reads
-        let generation2 = mailbox.request_gen.load(Ordering::Acquire);
-        if generation != generation2 {
-            // Request was overwritten while reading, retry
+            // Entry not yet published, spin briefly and retry
+            spin_loop();
             continue;
         }
 
-        // Step 4: Fields are consistent, process the request
-        let this_cr3 = current_cr3_value();
+        // Read flush parameters (Relaxed is fine, synchronized by generation Acquire)
+        let target_cr3 = entry.cr3.load(Ordering::Relaxed);
+        let len = entry.len.load(Ordering::Relaxed);
+        let start = entry.start.load(Ordering::Relaxed);
 
-        // Only flush if the CR3 matches (0 means unconditional flush)
+        // Perform the flush if CR3 matches (0 = unconditional flush)
         if target_cr3 == 0 || target_cr3 == this_cr3 {
             if len == 0 {
                 // Full TLB flush - use INVPCID if available
@@ -935,18 +954,16 @@ pub fn handle_shootdown_ipi() {
             }
         }
 
-        // Step 5: Write ACK with Release to allow requester to proceed
-        mailbox.ack_gen.store(generation, Ordering::Release);
-        return;
-    }
+        // ACK this generation (only if it advances ack_gen - ensures monotonicity)
+        // This prevents race where out-of-order processing could cause ack_gen
+        // to decrease, confusing waiters.
+        let current_ack = mailbox.ack_gen.load(Ordering::Acquire);
+        if generation > current_ack {
+            mailbox.ack_gen.store(generation, Ordering::Release);
+        }
 
-    // If we exhausted retries, ACK the latest generation anyway to avoid deadlock
-    // This is a best-effort fallback - the requester will see the ACK and proceed
-    let final_gen = mailbox.request_gen.load(Ordering::Acquire);
-    if final_gen > 0 {
-        // Do a full flush to be safe since we couldn't read consistent parameters
-        // Use INVPCID if available for efficiency
-        flush_all_local();
-        mailbox.ack_gen.store(final_gen, Ordering::Release);
+        // Clear entry and advance head
+        entry.generation.store(0, Ordering::Release);
+        mailbox.head.store(head + 1, Ordering::Release);
     }
 }

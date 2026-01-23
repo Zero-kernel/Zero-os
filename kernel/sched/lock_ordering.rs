@@ -179,6 +179,9 @@
 
 #![allow(dead_code)]
 
+#[cfg(all(debug_assertions, feature = "lockdep_graph"))]
+extern crate alloc;
+
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use spin::Mutex as RawMutex;
@@ -314,11 +317,25 @@ impl<T> LockdepMutex<T> {
     /// In debug builds, this validates that acquiring this lock doesn't
     /// violate the lock ordering hierarchy. In release builds, this is
     /// equivalent to `spin::Mutex::lock()`.
+    ///
+    /// # R71-3 FIX: IRQ Safety
+    ///
+    /// In debug builds, the entire check-lock-record sequence is wrapped in
+    /// `without_interrupts()` to prevent IRQ handlers from acquiring locks
+    /// in the window between check and record, which could cause ordering
+    /// violations to go undetected.
     #[inline]
     pub fn lock(&self) -> LockdepMutexGuard<'_, T> {
-        lock_tracking::check_acquire(self.class, self.level);
+        #[cfg(debug_assertions)]
+        let guard = x86_64::instructions::interrupts::without_interrupts(|| {
+            lock_tracking::check_acquire(self.class, self.level);
+            let g = self.inner.lock();
+            lock_tracking::record_acquire(self.class, self.level);
+            g
+        });
+        #[cfg(not(debug_assertions))]
         let guard = self.inner.lock();
-        lock_tracking::record_acquire(self.class, self.level);
+
         LockdepMutexGuard {
             lock: self,
             guard: ManuallyDrop::new(guard),
@@ -332,17 +349,34 @@ impl<T> LockdepMutex<T> {
     /// Note: In debug builds, ordering validation happens BEFORE the lock
     /// attempt to avoid the case where we've already acquired the lock
     /// before detecting a violation.
+    ///
+    /// # R71-3 FIX: IRQ Safety
+    ///
+    /// Same IRQ protection as `lock()` to ensure consistent lockdep tracking.
     #[inline]
     pub fn try_lock(&self) -> Option<LockdepMutexGuard<'_, T>> {
-        // Validate ordering before attempting acquisition (Codex R70 fix)
-        lock_tracking::check_acquire(self.class, self.level);
-        self.inner.try_lock().map(|guard| {
-            lock_tracking::record_acquire(self.class, self.level);
-            LockdepMutexGuard {
-                lock: self,
-                guard: ManuallyDrop::new(guard),
-            }
-        })
+        #[cfg(debug_assertions)]
+        {
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                lock_tracking::check_acquire(self.class, self.level);
+                self.inner.try_lock().map(|guard| {
+                    lock_tracking::record_acquire(self.class, self.level);
+                    LockdepMutexGuard {
+                        lock: self,
+                        guard: ManuallyDrop::new(guard),
+                    }
+                })
+            })
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.inner.try_lock().map(|guard| {
+                LockdepMutexGuard {
+                    lock: self,
+                    guard: ManuallyDrop::new(guard),
+                }
+            })
+        }
     }
 
     /// Get a mutable reference to the underlying data.
@@ -546,10 +580,145 @@ pub mod lock_tracking {
         fn len(&self) -> usize {
             self.depth.get()
         }
+
+        /// Iterate over held locks in acquisition order.
+        ///
+        /// This is used by the dependency graph feature to record edges
+        /// from all currently held locks to a newly acquired lock.
+        #[cfg(feature = "lockdep_graph")]
+        fn for_each_held<F: FnMut(LockEntry)>(&self, mut f: F) {
+            let depth = self.depth.get();
+            if depth == 0 {
+                return;
+            }
+            // Safety: entries below depth are initialized when depth is increased
+            let entries = unsafe { &*self.entries.get() };
+            for idx in 0..depth {
+                if let Some(entry) = entries[idx] {
+                    f(entry);
+                }
+            }
+        }
     }
 
     /// Per-CPU lock stack for tracking held locks.
     static HELD: CpuLocal<LockStack> = CpuLocal::new(LockStack::new);
+
+    // ========================================================================
+    // R72: Optional Dependency Graph Tracking (debug builds + feature flag)
+    // ========================================================================
+
+    /// Lock dependency graph for cycle detection.
+    ///
+    /// This module implements directed graph tracking of lock acquisitions.
+    /// An edge A → B means "lock A was held when lock B was acquired".
+    /// If a cycle is detected (B already has a path to A), acquiring B while
+    /// holding A would create a potential deadlock.
+    #[cfg(feature = "lockdep_graph")]
+    mod dep_graph {
+        use super::{LockClassKey, LockEntry, LockStack};
+        use alloc::collections::{BTreeMap, BTreeSet};
+        use alloc::vec::Vec;
+        use spin::{Mutex, MutexGuard, Once};
+
+        /// The dependency graph storing edges between lock classes.
+        struct DependencyGraph {
+            /// Map from lock class to set of classes acquired while holding it
+            edges: BTreeMap<LockClassKey, BTreeSet<LockClassKey>>,
+        }
+
+        impl DependencyGraph {
+            fn new() -> Self {
+                Self {
+                    edges: BTreeMap::new(),
+                }
+            }
+
+            /// Add a dependency edge: `from` was held when `to` was acquired.
+            fn add_edge(&mut self, from: LockClassKey, to: LockClassKey) {
+                self.edges.entry(from).or_default().insert(to);
+            }
+
+            /// Check if there's a path from `start` to `target` in the graph.
+            ///
+            /// Uses iterative DFS to avoid stack overflow on deep graphs.
+            fn has_path(&self, start: LockClassKey, target: LockClassKey) -> bool {
+                let mut stack = Vec::new();
+                let mut visited = BTreeSet::new();
+                stack.push(start);
+
+                while let Some(node) = stack.pop() {
+                    if !visited.insert(node) {
+                        continue;
+                    }
+
+                    if node == target {
+                        return true;
+                    }
+
+                    if let Some(children) = self.edges.get(&node) {
+                        for &next in children {
+                            if !visited.contains(&next) {
+                                stack.push(next);
+                            }
+                        }
+                    }
+                }
+
+                false
+            }
+
+            /// Check if adding edge `from` → `to` would create a cycle.
+            ///
+            /// A cycle would be created if `to` already has a path back to `from`.
+            fn would_create_cycle(&self, from: LockClassKey, to: LockClassKey) -> bool {
+                // If to → from already exists (directly or transitively), adding
+                // from → to would create a cycle
+                self.has_path(to, from)
+            }
+        }
+
+        /// Global dependency graph protected by a spinlock.
+        static GRAPH: Once<Mutex<DependencyGraph>> = Once::new();
+
+        fn graph() -> MutexGuard<'static, DependencyGraph> {
+            GRAPH.call_once(|| Mutex::new(DependencyGraph::new())).lock()
+        }
+
+        /// Validate that acquiring `new_class` won't create a cycle with held locks.
+        ///
+        /// For each currently held lock, check if adding the dependency edge
+        /// held_lock → new_class would create a cycle in the dependency graph.
+        pub(super) fn validate_edges(stack: &LockStack, new_class: LockClassKey) {
+            let graph = graph();
+            stack.for_each_held(|entry| {
+                if entry.class == new_class {
+                    return; // recursive lock of same class is allowed
+                }
+
+                if graph.would_create_cycle(entry.class, new_class) {
+                    panic!(
+                        "Lockdep: dependency cycle detected! \
+                         Acquiring '{}' while holding '{}' would create a deadlock path",
+                        new_class.name(),
+                        entry.class.name()
+                    );
+                }
+            });
+        }
+
+        /// Record dependency edges from all held locks to the newly acquired lock.
+        ///
+        /// This builds the dependency graph over time as locks are acquired.
+        pub(super) fn record_edges(stack: &LockStack, new_class: LockClassKey) {
+            let mut graph = graph();
+            stack.for_each_held(|entry| {
+                if entry.class != new_class {
+                    graph.add_edge(entry.class, new_class);
+                }
+            });
+        }
+    }
 
     /// Check lock ordering before acquiring.
     ///
@@ -559,10 +728,19 @@ pub mod lock_tracking {
     ///
     /// Uses `without_interrupts` to prevent IRQ handlers from corrupting
     /// the per-CPU lock stack during validation.
+    ///
+    /// # R72: Dependency Graph Integration
+    ///
+    /// When the `lockdep_graph` feature is enabled, this also validates that
+    /// acquiring this lock won't create a cycle in the dependency graph.
     #[inline]
     pub fn check_acquire(class: LockClassKey, level: LockLevel) {
         x86_64::instructions::interrupts::without_interrupts(|| {
-            HELD.with(|stack| stack.validate(class, level))
+            HELD.with(|stack| {
+                stack.validate(class, level);
+                #[cfg(feature = "lockdep_graph")]
+                dep_graph::validate_edges(stack, class);
+            })
         });
     }
 
@@ -574,10 +752,19 @@ pub mod lock_tracking {
     ///
     /// Uses `without_interrupts` to prevent IRQ handlers from corrupting
     /// the per-CPU lock stack during the push operation.
+    ///
+    /// # R72: Dependency Graph Integration
+    ///
+    /// When the `lockdep_graph` feature is enabled, this also records
+    /// dependency edges from all currently held locks to the new lock.
     #[inline]
     pub fn record_acquire(class: LockClassKey, level: LockLevel) {
         x86_64::instructions::interrupts::without_interrupts(|| {
-            HELD.with(|stack| stack.push(LockEntry { class, level }))
+            HELD.with(|stack| {
+                #[cfg(feature = "lockdep_graph")]
+                dep_graph::record_edges(stack, class);
+                stack.push(LockEntry { class, level })
+            })
         });
     }
 

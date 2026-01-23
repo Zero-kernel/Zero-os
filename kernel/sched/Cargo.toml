@@ -6,6 +6,12 @@ edition = "2021"
 [lib]
 path = "lib.rs"
 
+[features]
+default = []
+# Enable lock dependency graph for cycle detection (debug builds only)
+# This tracks edges between lock classes and detects potential deadlock cycles
+lockdep_graph = []
+
 [dependencies]
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }

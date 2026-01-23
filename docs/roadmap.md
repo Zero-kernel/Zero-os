@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-17
+**Last Updated:** 2026-01-22
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -13,7 +13,7 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 ### Current Status: Phase E IN PROGRESS (SMP Infrastructure)
 
 Zero-OS has completed network foundation with comprehensive validation:
-- **66 security audits** with 316 issues found, ~265 fixed (83.9%)
+- **71 security audits** with 320+ issues found, ~275 fixed (85.9%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -26,10 +26,13 @@ Zero-OS has completed network foundation with comprehensive validation:
   - D.2: TCP client/server with RFC 6298 RTT ✅
   - D.3: TCP hardening (MSS/WS validation, SYN cookies) ✅
   - D.4: Runtime loopback tests (UDP, TCP SYN, conntrack, firewall) ✅
-- **Phase E**: 🔨 **IN PROGRESS** (SMP & Concurrency)
-  - E.1: LAPIC/IOAPIC initialization ✅
-  - E.3: PerCpuData structure ✅, Per-CPU FPU save areas ✅
-  - Pending: AP bootstrap, TLB shootdown, per-CPU runqueues
+- **Phase E**: ✅ **MOSTLY COMPLETE** (SMP & Concurrency)
+  - E.1: LAPIC/IOAPIC initialization ✅, AP boot ✅, IPI ✅
+  - E.2: TLB shootdown ✅ (IPI-based, PCID support, per-CPU queue)
+  - E.3: PerCpuData ✅, Per-CPU runqueues ✅, FPU save areas ✅
+  - E.4: RCU ✅ (timer-driven grace periods, callback batching), Lockdep ✅ (dependency graph)
+  - E.5: Per-CPU scheduler ✅, Load balancing ✅, CPU affinity syscalls ✅
+  - Remaining: CPU isolation (cpuset), futex PI
 - **R54**: ISN secret auto-upgrade ✅, Challenge ACK rate limiting ✅
 - **R55**: NewReno congestion control ✅ (RFC 6582 partial ACK handling)
 - **R56**: Limited Transmit ✅ (RFC 3042 adapted for immediate-send architecture)
@@ -39,12 +42,13 @@ Zero-OS has completed network foundation with comprehensive validation:
 - **R60**: IP fragment reassembly ✅ (RFC 791/815/5722 security hardening)
 - **R61**: SYN cookies ✅ (RFC 4987 stateless SYN flood protection)
 - **R66**: TCP options validation ✅, VirtIO hardening ✅, Runtime network tests ✅
+- **R72**: RCU timer-driven epochs ✅, Callback batching ✅, TLB queue ✅, Lockdep graph ✅
 
 ### Gap Analysis vs Linux Kernel
 
 | Category | Linux | Zero-OS | Gap |
 |----------|-------|---------|-----|
-| **SMP** | 256+ CPUs | Single-core | Full implementation needed |
+| **SMP** | 256+ CPUs | Multi-core (per-CPU runqueues, load balancing, affinity) | CPU isolation, NUMA |
 | **Security Framework** | LSM/SELinux/AppArmor | LSM + Seccomp + Capabilities | ✅ Framework complete, policies needed |
 | **Network** | Full TCP/IP stack | TCP (w/retransmission + NewReno CC + Window Scaling + SYN cookies + Conntrack + Firewall + Options validation), UDP, ICMP | SACK, Timestamps |
 | **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
@@ -574,7 +578,7 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 
 - [x] Per-CPU segment (%gs) - CpuLocal<T> abstraction (kernel/cpu_local/lib.rs)
 - [x] Syscall stack per-CPU (PerCpuData.syscall_stack_top)
-- [ ] Scheduler runqueue per-CPU
+- [x] Scheduler runqueue per-CPU (R69-1 fix - CpuLocal<Mutex<ReadyQueues>>)
 - [x] IRQ stack per-CPU (PerCpuData.irq_stack_top)
 - [x] Safe cross-CPU access API (current_cpu(), init_bsp(), init_ap())
 - [x] Per-CPU FPU save areas (R66-7 fix - kernel/arch/interrupts.rs)
@@ -582,16 +586,16 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 
 #### E.4 Synchronization
 
-- [ ] Lock class annotations
-- [ ] Runtime lockdep checker (debug)
-- [ ] RCU/epoch-based garbage collection
+- [x] Lock class annotations (LockClassKey, LockLevel in lock_ordering.rs)
+- [x] Runtime lockdep checker (debug) - LockdepMutex with IRQ-safe validation (R71-3 fix)
+- [x] RCU/epoch-based garbage collection - call_rcu with grace period advancement (R71-1 fix)
 - [ ] Futex priority inheritance (preparation)
 
 #### E.5 Scheduler SMP
 
-- [ ] Per-CPU runqueues
-- [ ] Load balancing
-- [ ] CPU affinity
+- [x] Per-CPU runqueues (R69-1 - CpuLocal<Mutex<ReadyQueues>> in enhanced_scheduler.rs)
+- [x] Load balancing (R69 - work stealing + periodic migration in balance_queues())
+- [x] CPU affinity (R72 - sched_setaffinity/sched_getaffinity syscalls 203/204)
 - [ ] CPU isolation (cpuset preparation)
 
 **Security Requirements**:
@@ -617,7 +621,12 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 
 #### F.1 Namespaces
 
-- [ ] PID namespace (isolated PID numbering)
+- [x] PID namespace (isolated PID numbering)
+  - Hierarchical namespace tree with MAX_PID_NS_LEVEL=32 depth
+  - CLONE_NEWPID and unshare(CLONE_NEWPID) support
+  - Namespace-aware getpid/getppid/gettid/kill syscalls
+  - Init death cascade (SIGKILL to all namespace members)
+  - fork/clone/wait return namespace-local PIDs
 - [ ] Mount namespace (isolated FS view)
 - [ ] IPC namespace (isolated message queues)
 - [ ] Network namespace (isolated stack)
@@ -753,18 +762,25 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-19 | 68 | 7 | 7 | TLB shootdown ACK timeout, COW TLB flush, FPU nesting safety - **ALL FIXED** |
 | 2026-01-20 | 69 | 5 | 5 | PhysicalPageRefCount ABA race, lazy FPU migration, load balancer affinity, ASID writer starvation, lock ordering docs - **ALL FIXED** |
 | 2026-01-21 | 70 | 3 | 3 | AP idle loop race, TLB mailbox overwrite, CPU affinity semantics - **ALL FIXED** |
-| **Total** | **70** | **342** | **291 (85.1%)** | **51 open (R65 SMP + VirtIO IOMMU deferred)** |
+| 2026-01-22 | 71 | 4 | 4 | RCU grace period progress, RCU memory ordering, Lockdep IRQ window, TLB self-ACK safety - **ALL FIXED** |
+| 2026-01-22 | 72 | 0 | 0 | CPU affinity syscalls (sched_setaffinity/sched_getaffinity) - **E.5 FEATURE** |
+| **Total** | **72** | **346** | **295 (85.3%)** | **51 open (R65 SMP + VirtIO IOMMU deferred)** |
 
 ### Current Status
 
-- **Fixed**: 291 issues (85.1%)
-- **Open**: 51 issues (14.9%)
+- **Fixed**: 295 issues (85.3%)
+- **Open**: 51 issues (14.7%)
   - R65 remaining issues (SMP-related, non-blocking)
   - R62-6 (VirtIO IOMMU) deferred to Phase F.3
-- **Phase E Progress**: LAPIC/IOAPIC initialized, PerCpuData implemented, GS-relative syscall per-CPU, AP idle loop race-free, TLB shootdown serialized, **ALL R67-R70 SMP ISSUES FIXED**
+- **Phase E Progress**: ✅ **E.5 Scheduler SMP mostly complete**
+  - E.1 Hardware Init: ✅ LAPIC/IOAPIC, AP boot, IPI
+  - E.2 TLB Shootdown: ✅ IPI-based, PCID support (batched pending)
+  - E.3 Per-CPU Data: ✅ CpuLocal<T>, per-CPU stacks, runqueues
+  - E.4 Synchronization: ✅ RCU (R71), Lockdep (R71)
+  - E.5 Scheduler SMP: ✅ Per-CPU runqueues, load balancing, CPU affinity syscalls
 - **SMP Ready**: All critical SMP security issues resolved, multi-core testing can proceed
 
-See [qa-2026-01-21.md](review/qa-2026-01-21.md) for latest audit report.
+See [qa-2026-01-22.md](review/qa-2026-01-22.md) for latest audit report.
 
 ---
 

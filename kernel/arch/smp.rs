@@ -1090,17 +1090,20 @@ struct RsdpV2 {
 }
 
 /// ACPI SDT header
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can access ACPI table parsing.
 #[repr(C, packed)]
-struct SdtHeader {
-    signature: [u8; 4],
-    length: u32,
-    revision: u8,
-    checksum: u8,
-    oemid: [u8; 6],
-    oemtableid: [u8; 8],
-    oem_revision: u32,
-    creator_id: u32,
-    creator_rev: u32,
+#[derive(Clone, Copy)]
+pub(crate) struct SdtHeader {
+    pub signature: [u8; 4],
+    pub length: u32,
+    pub revision: u8,
+    pub checksum: u8,
+    pub oemid: [u8; 6],
+    pub oemtableid: [u8; 8],
+    pub oem_revision: u32,
+    pub creator_id: u32,
+    pub creator_rev: u32,
 }
 
 /// MADT header
@@ -1181,7 +1184,9 @@ unsafe fn parse_madt() -> Option<Vec<u32>> {
 ///
 /// For UEFI systems, the bootloader provides the RSDP address from the
 /// EFI Configuration Table. For legacy BIOS systems, we scan 0xE0000-0x100000.
-unsafe fn find_rsdp() -> Option<(u64, u64)> {
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can locate ACPI tables.
+pub(crate) unsafe fn find_rsdp() -> Option<(u64, u64)> {
     // First try bootloader-provided RSDP address (UEFI path)
     let rsdp_phys = RSDP_PHYS_ADDR.load(Ordering::Acquire);
     if rsdp_phys != 0 {
@@ -1243,7 +1248,9 @@ unsafe fn validate_rsdp_at(phys: u64) -> Option<(u64, u64)> {
 }
 
 /// Find a table in RSDT by signature.
-unsafe fn find_table_rsdt(rsdt_phys: u64, sig: &[u8; 4]) -> Option<u64> {
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can locate ACPI tables.
+pub(crate) unsafe fn find_table_rsdt(rsdt_phys: u64, sig: &[u8; 4]) -> Option<u64> {
     let header = read_sdt_header(rsdt_phys)?;
     if &header.signature != b"RSDT" {
         return None;
@@ -1267,7 +1274,9 @@ unsafe fn find_table_rsdt(rsdt_phys: u64, sig: &[u8; 4]) -> Option<u64> {
 }
 
 /// Find a table in XSDT by signature.
-unsafe fn find_table_xsdt(xsdt_phys: u64, sig: &[u8; 4]) -> Option<u64> {
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can locate ACPI tables.
+pub(crate) unsafe fn find_table_xsdt(xsdt_phys: u64, sig: &[u8; 4]) -> Option<u64> {
     let header = read_sdt_header(xsdt_phys)?;
     if &header.signature != b"XSDT" {
         return None;
@@ -1291,13 +1300,17 @@ unsafe fn find_table_xsdt(xsdt_phys: u64, sig: &[u8; 4]) -> Option<u64> {
 }
 
 /// Read an SDT header from physical memory.
-fn read_sdt_header(phys: u64) -> Option<SdtHeader> {
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can parse ACPI tables.
+pub(crate) fn read_sdt_header(phys: u64) -> Option<SdtHeader> {
     let slice = phys_slice(phys, core::mem::size_of::<SdtHeader>())?;
     Some(unsafe { ptr::read_unaligned(slice.as_ptr() as *const SdtHeader) })
 }
 
 /// Get a slice of physical memory via high-half mapping.
-fn phys_slice(phys: u64, len: usize) -> Option<&'static [u8]> {
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can read ACPI table data.
+pub(crate) fn phys_slice(phys: u64, len: usize) -> Option<&'static [u8]> {
     if phys == 0 || phys + len as u64 > MAX_PHYS_MAPPED {
         return None;
     }
@@ -1306,7 +1319,9 @@ fn phys_slice(phys: u64, len: usize) -> Option<&'static [u8]> {
 }
 
 /// Validate ACPI checksum (sum of all bytes must be 0).
-fn validate_checksum(data: &[u8]) -> bool {
+///
+/// E.1 HPET: Made pub(crate) so hpet.rs can validate ACPI tables.
+pub(crate) fn validate_checksum(data: &[u8]) -> bool {
     data.iter().fold(0u8, |acc, b| acc.wrapping_add(*b)) == 0
 }
 

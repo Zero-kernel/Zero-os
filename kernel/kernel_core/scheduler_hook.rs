@@ -84,10 +84,10 @@ pub fn on_scheduler_tick() {
         }
     }
 
-    // E.4 RCU: Mark quiescent state after timer tick processing.
-    // This helps advance RCU grace periods by signaling that no
-    // RCU read-side critical sections are active in IRQ context.
-    crate::rcu::rcu_quiescent_state();
+    // R72: Use rcu_timer_tick() instead of just rcu_quiescent_state().
+    // This not only marks quiescent state but also tries to advance
+    // COMPLETED_EPOCH, enabling callback progress on idle CPUs.
+    crate::rcu::rcu_timer_tick();
 }
 
 /// 检查并执行重调度（如果需要）

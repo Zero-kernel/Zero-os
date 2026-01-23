@@ -10,6 +10,7 @@ pub mod apic;
 pub mod context_switch;
 pub mod cpu_protection;
 pub mod gdt;
+pub mod hpet;
 pub mod interrupts;
 pub mod invpcid;
 pub mod ipi;

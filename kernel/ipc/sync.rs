@@ -281,6 +281,37 @@ impl WaitQueue {
         })
     }
 
+    /// E.4 PI: 唤醒指定的等待者（如果存在）
+    ///
+    /// 用于需要精确唤醒特定进程的场景（例如 FUTEX_LOCK_PI 选择最高优先级等待者）。
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - 要唤醒的进程 ID
+    ///
+    /// # Returns
+    ///
+    /// 如果成功唤醒该进程返回 true，否则返回 false
+    pub fn wake_specific(&self, pid: ProcessId) -> bool {
+        interrupts::without_interrupts(|| {
+            let mut waiters = self.waiters.lock();
+            if let Some(pos) = waiters.iter().position(|&p| p == pid) {
+                waiters.remove(pos);
+                // 取消该进程的定时等待
+                cancel_timed_wait(self as *const _ as usize, pid);
+                if let Some(proc_arc) = process::get_process(pid) {
+                    let mut proc = proc_arc.lock();
+                    if proc.state == ProcessState::Blocked {
+                        proc.state = ProcessState::Ready;
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     /// 检查等待队列是否为空
     pub fn is_empty(&self) -> bool {
         self.waiters.lock().is_empty()

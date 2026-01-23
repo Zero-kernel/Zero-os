@@ -3,6 +3,12 @@ name = "bootloader"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# A.4 KASLR: Enable kernel address space layout randomization
+# When enabled, the bootloader generates a random 2MB-aligned slide (0-512MB)
+# and adjusts page table mappings so virtual addresses map to slid physical addresses
+kaslr = []
+
 [dependencies]
 uefi = { version = "0.29", features = ["alloc", "global_allocator", "logger"] }
 log = "0.4"

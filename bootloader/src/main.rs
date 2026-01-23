@@ -269,9 +269,15 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             }
 
             // 分配一块连续的内存来容纳整个内核
-            // R39-7 FIX: KASLR - try to allocate at randomized address first
-            let mut kaslr_slide = generate_kaslr_slide();
-            let mut kernel_phys_base = KERNEL_PHYS_BASE + kaslr_slide;
+            // A.4 KASLR: Generate slide value for future PIE support, but always
+            // allocate at fixed address since page tables assume fixed mapping.
+            // When kaslr feature is enabled AND kernel is compiled as PIE:
+            // - generate_kaslr_slide() returns random 2MB-aligned value
+            // - Bootloader applies ELF relocations
+            // - Page tables are set up with slide offset
+            // Until then, slide is always 0 and kernel loads at fixed address.
+            let kaslr_slide = generate_kaslr_slide();
+            let kernel_phys_base = KERNEL_PHYS_BASE; // Always fixed until PIE support
             let kernel_size = (max_addr - min_addr) as usize;
             let pages = (kernel_size + 0xFFF) / 0x1000;
 
@@ -280,8 +286,7 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 pages, kernel_size, kernel_phys_base, kaslr_slide
             );
 
-            // 尝试在指定地址分配整块内存
-            // R39-7 FIX: Try KASLR address first, fall back to fixed address if unavailable
+            // Allocate at fixed address (KASLR address randomization requires PIE)
             let result = boot_services.allocate_pages(
                 AllocateType::Address(kernel_phys_base),
                 MemoryType::LOADER_DATA,
@@ -291,36 +296,12 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             let actual_phys_base = match result {
                 Ok(_) => kernel_phys_base,
                 Err(status) => {
-                    if kaslr_slide != 0 {
-                        // KASLR address unavailable, retry without slide
-                        info!(
-                            "KASLR slide 0x{:x} unavailable ({:?}), retrying at fixed address",
-                            kaslr_slide, status
-                        );
-                        kaslr_slide = 0;
-                        kernel_phys_base = KERNEL_PHYS_BASE;
-
-                        let fallback = boot_services.allocate_pages(
-                            AllocateType::Address(kernel_phys_base),
-                            MemoryType::LOADER_DATA,
-                            pages,
-                        );
-
-                        if fallback.is_err() {
-                            panic!(
-                                "FATAL: Cannot allocate kernel memory at fixed address 0x{:x}",
-                                kernel_phys_base
-                            );
-                        }
-                        kernel_phys_base
-                    } else {
-                        panic!(
-                            "FATAL: Cannot allocate kernel memory at required address 0x{:x}. \
-                            Page table mappings require kernel at this fixed address. \
-                            Ensure no UEFI runtime or reserved regions overlap.",
-                            kernel_phys_base
-                        );
-                    }
+                    panic!(
+                        "FATAL: Cannot allocate kernel memory at 0x{:x}: {:?}. \
+                        Page table mappings require kernel at this fixed address. \
+                        Ensure no UEFI runtime or reserved regions overlap.",
+                        kernel_phys_base, status
+                    );
                 }
             };
 
@@ -470,36 +451,44 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         // 虚拟地址 0xffffffff80000000 映射到物理地址 0
         // 由于使用2MB大页，必须从2MB边界开始，所以实际映射：
         // 虚拟 0xffffffff80000000 → 物理 0x0
-        // 内核在物理 KERNEL_PHYS_BASE + kaslr_slide 处
+        //
+        // A.4 KASLR NOTE: True KASLR requires Position Independent Executable (PIE)
+        // compilation. The current kernel uses absolute addresses that cannot be
+        // relocated. The kaslr_slide value is calculated and passed to the kernel
+        // for informational purposes, but physical memory layout is not randomized.
+        //
+        // To enable true KASLR, the kernel must be:
+        // 1. Compiled with -C relocation-model=pie
+        // 2. Have relocation sections (.rela.dyn) in the ELF
+        // 3. Bootloader must apply ELF relocations at load time
+        //
+        // The high-half mapping MUST remain at virtual→physical offset 0xffffffff80000000→0
+        // because PHYSICAL_MEMORY_OFFSET is used throughout the kernel for phys_to_virt().
         //
         // W^X 安全说明：
-        // - R39-7 FIX: 计算哪些 PD 条目包含内核（基于 KASLR slide）
+        // - Calculate which PD entries contain the kernel
         //   只有包含内核的条目设为可执行，其他设为 NX
         //   由于 2MB 粒度太粗，无法正确分离代码和数据
         //   暂时保持 RWX，由内核启动后通过 enforce_nx_for_kernel() 拆分为 4KB 页
-        //
-        // R39-7 FIX: Calculate which PD entries contain the kernel
-        // Kernel is loaded at physical address KERNEL_PHYS_BASE + kaslr_slide
-        // Codex Review Fix: Use actual kernel_size instead of hardcoded value
-        let kernel_phys_start = KERNEL_PHYS_BASE + kaslr_slide;
+        let kernel_phys_start = KERNEL_PHYS_BASE; // A.4: Fixed at 0x100000 until PIE is implemented
         let kernel_phys_end = kernel_phys_start + (kernel_size as u64);
         let start_pd_idx = (kernel_phys_start / 0x200000) as usize;
-        let end_pd_idx = (kernel_phys_end / 0x200000) as usize;
+        let end_pd_idx = ((kernel_phys_end + 0x1FFFFF) / 0x200000) as usize; // Round up
 
         for i in 0..512usize {
             let phys_addr = PhysAddr::new((i as u64) * 0x200000);
             let flags = if i >= start_pd_idx && i <= end_pd_idx {
-                // R39-7 FIX: 内核映像所在区域：暂时 RWX，由内核后续加固
+                // Kernel code/data region: RWX for now, hardened by kernel later
                 Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE
             } else {
-                // 数据区域：可写不可执行
+                // Non-kernel region: writable but not executable
                 Flags::PRESENT | Flags::WRITABLE | Flags::HUGE_PAGE | Flags::NO_EXECUTE
             };
             (&mut *pd_ptr)[i].set_addr(phys_addr, flags);
         }
 
         // PDPT的第510项指向PD（对应虚拟地址的第30-38位）
-        // 这映射虚拟地址 0xffffffff80000000-0xffffffffbfffffff (1GB) 到物理地址 0x0-0x3fffffff
+        // Maps virtual 0xffffffff80000000-0xffffffffbfffffff (1GB) to physical 0x0-0x3fffffff
         (&mut *pdpt_high_ptr)[510].set_addr(
             PhysAddr::new(pd_frame as u64),
             Flags::PRESENT | Flags::WRITABLE,

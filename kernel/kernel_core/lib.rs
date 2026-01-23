@@ -12,6 +12,7 @@ pub use drivers::vga_buffer;
 
 pub mod elf_loader;
 pub mod fork;
+pub mod pid_namespace;
 pub mod process;
 pub mod rcu;
 pub mod scheduler_hook;
@@ -27,6 +28,8 @@ pub use process::{
     // CLONE_VM sibling detection (R37-1 fix)
     address_space_share_count,
     allocate_kernel_stack,
+    // F.1 PID Namespace: create process in specific namespace
+    create_process_in_namespace,
     current_cap_table,
     current_credentials,
     current_egid,
@@ -52,6 +55,11 @@ pub use process::{
     // Thread group support (R33-1 fix)
     thread_group_size,
     with_current_cap_table,
+    // E.5 Cpuset callback registration
+    register_cpuset_task_joined,
+    register_cpuset_task_left,
+    CpusetTaskJoinedCallback,
+    CpusetTaskLeftCallback,
     // DAC support
     Credentials,
     FileDescriptor,
@@ -61,6 +69,9 @@ pub use process::{
     KSTACK_STRIDE,
     MAX_FD,
     NGROUPS_MAX,
+    // E.4 Priority Inheritance support
+    FutexKey,
+    Priority,
 };
 // Re-export capability types for convenience
 pub use cap::{
@@ -109,6 +120,13 @@ pub use usercopy::{
 pub use rcu::{
     call_rcu, rcu_quiescent_state, rcu_read_lock, rcu_read_lock_held, rcu_read_unlock,
     synchronize_rcu, RcuReadGuard,
+};
+// F.1: PID namespace support
+pub use pid_namespace::{
+    assign_pid_chain, detach_pid_chain, get_cascade_kill_pids, is_visible_in_namespace,
+    owning_namespace, pid_in_namespace, pid_in_owning_namespace, resolve_pid_in_namespace,
+    PidNamespace, PidNamespaceError, PidNamespaceMembership, ROOT_PID_NAMESPACE,
+    MAX_PID_NS_LEVEL,
 };
 
 // ============================================================================
