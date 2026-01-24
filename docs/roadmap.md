@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-22
+**Last Updated:** 2026-01-23
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,10 +10,10 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase E IN PROGRESS (SMP Infrastructure)
+### Current Status: Phase E COMPLETE (SMP Infrastructure)
 
 Zero-OS has completed network foundation with comprehensive validation:
-- **71 security audits** with 320+ issues found, ~275 fixed (85.9%)
+- **72 security audits** with 323+ issues found, ~278 fixed (86.1%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -26,13 +26,13 @@ Zero-OS has completed network foundation with comprehensive validation:
   - D.2: TCP client/server with RFC 6298 RTT ✅
   - D.3: TCP hardening (MSS/WS validation, SYN cookies) ✅
   - D.4: Runtime loopback tests (UDP, TCP SYN, conntrack, firewall) ✅
-- **Phase E**: ✅ **MOSTLY COMPLETE** (SMP & Concurrency)
+- **Phase E**: ✅ **COMPLETE** (SMP & Concurrency)
   - E.1: LAPIC/IOAPIC initialization ✅, AP boot ✅, IPI ✅
   - E.2: TLB shootdown ✅ (IPI-based, PCID support, per-CPU queue)
   - E.3: PerCpuData ✅, Per-CPU runqueues ✅, FPU save areas ✅
-  - E.4: RCU ✅ (timer-driven grace periods, callback batching), Lockdep ✅ (dependency graph)
+  - E.4: RCU ✅ (timer-driven grace periods, callback batching), Lockdep ✅ (dependency graph), **Futex PI ✅** (R72-1, R72-2)
   - E.5: Per-CPU scheduler ✅, Load balancing ✅, CPU affinity syscalls ✅
-  - Remaining: CPU isolation (cpuset), futex PI
+  - E.6: Cpuset CPU isolation ✅ (runtime test added)
 - **R54**: ISN secret auto-upgrade ✅, Challenge ACK rate limiting ✅
 - **R55**: NewReno congestion control ✅ (RFC 6582 partial ACK handling)
 - **R56**: Limited Transmit ✅ (RFC 3042 adapted for immediate-send architecture)
@@ -42,7 +42,7 @@ Zero-OS has completed network foundation with comprehensive validation:
 - **R60**: IP fragment reassembly ✅ (RFC 791/815/5722 security hardening)
 - **R61**: SYN cookies ✅ (RFC 4987 stateless SYN flood protection)
 - **R66**: TCP options validation ✅, VirtIO hardening ✅, Runtime network tests ✅
-- **R72**: RCU timer-driven epochs ✅, Callback batching ✅, TLB queue ✅, Lockdep graph ✅
+- **R72**: RCU memory ordering fix ✅, PI chain iterative ✅, Futex waiter cleanup ✅
 
 ### Gap Analysis vs Linux Kernel
 
@@ -589,14 +589,14 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] Lock class annotations (LockClassKey, LockLevel in lock_ordering.rs)
 - [x] Runtime lockdep checker (debug) - LockdepMutex with IRQ-safe validation (R71-3 fix)
 - [x] RCU/epoch-based garbage collection - call_rcu with grace period advancement (R71-1 fix)
-- [ ] Futex priority inheritance (preparation)
+- [x] Futex priority inheritance - Iterative PI propagation (R72-1, R72-2 fixes)
 
 #### E.5 Scheduler SMP
 
 - [x] Per-CPU runqueues (R69-1 - CpuLocal<Mutex<ReadyQueues>> in enhanced_scheduler.rs)
 - [x] Load balancing (R69 - work stealing + periodic migration in balance_queues())
 - [x] CPU affinity (R72 - sched_setaffinity/sched_getaffinity syscalls 203/204)
-- [ ] CPU isolation (cpuset preparation)
+- [x] CPU isolation (cpuset) - Runtime test validates hierarchical mask enforcement
 
 **Security Requirements**:
 - Cross-CPU kernel pointers obfuscated (kptr guard)
@@ -772,15 +772,16 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - **Open**: 51 issues (14.7%)
   - R65 remaining issues (SMP-related, non-blocking)
   - R62-6 (VirtIO IOMMU) deferred to Phase F.3
-- **Phase E Progress**: ✅ **E.5 Scheduler SMP mostly complete**
+- **Phase E Progress**: ✅ **COMPLETE**
   - E.1 Hardware Init: ✅ LAPIC/IOAPIC, AP boot, IPI
   - E.2 TLB Shootdown: ✅ IPI-based, PCID support (batched pending)
   - E.3 Per-CPU Data: ✅ CpuLocal<T>, per-CPU stacks, runqueues
-  - E.4 Synchronization: ✅ RCU (R71), Lockdep (R71)
+  - E.4 Synchronization: ✅ RCU (R71), Lockdep (R71), Futex PI (R72)
   - E.5 Scheduler SMP: ✅ Per-CPU runqueues, load balancing, CPU affinity syscalls
-- **SMP Ready**: All critical SMP security issues resolved, multi-core testing can proceed
+  - E.6 CPU Isolation: ✅ Cpuset with runtime test (R72)
+- **SMP Ready**: All Phase E components complete, 8-core SMP testing verified
 
-See [qa-2026-01-22.md](review/qa-2026-01-22.md) for latest audit report.
+See [qa-2026-01-23.md](review/qa-2026-01-23.md) for latest audit report.
 
 ---
 

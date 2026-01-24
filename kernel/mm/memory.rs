@@ -1,4 +1,7 @@
 use crate::buddy_allocator;
+use crate::page_table::PHYSICAL_MEMORY_OFFSET;
+use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use linked_list_allocator::LockedHeap;
 use x86_64::{
     structures::paging::{FrameAllocator as X64FrameAllocator, PhysFrame, Size4KiB},
@@ -85,11 +88,42 @@ const EFI_BOOT_SERVICES_DATA: u32 = 4;
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-// 堆地址必须在 bootloader 映射的范围内
-// Bootloader 映射了物理地址 0x0-0x1000000 (16MB) 到虚拟地址 0xffffffff80000000
-// 内核代码占用了前面的部分，我们将堆放在 2MB 之后
-const HEAP_START: usize = 0xffffffff80400000; // 虚拟地址 4MB 处（确保不与BSS段重叠）
-const HEAP_SIZE: usize = 1024 * 1024; // 1MB (increased for runtime tests and buddy allocator bitmaps)
+// ============================================================================
+// Partial KASLR: Heap Randomization Configuration
+// ============================================================================
+//
+// The heap address must reside within the bootloader's mapped region.
+// Bootloader maps physical 0x0-0x40000000 (0-1GB) to high-half starting at
+// 0xffffffff80000000. To avoid overlapping with kernel text/data sections,
+// the minimum heap address is 0xffffffff80400000 (4MB offset, 2MB aligned).
+//
+// Randomization window: [HEAP_DEFAULT_BASE, HEAP_WINDOW_END)
+// Alignment: 2MB for huge page compatibility
+
+/// Default (fallback) heap base address when randomization is unavailable
+pub const HEAP_DEFAULT_BASE: usize = 0xffffffff80400000;
+
+/// Upper bound of heap randomization window (exclusive)
+/// This leaves room for the heap itself within the 1GB mapped region
+const HEAP_WINDOW_END: usize = 0xffffffff90000000;
+
+/// Heap alignment (2MB for huge page compatibility)
+const HEAP_ALIGNMENT: usize = 2 * 1024 * 1024;
+
+/// Heap size in bytes
+const HEAP_SIZE: usize = 1024 * 1024; // 1MB
+
+/// Public constant for external modules
+pub const HEAP_SIZE_BYTES: usize = HEAP_SIZE;
+
+/// Actual heap base address (set during init via randomization or fallback)
+static HEAP_BASE: AtomicUsize = AtomicUsize::new(HEAP_DEFAULT_BASE);
+
+/// Whether heap was successfully randomized using early entropy
+static HEAP_RANDOMIZED: AtomicBool = AtomicBool::new(false);
+
+/// Whether heap address was validated against UEFI memory map
+static HEAP_VALIDATED: AtomicBool = AtomicBool::new(false);
 
 /// 物理内存管理起始地址（硬编码后备值，在256MB处）
 const FALLBACK_PHYS_MEM_START: u64 = 0x10000000;
@@ -114,15 +148,37 @@ const HIGH_HALF_MAP_LIMIT: u64 = 1 * 1024 * 1024 * 1024; // 1GB
 ///
 /// # Arguments
 /// * `boot_info` - Bootloader 传递的启动信息，包含 UEFI 内存映射
+///
+/// # R72-4 FIX: Memory Map Validation
+/// Heap base is now validated against the UEFI memory map before selection,
+/// ensuring the chosen address falls within EFI_CONVENTIONAL_MEMORY regions.
 pub fn init_with_bootinfo(boot_info: &BootInfo) {
-    // 初始化堆分配器
-    unsafe {
-        ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
-    }
+    // R72-4 FIX: Select heap base with UEFI memory map validation FIRST
+    // This ensures the heap doesn't overlap with reserved ACPI/runtime regions
+    let (heap_base, randomized, validated) =
+        if let Some((base, rand)) = select_heap_base_from_bootinfo(boot_info) {
+            (base, rand, true)
+        } else {
+            println!("  Warning: BootInfo memory map unavailable for heap validation, using default window");
+            let (base, rand) = select_heap_base();
+            (base, rand, false)
+        };
+
+    HEAP_VALIDATED.store(validated, Ordering::SeqCst);
+    let heap_base = init_heap_allocator_at(heap_base, randomized);
+
+    // Build accurate status message
+    let status = match (randomized, validated) {
+        (true, true) => " (randomized, validated)",
+        (true, false) => " (randomized, UNVALIDATED)",
+        (false, true) => " (static, validated)",
+        (false, false) => " (static)",
+    };
     println!(
-        "Heap allocator initialized: {} KB at 0x{:x}",
+        "Heap allocator initialized: {} KB at 0x{:x}{}",
         HEAP_SIZE / 1024,
-        HEAP_START
+        heap_base,
+        status
     );
 
     // 从 BootInfo 解析内存映射
@@ -150,14 +206,18 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
 
 /// 后备初始化函数（无 BootInfo 时使用）
 pub fn init() {
-    // 初始化堆分配器
-    unsafe {
-        ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
-    }
+    // 初始化堆分配器（包含 Partial KASLR 堆随机化，但无法验证内存映射）
+    let (heap_base, randomized) = select_heap_base();
+    let heap_base = init_heap_allocator_at(heap_base, randomized);
     println!(
-        "Heap allocator initialized: {} KB at 0x{:x}",
+        "Heap allocator initialized: {} KB at 0x{:x}{}",
         HEAP_SIZE / 1024,
-        HEAP_START
+        heap_base,
+        if heap_randomized() {
+            " (randomized, unvalidated)"
+        } else {
+            " (static)"
+        }
     );
 
     // 使用硬编码区域
@@ -172,6 +232,221 @@ pub fn init() {
     buddy_allocator::run_self_test();
 
     println!("Memory manager fully initialized (fallback mode)");
+}
+
+// ============================================================================
+// Partial KASLR: Heap Base Randomization
+// ============================================================================
+
+/// Initialize the heap allocator at a pre-selected address.
+///
+/// # R72-4 FIX: Separated selection from initialization
+/// This allows the caller to validate the heap address against the UEFI
+/// memory map before committing to it.
+fn init_heap_allocator_at(heap_base: usize, randomized: bool) -> usize {
+    HEAP_BASE.store(heap_base, Ordering::SeqCst);
+    HEAP_RANDOMIZED.store(randomized, Ordering::SeqCst);
+
+    unsafe {
+        ALLOCATOR.lock().init(heap_base as *mut u8, HEAP_SIZE);
+    }
+
+    heap_base
+}
+
+/// Select a randomized heap base address using early RDRAND entropy.
+///
+/// The randomization window is [HEAP_DEFAULT_BASE, HEAP_WINDOW_END), with
+/// 2MB alignment to maintain huge page compatibility.
+///
+/// # Returns
+///
+/// Tuple of (heap_base, was_randomized)
+fn select_heap_base() -> (usize, bool) {
+    // Calculate the maximum allowable heap base (ensuring heap fits within window)
+    let max_base = HEAP_WINDOW_END.saturating_sub(HEAP_SIZE);
+    let max_base_aligned = align_down(max_base as u64, HEAP_ALIGNMENT as u64) as usize;
+
+    // Validate we have room for randomization
+    if max_base_aligned < HEAP_DEFAULT_BASE {
+        return (HEAP_DEFAULT_BASE, false);
+    }
+
+    // Calculate number of possible slots
+    let slot_count = (max_base_aligned - HEAP_DEFAULT_BASE) / HEAP_ALIGNMENT;
+    if slot_count == 0 {
+        return (HEAP_DEFAULT_BASE, false);
+    }
+
+    // Attempt to get early entropy from RDRAND
+    if let Some(rand) = rdrand64_early() {
+        // Select a random slot (0 to slot_count inclusive)
+        let slot = (rand as usize) % (slot_count + 1);
+        let base = HEAP_DEFAULT_BASE + slot * HEAP_ALIGNMENT;
+        return (base, true);
+    }
+
+    // Fallback to default if RDRAND unavailable
+    (HEAP_DEFAULT_BASE, false)
+}
+
+/// Select a randomized heap base address with UEFI memory map validation.
+///
+/// # R72-4 FIX: Memory Map Aware Heap Selection
+/// This function validates that the chosen heap address falls entirely within
+/// EFI_CONVENTIONAL_MEMORY regions, preventing placement over ACPI tables,
+/// EFI runtime services, or other reserved memory.
+///
+/// # Algorithm
+/// 1. Attempt RDRAND to get entropy for random slot selection
+/// 2. Try the random slot first, if it lands in usable memory, use it
+/// 3. If not, iterate through all slots to find one in usable memory
+/// 4. Return None if no valid slot exists (caller falls back to unvalidated selection)
+fn select_heap_base_from_bootinfo(boot_info: &BootInfo) -> Option<(usize, bool)> {
+    let map_info = &boot_info.memory_map;
+
+    // Validate memory map is present
+    if map_info.buffer == 0 || map_info.size == 0 || map_info.descriptor_size == 0 {
+        return None;
+    }
+
+    // Calculate slot parameters (same as select_heap_base)
+    let max_base = HEAP_WINDOW_END.saturating_sub(HEAP_SIZE);
+    let max_base_aligned = align_down(max_base as u64, HEAP_ALIGNMENT as u64) as usize;
+    if max_base_aligned < HEAP_DEFAULT_BASE {
+        return None;
+    }
+
+    let slot_count = (max_base_aligned - HEAP_DEFAULT_BASE) / HEAP_ALIGNMENT;
+    if slot_count == 0 {
+        return None;
+    }
+
+    // Get optional entropy for random starting slot
+    let rand_slot = rdrand64_early().map(|r| (r as usize) % (slot_count + 1));
+    let start_slot = rand_slot.unwrap_or(0);
+
+    // Iterate through all slots, starting from the random one
+    for offset in 0..=slot_count {
+        let slot_idx = (start_slot + offset) % (slot_count + 1);
+        let heap_base = HEAP_DEFAULT_BASE + slot_idx * HEAP_ALIGNMENT;
+
+        // Convert virtual address to physical (bootloader maps phys 0-1GB to 0xffffffff80000000)
+        let phys_base = heap_base as u64 - PHYSICAL_MEMORY_OFFSET;
+
+        if heap_range_usable(phys_base, HEAP_SIZE, map_info) {
+            let randomized = rand_slot.is_some();
+            return Some((heap_base, randomized));
+        }
+    }
+
+    // No valid slot found in UEFI memory map
+    None
+}
+
+/// Check if a candidate heap physical range is entirely within usable UEFI memory.
+///
+/// A range is usable if:
+/// 1. It's within the bootloader's direct-map limit (1GB)
+/// 2. It's above MIN_SAFE_ADDRESS (1MB, protecting legacy hardware)
+/// 3. It's fully contained within an EFI_CONVENTIONAL_MEMORY or EFI_BOOT_SERVICES region
+fn heap_range_usable(phys_base: u64, len: usize, map_info: &MemoryMapInfo) -> bool {
+    let phys_end = phys_base.saturating_add(len as u64);
+
+    // Must be within bootloader's direct-map range
+    if phys_end > HIGH_HALF_MAP_LIMIT {
+        return false;
+    }
+
+    // Must be above MIN_SAFE_ADDRESS
+    if phys_base < MIN_SAFE_ADDRESS {
+        return false;
+    }
+
+    let desc_count = map_info.size / map_info.descriptor_size;
+
+    for i in 0..desc_count {
+        let addr = map_info.buffer + (i * map_info.descriptor_size) as u64;
+        let desc = unsafe { &*(addr as *const EfiMemoryDescriptor) };
+
+        // Only consider usable memory types
+        let usable = matches!(
+            desc.typ,
+            EFI_CONVENTIONAL_MEMORY | EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA
+        );
+        if !usable || desc.page_count == 0 {
+            continue;
+        }
+
+        let region_start = align_up(desc.phys_start, PAGE_SIZE);
+        let region_end = desc
+            .phys_start
+            .saturating_add(desc.page_count.saturating_mul(PAGE_SIZE));
+
+        // Check if heap range is fully contained within this region
+        if region_start <= phys_base && phys_end <= region_end {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Early RDRAND access for heap randomization (no CSPRNG dependency).
+///
+/// This function directly accesses the RDRAND instruction without relying
+/// on the ChaCha20 CSPRNG, which is initialized after the heap.
+fn rdrand64_early() -> Option<u64> {
+    if !rdrand_supported_early() {
+        return None;
+    }
+
+    // Retry up to 32 times (RDRAND may fail if entropy pool is depleted)
+    for _ in 0..32 {
+        let mut value: u64 = 0;
+        let ok: u8;
+
+        unsafe {
+            core::arch::asm!(
+                "rdrand {0}",
+                "setc {1}",
+                out(reg) value,
+                out(reg_byte) ok,
+                options(nomem, nostack)
+            );
+        }
+
+        if ok == 1 {
+            return Some(value);
+        }
+
+        spin_loop();
+    }
+
+    None
+}
+
+/// Check if CPU supports RDRAND (early boot, no allocations).
+///
+/// R72-4 FIX: Properly handle CPUID's rbx clobbering without UB.
+/// LLVM uses rbx internally, so we must save and restore it via the stack.
+/// Since we use push/pop, we cannot use `nostack` or `nomem` options
+/// (push/pop both use stack memory).
+fn rdrand_supported_early() -> bool {
+    // CPUID.01H:ECX.RDRAND[bit 30]
+    let ecx: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 1u32 => _,
+            lateout("ecx") ecx,
+            lateout("edx") _,
+            // No options - push/pop uses both stack and memory
+        );
+    }
+    (ecx & (1 << 30)) != 0
 }
 
 /// 从 BootInfo 选择最大的可用内存区域
@@ -248,6 +523,12 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
 #[inline]
 const fn align_up(val: u64, align: u64) -> u64 {
     (val + align - 1) & !(align - 1)
+}
+
+/// 对齐到页边界（向下取整）
+#[inline]
+const fn align_down(val: u64, align: u64) -> u64 {
+    val & !(align - 1)
 }
 
 /// 改进的物理帧分配器（使用Buddy分配器）
@@ -345,4 +626,41 @@ impl MemoryStats {
             self.heap_total_bytes / 1024
         );
     }
+}
+
+// ============================================================================
+// Partial KASLR: Public Accessors
+// ============================================================================
+
+/// Return the current heap base address.
+///
+/// This may differ from `HEAP_DEFAULT_BASE` if heap randomization was successful.
+#[inline]
+pub fn heap_base() -> usize {
+    HEAP_BASE.load(Ordering::SeqCst)
+}
+
+/// Return the heap size in bytes.
+#[inline]
+pub fn heap_size() -> usize {
+    HEAP_SIZE
+}
+
+/// Check if the heap was successfully randomized using early entropy.
+///
+/// Returns `true` if RDRAND was available and produced entropy during boot,
+/// allowing the heap to be placed at a random address within the safe window.
+#[inline]
+pub fn heap_randomized() -> bool {
+    HEAP_RANDOMIZED.load(Ordering::SeqCst)
+}
+
+/// Check if the heap address was validated against UEFI memory map.
+///
+/// Returns `true` if the heap base was verified to fall within
+/// EFI_CONVENTIONAL_MEMORY regions during boot, ensuring it doesn't
+/// overlap with ACPI tables or other reserved memory.
+#[inline]
+pub fn heap_validated() -> bool {
+    HEAP_VALIDATED.load(Ordering::SeqCst)
 }

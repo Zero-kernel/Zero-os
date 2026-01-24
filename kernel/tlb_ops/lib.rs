@@ -53,21 +53,19 @@ pub fn invpcid_supported() -> bool {
 
     // Use CPUID leaf 7 (subleaf 0) to query EBX[10]
     // LLVM reserves rbx, so we must save/restore it manually.
-    // We cannot use `options(nostack)` since we push/pop rbx.
+    // R72-4 FIX: Cannot use `nostack` or `nomem` since push/pop uses stack memory.
     let ebx: u32;
     unsafe {
         asm!(
             "push rbx",
-            "mov eax, 7",
-            "xor ecx, ecx",
             "cpuid",
             "mov {0:e}, ebx",
             "pop rbx",
             out(reg) ebx,
-            out("eax") _,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem),  // No nostack - we use push/pop
+            inout("eax") 7u32 => _,
+            inout("ecx") 0u32 => _,
+            lateout("edx") _,
+            // No options - push/pop uses both stack and memory
         );
     }
     let supported = (ebx & (1 << 10)) != 0;

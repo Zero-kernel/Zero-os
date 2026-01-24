@@ -553,10 +553,18 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
             // A.3: Register audit snapshot authorizer (capability gate)
             // Policy: Allow root (euid == 0) OR holders of CAP_AUDIT_READ
+            // R72-HMAC FIX: During early boot (no process context), allow kernel init code
             audit::register_snapshot_authorizer(|| {
-                // Allow root users
-                if let Some(creds) = current_credentials() {
-                    if creds.euid == 0 {
+                // R72-HMAC FIX: Allow during early kernel boot when no process exists yet
+                let creds = current_credentials();
+                if creds.is_none() {
+                    // Early boot - kernel init context, allow
+                    return Ok(());
+                }
+
+                // After boot: Allow root users
+                if let Some(ref c) = creds {
+                    if c.euid == 0 {
                         return Ok(());
                     }
                 }
@@ -575,10 +583,19 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
             // R66-10 FIX: Register HMAC key authorizer (capability gate for audit config)
             // Policy: Allow root (euid == 0) OR holders of CAP_AUDIT_WRITE
+            // R72-HMAC FIX: During early boot (no process context), allow kernel init code
             audit::register_hmac_key_authorizer(|| {
-                // Allow root users
-                if let Some(creds) = current_credentials() {
-                    if creds.euid == 0 {
+                // R72-HMAC FIX: Allow during early kernel boot when no process exists yet
+                // This is safe because only privileged kernel code runs before processes exist
+                let creds = current_credentials();
+                if creds.is_none() {
+                    // Early boot - kernel init context, allow
+                    return Ok(());
+                }
+
+                // After boot: Allow root users
+                if let Some(ref c) = creds {
+                    if c.euid == 0 {
                         return Ok(());
                     }
                 }
@@ -594,6 +611,34 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 Err(audit::AuditError::AccessDenied)
             });
             println!("      ✓ Audit HMAC key gate registered (CAP_AUDIT_WRITE)");
+
+            // R72-HMAC: Generate and install audit HMAC key for integrity protection
+            // Uses CSPRNG to generate a 32-byte cryptographically secure key.
+            // The key is zeroed from stack memory after use to minimize exposure.
+            {
+                let mut audit_hmac_key = [0u8; audit::MAX_HMAC_KEY_SIZE];
+                match security::rng::fill_random(&mut audit_hmac_key) {
+                    Ok(()) => match audit::set_hmac_key(&audit_hmac_key) {
+                        Ok(()) => {
+                            println!("      ✓ Audit HMAC key installed (32 bytes, CSPRNG)");
+                            println!("        - All audit events now HMAC-SHA256 protected");
+                        }
+                        Err(e) => {
+                            println!("      ! Failed to set audit HMAC key: {:?}", e);
+                        }
+                    },
+                    Err(e) => {
+                        println!("      ! Failed to generate audit HMAC key: {:?}", e);
+                        println!("        - Audit events using plain SHA-256 chain only");
+                    }
+                }
+                // R72-HMAC: Zero key material from stack to limit exposure window
+                // Use volatile writes to prevent the compiler from eliding the wipe
+                for byte in audit_hmac_key.iter_mut() {
+                    unsafe { core::ptr::write_volatile(byte, 0) };
+                }
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            }
         }
         Err(e) => {
             println!("      ! Audit initialization failed: {:?}", e);

@@ -23,6 +23,9 @@ pub use context_switch::{
     USER_DATA_SELECTOR,
 };
 pub use cpu_protection::{check_cpu_features, enable_protections, CpuProtectionStatus};
+pub use cpu_protection::{
+    detect_hypervisor, hypervisor_present, is_software_emulated, is_virtualized, HypervisorType,
+};
 pub use gdt::{
     default_kernel_stack_top, get_kernel_stack, init as init_gdt, init_for_ap as init_gdt_for_ap,
     selectors, set_ist_stack, set_kernel_stack, Selectors, DOUBLE_FAULT_IST_INDEX,

@@ -1074,7 +1074,7 @@ impl RuntimeTest for IpiPingPongTest {
 
     fn run(&self) -> TestResult {
         use arch::ipi::{send_ipi, IpiType};
-        use arch::{current_cpu_id, max_cpus, num_online_cpus, PER_CPU_DATA};
+        use arch::{current_cpu_id, is_software_emulated, max_cpus, num_online_cpus, PER_CPU_DATA};
         use kernel_core::time::read_tsc;
         use mm::tlb_shootdown::is_cpu_online;
 
@@ -1097,6 +1097,20 @@ impl RuntimeTest for IpiPingPongTest {
             None => return TestResult::Fail(String::from("Per-CPU slot unavailable")),
         };
 
+        // Detect emulation environment for tuning thresholds
+        // QEMU TCG has much higher IPI latency than real hardware or KVM
+        let in_emulation = is_software_emulated();
+        let (max_spins, warn_threshold, expected_typical) = if in_emulation {
+            // Software emulation (QEMU TCG): use generous thresholds
+            // TCG emulates x86 instructions, making IPI delivery 10-100x slower
+            // Typical latency: 20-50M cycles; warn at 80M to catch severe issues
+            (500_000usize, 80_000_000u64, "20-50M")
+        } else {
+            // Bare metal / KVM / hardware-assisted VM: use stricter thresholds
+            // Typical latency: 1-5M cycles; warn at 10M
+            (100_000usize, 10_000_000u64, "1-5M")
+        };
+
         // Clear any stale reschedule flag before sending the IPI
         per_cpu.need_resched.store(false, Ordering::Release);
 
@@ -1104,18 +1118,20 @@ impl RuntimeTest for IpiPingPongTest {
         send_ipi(target, IpiType::Reschedule);
 
         // Wait for the remote handler to set need_resched (bounded spin)
-        const MAX_SPINS: usize = 100_000;
-        for _ in 0..MAX_SPINS {
+        for _ in 0..max_spins {
             if per_cpu.need_resched.load(Ordering::Acquire) {
                 // Clear flag to restore CPU state
                 per_cpu.need_resched.store(false, Ordering::Release);
                 let cycles = read_tsc().saturating_sub(start);
 
-                // Warn if latency is suspiciously high (>10M cycles ~= several ms)
-                return if cycles > 10_000_000 {
+                // Warn if latency exceeds threshold (environment-dependent)
+                return if cycles > warn_threshold {
                     TestResult::Warning(alloc::format!(
-                        "High IPI latency: {} cycles to CPU {}",
-                        cycles, target
+                        "High IPI latency: {} cycles to CPU {} (expected {} cycles{})",
+                        cycles,
+                        target,
+                        expected_typical,
+                        if in_emulation { ", QEMU TCG" } else { "" }
                     ))
                 } else {
                     TestResult::Pass
@@ -1125,8 +1141,13 @@ impl RuntimeTest for IpiPingPongTest {
         }
 
         TestResult::Fail(alloc::format!(
-            "Reschedule IPI to CPU {} not acknowledged within timeout",
-            target
+            "Reschedule IPI to CPU {} not acknowledged within timeout{}",
+            target,
+            if in_emulation {
+                " (QEMU TCG: consider longer timeout)"
+            } else {
+                ""
+            }
         ))
     }
 }
@@ -1183,6 +1204,234 @@ impl RuntimeTest for TlbShootdownCoherencyTest {
             ))
         } else {
             TestResult::Pass
+        }
+    }
+}
+
+// ============================================================================
+// Cpuset Tests
+// ============================================================================
+
+/// Validate cpuset creation and effective mask calculation
+struct CpusetIsolationTest;
+
+impl RuntimeTest for CpusetIsolationTest {
+    fn name(&self) -> &'static str {
+        "cpuset_isolation"
+    }
+
+    fn description(&self) -> &'static str {
+        "Verify cpuset creation, mask validation, and effective CPU masks"
+    }
+
+    fn run(&self) -> TestResult {
+        use sched::cpuset::{self, CpusetError, CpusetId};
+
+        // Step 1: Verify root cpuset is initialized
+        let root = match cpuset::root_cpuset() {
+            Some(root) => root,
+            None => return TestResult::Fail(String::from("Cpuset subsystem not initialized")),
+        };
+
+        let online = cpuset::online_cpu_mask();
+        if online == 0 {
+            return TestResult::Fail(String::from("No CPUs reported in online mask"));
+        }
+
+        let root_mask = root.cpus();
+        if root_mask != online {
+            return TestResult::Fail(alloc::format!(
+                "Root cpuset mask mismatch (root=0x{:016x}, online=0x{:016x})",
+                root_mask, online
+            ));
+        }
+
+        // Find first and second online CPUs for testing
+        let first_cpu = root_mask.trailing_zeros() as usize;
+        let first_mask = 1u64 << first_cpu;
+
+        // Step 2: Test invalid parent rejection
+        match cpuset::cpuset_create(first_mask, CpusetId(9999)) {
+            Err(CpusetError::InvalidParent) => {}
+            Ok(id) => {
+                let _ = cpuset::cpuset_destroy(id);
+                return TestResult::Fail(String::from("cpuset_create succeeded with invalid parent"));
+            }
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "Unexpected error for invalid parent: {:?}",
+                    e
+                ));
+            }
+        }
+
+        // Step 3: Test empty mask rejection
+        match cpuset::cpuset_create(0, CpusetId::ROOT) {
+            Err(CpusetError::EmptyMask) => {}
+            Ok(id) => {
+                let _ = cpuset::cpuset_destroy(id);
+                return TestResult::Fail(String::from("cpuset_create allowed empty mask"));
+            }
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "Unexpected error for empty mask: {:?}",
+                    e
+                ));
+            }
+        }
+
+        // Step 4: Test invalid mask (CPUs outside parent) if possible
+        let offline_bits = !online;
+        if offline_bits != 0 {
+            let bad_cpu = offline_bits.trailing_zeros() as usize;
+            let invalid_mask = online | (1u64 << bad_cpu);
+            match cpuset::cpuset_create(invalid_mask, CpusetId::ROOT) {
+                Err(CpusetError::InvalidMask) => {}
+                Ok(id) => {
+                    let _ = cpuset::cpuset_destroy(id);
+                    return TestResult::Fail(alloc::format!(
+                        "cpuset_create accepted CPU {} outside parent mask",
+                        bad_cpu
+                    ));
+                }
+                Err(e) => {
+                    return TestResult::Fail(alloc::format!(
+                        "Unexpected error for invalid mask: {:?}",
+                        e
+                    ));
+                }
+            }
+        }
+
+        let mut created: Vec<CpusetId> = Vec::new();
+
+        // Find second CPU if available (for multi-core testing)
+        let second_mask = {
+            let remaining = root_mask & !first_mask;
+            if remaining != 0 {
+                1u64 << remaining.trailing_zeros()
+            } else {
+                0
+            }
+        };
+
+        // Parent covers first CPU (and second if available)
+        let parent_mask = if second_mask != 0 {
+            first_mask | second_mask
+        } else {
+            first_mask
+        };
+
+        // Step 5: Create parent cpuset
+        let parent_id = match cpuset::cpuset_create(parent_mask, CpusetId::ROOT) {
+            Ok(id) => id,
+            Err(e) => {
+                return TestResult::Fail(alloc::format!(
+                    "Failed to create parent cpuset: {:?}",
+                    e
+                ))
+            }
+        };
+        created.push(parent_id);
+
+        // Step 6: Create child cpuset (subset of parent)
+        let child_id = match cpuset::cpuset_create(first_mask, parent_id) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = cpuset::cpuset_destroy(parent_id);
+                return TestResult::Fail(alloc::format!(
+                    "Failed to create child cpuset: {:?}",
+                    e
+                ))
+            }
+        };
+        created.push(child_id);
+
+        // Step 7: Run effective mask and is_cpu_allowed tests
+        let result = (|| -> Result<(), String> {
+            // Test effective_cpus for parent (should be intersection with online)
+            let effective_parent = cpuset::effective_cpus(parent_id, 0);
+            let expected_parent = online & parent_mask;
+            if effective_parent != expected_parent {
+                return Err(alloc::format!(
+                    "Parent effective mask mismatch (got 0x{:016x}, expected 0x{:016x})",
+                    effective_parent,
+                    expected_parent
+                ));
+            }
+
+            // Test effective_cpus for child (should be intersection with parent and online)
+            let effective_child = cpuset::effective_cpus(child_id, 0);
+            let expected_child = online & first_mask;
+            if effective_child != expected_child {
+                return Err(alloc::format!(
+                    "Child effective mask mismatch (got 0x{:016x}, expected 0x{:016x})",
+                    effective_child,
+                    expected_child
+                ));
+            }
+
+            // Test task affinity intersection
+            let affinity_mismatch = if second_mask != 0 {
+                second_mask // Affinity only for second CPU
+            } else {
+                1u64 << ((first_cpu + 1) % 64) // Non-overlapping affinity
+            };
+            let restricted = cpuset::effective_cpus(child_id, affinity_mismatch);
+            let expected_restricted = online & first_mask & affinity_mismatch;
+            if restricted != expected_restricted {
+                return Err(alloc::format!(
+                    "Affinity intersection mismatch (got 0x{:016x}, expected 0x{:016x})",
+                    restricted,
+                    expected_restricted
+                ));
+            }
+
+            // Test is_cpu_allowed with matching CPU
+            if !cpuset::is_cpu_allowed(first_cpu, child_id, first_mask) {
+                return Err(alloc::format!(
+                    "CPU {} should be allowed by cpuset + affinity",
+                    first_cpu
+                ));
+            }
+
+            // Multi-core specific tests
+            if second_mask != 0 {
+                let second_cpu = second_mask.trailing_zeros() as usize;
+
+                // Second CPU should be allowed in parent
+                if !cpuset::is_cpu_allowed(second_cpu, parent_id, 0) {
+                    return Err(alloc::format!(
+                        "CPU {} should be allowed in parent cpuset",
+                        second_cpu
+                    ));
+                }
+
+                // Second CPU should NOT be allowed in child cpuset
+                if cpuset::is_cpu_allowed(second_cpu, child_id, 0) {
+                    return Err(alloc::format!(
+                        "CPU {} should be disallowed by child cpuset",
+                        second_cpu
+                    ));
+                }
+            }
+
+            Ok(())
+        })();
+
+        // Step 8: Cleanup - destroy cpusets in reverse order
+        for id in created.into_iter().rev() {
+            if let Err(e) = cpuset::cpuset_destroy(id) {
+                return TestResult::Fail(alloc::format!(
+                    "Failed to destroy cpuset {:?}: {:?}",
+                    id, e
+                ));
+            }
+        }
+
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(msg) => TestResult::Fail(msg),
         }
     }
 }
@@ -1259,7 +1508,7 @@ impl RuntimeTest for SchedulerAffinityTest {
 
 /// Run all runtime tests and return a report
 pub fn run_all_runtime_tests() -> TestReport {
-    let tests: [&dyn RuntimeTest; 15] = [
+    let tests: [&dyn RuntimeTest; 16] = [
         &HeapAllocationTest,
         &BuddyAllocatorTest,
         &CapTableLifecycleTest,
@@ -1271,6 +1520,7 @@ pub fn run_all_runtime_tests() -> TestReport {
         &SmpOnlineTest,
         &IpiPingPongTest,
         &TlbShootdownCoherencyTest,
+        &CpusetIsolationTest,
         &SchedulerAffinityTest,
         &SchedulerStarvationTest,
         &ProcessCreationTest,
@@ -1329,7 +1579,7 @@ pub fn run_all_runtime_tests() -> TestReport {
 
 /// Run a single test by name
 pub fn run_test(name: &str) -> Option<TestOutcome> {
-    let tests: [&dyn RuntimeTest; 15] = [
+    let tests: [&dyn RuntimeTest; 16] = [
         &HeapAllocationTest,
         &BuddyAllocatorTest,
         &CapTableLifecycleTest,
@@ -1341,6 +1591,7 @@ pub fn run_test(name: &str) -> Option<TestOutcome> {
         &SmpOnlineTest,
         &IpiPingPongTest,
         &TlbShootdownCoherencyTest,
+        &CpusetIsolationTest,
         &SchedulerAffinityTest,
         &SchedulerStarvationTest,
         &ProcessCreationTest,

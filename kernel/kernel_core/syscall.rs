@@ -4309,8 +4309,11 @@ fn sys_mmap(
     }
 
     // 文件映射暂不支持
+    // R72-ENOSYS FIX: Return EOPNOTSUPP instead of ENOSYS. The syscall IS
+    // implemented (for anonymous mappings), but file-backed mappings are not
+    // yet supported.
     if fd >= 0 {
-        return Err(SyscallError::ENOSYS);
+        return Err(SyscallError::EOPNOTSUPP);
     }
 
     // R29-3 FIX: Call LSM hook for anonymous mmap operations
@@ -5854,7 +5857,10 @@ fn sys_fstatat(dirfd: i32, path: *const u8, statbuf: *mut VfsStat, _flags: i32) 
 
     if dirfd != AT_FDCWD && first_byte != b'/' {
         // 相对路径 + 非AT_FDCWD: 暂不支持
-        return Err(SyscallError::ENOSYS);
+        // R72-ENOSYS FIX: Return EOPNOTSUPP (operation not supported) instead of
+        // ENOSYS. The syscall exists but relative path resolution from dirfd is
+        // not yet implemented.
+        return Err(SyscallError::EOPNOTSUPP);
     }
 
     sys_stat(path, statbuf)
@@ -5871,7 +5877,10 @@ fn sys_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -> SyscallResu
     let first_byte = unsafe { *path };
 
     if dirfd != AT_FDCWD && first_byte != b'/' {
-        return Err(SyscallError::ENOSYS);
+        // R72-ENOSYS FIX: Return EOPNOTSUPP (operation not supported) instead of
+        // ENOSYS. The syscall exists but relative path resolution from dirfd is
+        // not yet implemented.
+        return Err(SyscallError::EOPNOTSUPP);
     }
 
     sys_open(path, flags, mode)
@@ -5953,12 +5962,16 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
             }
             drop(proc_guard);
 
-            // Since we don't have full fd_path tracking yet, return ENOSYS for
+            // Since we don't have full fd_path tracking yet, return EOPNOTSUPP for
             // non-AT_FDCWD dirfd with relative paths. This is safer than incorrectly
             // resolving paths, as it prevents potential sandbox escapes.
             //
+            // R72-ENOSYS FIX: Return EOPNOTSUPP (operation not supported) instead of
+            // ENOSYS. The syscall exists but relative path resolution from dirfd is
+            // not yet implemented.
+            //
             // TODO: Implement full fd_paths tracking for complete openat2 support
-            return Err(SyscallError::ENOSYS);
+            return Err(SyscallError::EOPNOTSUPP);
         };
     };
 
@@ -5966,11 +5979,14 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     // These flags should confine path resolution to the anchor directory.
     // Without proper dirfd tracking, we cannot fully enforce these flags for
     // non-AT_FDCWD dirfd, so we reject such combinations.
+    //
+    // R72-ENOSYS FIX: Return EINVAL instead of ENOSYS. The syscall exists but
+    // this specific flag combination is invalid for our current implementation.
     let resolve = how_local.resolve;
     if dirfd != AT_FDCWD && (resolve & 0x08 != 0 || resolve & 0x10 != 0) {
         // RESOLVE_BENEATH (0x08) or RESOLVE_IN_ROOT (0x10) with non-AT_FDCWD dirfd
         // Cannot properly enforce without fd_path tracking
-        return Err(SyscallError::ENOSYS);
+        return Err(SyscallError::EINVAL);
     }
 
     // Validate flags: reject unknown flags
@@ -6159,16 +6175,24 @@ fn sys_ftruncate(fd: i32, length: i64) -> SyscallResult {
 /// sys_chmod - 修改文件权限
 ///
 /// 当前VFS不支持chmod操作。
+///
+/// # R72-ENOSYS FIX
+/// Returns EOPNOTSUPP instead of ENOSYS since the syscall IS implemented,
+/// but the operation is not supported by the current VFS backend.
 fn sys_chmod(_path: *const u8, _mode: u32) -> SyscallResult {
     // VFS trait未提供chmod方法
-    Err(SyscallError::ENOSYS)
+    Err(SyscallError::EOPNOTSUPP)
 }
 
 /// sys_fchmod - 修改文件权限(通过fd)
 ///
 /// 当前VFS不支持chmod操作。
+///
+/// # R72-ENOSYS FIX
+/// Returns EOPNOTSUPP instead of ENOSYS since the syscall IS implemented,
+/// but the operation is not supported by the current VFS backend.
 fn sys_fchmod(_fd: i32, _mode: u32) -> SyscallResult {
-    Err(SyscallError::ENOSYS)
+    Err(SyscallError::EOPNOTSUPP)
 }
 
 /// sys_umask - 设置文件创建掩码

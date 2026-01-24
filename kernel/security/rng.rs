@@ -201,6 +201,43 @@ fn fill_entropy(buf: &mut [u8]) -> Result<(), RngError> {
     Ok(())
 }
 
+// ============================================================================
+// Early Boot Entropy (Pre-CSPRNG)
+// ============================================================================
+
+/// Early RDRAND access for pre-CSPRNG initialization.
+///
+/// This function provides raw hardware entropy without relying on the global
+/// ChaCha20 CSPRNG, enabling early boot code (e.g., heap randomization) to
+/// obtain randomness before `init_global()` is called.
+///
+/// # Use Cases
+///
+/// - Heap base randomization (Partial KASLR)
+/// - Per-CPU stack randomization
+/// - Early boot entropy seeding
+///
+/// # Security Note
+///
+/// This function directly uses RDRAND without additional mixing or whitening.
+/// For cryptographic purposes after boot, prefer `fill_random()` which uses
+/// the properly seeded ChaCha20 CSPRNG.
+///
+/// # Returns
+///
+/// `Ok(u64)` on success, `Err(RngError)` if RDRAND is unsupported or fails
+pub fn rdrand64_early() -> Result<u64, RngError> {
+    rdrand64()
+}
+
+/// Check if hardware RNG (RDRAND) is available for early boot use.
+///
+/// This is safe to call before CSPRNG initialization.
+#[inline]
+pub fn rdrand_available() -> bool {
+    rdrand_supported()
+}
+
 /// Execute RDRAND instruction to get 64-bit random value
 fn rdrand64() -> Result<u64, RngError> {
     if !rdrand_supported() {
@@ -264,41 +301,42 @@ fn rdseed64() -> Result<u64, RngError> {
 }
 
 /// Check if RDRAND is supported via CPUID
+///
+/// R72-4 FIX: Remove nostack and nomem since push/pop uses stack memory.
 fn rdrand_supported() -> bool {
     // CPUID.01H:ECX.RDRAND[bit 30]
     let ecx: u32;
     unsafe {
         core::arch::asm!(
             "push rbx",
-            "mov eax, 1",
             "cpuid",
             "pop rbx",
-            out("ecx") ecx,
-            out("eax") _,
-            out("edx") _,
-            options(nomem, nostack)
+            inout("eax") 1u32 => _,
+            lateout("ecx") ecx,
+            lateout("edx") _,
+            // No options - push/pop uses both stack and memory
         );
     }
     (ecx & (1 << 30)) != 0
 }
 
 /// Check if RDSEED is supported via CPUID
+///
+/// R72-4 FIX: Remove nostack and nomem since push/pop uses stack memory.
 fn rdseed_supported() -> bool {
     // CPUID.07H:EBX.RDSEED[bit 18]
     let ebx: u32;
     unsafe {
         core::arch::asm!(
             "push rbx",
-            "mov eax, 7",
-            "xor ecx, ecx",
             "cpuid",
             "mov {0:e}, ebx",
             "pop rbx",
             out(reg) ebx,
-            out("eax") _,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem, nostack)
+            inout("eax") 7u32 => _,
+            inout("ecx") 0u32 => _,
+            lateout("edx") _,
+            // No options - push/pop uses both stack and memory
         );
     }
     (ebx & (1 << 18)) != 0
