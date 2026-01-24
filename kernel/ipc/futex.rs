@@ -510,10 +510,80 @@ pub fn futex_unlock_pi(tgid: ProcessId, uaddr: usize) -> Result<usize, FutexErro
 /// R37-2 FIX (Codex review): Accept TGID directly from caller to avoid deadlock.
 /// The caller (free_process_resources) already holds the process lock, so we must
 /// not try to lock the process again.
+///
+/// # R72-1 FIX: Waiter Cleanup
+///
+/// Previously, this function only handled the exiting thread when it was the futex
+/// owner. If the thread was a waiter (in pi_waiters and/or WaitQueue), its entry
+/// was left behind. This is dangerous because:
+///
+/// 1. The PID may be reused by a new process
+/// 2. When the owner unlocks, `select_highest_waiter()` may return the stale PID
+/// 3. `wake_specific()` would try to wake the new (unrelated) process
+/// 4. The real waiters would never be woken, causing deadlock
+///
+/// Now we clean up waiter entries first, before handling owner cleanup.
 pub fn cleanup_process_futexes(pid: ProcessId, tgid: ProcessId) {
     // R37-2 FIX (Codex review): Use TGID provided by caller, not from process lock.
     // Check thread group size without locking the current process.
     let group_size = process::thread_group_size(tgid);
+
+    // R72-1 FIX: Clean up this PID from ALL waiter lists (even if not owner).
+    // This prevents stale PID references from poisoning futex state after PID reuse.
+    {
+        let table = FUTEX_TABLE.lock();
+        let buckets: alloc::vec::Vec<(FutexKey, Arc<Mutex<FutexBucket>>)> = table
+            .iter()
+            .filter(|(k, _)| k.0 == tgid)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        drop(table);
+
+        for (key, bucket) in buckets {
+            let mut needs_pi_recompute = false;
+            let (queue, removed_from_pi) = {
+                let mut b = bucket.lock();
+
+                // Skip if this PID is the owner (handled in next phase)
+                if b.owner == Some(pid) {
+                    continue;
+                }
+
+                // Remove from pi_waiters if present
+                let removed_from_pi = b.pi_waiters.remove(&pid).is_some();
+
+                if removed_from_pi {
+                    needs_pi_recompute = true;
+                }
+
+                (b.queue.clone(), removed_from_pi)
+            };
+
+            // Remove from WaitQueue (this handles non-PI waiters too)
+            // wake_specific returns true if the PID was found and removed
+            let was_in_queue = queue.wake_specific(pid);
+
+            // R72-1 FIX (Codex review): Only decrement waiter_count once.
+            // A process waiting on a PI futex is counted once in waiter_count,
+            // even though it appears in both pi_waiters and WaitQueue.
+            // Decrement only if we found it in either location.
+            if removed_from_pi || was_in_queue {
+                let mut b = bucket.lock();
+                if b.waiter_count > 0 {
+                    b.waiter_count -= 1;
+                }
+            }
+
+            // Recompute PI state if we removed a PI waiter
+            // This ensures the owner's priority boost is correctly updated
+            if needs_pi_recompute {
+                recompute_pi_state(key, &bucket);
+            }
+
+            // Try to clean up empty bucket
+            cleanup_empty_bucket(key, &bucket);
+        }
+    }
 
     // E.4 PI: 先标记由退出线程持有的 futex（robust 语义）
     {
@@ -652,50 +722,88 @@ fn highest_waiter_priority(bucket: &FutexBucket) -> Option<Priority> {
     bucket.pi_waiters.values().min().copied()
 }
 
+/// E.4 PI: Maximum PI chain propagation depth
+///
+/// Limits the depth of PI chain traversal to prevent stack overflow from
+/// maliciously constructed long wait chains. 64 is a reasonable limit -
+/// real-world systems rarely have chains deeper than 5-10 levels.
+const MAX_PI_CHAIN_DEPTH: usize = 64;
+
 /// E.4 PI: 将优先级捐赠应用于 owner 并沿等待链路传播（A -> B -> C）
 ///
 /// 支持链式优先级继承：如果 owner 也在等待其他 futex，则继续向上传播
+///
+/// # R72-2 FIX: Iterative Implementation
+///
+/// This function now uses an iterative approach with a work stack instead of
+/// recursive calls to prevent stack overflow when traversing long PI chains.
+/// A malicious user could construct a chain of N processes where each waits
+/// on the next's futex (A → B → C → ... → N). With recursive propagation,
+/// unlock_pi() would cause O(N) stack frames, overflowing the 16KB kernel
+/// stack for N > ~100. The iterative version uses O(1) stack space.
+///
+/// Additionally, a depth limit of MAX_PI_CHAIN_DEPTH prevents unbounded
+/// traversal even with a Vec work stack, limiting worst-case to O(MAX_PI_CHAIN_DEPTH).
 fn apply_pi_and_propagate(
     key: FutexKey,
     owner: ProcessId,
     donated: Option<Priority>,
     visited: &mut BTreeSet<FutexKey>,
 ) {
-    if let Some(proc) = process::get_process(owner) {
-        let (changed, next_wait, effective_prio) = {
-            let mut p = proc.lock();
-            let changed = match donated {
-                Some(prio) => p.apply_pi_boost(key, prio),
-                None => p.clear_pi_boost(&key),
-            };
-            let next = p.get_waiting_on_futex();
-            let eff = p.dynamic_priority;
-            (changed, next, eff)
-        };
+    // R72-2 FIX: Use work stack instead of recursion
+    // Stack entry: (futex_key, owner_pid, donated_priority)
+    let mut work_stack: alloc::vec::Vec<(FutexKey, ProcessId, Option<Priority>)> =
+        alloc::vec::Vec::with_capacity(8);
+    work_stack.push((key, owner, donated));
 
-        if changed {
-            // 通知调度器重新评估优先级
-            request_resched_from_irq();
+    let mut depth = 0;
+
+    while let Some((cur_key, cur_owner, donation)) = work_stack.pop() {
+        // R72-2 FIX: Depth limit to prevent unbounded traversal
+        depth += 1;
+        if depth > MAX_PI_CHAIN_DEPTH {
+            // Log warning but don't panic - gracefully stop propagation
+            #[cfg(debug_assertions)]
+            drivers::println!(
+                "[FUTEX] PI chain depth exceeded {} at key {:?}, truncating",
+                MAX_PI_CHAIN_DEPTH,
+                cur_key
+            );
+            break;
         }
 
-        // 链式传播（如果 owner 也在等待其他 futex）
-        if let Some(next_key) = next_wait {
-            if visited.insert(next_key) {
-                propagate_pi(next_key, effective_prio, visited);
+        if let Some(proc) = process::get_process(cur_owner) {
+            let (changed, next_wait, effective_prio) = {
+                let mut p = proc.lock();
+                let changed = match donation {
+                    Some(prio) => p.apply_pi_boost(cur_key, prio),
+                    None => p.clear_pi_boost(&cur_key),
+                };
+                let next = p.get_waiting_on_futex();
+                let eff = p.dynamic_priority;
+                (changed, next, eff)
+            };
+
+            if changed {
+                // 通知调度器重新评估优先级
+                request_resched_from_irq();
+            }
+
+            // 链式传播（如果 owner 也在等待其他 futex）
+            if let Some(next_key) = next_wait {
+                if visited.insert(next_key) {
+                    // Look up next owner and push to work stack
+                    let next_owner = {
+                        let table = FUTEX_TABLE.lock();
+                        table.get(&next_key).and_then(|b| b.lock().owner)
+                    };
+
+                    if let Some(next_owner_pid) = next_owner {
+                        work_stack.push((next_key, next_owner_pid, Some(effective_prio)));
+                    }
+                }
             }
         }
-    }
-}
-
-/// E.4 PI: 从等待链路继续向上传播 PI
-fn propagate_pi(key: FutexKey, donation: Priority, visited: &mut BTreeSet<FutexKey>) {
-    let owner = {
-        let table = FUTEX_TABLE.lock();
-        table.get(&key).and_then(|b| b.lock().owner)
-    };
-
-    if let Some(owner_pid) = owner {
-        apply_pi_and_propagate(key, owner_pid, Some(donation), visited);
     }
 }
 

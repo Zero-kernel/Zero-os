@@ -99,6 +99,19 @@ static KPTI_ENABLED: AtomicBool = AtomicBool::new(false);
 static PCID_ENABLED: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
+// Partial KASLR Feature Flags
+// ============================================================================
+
+/// Whether heap base randomization is active
+static PARTIAL_KASLR_HEAP: AtomicBool = AtomicBool::new(false);
+
+/// Whether kernel stack randomization is active
+static PARTIAL_KASLR_KERNEL_STACKS: AtomicBool = AtomicBool::new(false);
+
+/// Whether userspace ASLR is active
+static PARTIAL_KASLR_USERSPACE: AtomicBool = AtomicBool::new(false);
+
+// ============================================================================
 // PCID Allocation Constants
 // ============================================================================
 
@@ -136,6 +149,54 @@ const KASLR_SLIDE_GRANULARITY: u64 = 2 * 1024 * 1024;
 
 /// Global kernel layout (updated during init)
 static KERNEL_LAYOUT: Mutex<KernelLayout> = Mutex::new(KernelLayout::fixed());
+
+// ============================================================================
+// Partial KASLR Status
+// ============================================================================
+
+/// Partial KASLR feature status.
+///
+/// When full text KASLR is unavailable (kernel compiled with `-C relocation-model=static`),
+/// Partial KASLR provides defense-in-depth by randomizing other kernel regions.
+#[derive(Debug, Clone, Copy)]
+pub struct PartialKaslrStatus {
+    /// Heap base randomization via early RDRAND entropy
+    pub heap_base: bool,
+    /// Per-CPU/IRQ kernel stack randomization
+    pub kernel_stacks: bool,
+    /// Userspace ASLR (mmap, stack, brk randomization)
+    pub userspace_aslr: bool,
+}
+
+impl PartialKaslrStatus {
+    /// Check if any partial KASLR feature is active.
+    #[inline]
+    pub fn enabled(&self) -> bool {
+        self.heap_base || self.kernel_stacks || self.userspace_aslr
+    }
+
+    /// Get a summary string for logging.
+    pub fn summary(&self) -> &'static str {
+        if self.heap_base && self.kernel_stacks && self.userspace_aslr {
+            "all features enabled"
+        } else if self.enabled() {
+            "partially enabled"
+        } else {
+            "disabled"
+        }
+    }
+}
+
+/// Partial KASLR feature identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialKaslrFeature {
+    /// Heap base address randomization
+    HeapBase,
+    /// Kernel stack address randomization
+    KernelStacks,
+    /// Userspace ASLR (mmap, stack, brk)
+    UserspaceAslr,
+}
 
 // ============================================================================
 // Kernel Layout
@@ -219,8 +280,9 @@ impl Default for KernelLayout {
 impl KernelLayout {
     /// Create a kernel layout with fixed (non-randomized) addresses
     ///
-    /// This is the current configuration. KASLR support will add
-    /// a constructor that accepts a slide value.
+    /// This is used for static initialization. The actual layout is populated
+    /// at runtime by `build_kernel_layout_from_linker()` which uses the real
+    /// heap address (potentially randomized via Partial KASLR).
     pub const fn fixed() -> Self {
         Self {
             virt_base: KERNEL_VIRT_BASE,
@@ -236,8 +298,9 @@ impl KernelLayout {
             data_size: 0,
             bss_start: 0,
             bss_size: 0,
-            // Fixed heap address (matches mm::memory.rs)
-            heap_start: 0xffffffff80200000,
+            // Fixed heap address (placeholder - actual value set at runtime via mm::memory)
+            // This matches mm::memory::HEAP_DEFAULT_BASE
+            heap_start: 0xffffffff80400000,
             heap_size: 1 * 1024 * 1024, // 1 MiB
             phys_offset: PHYSICAL_MEMORY_OFFSET,
         }
@@ -254,6 +317,11 @@ impl KernelLayout {
     ///
     /// phys_base is now also adjusted by the slide value to match
     /// the actual kernel load address.
+    ///
+    /// # Note
+    ///
+    /// This is a const fn using placeholder values. Runtime heap address
+    /// (potentially randomized) is obtained from mm::memory at init time.
     #[allow(dead_code)]
     pub const fn with_slide(slide: u64) -> Self {
         Self {
@@ -268,7 +336,8 @@ impl KernelLayout {
             data_size: 0,
             bss_start: 0,
             bss_size: 0,
-            heap_start: 0xffffffff80200000 + slide,
+            // Placeholder - actual heap address set at runtime via mm::memory
+            heap_start: 0xffffffff80400000 + slide,
             heap_size: 1 * 1024 * 1024,
             phys_offset: PHYSICAL_MEMORY_OFFSET,
         }
@@ -353,6 +422,10 @@ fn build_kernel_layout_from_linker() -> KernelLayout {
     // If bootloader relocates kernel, this will show the offset
     let runtime_slide = kernel_start_addr.saturating_sub(KERNEL_VIRT_BASE + KERNEL_ENTRY_OFFSET);
 
+    // Partial KASLR: Use actual heap address from mm::memory (may be randomized)
+    let heap_start = mm::memory::heap_base() as u64;
+    let heap_size = mm::memory::heap_size() as u64;
+
     KernelLayout {
         virt_base: KERNEL_VIRT_BASE + runtime_slide,
         phys_base: KERNEL_PHYS_BASE + runtime_slide, // R39-7 FIX: Include slide in physical base
@@ -365,8 +438,8 @@ fn build_kernel_layout_from_linker() -> KernelLayout {
         data_size: data_end_addr.saturating_sub(data_start_addr),
         bss_start: bss_start_addr,
         bss_size: bss_end_addr.saturating_sub(bss_start_addr),
-        heap_start: KERNEL_VIRT_BASE + 0x200000 + runtime_slide,
-        heap_size: 1 * 1024 * 1024, // 1 MiB
+        heap_start,
+        heap_size,
         phys_offset: PHYSICAL_MEMORY_OFFSET,
     }
 }
@@ -621,6 +694,42 @@ pub fn is_kpti_enabled() -> bool {
     KPTI_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Check if any partial KASLR feature is enabled.
+///
+/// Partial KASLR provides defense-in-depth when full text KASLR is unavailable.
+#[inline]
+pub fn is_partial_kaslr_enabled() -> bool {
+    partial_kaslr_status().enabled()
+}
+
+/// Get the current partial KASLR feature status.
+pub fn partial_kaslr_status() -> PartialKaslrStatus {
+    PartialKaslrStatus {
+        heap_base: PARTIAL_KASLR_HEAP.load(Ordering::Relaxed),
+        kernel_stacks: PARTIAL_KASLR_KERNEL_STACKS.load(Ordering::Relaxed),
+        userspace_aslr: PARTIAL_KASLR_USERSPACE.load(Ordering::Relaxed),
+    }
+}
+
+/// Enable a partial KASLR feature.
+///
+/// # Arguments
+///
+/// * `feature` - The feature to enable
+pub fn enable_partial_kaslr(feature: PartialKaslrFeature) {
+    match feature {
+        PartialKaslrFeature::HeapBase => {
+            PARTIAL_KASLR_HEAP.store(true, Ordering::SeqCst)
+        }
+        PartialKaslrFeature::KernelStacks => {
+            PARTIAL_KASLR_KERNEL_STACKS.store(true, Ordering::SeqCst)
+        }
+        PartialKaslrFeature::UserspaceAslr => {
+            PARTIAL_KASLR_USERSPACE.store(true, Ordering::SeqCst)
+        }
+    }
+}
+
 /// Get the current kernel layout
 ///
 /// Returns the global kernel layout, which may include a KASLR slide
@@ -662,6 +771,8 @@ pub fn enable_kpti() {
 /// - ecx[17] = PCID support
 /// - ecx[30] = RDRAND support
 /// - edx[13] = PGE (Global Pages) support
+///
+/// R72-4 FIX: Remove nostack and nomem since push/pop uses stack memory.
 fn cpuid_leaf1() -> (u32, u32, u32, u32) {
     let eax: u32;
     let ebx: u32;
@@ -671,15 +782,14 @@ fn cpuid_leaf1() -> (u32, u32, u32, u32) {
     unsafe {
         core::arch::asm!(
             "push rbx",
-            "mov eax, 1",
             "cpuid",
             "mov {ebx_out:e}, ebx",
             "pop rbx",
-            out("eax") eax,
+            inout("eax") 1u32 => eax,
             ebx_out = out(reg) ebx,
-            out("ecx") ecx,
-            out("edx") edx,
-            options(nomem, nostack)
+            lateout("ecx") ecx,
+            lateout("edx") edx,
+            // No options - push/pop uses both stack and memory
         );
     }
 
@@ -988,6 +1098,14 @@ pub fn init(boot_slide: Option<u64>) {
 
     set_kernel_layout(layout);
 
+    // Step 3: Track Partial KASLR features
+    // Heap randomization status is determined during mm::memory::init() (before this runs)
+    if mm::memory::heap_randomized() {
+        enable_partial_kaslr(PartialKaslrFeature::HeapBase);
+    }
+
+    let partial = partial_kaslr_status();
+
     // Report status
     println!(
         "  PCID: {}",
@@ -1006,6 +1124,19 @@ pub fn init(boot_slide: Option<u64>) {
         },
         layout.kaslr_slide
     );
+    // Report Partial KASLR status
+    println!(
+        "  Partial KASLR: heap={}, kstack={}, user={}",
+        if partial.heap_base { "yes" } else { "no" },
+        if partial.kernel_stacks { "yes" } else { "no" },
+        if partial.userspace_aslr { "yes" } else { "no" }
+    );
+    if partial.heap_base {
+        println!(
+            "    Heap base: 0x{:x} (randomized)",
+            mm::memory::heap_base()
+        );
+    }
     println!(
         "  Kernel sections: text={:#x}..{:#x} ({} bytes)",
         layout.text_start,

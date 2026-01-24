@@ -192,3 +192,144 @@ pub unsafe fn stac() {
 pub unsafe fn clac() {
     core::arch::asm!("clac", options(nostack, nomem));
 }
+
+// ============================================================================
+// Hypervisor Detection
+// ============================================================================
+
+/// Hypervisor type detected via CPUID
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HypervisorType {
+    /// No hypervisor detected (bare metal)
+    None,
+    /// QEMU TCG (software CPU emulation)
+    QemuTcg,
+    /// KVM (hardware-assisted virtualization)
+    Kvm,
+    /// VMware
+    VMware,
+    /// Microsoft Hyper-V
+    HyperV,
+    /// Xen
+    Xen,
+    /// Unknown hypervisor
+    Unknown,
+}
+
+/// Check if running under a hypervisor using CPUID leaf 0x1
+///
+/// CPUID.01H:ECX[31] is the hypervisor present bit.
+/// When set, the CPU is running in a virtualized environment.
+///
+/// R72-4 FIX: Remove nomem since push/pop uses stack memory.
+#[inline]
+pub fn hypervisor_present() -> bool {
+    let ecx: u32;
+    unsafe {
+        // rbx is reserved by LLVM, so we save/restore it
+        // Cannot use `nostack` or `nomem` with push/pop (uses stack memory)
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 1u32 => _,
+            lateout("ecx") ecx,
+            lateout("edx") _,
+            // No options - push/pop uses both stack and memory
+        );
+    }
+    // Bit 31 = Hypervisor present
+    (ecx & (1 << 31)) != 0
+}
+
+/// Detect hypervisor type using CPUID leaf 0x40000000
+///
+/// Returns the hypervisor vendor signature and type.
+/// Common signatures:
+/// - "TCGTCGTCGTCG" = QEMU TCG
+/// - "KVMKVMKVM\0\0\0" = KVM
+/// - "VMwareVMware" = VMware
+/// - "Microsoft Hv" = Hyper-V
+/// - "XenVMMXenVMM" = Xen
+///
+/// R72-4 FIX: Remove nomem since push/pop uses stack memory.
+pub fn detect_hypervisor() -> HypervisorType {
+    if !hypervisor_present() {
+        return HypervisorType::None;
+    }
+
+    // CPUID leaf 0x40000000 returns hypervisor signature
+    let ebx: u32;
+    let ecx: u32;
+    let edx: u32;
+    unsafe {
+        // rbx is reserved by LLVM, so we save/restore it
+        // Cannot use `nostack` or `nomem` with push/pop (uses stack memory)
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "mov {ebx_out:e}, ebx",
+            "pop rbx",
+            ebx_out = out(reg) ebx,
+            inout("eax") 0x40000000u32 => _,
+            lateout("ecx") ecx,
+            lateout("edx") edx,
+            // No options - push/pop uses both stack and memory
+        );
+    }
+
+    // Signature is stored in EBX:ECX:EDX (12 bytes)
+    let sig = [
+        (ebx & 0xFF) as u8,
+        ((ebx >> 8) & 0xFF) as u8,
+        ((ebx >> 16) & 0xFF) as u8,
+        ((ebx >> 24) & 0xFF) as u8,
+        (ecx & 0xFF) as u8,
+        ((ecx >> 8) & 0xFF) as u8,
+        ((ecx >> 16) & 0xFF) as u8,
+        ((ecx >> 24) & 0xFF) as u8,
+        (edx & 0xFF) as u8,
+        ((edx >> 8) & 0xFF) as u8,
+        ((edx >> 16) & 0xFF) as u8,
+        ((edx >> 24) & 0xFF) as u8,
+    ];
+
+    // Match known hypervisor signatures
+    // QEMU TCG: "TCGTCGTCGTCG"
+    if sig.starts_with(b"TCGTCGTCG") {
+        return HypervisorType::QemuTcg;
+    }
+    // KVM: "KVMKVMKVM"
+    if sig.starts_with(b"KVMKVMKVM") {
+        return HypervisorType::Kvm;
+    }
+    // VMware: "VMwareVMware"
+    if sig.starts_with(b"VMwareVMwa") {
+        return HypervisorType::VMware;
+    }
+    // Hyper-V: "Microsoft Hv"
+    if sig.starts_with(b"Microsoft ") {
+        return HypervisorType::HyperV;
+    }
+    // Xen: "XenVMMXenVMM"
+    if sig.starts_with(b"XenVMMXenV") {
+        return HypervisorType::Xen;
+    }
+
+    HypervisorType::Unknown
+}
+
+/// Check if running in software emulation (QEMU TCG)
+///
+/// Returns true if QEMU TCG is detected, which has significantly
+/// higher IPI and interrupt latency compared to hardware or KVM.
+#[inline]
+pub fn is_software_emulated() -> bool {
+    matches!(detect_hypervisor(), HypervisorType::QemuTcg)
+}
+
+/// Check if running in any virtualized environment
+#[inline]
+pub fn is_virtualized() -> bool {
+    hypervisor_present()
+}

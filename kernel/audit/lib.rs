@@ -1118,6 +1118,38 @@ pub type HmacKeyAuthorizer = fn() -> Result<(), AuditError>;
 /// ```
 pub type FlushHook = fn();
 
+/// R72-PERSIST: Callback type for persistence hook.
+///
+/// This function is called by `snapshot()` after draining the audit ring
+/// buffer to allow persisting the drained events to durable storage (e.g.,
+/// writing to ext2 via the VFS). Errors are treated as best-effort; the
+/// snapshot still returns the drained events so callers can retry or forward
+/// them elsewhere.
+///
+/// # Arguments
+///
+/// * `events` - Slice of drained audit events to persist
+///
+/// # Returns
+///
+/// * `Ok(())` - Events successfully persisted
+/// * `Err(...)` - Persistence failed (events still returned to caller)
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// fn persist_audit_events(events: &[AuditEvent]) -> Result<(), AuditError> {
+///     for event in events {
+///         let record = serialize_event(event);
+///         vfs::append("/var/log/audit.log", &record)?;
+///     }
+///     Ok(())
+/// }
+///
+/// audit::register_persistence_hook(persist_audit_events);
+/// ```
+pub type PersistenceHook = fn(&[AuditEvent]) -> Result<(), AuditError>;
+
 /// Optional capability gate for audit snapshots (set once at boot).
 ///
 /// When set, `snapshot()` calls this function to verify the caller
@@ -1130,6 +1162,13 @@ static SNAPSHOT_AUTHORIZER: Mutex<Option<SnapshotAuthorizer>> = Mutex::new(None)
 /// When set, `snapshot()` calls this function before draining events,
 /// allowing other subsystems to flush pending audit data.
 static FLUSH_HOOK: Mutex<Option<FlushHook>> = Mutex::new(None);
+
+/// R72-PERSIST: Optional persistence hook executed after draining the audit ring.
+///
+/// When set, drained events are forwarded to this hook so they can be written
+/// to persistent storage. Failures are best-effort and do not drop the events
+/// returned by `snapshot()`.
+static PERSISTENCE_HOOK: Mutex<Option<PersistenceHook>> = Mutex::new(None);
 
 /// R66-10 FIX: Optional capability gate for audit HMAC key configuration.
 ///
@@ -1235,6 +1274,54 @@ fn run_flush_hook() {
 
     if let Some(func) = hook {
         func();
+    }
+}
+
+/// R72-PERSIST: Register a persistence hook to be called after snapshot drains the ring buffer.
+///
+/// The persistence hook can store drained audit events to durable media (e.g., ext2 file).
+/// Failures are treated as best-effort; the snapshot still returns the events
+/// to the caller so they can be retried or forwarded elsewhere.
+///
+/// # Arguments
+///
+/// * `hook` - Function to call with drained events
+///
+/// # Example
+///
+/// ```rust,ignore
+/// fn persist_to_disk(events: &[AuditEvent]) -> Result<(), AuditError> {
+///     let fd = vfs::open("/var/log/audit.log", O_APPEND)?;
+///     for event in events {
+///         vfs::write(fd, &serialize_event(event))?;
+///     }
+///     vfs::close(fd);
+///     Ok(())
+/// }
+///
+/// audit::register_persistence_hook(persist_to_disk);
+/// ```
+pub fn register_persistence_hook(hook: PersistenceHook) {
+    interrupts::without_interrupts(|| {
+        let mut guard = PERSISTENCE_HOOK.lock();
+        *guard = Some(hook);
+    });
+}
+
+/// R72-PERSIST: Invoke the registered persistence hook if present.
+///
+/// Called by `snapshot()` after draining the ring buffer. Errors are returned
+/// so callers can log and retry without dropping the drained events (they are
+/// still returned by `snapshot()`).
+fn run_persistence_hook(events: &[AuditEvent]) -> Result<(), AuditError> {
+    let hook = interrupts::without_interrupts(|| {
+        let guard = PERSISTENCE_HOOK.lock();
+        *guard
+    });
+
+    match hook {
+        Some(func) => func(events),
+        None => Ok(()),
     }
 }
 
@@ -1698,7 +1785,8 @@ pub fn snapshot() -> Result<AuditSnapshot, AuditError> {
     // any pending audit events before we drain the ring buffer
     run_flush_hook();
 
-    interrupts::without_interrupts(|| {
+    // Drain events from the ring buffer
+    let snapshot = interrupts::without_interrupts(|| {
         let mut ring = AUDIT_RING.lock();
         if let Some(ref mut r) = *ring {
             let dropped = r.dropped;
@@ -1712,7 +1800,17 @@ pub fn snapshot() -> Result<AuditSnapshot, AuditError> {
         } else {
             Err(AuditError::Uninitialized)
         }
-    })
+    })?;
+
+    // R72-PERSIST: Invoke persistence hook (best-effort, don't lose events on failure)
+    if let Err(err) = run_persistence_hook(&snapshot.events) {
+        println!(
+            "  audit: persistence hook failed: {:?} (events returned to caller)",
+            err
+        );
+    }
+
+    Ok(snapshot)
 }
 
 /// Get audit statistics without draining events

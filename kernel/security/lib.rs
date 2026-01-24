@@ -46,14 +46,15 @@ use x86_64::VirtAddr;
 
 // Re-export public types
 pub use kaslr::{
-    get_kernel_layout, init as init_kaslr, is_kaslr_enabled, is_kpti_enabled, KernelLayout,
-    KptiContext, TrampolineDesc, KERNEL_PHYS_BASE, KERNEL_VIRT_BASE,
+    enable_partial_kaslr, get_kernel_layout, init as init_kaslr, is_kaslr_enabled,
+    is_kpti_enabled, is_partial_kaslr_enabled, partial_kaslr_status, KernelLayout, KptiContext,
+    PartialKaslrFeature, PartialKaslrStatus, TrampolineDesc, KERNEL_PHYS_BASE, KERNEL_VIRT_BASE,
 };
 pub use kptr::KptrGuard;
 pub use memory_hardening::{
     CleanupOutcome, HardeningError, IdentityCleanupStrategy, NxEnforcementSummary,
 };
-pub use rng::{fill_random, random_u32, random_u64, RngError};
+pub use rng::{fill_random, random_u32, random_u64, rdrand64_early, rdrand_available, RngError};
 pub use spectre::{MitigationStatus, SpectreError, VulnerabilityInfo};
 pub use tests::{run_security_tests, SecurityTest, TestContext, TestReport, TestResult};
 pub use wxorx::{PageLevel, ValidationSummary, Violation, WxorxError};

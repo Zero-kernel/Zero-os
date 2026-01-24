@@ -574,28 +574,25 @@ fn read_arch_capabilities() -> Option<u64> {
 }
 
 /// Execute CPUID leaf 7, subleaf 0.
+///
+/// R72-4 FIX: Remove nostack and nomem since push/pop uses stack memory.
 fn cpuid_7_0() -> (u32, u32, u32, u32) {
-    let mut eax: u32;
-    let mut ebx: u32;
-    let mut ecx: u32;
-    let mut edx: u32;
+    let eax: u32;
+    let ebx: u32;
+    let ecx: u32;
+    let edx: u32;
 
     unsafe {
         core::arch::asm!(
             "push rbx",
-            "mov eax, 7",
-            "mov ecx, 0",
             "cpuid",
-            "mov {0:e}, eax",
-            "mov {1:e}, ebx",
-            "mov {2:e}, ecx",
-            "mov {3:e}, edx",
+            "mov {ebx_out:e}, ebx",
             "pop rbx",
-            out(reg) eax,
-            out(reg) ebx,
-            out(reg) ecx,
-            out(reg) edx,
-            options(nomem, nostack)
+            inout("eax") 7u32 => eax,
+            ebx_out = out(reg) ebx,
+            inout("ecx") 0u32 => ecx,
+            lateout("edx") edx,
+            // No options - push/pop uses both stack and memory
         );
     }
 

@@ -211,9 +211,20 @@ pub fn rcu_quiescent_state() {
 /// # Safety
 ///
 /// Caller must ensure no RCU read-side critical section is active on this CPU.
+///
+/// # R72-3 FIX: Memory Ordering
+///
+/// Uses `Ordering::Acquire` to synchronize with the `Ordering::SeqCst` increment
+/// in `synchronize_rcu()`. This ensures we never store a stale epoch value that
+/// would cause grace period detection to stall indefinitely. A CPU that stores
+/// an old epoch and then halts (e.g., during shutdown) would otherwise block
+/// all future grace periods since `all_cpus_quiescent()` would never see it
+/// reach the target epoch.
 #[inline]
 pub unsafe fn rcu_quiescent_state_force() {
-    let epoch = GLOBAL_EPOCH.load(Ordering::Relaxed);
+    // R72-3 FIX: Use Acquire ordering to pair with SeqCst increment in synchronize_rcu().
+    // This prevents storing a stale epoch that would stall grace periods.
+    let epoch = GLOBAL_EPOCH.load(Ordering::Acquire);
     current_cpu().rcu_epoch.store(epoch, Ordering::Release);
 }
 
