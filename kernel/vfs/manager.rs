@@ -19,9 +19,10 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use block::BlockDevice;
+use cap::NamespaceId;
 use kernel_core::{
-    current_egid, current_euid, current_supplementary_groups, current_umask, FileDescriptor,
-    FileOps, SyscallError, VfsStat,
+    current_egid, current_euid, current_mount_ns, current_supplementary_groups, current_umask,
+    FileDescriptor, FileOps, MountNamespace, SyscallError, VfsStat, ROOT_MNT_NAMESPACE,
 };
 use spin::RwLock;
 
@@ -158,6 +159,7 @@ fn strip_suid_sgid_if_needed(perm: u16, is_dir: bool) -> u16 {
 }
 
 /// Mount point information
+#[derive(Clone)]
 struct Mount {
     /// Absolute path where this filesystem is mounted
     path: String,
@@ -165,12 +167,53 @@ struct Mount {
     fs: Arc<dyn FileSystem>,
 }
 
+// ============================================================================
+// Namespace Mount Table
+// ============================================================================
+
+/// Mount table for a single namespace
+///
+/// Each namespace has its own mount table, allowing filesystem views
+/// to be isolated between namespaces.
+struct NamespaceMountTable {
+    /// Mount points within this namespace: path -> Mount
+    mounts: RwLock<BTreeMap<String, Mount>>,
+    /// Root filesystem for this namespace
+    root_fs: RwLock<Option<Arc<dyn FileSystem>>>,
+}
+
+impl NamespaceMountTable {
+    /// Create a new empty mount table.
+    fn new() -> Self {
+        Self {
+            mounts: RwLock::new(BTreeMap::new()),
+            root_fs: RwLock::new(None),
+        }
+    }
+
+    /// Clone mount table from a parent namespace (CLONE_NEWNS semantics).
+    ///
+    /// This creates a copy of all mount points, allowing the child namespace
+    /// to diverge from the parent without affecting it.
+    fn clone_from(parent: &NamespaceMountTable) -> Self {
+        let src = parent.mounts.read();
+        let mut mounts = BTreeMap::new();
+        for (k, v) in src.iter() {
+            mounts.insert(k.clone(), v.clone());
+        }
+        Self {
+            mounts: RwLock::new(mounts),
+            root_fs: RwLock::new(parent.root_fs.read().clone()),
+        }
+    }
+}
+
 /// Global VFS state
 pub struct Vfs {
-    /// Mount table: path -> filesystem
-    mounts: RwLock<BTreeMap<String, Mount>>,
-    /// Root filesystem
-    root_fs: RwLock<Option<Arc<dyn FileSystem>>>,
+    /// Namespace ID -> mount table mapping
+    ///
+    /// Each mount namespace has its own mount table for filesystem isolation.
+    mount_tables: RwLock<BTreeMap<NamespaceId, Arc<NamespaceMountTable>>>,
     /// Device filesystem handle for block device registration
     devfs: RwLock<Option<Arc<DevFs>>>,
 }
@@ -179,10 +222,63 @@ impl Vfs {
     /// Create a new VFS instance
     pub const fn new() -> Self {
         Self {
-            mounts: RwLock::new(BTreeMap::new()),
-            root_fs: RwLock::new(None),
+            mount_tables: RwLock::new(BTreeMap::new()),
             devfs: RwLock::new(None),
         }
+    }
+
+    /// Ensure a mount table exists for the given namespace.
+    ///
+    /// If the namespace doesn't have a table yet:
+    /// - For root namespace: create an empty table
+    /// - For child namespaces: clone from parent (CLONE_NEWNS semantics)
+    ///
+    /// # CLONE_NEWNS Semantics
+    ///
+    /// When a child namespace is created, its mount table is a copy of the parent's.
+    /// This ensures that:
+    /// 1. The child sees all mounts that existed in the parent at creation time
+    /// 2. Subsequent mounts in either namespace are independent
+    fn ensure_namespace_table(&self, ns: &Arc<MountNamespace>) -> Arc<NamespaceMountTable> {
+        // Fast path: table already exists
+        {
+            let guard = self.mount_tables.read();
+            if let Some(existing) = guard.get(&ns.id()).cloned() {
+                return existing;
+            }
+        }
+
+        // For child namespaces, ensure parent table exists first (recursive)
+        // This guarantees CLONE_NEWNS semantics: child always inherits from parent
+        if let Some(parent) = ns.parent() {
+            // Recursive call to ensure parent table is materialized
+            // This avoids the case where child gets empty table because parent wasn't created yet
+            let _ = self.ensure_namespace_table(&parent);
+        }
+
+        // Slow path: create table
+        let mut guard = self.mount_tables.write();
+
+        // Double-check after acquiring write lock
+        if let Some(existing) = guard.get(&ns.id()).cloned() {
+            return existing;
+        }
+
+        // Create new table
+        let table = if let Some(parent) = ns.parent() {
+            // Clone from parent - parent table is guaranteed to exist now
+            guard
+                .get(&parent.id())
+                .cloned()
+                .map(|p| Arc::new(NamespaceMountTable::clone_from(p.as_ref())))
+                .unwrap_or_else(|| Arc::new(NamespaceMountTable::new()))
+        } else {
+            // Root namespace: create empty table
+            Arc::new(NamespaceMountTable::new())
+        };
+
+        guard.insert(ns.id(), table.clone());
+        table
     }
 
     /// Initialize the VFS with default mounts
@@ -190,11 +286,15 @@ impl Vfs {
         // Create ramfs as root filesystem
         let ramfs = RamFs::new();
 
-        // Set ramfs as root
-        *self.root_fs.write() = Some(ramfs.clone());
+        // Get the root mount namespace and its table
+        let root_ns = ROOT_MNT_NAMESPACE.clone();
+        let root_table = self.ensure_namespace_table(&root_ns);
 
-        // Mount ramfs at / first
-        self.mount("/", ramfs.clone())
+        // Set ramfs as root in the root namespace's table
+        *root_table.root_fs.write() = Some(ramfs.clone());
+
+        // Mount ramfs at / first (in root namespace)
+        self.mount_in_namespace(&root_ns, "/", ramfs.clone())
             .expect("Failed to mount ramfs at /");
 
         // Create mount point directories in root ramfs so they appear in ls
@@ -214,18 +314,19 @@ impl Vfs {
 
         // Create and mount devfs at /dev
         let devfs = DevFs::new();
-        self.mount("/dev", devfs.clone())
+        self.mount_in_namespace(&root_ns, "/dev", devfs.clone())
             .expect("Failed to mount devfs");
         *self.devfs.write() = Some(devfs);
 
         // Create and mount procfs at /proc
         let procfs = ProcFs::new();
-        self.mount("/proc", procfs).expect("Failed to mount procfs");
+        self.mount_in_namespace(&root_ns, "/proc", procfs)
+            .expect("Failed to mount procfs");
 
         println!("VFS initialized: ramfs at /, devfs at /dev, procfs at /proc");
     }
 
-    /// Mount a filesystem at the given path
+    /// Mount a filesystem at the given path (in current process's namespace)
     ///
     /// # Security (X-4 fix)
     ///
@@ -253,16 +354,49 @@ impl Vfs {
             lsm::hook_file_mount(&task, 0, path_hash, 0, 0).map_err(|_| FsError::PermDenied)?;
         }
 
-        let mut mounts = self.mounts.write();
+        // Use current process's namespace if available, otherwise root
+        let ns = current_mount_ns().unwrap_or_else(|| ROOT_MNT_NAMESPACE.clone());
+
+        // Delegate to namespace-aware implementation
+        self.mount_in_namespace(&ns, &path, fs)
+    }
+
+    /// Mount a filesystem in a specific mount namespace.
+    ///
+    /// This is the core implementation without security checks.
+    /// The wrapper methods (mount, mount_in_namespace_checked) should perform
+    /// appropriate security checks before calling this.
+    ///
+    /// # Arguments
+    /// * `ns` - The mount namespace to mount in
+    /// * `path` - Normalized mount path
+    /// * `fs` - Filesystem to mount
+    pub fn mount_in_namespace(
+        &self,
+        ns: &Arc<MountNamespace>,
+        path: &str,
+        fs: Arc<dyn FileSystem>,
+    ) -> Result<(), FsError> {
+        let path = normalize_path(path)?;
+        let table = self.ensure_namespace_table(ns);
+        let mut mounts = table.mounts.write();
+
         if mounts.contains_key(&path) {
             return Err(FsError::Exists);
         }
 
-        mounts.insert(path.clone(), Mount { path, fs });
+        mounts.insert(path.clone(), Mount { path: path.clone(), fs: fs.clone() });
+
+        // Sync root_fs when mounting at "/"
+        if path == "/" {
+            drop(mounts); // Release lock before acquiring root_fs lock
+            *table.root_fs.write() = Some(fs);
+        }
+
         Ok(())
     }
 
-    /// Unmount filesystem at path
+    /// Unmount filesystem at path (in current process's namespace)
     ///
     /// # Security (X-4 fix)
     ///
@@ -285,9 +419,36 @@ impl Vfs {
             lsm::hook_file_umount(&task, path_hash, 0).map_err(|_| FsError::PermDenied)?;
         }
 
-        let mut mounts = self.mounts.write();
+        // Use current process's namespace if available, otherwise root
+        let ns = current_mount_ns().unwrap_or_else(|| ROOT_MNT_NAMESPACE.clone());
+
+        // Delegate to namespace-aware implementation
+        self.umount_in_namespace(&ns, &path)
+    }
+
+    /// Unmount filesystem at path within a specific mount namespace.
+    ///
+    /// This is the core implementation without security checks.
+    /// The wrapper methods should perform appropriate security checks before calling this.
+    ///
+    /// # Arguments
+    /// * `ns` - The mount namespace to unmount from
+    /// * `path` - Normalized path to unmount
+    pub fn umount_in_namespace(
+        &self,
+        ns: &Arc<MountNamespace>,
+        path: &str,
+    ) -> Result<(), FsError> {
+        let path = normalize_path(path)?;
+        let table = self.ensure_namespace_table(ns);
+        let mut mounts = table.mounts.write();
 
         if mounts.remove(&path).is_some() {
+            // Sync root_fs when unmounting "/"
+            if path == "/" {
+                drop(mounts); // Release lock before acquiring root_fs lock
+                *table.root_fs.write() = None;
+            }
             Ok(())
         } else {
             Err(FsError::NotFound)
@@ -868,9 +1029,36 @@ impl Vfs {
         fs.unlink(&parent, filename)
     }
 
-    /// Find the mount point for a given path
+    /// Find the mount point for a given path (in current process's namespace)
+    ///
+    /// Uses current_mount_ns() to get the process's namespace, falling back
+    /// to ROOT_MNT_NAMESPACE during kernel initialization or for kernel threads.
     fn find_mount(&self, path: &str) -> Result<(String, Arc<dyn FileSystem>, String), FsError> {
-        let mounts = self.mounts.read();
+        // Use current process's mount namespace if available, otherwise root
+        let ns = current_mount_ns().unwrap_or_else(|| ROOT_MNT_NAMESPACE.clone());
+        self.find_mount_in_namespace(&ns, path)
+    }
+
+    /// Find the mount point for a given path within a specific mount namespace.
+    ///
+    /// Returns (mount_path, filesystem, relative_path_within_fs).
+    ///
+    /// # Security
+    ///
+    /// Path is normalized to prevent directory traversal attacks (R32-VFS-1).
+    ///
+    /// # Arguments
+    /// * `ns` - The mount namespace to search in
+    /// * `path` - Absolute path to look up
+    pub fn find_mount_in_namespace(
+        &self,
+        ns: &Arc<MountNamespace>,
+        path: &str,
+    ) -> Result<(String, Arc<dyn FileSystem>, String), FsError> {
+        // Normalize path to prevent traversal attacks and ensure consistent matching
+        let path = normalize_path(path)?;
+        let table = self.ensure_namespace_table(ns);
+        let mounts = table.mounts.read();
 
         // Helper to check if path matches mount point with proper boundaries
         // e.g., /dev matches /dev and /dev/null, but not /device
@@ -889,7 +1077,7 @@ impl Vfs {
         let mut best_match: Option<(&String, &Mount)> = None;
 
         for (mount_path, mount) in mounts.iter() {
-            if mount_matches(path, mount_path.as_str()) {
+            if mount_matches(&path, mount_path.as_str()) {
                 match best_match {
                     None => best_match = Some((mount_path, mount)),
                     Some((current_path, _)) => {
@@ -907,19 +1095,22 @@ impl Vfs {
             } else {
                 "/"
             };
-            Ok((
+            return Ok((
                 mount_path.clone(),
                 Arc::clone(&mount.fs),
                 relative.to_string(),
-            ))
+            ));
+        }
+
+        // Release mounts lock before accessing root_fs
+        drop(mounts);
+
+        // No mount found, check if this namespace has a root fs
+        let root_fs = table.root_fs.read();
+        if let Some(fs) = root_fs.as_ref() {
+            Ok(("/".to_string(), Arc::clone(fs), path.to_string()))
         } else {
-            // No mount found, check if we have a root fs
-            let root_fs = self.root_fs.read();
-            if let Some(fs) = root_fs.as_ref() {
-                Ok(("/".to_string(), Arc::clone(fs), path.to_string()))
-            } else {
-                Err(FsError::NotFound)
-            }
+            Err(FsError::NotFound)
         }
     }
 

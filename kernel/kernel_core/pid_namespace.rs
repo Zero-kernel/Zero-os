@@ -30,7 +30,7 @@
 //! let global = resolve_pid_in_namespace(&ns, ns_pid);
 //! ```
 
-use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, sync::{Arc, Weak}, vec, vec::Vec};
 use cap::NamespaceId;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
@@ -130,6 +130,9 @@ pub struct PidNamespace {
 
     /// Whether namespace is shutting down (init died)
     shutting_down: AtomicBool,
+
+    /// R73-2 FIX: Child namespaces for cascade kill traversal
+    children: Mutex<Vec<Weak<PidNamespace>>>,
 }
 
 // ============================================================================
@@ -168,6 +171,7 @@ impl PidNamespace {
             pid_by_global: Mutex::new(BTreeMap::new()),
             init_global_pid: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
+            children: Mutex::new(Vec::new()),
         }
     }
 
@@ -193,7 +197,7 @@ impl PidNamespace {
         // Generate unique namespace ID
         let id = NEXT_NS_ID.fetch_add(1, Ordering::SeqCst);
 
-        Ok(Arc::new(PidNamespace {
+        let child = Arc::new(PidNamespace {
             id: NamespaceId::new(id),
             parent: Some(parent.clone()),
             level: parent.level.saturating_add(1),
@@ -202,7 +206,13 @@ impl PidNamespace {
             pid_by_global: Mutex::new(BTreeMap::new()),
             init_global_pid: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
-        }))
+            children: Mutex::new(Vec::new()),
+        });
+
+        // R73-2 FIX: Register child in parent's children list for cascade kill traversal
+        parent.children.lock().push(Arc::downgrade(&child));
+
+        Ok(child)
     }
 
     /// Get the namespace identifier.
@@ -544,19 +554,26 @@ pub fn is_visible_in_namespace(
 ///
 /// Global PIDs of all processes to kill
 pub fn get_cascade_kill_pids(ns: &Arc<PidNamespace>) -> Vec<ProcessId> {
+    // R73-2 FIX: Traverse the entire namespace subtree, including descendants
     let mut pids = Vec::new();
+    let mut stack: Vec<Arc<PidNamespace>> = vec![ns.clone()];
 
-    // Get all members of this namespace (except init itself)
-    let init_pid = ns.init_global_pid();
-    for pid in ns.members() {
-        if Some(pid) != init_pid {
-            pids.push(pid);
+    while let Some(cur) = stack.pop() {
+        // Get all members of this namespace (except init itself)
+        let init_pid = cur.init_global_pid();
+        for pid in cur.members() {
+            if init_pid != Some(pid) {
+                pids.push(pid);
+            }
         }
-    }
 
-    // Note: In a full implementation, we'd also need to find
-    // processes in descendant namespaces. This requires access
-    // to the process table which we'll handle in process.rs.
+        // Traverse child namespaces
+        let mut children = cur.children.lock();
+        // Clean up released children (strong_count == 0)
+        children.retain(|w: &Weak<PidNamespace>| w.strong_count() > 0);
+        // Add live children to the traversal stack
+        stack.extend(children.iter().filter_map(|w: &Weak<PidNamespace>| w.upgrade()));
+    }
 
     pids
 }

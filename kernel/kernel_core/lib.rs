@@ -12,6 +12,7 @@ pub use drivers::vga_buffer;
 
 pub mod elf_loader;
 pub mod fork;
+pub mod mount_namespace;
 pub mod pid_namespace;
 pub mod process;
 pub mod rcu;
@@ -34,6 +35,7 @@ pub use process::{
     current_credentials,
     current_egid,
     current_euid,
+    current_mount_ns,  // F.1: Mount namespace
     current_pid,
     current_supplementary_groups,
     current_umask,
@@ -127,6 +129,12 @@ pub use pid_namespace::{
     owning_namespace, pid_in_namespace, pid_in_owning_namespace, resolve_pid_in_namespace,
     PidNamespace, PidNamespaceError, PidNamespaceMembership, ROOT_PID_NAMESPACE,
     MAX_PID_NS_LEVEL,
+};
+// F.1: Mount namespace support
+pub use mount_namespace::{
+    clone_namespace as clone_mount_namespace, init as init_mount_namespace,
+    print_namespace_info as print_mount_namespace_info, MountFlags, MountNamespace,
+    MountNamespaceFd, MountNsError, ROOT_MNT_NAMESPACE, MAX_MNT_NS_LEVEL,
 };
 
 // ============================================================================

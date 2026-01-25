@@ -557,6 +557,19 @@ pub struct Process {
     /// Otherwise, children inherit this namespace (same as parent's owning namespace).
     pub pid_ns_for_children: Arc<crate::pid_namespace::PidNamespace>,
 
+    // ========== F.1: Mount Namespace Support ==========
+    /// Mount namespace of this process
+    ///
+    /// All path resolution and mount operations are confined to this namespace.
+    /// CLONE_THREAD keeps the same mount namespace; CLONE_NEWNS creates a copy.
+    pub mount_ns: Arc<crate::mount_namespace::MountNamespace>,
+
+    /// Mount namespace for children (set by CLONE_NEWNS)
+    ///
+    /// Children inherit this namespace unless CLONE_NEWNS is requested,
+    /// in which case a new namespace copy is created for them.
+    pub mount_ns_for_children: Arc<crate::mount_namespace::MountNamespace>,
+
     // ========== Seccomp/Pledge 沙箱 ==========
     /// Seccomp 过滤器状态
     /// 包含 BPF 过滤器栈和 no_new_privs 标志
@@ -637,6 +650,10 @@ impl Process {
             // The actual chain will be assigned by create_process after PID allocation
             pid_ns_chain: Vec::new(),
             pid_ns_for_children: crate::pid_namespace::ROOT_PID_NAMESPACE.clone(),
+            // F.1: Mount namespace - default to root mount namespace
+            // The actual namespace will be assigned by create_process from parent
+            mount_ns: crate::mount_namespace::ROOT_MNT_NAMESPACE.clone(),
+            mount_ns_for_children: crate::mount_namespace::ROOT_MNT_NAMESPACE.clone(),
             // Seccomp/Pledge 沙箱 (默认无限制)
             seccomp_state: SeccompState::new(),
             pledge_state: None,
@@ -1010,6 +1027,24 @@ pub fn create_process(
         }
     }
 
+    // Mount namespace: inherit from parent's mount_ns_for_children (or root for kernel threads)
+    {
+        let target_mnt_ns = if ppid == 0 {
+            crate::mount_namespace::ROOT_MNT_NAMESPACE.clone()
+        } else {
+            let table = PROCESS_TABLE.lock();
+            if let Some(Some(parent)) = table.get(ppid) {
+                parent.lock().mount_ns_for_children.clone()
+            } else {
+                crate::mount_namespace::ROOT_MNT_NAMESPACE.clone()
+            }
+        };
+
+        let mut proc = process.lock();
+        proc.mount_ns = target_mnt_ns.clone();
+        proc.mount_ns_for_children = target_mnt_ns;
+    }
+
     let mut table = PROCESS_TABLE.lock();
 
     // 确保进程表有足够的空间存储新进程
@@ -1111,6 +1146,24 @@ pub fn create_process_in_namespace(
             free_kernel_stack(pid, stack_base);
             return Err(ProcessCreateError::NamespaceError);
         }
+    }
+
+    // Mount namespace: inherit from parent's mount_ns_for_children (or root for kernel threads)
+    {
+        let target_mnt_ns = if ppid == 0 {
+            crate::mount_namespace::ROOT_MNT_NAMESPACE.clone()
+        } else {
+            let table = PROCESS_TABLE.lock();
+            if let Some(Some(parent)) = table.get(ppid) {
+                parent.lock().mount_ns_for_children.clone()
+            } else {
+                crate::mount_namespace::ROOT_MNT_NAMESPACE.clone()
+            }
+        };
+
+        let mut proc = process.lock();
+        proc.mount_ns = target_mnt_ns.clone();
+        proc.mount_ns_for_children = target_mnt_ns;
     }
 
     let mut table = PROCESS_TABLE.lock();
@@ -1262,6 +1315,18 @@ pub fn current_euid() -> Option<u32> {
 /// 获取当前进程的有效组ID
 pub fn current_egid() -> Option<u32> {
     current_credentials().map(|c| c.egid)
+}
+
+/// F.1: 获取当前进程的挂载命名空间
+///
+/// Returns the current process's mount namespace, used by VFS for
+/// namespace-aware path resolution.
+pub fn current_mount_ns() -> Option<Arc<crate::mount_namespace::MountNamespace>> {
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let proc = slot.as_ref()?.lock();
+    Some(proc.mount_ns.clone())
 }
 
 /// 获取当前进程的附属组列表

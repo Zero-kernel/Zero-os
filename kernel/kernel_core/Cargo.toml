@@ -9,6 +9,7 @@ path = "lib.rs"
 [dependencies]
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
+bitflags = "2.4"
 drivers = { path = "../drivers" }
 x86_64 = "0.15"
 mm = { path = "../mm" }

@@ -9,8 +9,10 @@ path = "lib.rs"
 [dependencies]
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
+bitflags = "2.4"
 kernel_core = { path = "../kernel_core" }
 drivers = { path = "../drivers" }
 lsm = { path = "../lsm", features = ["lsm"] }
 block = { path = "../block" }
 mm = { path = "../mm" }
+cap = { path = "../cap" }

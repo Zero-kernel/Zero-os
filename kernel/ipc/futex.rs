@@ -355,6 +355,35 @@ pub fn futex_lock_pi(
         b.pi_waiters.insert(pid, waiter_priority);
     }
 
+    // R73-1 FIX: 窗口修复——在 pi_waiters.insert 后再次检查 owner 状态
+    // 如果在 prepare_to_wait() 和 pi_waiters.insert() 之间 owner 已经 unlock,
+    // 此时 owner 会是 None，我们需要直接获取锁而不是阻塞
+    {
+        let mut b = bucket.lock();
+        if b.owner.is_none() {
+            let owner_died = b.owner_dead;
+            b.owner = Some(pid);
+            b.owner_dead = false;
+            b.pi_waiters.remove(&pid);
+            if b.waiter_count > 0 {
+                b.waiter_count -= 1;
+            }
+            drop(b);
+            // 取消排队的等待，防止永久阻塞
+            queue.cancel_wait();
+            if let Some(proc) = process::get_process(pid) {
+                proc.lock().set_waiting_on_futex(None);
+            }
+            recompute_pi_state(key, &bucket);
+            cleanup_empty_bucket(key, &bucket);
+            return if owner_died {
+                Err(FutexError::OwnerDied)
+            } else {
+                Ok(0)
+            };
+        }
+    }
+
     // 触发 PI 传播到当前 owner
     recompute_pi_state(key, &bucket);
 

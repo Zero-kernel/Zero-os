@@ -249,7 +249,7 @@ pub fn cpuset_create(cpus: u64, parent_id: CpusetId) -> Result<CpusetId, CpusetE
 
 /// Destroy a cpuset.
 ///
-/// The cpuset must have no attached tasks.
+/// The cpuset must have no attached tasks and no child cpusets.
 pub fn cpuset_destroy(id: CpusetId) -> Result<(), CpusetError> {
     if id == CpusetId::ROOT {
         return Err(CpusetError::CannotDestroyRoot);
@@ -262,6 +262,23 @@ pub fn cpuset_destroy(id: CpusetId) -> Result<(), CpusetError> {
     let cpuset = registry.sets.get(&id).ok_or(CpusetError::NotFound)?;
     if cpuset.task_count() > 0 {
         return Err(CpusetError::NotEmpty);
+    }
+
+    // R73-3 FIX: Prevent destroying cpusets that still have children
+    // This would leave orphaned cpusets that bypass parent mask constraints
+    let has_children = registry
+        .sets
+        .values()
+        .any(|child| {
+            child
+                .parent
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .map(|p| p.id == cpuset.id)
+                .unwrap_or(false)
+        });
+    if has_children {
+        return Err(CpusetError::NotEmpty); // Reuse NotEmpty - has child cpusets
     }
 
     registry.sets.remove(&id);
@@ -287,12 +304,26 @@ pub fn cpuset_set_cpus(id: CpusetId, cpus: u64) -> Result<(), CpusetError> {
         }
     } else {
         // For non-root, validate against parent
-        if let Some(ref parent_weak) = cpuset.parent {
-            if let Some(parent) = parent_weak.upgrade() {
-                let parent_mask = parent.cpus();
-                if (cpus & !parent_mask) != 0 {
-                    return Err(CpusetError::InvalidMask);
+        // R73-3 FIX: Return error if parent is missing or dropped
+        // This prevents bypassing parent mask constraints after orphaning
+        match &cpuset.parent {
+            Some(parent_weak) => {
+                match parent_weak.upgrade() {
+                    Some(parent) => {
+                        let parent_mask = parent.cpus();
+                        if (cpus & !parent_mask) != 0 {
+                            return Err(CpusetError::InvalidMask);
+                        }
+                    }
+                    None => {
+                        // Parent has been destroyed - hierarchy integrity violated
+                        return Err(CpusetError::InvalidParent);
+                    }
                 }
+            }
+            None => {
+                // Non-root cpuset without parent reference - should not happen
+                return Err(CpusetError::InvalidParent);
             }
         }
     }

@@ -1890,6 +1890,8 @@ pub fn syscall_dispatcher(
         62 => sys_kill(arg0 as ProcessId, arg1 as i32),
         // F.1: Namespace unshare
         272 => sys_unshare(arg0 as u64),
+        // F.1: setns for mount namespace
+        308 => sys_setns(arg0 as i32, arg1 as i32),
 
         // 文件I/O
         0 => sys_read(arg0 as i32, arg1 as *mut u8, arg2 as usize),
@@ -2133,6 +2135,8 @@ const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 /// F.1: Create a new PID namespace for the child
 const CLONE_NEWPID: u64 = 0x2000_0000;
+/// F.1: Create a new mount namespace for the child
+const CLONE_NEWNS: u64 = 0x0002_0000;
 
 /// sys_clone - 创建线程/轻量级进程
 ///
@@ -2175,7 +2179,8 @@ fn sys_clone(
         | CLONE_PARENT_SETTID
         | CLONE_CHILD_CLEARTID
         | CLONE_CHILD_SETTID
-        | CLONE_NEWPID; // F.1: PID namespace support
+        | CLONE_NEWPID  // F.1: PID namespace support
+        | CLONE_NEWNS;  // F.1: Mount namespace support
 
     // 检查不支持的 flags
     // 返回 EINVAL 而不是 ENOSYS，因为这是参数验证失败而非功能未实现
@@ -2207,6 +2212,24 @@ fn sys_clone(
     if flags & CLONE_NEWPID != 0 && flags & CLONE_THREAD != 0 {
         println!("[sys_clone] CLONE_NEWPID cannot be combined with CLONE_THREAD");
         return Err(SyscallError::EINVAL);
+    }
+
+    // F.1: CLONE_NEWNS cannot be combined with CLONE_THREAD
+    // Mount namespace is per-process; threads must share the same mount namespace
+    if flags & CLONE_NEWNS != 0 && flags & CLONE_THREAD != 0 {
+        println!("[sys_clone] CLONE_NEWNS cannot be combined with CLONE_THREAD");
+        return Err(SyscallError::EINVAL);
+    }
+
+    // F.1 Security: CLONE_NEWNS requires CAP_SYS_ADMIN (CapRights::ADMIN) or root
+    if flags & CLONE_NEWNS != 0 {
+        let has_cap_admin =
+            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(true);
+        if !is_root && !has_cap_admin {
+            println!("[sys_clone] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
+            return Err(SyscallError::EPERM);
+        }
     }
 
     // 验证 parent_tid 指针
@@ -2261,6 +2284,8 @@ fn sys_clone(
         parent_pledge_state,
         parent_seccomp_installing,
         parent_pid_ns_for_children, // F.1: PID namespace for children
+        parent_mount_ns,             // F.1: Mount namespace
+        parent_mount_ns_for_children, // F.1: Mount namespace for children
     ) = {
         let mut parent = parent_arc.lock();
         // 始终从 MSR 同步 fs_base 到 PCB
@@ -2288,6 +2313,8 @@ fn sys_clone(
             parent.pledge_state.clone(),
             parent.seccomp_installing,
             parent.pid_ns_for_children.clone(), // F.1: PID namespace
+            parent.mount_ns.clone(),             // F.1: Mount namespace
+            parent.mount_ns_for_children.clone(), // F.1: Mount namespace for children
         )
     };
 
@@ -2324,6 +2351,30 @@ fn sys_clone(
         alloc::format!("{}-thread", parent_name)
     } else {
         alloc::format!("{}-clone", parent_name)
+    };
+
+    // F.1: Handle CLONE_NEWNS - create new mount namespace
+    let new_mount_ns = if flags & CLONE_NEWNS != 0 {
+        match crate::mount_namespace::clone_namespace(parent_mount_ns.clone()) {
+            Ok(ns) => {
+                println!(
+                    "[sys_clone] Created new mount namespace: id={}, level={}",
+                    ns.id().raw(),
+                    ns.level()
+                );
+                Some(ns)
+            }
+            Err(crate::mount_namespace::MountNsError::MaxDepthExceeded) => {
+                println!("[sys_clone] Failed to create mount namespace: max depth exceeded");
+                return Err(SyscallError::EAGAIN);
+            }
+            Err(e) => {
+                println!("[sys_clone] Failed to create mount namespace: {:?}", e);
+                return Err(SyscallError::ENOMEM);
+            }
+        }
+    } else {
+        None
     };
 
     // F.1: Handle CLONE_NEWPID - create child in new PID namespace
@@ -2551,6 +2602,16 @@ fn sys_clone(
             let parent = parent_arc.lock();
             child.cap_table = Arc::new(parent.cap_table.clone_for_fork());
         }
+
+        // F.1 Mount Namespace: Assign mount namespace to child
+        //
+        // CLONE_NEWNS: Use the new mount namespace created earlier
+        // Without CLONE_NEWNS: Inherit parent's mount_ns_for_children
+        let child_mount_ns = new_mount_ns
+            .clone()
+            .unwrap_or_else(|| parent_mount_ns_for_children.clone());
+        child.mount_ns = child_mount_ns.clone();
+        child.mount_ns_for_children = child_mount_ns;
 
         // 设置进程状态为就绪
         child.state = ProcessState::Ready;
@@ -3408,13 +3469,13 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
 /// Unlike clone(), unshare() affects only the namespace for children, not the
 /// caller's own namespace membership (for PID namespace).
 fn sys_unshare(flags: u64) -> SyscallResult {
-    // F.1: Currently only CLONE_NEWPID is supported
-    let supported = CLONE_NEWPID;
+    // F.1: Currently CLONE_NEWPID and CLONE_NEWNS are supported
+    let supported = CLONE_NEWPID | CLONE_NEWNS;
     let unsupported = flags & !supported;
 
     if unsupported != 0 {
         println!(
-            "[sys_unshare] Unsupported flags: 0x{:x} (supported: CLONE_NEWPID)",
+            "[sys_unshare] Unsupported flags: 0x{:x} (supported: CLONE_NEWPID | CLONE_NEWNS)",
             unsupported
         );
         return Err(SyscallError::EINVAL);
@@ -3460,6 +3521,119 @@ fn sys_unshare(flags: u64) -> SyscallResult {
             new_ns.id().raw(),
             new_ns.level()
         );
+    }
+
+    // F.1: Handle CLONE_NEWNS - unshare mount namespace
+    //
+    // Unlike PID namespace, mount namespace unshare immediately affects the
+    // current process's view of the filesystem. The process moves to a new
+    // mount namespace with a copy of the parent's mount table.
+    if flags & CLONE_NEWNS != 0 {
+        // F.1 Security: require CAP_SYS_ADMIN or root
+        let has_cap_admin =
+            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(true);
+        if !is_root && !has_cap_admin {
+            println!("[sys_unshare] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
+            return Err(SyscallError::EPERM);
+        }
+
+        let current_ns = {
+            let proc = proc_arc.lock();
+            proc.mount_ns.clone()
+        };
+
+        let new_ns = crate::mount_namespace::clone_namespace(current_ns.clone()).map_err(|e| {
+            println!("[sys_unshare] Failed to create mount namespace: {:?}", e);
+            match e {
+                crate::mount_namespace::MountNsError::MaxDepthExceeded => SyscallError::EAGAIN,
+                _ => SyscallError::ENOMEM,
+            }
+        })?;
+
+        // Update process's mount namespace (immediately takes effect)
+        {
+            let mut proc = proc_arc.lock();
+            proc.mount_ns = new_ns.clone();
+            proc.mount_ns_for_children = new_ns.clone();
+        }
+
+        println!(
+            "[sys_unshare] Process {} unshared mount namespace, now using ns_id={}, level={}",
+            pid,
+            new_ns.id().raw(),
+            new_ns.level()
+        );
+    }
+
+    Ok(0)
+}
+
+/// sys_setns - Switch to an existing mount namespace.
+///
+/// Allows a process to join an existing mount namespace referenced by
+/// a file descriptor. This is used by container runtimes to enter
+/// namespaces created by other processes.
+///
+/// # Arguments
+///
+/// * `fd` - File descriptor referencing a MountNamespaceFd
+/// * `nstype` - Namespace type (must be 0 or CLONE_NEWNS for mount ns)
+///
+/// # Returns
+///
+/// 0 on success, -EINVAL for invalid namespace type, -EPERM if not root,
+/// -EBADF for invalid fd, -EINVAL if fd is not a mount namespace fd
+///
+/// # Security
+///
+/// Requires root (euid == 0) or CAP_SYS_ADMIN equivalent.
+fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
+    // Validate namespace type
+    if nstype != 0 && (nstype as u64) != CLONE_NEWNS {
+        println!("[sys_setns] Invalid nstype: {}", nstype);
+        return Err(SyscallError::EINVAL);
+    }
+
+    // F.1 Security: Require CAP_SYS_ADMIN (CapRights::ADMIN) or root
+    let has_cap_admin =
+        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(true);
+    if !is_root && !has_cap_admin {
+        println!("[sys_setns] Permission denied: requires CAP_SYS_ADMIN or root");
+        return Err(SyscallError::EPERM);
+    }
+
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // Extract target mount namespace from fd
+    let target_ns = {
+        let proc = proc_arc.lock();
+        let fd_entry = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+        if let Some(ns_fd) = fd_entry
+            .as_any()
+            .downcast_ref::<crate::mount_namespace::MountNamespaceFd>()
+        {
+            ns_fd.namespace()
+        } else {
+            println!("[sys_setns] fd {} is not a mount namespace fd", fd);
+            return Err(SyscallError::EINVAL);
+        }
+    };
+
+    println!(
+        "[sys_setns] Process {} switching to mount namespace id={}, level={}",
+        pid,
+        target_ns.id().raw(),
+        target_ns.level()
+    );
+
+    // Switch current process mount namespace (and future children)
+    {
+        let mut proc = proc_arc.lock();
+        proc.mount_ns = target_ns.clone();
+        proc.mount_ns_for_children = target_ns;
     }
 
     Ok(0)

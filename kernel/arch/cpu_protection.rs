@@ -228,12 +228,13 @@ pub fn hypervisor_present() -> bool {
     unsafe {
         // rbx is reserved by LLVM, so we save/restore it
         // Cannot use `nostack` or `nomem` with push/pop (uses stack memory)
+        // R73-4 FIX: Initialize ECX to 0 for consistent behavior across CPU models
         core::arch::asm!(
             "push rbx",
             "cpuid",
             "pop rbx",
             inout("eax") 1u32 => _,
-            lateout("ecx") ecx,
+            inout("ecx") 0u32 => ecx,
             lateout("edx") _,
             // No options - push/pop uses both stack and memory
         );
@@ -265,6 +266,7 @@ pub fn detect_hypervisor() -> HypervisorType {
     unsafe {
         // rbx is reserved by LLVM, so we save/restore it
         // Cannot use `nostack` or `nomem` with push/pop (uses stack memory)
+        // R73-4 FIX: Initialize ECX to 0 for consistent behavior across CPU models
         core::arch::asm!(
             "push rbx",
             "cpuid",
@@ -272,7 +274,7 @@ pub fn detect_hypervisor() -> HypervisorType {
             "pop rbx",
             ebx_out = out(reg) ebx,
             inout("eax") 0x40000000u32 => _,
-            lateout("ecx") ecx,
+            inout("ecx") 0u32 => ecx,
             lateout("edx") edx,
             // No options - push/pop uses both stack and memory
         );

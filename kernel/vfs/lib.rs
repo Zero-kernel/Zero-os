@@ -48,6 +48,7 @@ pub mod devfs;
 pub mod ext2;
 pub mod initramfs;
 pub mod manager;
+pub mod mount_namespace;
 pub mod procfs;
 pub mod ramfs;
 pub mod traits;
@@ -62,6 +63,12 @@ pub use procfs::ProcFs;
 pub use ramfs::{RamFs, RamFsInode};
 pub use traits::{FileHandle, FileSystem, Inode};
 pub use types::{DirEntry, FileMode, FileType, FsError, OpenFlags, SeekWhence, Stat, TimeSpec};
+
+// Mount namespace re-exports
+pub use mount_namespace::{
+    init as mount_ns_init, clone_namespace, copy_mounts, get_mount, add_mount, remove_mount,
+    Mount, MountFlags, MountNamespace, MountNsError, MAX_MNT_NS_LEVEL, ROOT_MNT_NAMESPACE,
+};
 
 /// Initialize the VFS subsystem
 ///
