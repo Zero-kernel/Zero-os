@@ -3,6 +3,7 @@
 //! Buddy分配器是一种高效的内存管理算法，通过将内存分割成2的幂次大小的块来管理。
 //! 当需要分配内存时，找到最小的能满足需求的块；释放时尝试与相邻的块合并。
 
+use alloc::vec;
 use alloc::vec::Vec;
 use bit_vec::BitVec;
 use spin::Mutex;
@@ -24,6 +25,16 @@ pub struct BuddyAllocator {
     /// 位图，用于跟踪块的状态
     /// 每个位表示对应的块是否已分配
     bitmap: BitVec,
+
+    /// R74-4 Enhancement: Track allocation order for each block.
+    ///
+    /// Stores (order + 1) for allocated blocks, 0 for free.
+    /// This prevents freeing with a mismatched order (e.g., freeing 1 page
+    /// from an 8-page allocation), which would corrupt the allocator.
+    ///
+    /// MAX_ORDER=11 fits in 4 bits, so u8 is sufficient and keeps memory
+    /// overhead reasonable (~1 byte per page).
+    alloc_order: Vec<u8>,
 
     /// 内存起始物理地址
     base_addr: PhysAddr,
@@ -52,6 +63,7 @@ impl BuddyAllocator {
         let mut allocator = BuddyAllocator {
             free_lists: Default::default(),
             bitmap: BitVec::from_elem(bitmap_size, false),
+            alloc_order: vec![0u8; total_pages],  // R74-4: Initialize all as free (0)
             base_addr,
             total_pages,
             free_pages: total_pages,
@@ -104,6 +116,9 @@ impl BuddyAllocator {
                 let pages = 1 << order;
                 self.mark_allocated(block_idx, pages);
 
+                // R74-4 Enhancement: Record allocation order for verification at free time
+                self.record_alloc_order(block_idx, pages, order);
+
                 // 更新统计
                 self.free_pages -= pages;
 
@@ -153,15 +168,55 @@ impl BuddyAllocator {
         let block_idx = ((addr - self.base_addr) / PAGE_SIZE as u64) as usize;
         let pages = 1 << order;
 
+        // R74-4 FIX: Enforce block alignment to prevent partial block frees.
+        //
+        // The buddy allocator requires that blocks be freed with the same order
+        // they were allocated with. Freeing a sub-block of a larger allocation
+        // would corrupt the allocator state and enable overlapping allocations,
+        // leading to memory corruption and use-after-free vulnerabilities.
+        //
+        // Security check: Reject frees where block_idx is not aligned to the
+        // block size (2^order pages). For example, freeing order=3 (8 pages)
+        // requires block_idx to be divisible by 8.
+        if block_idx & (pages - 1) != 0 {
+            // Block is not aligned to its size - this is a partial free attempt
+            return;
+        }
+
         // 范围验证：确保不超出管理的内存区域
         if block_idx + pages > self.total_pages {
             return;
         }
 
-        // 双重释放检测：如果任意页已标记为空闲，则拒绝释放
+        // R74-4 Enhancement: Verify freeing order matches recorded allocation order.
+        //
+        // The alignment check alone is insufficient. For example:
+        // - Allocate 8 pages (order=3) at block_idx=0
+        // - Free with order=0 at block_idx=0 (passes alignment: 0 & 0 == 0)
+        // - This would free 1 page from an 8-page block → allocator corruption
+        //
+        // By storing the allocation order and checking it at free time, we catch
+        // all order mismatch scenarios, preventing the Codex-identified edge case.
+        let recorded = self.alloc_order.get(block_idx).copied().unwrap_or(0);
+        if recorded == 0 {
+            // No allocation starts here (already free or mid-block access)
+            return;
+        }
+        let recorded_order = (recorded - 1) as usize;
+        if recorded_order != order {
+            // Order mismatch: trying to free with different order than allocated
+            // This would corrupt the buddy allocator structure
+            return;
+        }
+
+        // R74-4 FIX: Enhanced double-free/size-mismatch detection.
+        // All pages in the range must be currently allocated. If any page is
+        // already free or out of bounds, reject the operation to prevent
+        // partial blocks from entering the free lists.
         for i in 0..pages {
-            if block_idx + i < self.bitmap.len() && !self.bitmap[block_idx + i] {
-                // 页面已经是空闲状态，可能是双重释放
+            if block_idx + i >= self.bitmap.len() || !self.bitmap[block_idx + i] {
+                // Page is out of bounds or already free - reject to prevent
+                // allocator corruption and overlapping allocations
                 return;
             }
         }
@@ -229,10 +284,40 @@ impl BuddyAllocator {
         }
     }
 
+    /// R74-4 Enhancement: Record allocation order for each page in the block.
+    ///
+    /// Stores (order + 1) so that 0 represents free. This allows us to detect:
+    /// - Order mismatch on free (e.g., free order=0 from order=3 allocation)
+    /// - Access from mid-block (non-starting page of an allocation)
+    ///
+    /// # Arguments
+    /// * `start_idx` - Starting block index
+    /// * `pages` - Number of pages in the block (2^order)
+    /// * `order` - Allocation order (0 to MAX_ORDER-1)
+    fn record_alloc_order(&mut self, start_idx: usize, pages: usize, order: usize) {
+        let encoded_order = (order as u8) + 1;
+        for i in 0..pages {
+            if start_idx + i < self.alloc_order.len() {
+                self.alloc_order[start_idx + i] = encoded_order;
+            }
+        }
+    }
+
     /// 标记页面为空闲
     fn mark_free(&mut self, start_idx: usize, pages: usize) {
         for i in 0..pages {
             self.bitmap.set(start_idx + i, false);
+        }
+        // R74-4 Enhancement: Clear the allocation order tracking
+        self.clear_alloc_order(start_idx, pages);
+    }
+
+    /// R74-4 Enhancement: Clear allocation order tracking for freed block.
+    fn clear_alloc_order(&mut self, start_idx: usize, pages: usize) {
+        for i in 0..pages {
+            if start_idx + i < self.alloc_order.len() {
+                self.alloc_order[start_idx + i] = 0;
+            }
         }
     }
 

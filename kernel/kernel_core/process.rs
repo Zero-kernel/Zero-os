@@ -570,6 +570,26 @@ pub struct Process {
     /// in which case a new namespace copy is created for them.
     pub mount_ns_for_children: Arc<crate::mount_namespace::MountNamespace>,
 
+    // ========== F.1: IPC Namespace Support ==========
+    /// IPC namespace of this process
+    ///
+    /// All IPC resources (message queues, semaphores, shared memory) are
+    /// confined to this namespace. CLONE_NEWIPC creates an isolated namespace.
+    pub ipc_ns: Arc<crate::ipc_namespace::IpcNamespace>,
+
+    /// IPC namespace for children (set by CLONE_NEWIPC)
+    pub ipc_ns_for_children: Arc<crate::ipc_namespace::IpcNamespace>,
+
+    // ========== F.1: Network Namespace Support ==========
+    /// Network namespace of this process
+    ///
+    /// All network operations (sockets, interfaces, routing) are confined
+    /// to this namespace. CLONE_NEWNET creates an isolated namespace.
+    pub net_ns: Arc<crate::net_namespace::NetNamespace>,
+
+    /// Network namespace for children (set by CLONE_NEWNET)
+    pub net_ns_for_children: Arc<crate::net_namespace::NetNamespace>,
+
     // ========== Seccomp/Pledge 沙箱 ==========
     /// Seccomp 过滤器状态
     /// 包含 BPF 过滤器栈和 no_new_privs 标志
@@ -654,6 +674,12 @@ impl Process {
             // The actual namespace will be assigned by create_process from parent
             mount_ns: crate::mount_namespace::ROOT_MNT_NAMESPACE.clone(),
             mount_ns_for_children: crate::mount_namespace::ROOT_MNT_NAMESPACE.clone(),
+            // F.1: IPC namespace - default to root IPC namespace
+            ipc_ns: crate::ipc_namespace::ROOT_IPC_NAMESPACE.clone(),
+            ipc_ns_for_children: crate::ipc_namespace::ROOT_IPC_NAMESPACE.clone(),
+            // F.1: Network namespace - default to root network namespace
+            net_ns: crate::net_namespace::ROOT_NET_NAMESPACE.clone(),
+            net_ns_for_children: crate::net_namespace::ROOT_NET_NAMESPACE.clone(),
             // Seccomp/Pledge 沙箱 (默认无限制)
             seccomp_state: SeccompState::new(),
             pledge_state: None,
@@ -1327,6 +1353,30 @@ pub fn current_mount_ns() -> Option<Arc<crate::mount_namespace::MountNamespace>>
     let slot = table.get(pid)?;
     let proc = slot.as_ref()?.lock();
     Some(proc.mount_ns.clone())
+}
+
+/// F.1: 获取当前进程的IPC命名空间
+///
+/// Returns the current process's IPC namespace, used for isolating
+/// System V IPC resources (message queues, semaphores, shared memory).
+pub fn current_ipc_ns() -> Option<Arc<crate::ipc_namespace::IpcNamespace>> {
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let proc = slot.as_ref()?.lock();
+    Some(proc.ipc_ns.clone())
+}
+
+/// F.1: 获取当前进程的网络命名空间
+///
+/// Returns the current process's network namespace, used for isolating
+/// network devices, sockets, and routing tables.
+pub fn current_net_ns() -> Option<Arc<crate::net_namespace::NetNamespace>> {
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let proc = slot.as_ref()?.lock();
+    Some(proc.net_ns.clone())
 }
 
 /// 获取当前进程的附属组列表

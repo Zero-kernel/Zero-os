@@ -12,7 +12,9 @@ pub use drivers::vga_buffer;
 
 pub mod elf_loader;
 pub mod fork;
+pub mod ipc_namespace;
 pub mod mount_namespace;
+pub mod net_namespace;
 pub mod pid_namespace;
 pub mod process;
 pub mod rcu;
@@ -35,7 +37,9 @@ pub use process::{
     current_credentials,
     current_egid,
     current_euid,
+    current_ipc_ns,    // F.1: IPC namespace
     current_mount_ns,  // F.1: Mount namespace
+    current_net_ns,    // F.1: Network namespace
     current_pid,
     current_supplementary_groups,
     current_umask,
@@ -74,6 +78,8 @@ pub use process::{
     // E.4 Priority Inheritance support
     FutexKey,
     Priority,
+    // Process ID type
+    ProcessId,
 };
 // Re-export capability types for convenience
 pub use cap::{
@@ -90,11 +96,14 @@ pub use signal::{
 };
 pub use syscall::{
     register_fd_close_callback, register_fd_read_callback, register_fd_write_callback,
-    register_futex_callback, register_pipe_callback, register_syscall_frame_callback,
-    register_vfs_create_callback, register_vfs_lseek_callback, register_vfs_open_callback,
-    register_vfs_open_with_resolve_callback, register_vfs_readdir_callback,
-    register_vfs_stat_callback, register_vfs_truncate_callback, register_vfs_unlink_callback,
-    wake_stdin_waiters, DirEntry, FileType, SyscallError, SyscallFrame, VfsStat,
+    register_futex_callback, register_mount_ns_materialize_callback, register_pipe_callback,
+    register_syscall_frame_callback, register_vfs_create_callback, register_vfs_lseek_callback,
+    register_vfs_open_callback, register_vfs_open_with_resolve_callback,
+    register_vfs_readdir_callback, register_vfs_stat_callback, register_vfs_truncate_callback,
+    register_vfs_unlink_callback, wake_stdin_waiters, DirEntry, FileType, SyscallError,
+    SyscallFrame, VfsStat,
+    // R74-2 test helper
+    test_is_mount_ns_callback_registered,
 };
 pub use time::{current_timestamp_ms, get_ticks, on_timer_tick};
 pub use usercopy::{
@@ -135,6 +144,20 @@ pub use mount_namespace::{
     clone_namespace as clone_mount_namespace, init as init_mount_namespace,
     print_namespace_info as print_mount_namespace_info, MountFlags, MountNamespace,
     MountNamespaceFd, MountNsError, ROOT_MNT_NAMESPACE, MAX_MNT_NS_LEVEL,
+};
+// F.1: IPC namespace support
+pub use ipc_namespace::{
+    clone_ipc_namespace, init as init_ipc_namespace,
+    print_ipc_namespace_info, IpcNamespace, IpcNamespaceFd, IpcNsError,
+    ROOT_IPC_NAMESPACE, MAX_IPC_NS_LEVEL, CLONE_NEWIPC,
+    test_is_ipc_ns_initialized,
+};
+// F.1: Network namespace support
+pub use net_namespace::{
+    clone_net_namespace, init as init_net_namespace,
+    print_net_namespace_info, move_device as move_net_device, NetNamespace,
+    NetNamespaceFd, NetNsError, ROOT_NET_NAMESPACE, MAX_NET_NS_LEVEL, CLONE_NEWNET,
+    test_is_net_ns_initialized,
 };
 
 // ============================================================================

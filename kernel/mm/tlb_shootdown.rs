@@ -41,7 +41,7 @@ use cpu_local::{
 };
 use spin::RwLock;
 use x86_64::instructions::tlb;
-use x86_64::registers::control::Cr3;
+use x86_64::registers::control::{Cr3, Cr3Flags, Cr4, Cr4Flags};
 use x86_64::VirtAddr;
 
 // INVPCID support for efficient TLB invalidation
@@ -171,17 +171,104 @@ fn is_invpcid_available() -> bool {
     INVPCID_SUPPORTED.load(Ordering::Acquire)
 }
 
+/// Check if CR4.PCIDE is enabled on the current CPU (CR4 bit 17).
+///
+/// R74-1 Enhancement: The `mm` crate cannot depend on the `security` crate's
+/// `is_pcid_enabled()` helper (would create cyclic dependency), so we read
+/// CR4 directly. This is a CPU-local check and doesn't require synchronization.
+#[inline]
+fn is_pcid_enabled() -> bool {
+    Cr4::read().contains(Cr4Flags::PCID)
+}
+
+/// Flush all PCID-tagged TLB translations on CPUs without INVPCID.
+///
+/// # R74-1 Enhancement: Non-INVPCID PCID-Wide Flush
+///
+/// When PCID is enabled but INVPCID is not available, a standard CR3 reload
+/// only flushes TLB entries for the *current* PCID. Stale entries for other
+/// PCIDs may remain, creating a security vulnerability where:
+///
+/// 1. CPU1 runs process A (PCID=5), caches TLB entry for 0x1000
+/// 2. CPU1 switches to process B (PCID=3), TLB entry for PCID=5 retained
+/// 3. Process A unmaps 0x1000, sends TLB shootdown to CPU1
+/// 4. CPU1 does CR3 reload, but only flushes PCID=3 (current), not PCID=5
+/// 5. CPU1 switches back to process A (PCID=5), stale TLB entry active
+/// 6. Process A can access freed memory → Use-after-free
+///
+/// # Intel SDM Vol. 3A Section 4.10.4.1 Fix
+///
+/// Clearing CR4.PCIDE invalidates ALL TLB entries for ALL PCIDs. The sequence:
+/// 1. Save original CR3 (with PCID in bits [11:0]) and CR4
+/// 2. Write CR3 with [11:0]=0 (required before toggling PCIDE)
+/// 3. Clear CR4.PCIDE → invalidates all TLB entries for all PCIDs
+/// 4. Reload CR3 to serialize the flush
+/// 5. Restore CR4.PCIDE (safe now: CR3[11:0]=0)
+/// 6. Restore CR3 with original PCID
+///
+/// # Safety
+///
+/// - Must be called with interrupts disabled (IPI handler context)
+/// - Modifies CR3/CR4 which affects page translation
+/// - All kernel mappings must remain valid throughout
+/// - Intel SDM requirement: CR3[11:0] must be 0 when toggling CR4.PCIDE
+#[inline]
+unsafe fn flush_all_pcid_without_invpcid() {
+    // Read current CR3 with PCID bits preserved (u16 contains PCID value 0-4095)
+    let (frame, raw_pcid) = Cr3::read_raw();
+
+    // Read current CR4
+    let cr4 = Cr4::read();
+
+    // Step 1: Ensure CR3[11:0]=0 before touching PCIDE (Intel SDM requirement)
+    // Using empty() flags - no cache flags when PCID is in use
+    Cr3::write(frame, Cr3Flags::empty());
+
+    // Step 2: Clear CR4.PCIDE
+    // Intel SDM: "If CR4.PCIDE was 1 before the MOV to CR4, any TLB entries
+    // established with any PCID are invalidated."
+    let mut cr4_no_pcid = cr4;
+    cr4_no_pcid.remove(Cr4Flags::PCID);
+    Cr4::write(cr4_no_pcid);
+
+    // Step 3: Reload CR3 to serialize the invalidation (PCIDE=0, low bits=0)
+    Cr3::write(frame, Cr3Flags::empty());
+
+    // Step 4: Restore CR4.PCIDE
+    // Intel SDM: "Software can set CR4.PCIDE to 1 only if CR3[11:0] = 000H"
+    // CR3[11:0] is 0 from the write above, so this is safe
+    Cr4::write(cr4);
+
+    // Step 5: Restore original CR3 with PCID
+    // This sets up the correct PCID for the current execution context
+    Cr3::write_raw(frame, raw_pcid);
+}
+
 /// Flush all non-global TLB entries locally, using INVPCID if available.
 ///
 /// This is more efficient than CR3 reload when INVPCID type 2 is available,
 /// as it doesn't require reading/writing CR3.
+///
+/// # R74-1 Enhancement: PCID-Aware Flush
+///
+/// Three code paths:
+/// 1. **INVPCID available**: Use INVPCID type 2 (most efficient, flushes all PCIDs)
+/// 2. **PCID enabled, no INVPCID**: Toggle CR4.PCIDE to flush all PCIDs
+/// 3. **No PCID**: Standard CR3 reload (fastest, no PCID tracking overhead)
 #[inline]
 fn flush_all_local() {
     if is_invpcid_available() {
         // INVPCID type 2: flush all non-global entries for all PCIDs
+        // Most efficient path - single instruction
         unsafe { invpcid_all_nonglobal() };
+    } else if is_pcid_enabled() {
+        // R74-1 Enhancement: PCID without INVPCID
+        // Toggle CR4.PCIDE to invalidate all PCID-tagged translations
+        // More expensive (4 control register writes) but necessary for correctness
+        unsafe { flush_all_pcid_without_invpcid() };
     } else {
-        // Fallback: standard CR3 reload flush
+        // No PCID: standard CR3 reload flushes all non-global TLB entries
+        // This is the legacy path for older CPUs
         tlb::flush_all();
     }
 }
@@ -943,15 +1030,29 @@ pub fn handle_shootdown_ipi() {
         let len = entry.len.load(Ordering::Relaxed);
         let start = entry.start.load(Ordering::Relaxed);
 
-        // Perform the flush if CR3 matches (0 = unconditional flush)
-        if target_cr3 == 0 || target_cr3 == this_cr3 {
-            if len == 0 {
-                // Full TLB flush - use INVPCID if available
-                flush_all_local();
-            } else {
-                // Range flush
-                flush_range_local(start, len);
-            }
+        // R74-1 FIX: Always invalidate TLB before ACKing.
+        //
+        // With PCID enabled, a CPU may have stale TLB entries for an address space
+        // it previously ran but is not currently running. If we only flush when
+        // target_cr3 == this_cr3, we leave stale entries intact that become active
+        // on context switch back to that CR3, enabling use-after-free and W^X bypass.
+        //
+        // Security fix: Always perform a flush. When the target address space is not
+        // currently active, fall back to flushing all non-global entries to ensure
+        // any cached entries for target_cr3 are invalidated.
+        if len == 0 || target_cr3 == 0 {
+            // Full TLB flush requested or unconditional flush
+            flush_all_local();
+        } else if target_cr3 == this_cr3 {
+            // Target address space is currently active - range flush is safe
+            flush_range_local(start, len);
+        } else {
+            // R74-1 FIX: Target address space not currently running here.
+            // We may have stale entries from a previous execution of this CR3.
+            // Flush all non-global entries (all PCIDs) to ensure no stale
+            // translations survive. This is more expensive but necessary for
+            // security when PCID is enabled.
+            flush_all_local();
         }
 
         // ACK this generation (only if it advances ack_gen - ensures monotonicity)

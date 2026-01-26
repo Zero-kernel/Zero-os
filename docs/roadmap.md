@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-23
+**Last Updated:** 2026-01-25
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,9 +10,9 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase E COMPLETE (SMP Infrastructure)
+### Current Status: Phase F IN PROGRESS (Resource Governance)
 
-Zero-OS has completed network foundation with comprehensive validation:
+Zero-OS has completed SMP infrastructure and begun resource governance:
 - **72 security audits** with 323+ issues found, ~278 fixed (86.1%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
@@ -33,6 +33,12 @@ Zero-OS has completed network foundation with comprehensive validation:
   - E.4: RCU ✅ (timer-driven grace periods, callback batching), Lockdep ✅ (dependency graph), **Futex PI ✅** (R72-1, R72-2)
   - E.5: Per-CPU scheduler ✅, Load balancing ✅, CPU affinity syscalls ✅
   - E.6: Cpuset CPU isolation ✅ (runtime test added)
+- **Phase F**: IN PROGRESS (Resource Governance)
+  - F.1: Namespaces ✅ **COMPLETE** (PID, Mount, IPC, Network)
+    - PID namespace (CLONE_NEWPID, cascade kill, namespace-local PIDs)
+    - Mount namespace (CLONE_NEWNS, sys_setns, per-namespace mount tables, R74-2 materialization fix)
+    - IPC namespace (CLONE_NEWIPC, isolated message queues/semaphores/shared memory)
+    - Network namespace (CLONE_NEWNET, device management, isolated sockets)
 - **R54**: ISN secret auto-upgrade ✅, Challenge ACK rate limiting ✅
 - **R55**: NewReno congestion control ✅ (RFC 6582 partial ACK handling)
 - **R56**: Limited Transmit ✅ (RFC 3042 adapted for immediate-send architecture)
@@ -43,6 +49,7 @@ Zero-OS has completed network foundation with comprehensive validation:
 - **R61**: SYN cookies ✅ (RFC 4987 stateless SYN flood protection)
 - **R66**: TCP options validation ✅, VirtIO hardening ✅, Runtime network tests ✅
 - **R72**: RCU memory ordering fix ✅, PI chain iterative ✅, Futex waiter cleanup ✅
+- **R74**: Mount namespace materialization fix ✅ (eager snapshot prevents mount leakage)
 
 ### Gap Analysis vs Linux Kernel
 
@@ -53,7 +60,7 @@ Zero-OS has completed network foundation with comprehensive validation:
 | **Network** | Full TCP/IP stack | TCP (w/retransmission + NewReno CC + Window Scaling + SYN cookies + Conntrack + Firewall + Options validation), UDP, ICMP | SACK, Timestamps |
 | **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
 | **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
-| **Containers** | Namespaces/Cgroups | Not started | Full implementation needed |
+| **Containers** | Namespaces/Cgroups | PID ✅, Mount ✅, IPC ✅, Network ✅ namespaces | User namespace, Cgroups |
 | **Virtualization** | KVM/QEMU | Not started | Future consideration |
 
 ---
@@ -612,14 +619,15 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 
 ---
 
-### Phase F: Resource Governance
+### Phase F: Resource Governance [IN PROGRESS]
 
 **Goal**: Multi-tenant resource isolation.
 
 **Priority**: Medium
 **Dependencies**: Phase B (Cap/LSM), Phase C (storage), Phase D (network)
+**Status**: F.1 Complete, F.2-F.3 pending
 
-#### F.1 Namespaces
+#### F.1 Namespaces ✅ **COMPLETE**
 
 - [x] PID namespace (isolated PID numbering)
   - Hierarchical namespace tree with MAX_PID_NS_LEVEL=32 depth
@@ -627,9 +635,37 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
   - Namespace-aware getpid/getppid/gettid/kill syscalls
   - Init death cascade (SIGKILL to all namespace members)
   - fork/clone/wait return namespace-local PIDs
-- [ ] Mount namespace (isolated FS view)
-- [ ] IPC namespace (isolated message queues)
-- [ ] Network namespace (isolated stack)
+- [x] Mount namespace (isolated FS view) ✅ **COMPLETE** (2026-01-25)
+  - `kernel/kernel_core/mount_namespace.rs`: Core MountNamespace structure
+  - Per-namespace mount tables in VFS (`NamespaceMountTable`)
+  - CLONE_NEWNS in sys_clone with copy-on-write mount table
+  - sys_unshare(CLONE_NEWNS) for process mount namespace isolation
+  - sys_setns (syscall 308) for mount namespace switching
+  - MountNamespaceFd for namespace file descriptor wrapper
+  - R74-2 fix: Eager materialization prevents mount leakage
+  - Security: CAP_SYS_ADMIN or root required, single-threaded validation
+  - Runtime test: `MountNamespaceIsolationTest` (hierarchy, IDs, isolation, depth limit)
+  - Audit events: `AuditObject::Namespace` for clone/unshare/setns logging
+  - See [phase-f-mount-namespace-plan.md](phase-f-mount-namespace-plan.md) for details
+- [x] IPC namespace (isolated message queues) ✅ **COMPLETE** (2026-01-25)
+  - `kernel/kernel_core/ipc_namespace.rs`: Core IpcNamespace structure
+  - Hierarchical namespace tree with MAX_IPC_NS_LEVEL=32 depth
+  - CLONE_NEWIPC in sys_clone creates isolated IPC namespace
+  - Isolated System V IPC resources (message queues, semaphores, shared memory)
+  - IpcNamespaceFd for namespace file descriptor wrapper
+  - Security: CAP_SYS_ADMIN or root required
+  - Runtime test: `IpcNamespaceIsolationTest` (hierarchy, IDs, refcounting, depth limit)
+  - Audit events: `AuditObject::Namespace` for clone logging
+- [x] Network namespace (isolated stack) ✅ **COMPLETE** (2026-01-25)
+  - `kernel/kernel_core/net_namespace.rs`: Core NetNamespace structure
+  - Hierarchical namespace tree with MAX_NET_NS_LEVEL=32 depth
+  - CLONE_NEWNET in sys_clone creates isolated network namespace
+  - Device management (add_device, remove_device, move_device)
+  - Each namespace has loopback interface by default
+  - NetNamespaceFd for namespace file descriptor wrapper
+  - Security: CAP_NET_ADMIN or root required
+  - Runtime test: `NetNamespaceIsolationTest` (hierarchy, IDs, devices, refcounting, depth limit)
+  - Audit events: `AuditObject::Namespace` for clone logging
 - [ ] User namespace (UID/GID mapping)
 
 #### F.2 Cgroups v1.5
@@ -764,11 +800,13 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-21 | 70 | 3 | 3 | AP idle loop race, TLB mailbox overwrite, CPU affinity semantics - **ALL FIXED** |
 | 2026-01-22 | 71 | 4 | 4 | RCU grace period progress, RCU memory ordering, Lockdep IRQ window, TLB self-ACK safety - **ALL FIXED** |
 | 2026-01-22 | 72 | 0 | 0 | CPU affinity syscalls (sched_setaffinity/sched_getaffinity) - **E.5 FEATURE** |
-| **Total** | **72** | **346** | **295 (85.3%)** | **51 open (R65 SMP + VirtIO IOMMU deferred)** |
+| 2026-01-25 | 74 | 1 | 1 | Mount namespace materialization (R74-2 eager snapshot) - **F.1 FEATURE** |
+| 2026-01-25 | - | 0 | 0 | Mount namespace runtime test + audit events - **F.1 COMPLETE** |
+| **Total** | **74** | **347** | **296 (85.3%)** | **51 open (R65 SMP + VirtIO IOMMU deferred)** |
 
 ### Current Status
 
-- **Fixed**: 295 issues (85.3%)
+- **Fixed**: 296 issues (85.3%)
 - **Open**: 51 issues (14.7%)
   - R65 remaining issues (SMP-related, non-blocking)
   - R62-6 (VirtIO IOMMU) deferred to Phase F.3
@@ -779,7 +817,12 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
   - E.4 Synchronization: ✅ RCU (R71), Lockdep (R71), Futex PI (R72)
   - E.5 Scheduler SMP: ✅ Per-CPU runqueues, load balancing, CPU affinity syscalls
   - E.6 CPU Isolation: ✅ Cpuset with runtime test (R72)
+- **Phase F Progress**: IN PROGRESS
+  - F.1 Namespaces: ✅ PID namespace complete, Mount namespace complete (R74)
+  - F.2 Cgroups: Pending
+  - F.3 IOMMU: Pending
 - **SMP Ready**: All Phase E components complete, 8-core SMP testing verified
+- **Container Foundation**: PID + Mount namespaces provide basic container isolation
 
 See [qa-2026-01-23.md](review/qa-2026-01-23.md) for latest audit report.
 

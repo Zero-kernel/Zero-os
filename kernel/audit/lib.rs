@@ -324,6 +324,15 @@ pub enum AuditObject {
         /// Protection flags
         prot: u32,
     },
+    /// Namespace (F.1: Mount namespace audit support)
+    Namespace {
+        /// Namespace ID
+        ns_id: u64,
+        /// Namespace type (CLONE_NEWNS=0x20000, CLONE_NEWPID=0x20000000)
+        ns_type: u32,
+        /// Parent namespace ID (0 if root)
+        parent_id: u64,
+    },
 }
 
 // ============================================================================
@@ -693,6 +702,16 @@ fn hash_object(hasher: &mut Sha256Writer, obj: &AuditObject) {
             hasher.write_u64(*vaddr);
             hasher.write_u64(*size);
             hasher.write_u32(*prot);
+        }
+        AuditObject::Namespace {
+            ns_id,
+            ns_type,
+            parent_id,
+        } => {
+            hasher.write_u8(7);
+            hasher.write_u64(*ns_id);
+            hasher.write_u32(*ns_type);
+            hasher.write_u64(*parent_id);
         }
     }
 }

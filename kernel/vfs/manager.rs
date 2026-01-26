@@ -281,6 +281,43 @@ impl Vfs {
         table
     }
 
+    /// R74-2 FIX: Force eager materialization of mount namespace table.
+    ///
+    /// This public method ensures that a namespace's mount table is created
+    /// immediately by cloning from its parent at namespace creation time,
+    /// rather than lazily on first VFS access.
+    ///
+    /// # Security Issue Fixed
+    ///
+    /// Without eager materialization, the following vulnerability exists:
+    /// 1. Process calls sys_clone(CLONE_NEWNS) -> creates child namespace
+    /// 2. Mount table is NOT materialized yet (lazy creation)
+    /// 3. Parent makes new mount (e.g., /host/secrets)
+    /// 4. Child makes first VFS access -> ensure_namespace_table() clones
+    ///    parent's CURRENT state (including /host/secrets)
+    /// 5. Child sees mounts added AFTER namespace creation -> isolation bypassed
+    ///
+    /// Fix: Call this method immediately after creating a namespace to snapshot
+    /// the parent's mount table at creation time, not at first use.
+    ///
+    /// # Arguments
+    ///
+    /// * `ns` - The namespace whose mount table should be materialized
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let new_ns = clone_namespace(parent_ns.clone())?;
+    /// VFS.materialize_namespace(&parent_ns);  // Ensure parent is stable
+    /// VFS.materialize_namespace(&new_ns);     // Snapshot parent NOW
+    /// ```
+    pub fn materialize_namespace(&self, ns: &Arc<MountNamespace>) {
+        // ensure_namespace_table already performs the snapshot when the
+        // table doesn't exist. Calling it explicitly forces immediate
+        // materialization instead of deferring to first VFS access.
+        let _ = self.ensure_namespace_table(ns);
+    }
+
     /// Initialize the VFS with default mounts
     pub fn init(&self) {
         // Create ramfs as root filesystem
@@ -1387,7 +1424,23 @@ pub fn register_syscall_callbacks() {
     kernel_core::register_vfs_unlink_callback(vfs_unlink_callback);
     kernel_core::register_vfs_readdir_callback(vfs_readdir_callback);
     kernel_core::register_vfs_truncate_callback(vfs_truncate_callback);
-    println!("VFS syscall callbacks registered (openat2 enabled)");
+
+    // R74-2 FIX: Register mount namespace materialization callback.
+    // This enables eager materialization when namespaces are created via
+    // sys_clone(CLONE_NEWNS) or sys_unshare(CLONE_NEWNS), preventing
+    // post-clone parent mounts from leaking into child namespaces.
+    kernel_core::register_mount_ns_materialize_callback(mount_ns_materialize_callback);
+
+    println!("VFS syscall callbacks registered (openat2 enabled, R74-2 materialize enabled)");
+}
+
+/// R74-2 FIX: Mount namespace materialization callback.
+///
+/// Called by syscall layer when a new mount namespace is created to ensure
+/// the mount table is eagerly materialized, preventing race conditions where
+/// parent namespace mounts could leak into the child.
+fn mount_ns_materialize_callback(ns: &alloc::sync::Arc<kernel_core::MountNamespace>) {
+    VFS.materialize_namespace(ns);
 }
 
 /// VFS create callback for syscall registration

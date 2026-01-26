@@ -1058,6 +1058,15 @@ pub type VfsReaddirCallback = fn(i32) -> Result<alloc::vec::Vec<DirEntry>, Sysca
 /// 参数: (fd, length) -> () 或错误
 pub type VfsTruncateCallback = fn(i32, u64) -> Result<(), SyscallError>;
 
+/// R74-2 FIX: Mount namespace materialization callback type.
+///
+/// Registered by vfs module to force eager materialization of mount tables.
+/// This prevents security vulnerabilities where lazy materialization allows
+/// parent namespace mounts to leak into child namespaces.
+///
+/// Parameter: Arc<MountNamespace> to materialize
+pub type MountNsMaterializeCallback = fn(&alloc::sync::Arc<crate::mount_namespace::MountNamespace>);
+
 /// 文件类型枚举(本地定义避免循环依赖)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
@@ -1127,6 +1136,8 @@ lazy_static::lazy_static! {
     static ref VFS_READDIR_CALLBACK: spin::Mutex<Option<VfsReaddirCallback>> = spin::Mutex::new(None);
     /// VFS 截断回调
     static ref VFS_TRUNCATE_CALLBACK: spin::Mutex<Option<VfsTruncateCallback>> = spin::Mutex::new(None);
+    /// R74-2 FIX: Mount namespace materialization callback
+    static ref MOUNT_NS_MATERIALIZE_CALLBACK: spin::Mutex<Option<MountNsMaterializeCallback>> = spin::Mutex::new(None);
 }
 
 /// 注册管道创建回调
@@ -1192,6 +1203,59 @@ pub fn register_vfs_readdir_callback(cb: VfsReaddirCallback) {
 /// 注册 VFS 截断回调
 pub fn register_vfs_truncate_callback(cb: VfsTruncateCallback) {
     *VFS_TRUNCATE_CALLBACK.lock() = Some(cb);
+}
+
+/// R74-2 FIX: Register mount namespace materialization callback.
+///
+/// The VFS module **must** call this at initialization to register the function
+/// that materializes mount namespace tables. This forces eager table creation
+/// to prevent parent namespace mounts from leaking into child namespaces.
+///
+/// # R74-2 Enhancement
+///
+/// Missing registration will panic during namespace creation to avoid silent
+/// isolation bypasses. This enforces proper initialization order: VFS callbacks
+/// must be registered before any namespace operations (clone/unshare with CLONE_NEWNS).
+pub fn register_mount_ns_materialize_callback(cb: MountNsMaterializeCallback) {
+    *MOUNT_NS_MATERIALIZE_CALLBACK.lock() = Some(cb);
+}
+
+/// R74-2 Test Helper: Check if mount namespace materialization callback is registered.
+///
+/// Used by runtime tests to verify the R74-2 fix is properly initialized.
+/// Returns true if the callback is registered, false otherwise.
+pub fn test_is_mount_ns_callback_registered() -> bool {
+    MOUNT_NS_MATERIALIZE_CALLBACK.lock().is_some()
+}
+
+/// R74-2 FIX: Mandatory mount namespace materialization.
+///
+/// Private helper used by sys_clone and sys_unshare to ensure mount tables are
+/// eagerly materialized when namespaces are created.
+///
+/// # R74-2 Enhancement: Panic if Callback Absent
+///
+/// This function will panic if the VFS has not registered the materialization
+/// callback. This prevents silent isolation bypasses where namespace operations
+/// could proceed without proper mount table snapshots, potentially leaking
+/// parent namespace mounts to child namespaces.
+///
+/// # Panics
+///
+/// Panics with a critical error if `register_mount_ns_materialize_callback()`
+/// was not called before this function is invoked.
+fn materialize_namespace(ns: &Arc<crate::mount_namespace::MountNamespace>) {
+    // R74-2 Enhancement: Mandatory callback - panic if not registered.
+    // Copy the fn pointer out immediately to avoid holding lock during callback.
+    // MountNsMaterializeCallback is `fn(...)` which is Copy, so we dereference
+    // to copy the pointer and release the mutex before invoking.
+    let cb = *MOUNT_NS_MATERIALIZE_CALLBACK.lock().as_ref().expect(
+        "CRITICAL: Mount namespace materialization callback not registered! \
+         VFS must call register_mount_ns_materialize_callback() before any \
+         namespace operations (clone/unshare with CLONE_NEWNS). This is a \
+         kernel initialization bug."
+    );
+    cb(ns);
 }
 
 // ============================================================================
@@ -2137,6 +2201,10 @@ const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 const CLONE_NEWPID: u64 = 0x2000_0000;
 /// F.1: Create a new mount namespace for the child
 const CLONE_NEWNS: u64 = 0x0002_0000;
+/// F.1: Create a new IPC namespace for the child
+const CLONE_NEWIPC: u64 = crate::CLONE_NEWIPC;
+/// F.1: Create a new network namespace for the child
+const CLONE_NEWNET: u64 = crate::CLONE_NEWNET;
 
 /// sys_clone - 创建线程/轻量级进程
 ///
@@ -2179,8 +2247,10 @@ fn sys_clone(
         | CLONE_PARENT_SETTID
         | CLONE_CHILD_CLEARTID
         | CLONE_CHILD_SETTID
-        | CLONE_NEWPID  // F.1: PID namespace support
-        | CLONE_NEWNS;  // F.1: Mount namespace support
+        | CLONE_NEWPID   // F.1: PID namespace support
+        | CLONE_NEWNS    // F.1: Mount namespace support
+        | CLONE_NEWIPC   // F.1: IPC namespace support
+        | CLONE_NEWNET;  // F.1: Network namespace support
 
     // 检查不支持的 flags
     // 返回 EINVAL 而不是 ENOSYS，因为这是参数验证失败而非功能未实现
@@ -2228,6 +2298,42 @@ fn sys_clone(
         let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(true);
         if !is_root && !has_cap_admin {
             println!("[sys_clone] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
+            return Err(SyscallError::EPERM);
+        }
+    }
+
+    // F.1: CLONE_NEWIPC cannot be combined with CLONE_THREAD
+    // IPC namespace is per-process; threads must share the same IPC namespace
+    if flags & CLONE_NEWIPC != 0 && flags & CLONE_THREAD != 0 {
+        println!("[sys_clone] CLONE_NEWIPC cannot be combined with CLONE_THREAD");
+        return Err(SyscallError::EINVAL);
+    }
+
+    // F.1 Security: CLONE_NEWIPC requires CAP_SYS_ADMIN or root
+    if flags & CLONE_NEWIPC != 0 {
+        let has_cap_admin =
+            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(true);
+        if !is_root && !has_cap_admin {
+            println!("[sys_clone] CLONE_NEWIPC denied: requires CAP_SYS_ADMIN or root");
+            return Err(SyscallError::EPERM);
+        }
+    }
+
+    // F.1: CLONE_NEWNET cannot be combined with CLONE_THREAD
+    // Network namespace is per-process; threads must share the same network namespace
+    if flags & CLONE_NEWNET != 0 && flags & CLONE_THREAD != 0 {
+        println!("[sys_clone] CLONE_NEWNET cannot be combined with CLONE_THREAD");
+        return Err(SyscallError::EINVAL);
+    }
+
+    // F.1 Security: CLONE_NEWNET requires CAP_NET_ADMIN (CapRights::ADMIN) or root
+    if flags & CLONE_NEWNET != 0 {
+        let has_cap_admin =
+            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(true);
+        if !is_root && !has_cap_admin {
+            println!("[sys_clone] CLONE_NEWNET denied: requires CAP_NET_ADMIN or root");
             return Err(SyscallError::EPERM);
         }
     }
@@ -2286,6 +2392,10 @@ fn sys_clone(
         parent_pid_ns_for_children, // F.1: PID namespace for children
         parent_mount_ns,             // F.1: Mount namespace
         parent_mount_ns_for_children, // F.1: Mount namespace for children
+        parent_ipc_ns,               // F.1: IPC namespace
+        parent_ipc_ns_for_children,  // F.1: IPC namespace for children
+        parent_net_ns,               // F.1: Network namespace
+        parent_net_ns_for_children,  // F.1: Network namespace for children
     ) = {
         let mut parent = parent_arc.lock();
         // 始终从 MSR 同步 fs_base 到 PCB
@@ -2315,6 +2425,10 @@ fn sys_clone(
             parent.pid_ns_for_children.clone(), // F.1: PID namespace
             parent.mount_ns.clone(),             // F.1: Mount namespace
             parent.mount_ns_for_children.clone(), // F.1: Mount namespace for children
+            parent.ipc_ns.clone(),               // F.1: IPC namespace
+            parent.ipc_ns_for_children.clone(),  // F.1: IPC namespace for children
+            parent.net_ns.clone(),               // F.1: Network namespace
+            parent.net_ns_for_children.clone(),  // F.1: Network namespace for children
         )
     };
 
@@ -2357,11 +2471,41 @@ fn sys_clone(
     let new_mount_ns = if flags & CLONE_NEWNS != 0 {
         match crate::mount_namespace::clone_namespace(parent_mount_ns.clone()) {
             Ok(ns) => {
+                // R74-2 FIX: Eagerly materialize mount namespace tables.
+                //
+                // Without eager materialization, the child namespace's mount table
+                // is created lazily on first VFS access. This creates a race where
+                // mounts added to the parent AFTER clone() but BEFORE the child's
+                // first VFS access would leak into the child, bypassing namespace
+                // isolation.
+                //
+                // Fix: Materialize both parent and child mount tables NOW to
+                // snapshot the parent's mount state at clone time.
+                materialize_namespace(&parent_mount_ns);
+                materialize_namespace(&ns);
+
                 println!(
-                    "[sys_clone] Created new mount namespace: id={}, level={}",
+                    "[sys_clone] Created new mount namespace: id={}, level={} (eagerly materialized)",
                     ns.id().raw(),
                     ns.level()
                 );
+
+                // F.1 Audit: Emit namespace creation event
+                let parent_id = ns.parent().map(|p| p.id().raw()).unwrap_or(0);
+                let _ = audit::emit(
+                    AuditKind::Process,
+                    AuditOutcome::Success,
+                    get_audit_subject(),
+                    AuditObject::Namespace {
+                        ns_id: ns.id().raw(),
+                        ns_type: CLONE_NEWNS as u32,
+                        parent_id,
+                    },
+                    &[56, flags, CLONE_NEWNS], // syscall 56 = clone, flags, CLONE_NEWNS
+                    0,
+                    crate::time::current_timestamp_ms(),
+                );
+
                 Some(ns)
             }
             Err(crate::mount_namespace::MountNsError::MaxDepthExceeded) => {
@@ -2370,6 +2514,89 @@ fn sys_clone(
             }
             Err(e) => {
                 println!("[sys_clone] Failed to create mount namespace: {:?}", e);
+                return Err(SyscallError::ENOMEM);
+            }
+        }
+    } else {
+        None
+    };
+
+    // F.1: Handle CLONE_NEWIPC - create new IPC namespace
+    let new_ipc_ns = if flags & CLONE_NEWIPC != 0 {
+        match crate::ipc_namespace::clone_ipc_namespace(parent_ipc_ns_for_children.clone()) {
+            Ok(ns) => {
+                println!(
+                    "[sys_clone] Created new IPC namespace: id={}, level={}",
+                    ns.id().raw(),
+                    ns.level()
+                );
+
+                // F.1 Audit: Emit namespace creation event
+                let parent_id = ns.parent().map(|p| p.id().raw()).unwrap_or(0);
+                let _ = audit::emit(
+                    AuditKind::Process,
+                    AuditOutcome::Success,
+                    get_audit_subject(),
+                    AuditObject::Namespace {
+                        ns_id: ns.id().raw(),
+                        ns_type: CLONE_NEWIPC as u32,
+                        parent_id,
+                    },
+                    &[56, flags, CLONE_NEWIPC], // syscall 56 = clone
+                    0,
+                    crate::time::current_timestamp_ms(),
+                );
+
+                Some(ns)
+            }
+            Err(crate::ipc_namespace::IpcNsError::MaxDepthExceeded) => {
+                println!("[sys_clone] Failed to create IPC namespace: max depth exceeded");
+                return Err(SyscallError::EAGAIN);
+            }
+            Err(e) => {
+                println!("[sys_clone] Failed to create IPC namespace: {:?}", e);
+                return Err(SyscallError::ENOMEM);
+            }
+        }
+    } else {
+        None
+    };
+
+    // F.1: Handle CLONE_NEWNET - create new network namespace
+    let new_net_ns = if flags & CLONE_NEWNET != 0 {
+        match crate::net_namespace::clone_net_namespace(parent_net_ns_for_children.clone()) {
+            Ok(ns) => {
+                println!(
+                    "[sys_clone] Created new network namespace: id={}, level={}, has_loopback={}",
+                    ns.id().raw(),
+                    ns.level(),
+                    ns.has_loopback()
+                );
+
+                // F.1 Audit: Emit namespace creation event
+                let parent_id = ns.parent().map(|p| p.id().raw()).unwrap_or(0);
+                let _ = audit::emit(
+                    AuditKind::Process,
+                    AuditOutcome::Success,
+                    get_audit_subject(),
+                    AuditObject::Namespace {
+                        ns_id: ns.id().raw(),
+                        ns_type: CLONE_NEWNET as u32,
+                        parent_id,
+                    },
+                    &[56, flags, CLONE_NEWNET], // syscall 56 = clone
+                    0,
+                    crate::time::current_timestamp_ms(),
+                );
+
+                Some(ns)
+            }
+            Err(crate::net_namespace::NetNsError::MaxDepthExceeded) => {
+                println!("[sys_clone] Failed to create network namespace: max depth exceeded");
+                return Err(SyscallError::EAGAIN);
+            }
+            Err(e) => {
+                println!("[sys_clone] Failed to create network namespace: {:?}", e);
                 return Err(SyscallError::ENOMEM);
             }
         }
@@ -2612,6 +2839,26 @@ fn sys_clone(
             .unwrap_or_else(|| parent_mount_ns_for_children.clone());
         child.mount_ns = child_mount_ns.clone();
         child.mount_ns_for_children = child_mount_ns;
+
+        // F.1 IPC Namespace: Assign IPC namespace to child
+        //
+        // CLONE_NEWIPC: Use the new IPC namespace created earlier
+        // Without CLONE_NEWIPC: Inherit parent's ipc_ns_for_children
+        let child_ipc_ns = new_ipc_ns
+            .clone()
+            .unwrap_or_else(|| parent_ipc_ns_for_children.clone());
+        child.ipc_ns = child_ipc_ns.clone();
+        child.ipc_ns_for_children = child_ipc_ns;
+
+        // F.1 Network Namespace: Assign network namespace to child
+        //
+        // CLONE_NEWNET: Use the new network namespace created earlier
+        // Without CLONE_NEWNET: Inherit parent's net_ns_for_children
+        let child_net_ns = new_net_ns
+            .clone()
+            .unwrap_or_else(|| parent_net_ns_for_children.clone());
+        child.net_ns = child_net_ns.clone();
+        child.net_ns_for_children = child_net_ns;
 
         // 设置进程状态为就绪
         child.state = ProcessState::Ready;
@@ -3538,6 +3785,27 @@ fn sys_unshare(flags: u64) -> SyscallResult {
             return Err(SyscallError::EPERM);
         }
 
+        // R74-3 FIX: Prevent mount namespace divergence in multi-threaded processes.
+        //
+        // CLONE_NEWNS can only be used by single-threaded processes. If multiple
+        // threads share the same tgid, allowing one thread to unshare its mount
+        // namespace would cause thread-local divergence, violating the assumption
+        // that all threads in a thread group share the same mount namespace.
+        //
+        // This matches Linux behavior (EINVAL if CLONE_NEWNS with CLONE_THREAD).
+        let tgid = {
+            let proc = proc_arc.lock();
+            proc.tgid
+        };
+        let thread_count = crate::thread_group_size(tgid);
+        if thread_count > 1 {
+            println!(
+                "[sys_unshare] CLONE_NEWNS denied: thread group has {} threads (must be 1)",
+                thread_count
+            );
+            return Err(SyscallError::EINVAL);
+        }
+
         let current_ns = {
             let proc = proc_arc.lock();
             proc.mount_ns.clone()
@@ -3551,6 +3819,13 @@ fn sys_unshare(flags: u64) -> SyscallResult {
             }
         })?;
 
+        // R74-2 FIX: Eagerly materialize mount namespace tables at unshare time.
+        //
+        // Same security fix as sys_clone: snapshot the parent's mount table NOW
+        // to prevent post-unshare parent mounts from leaking into the child.
+        materialize_namespace(&current_ns);
+        materialize_namespace(&new_ns);
+
         // Update process's mount namespace (immediately takes effect)
         {
             let mut proc = proc_arc.lock();
@@ -3559,10 +3834,26 @@ fn sys_unshare(flags: u64) -> SyscallResult {
         }
 
         println!(
-            "[sys_unshare] Process {} unshared mount namespace, now using ns_id={}, level={}",
+            "[sys_unshare] Process {} unshared mount namespace, now using ns_id={}, level={} (eagerly materialized)",
             pid,
             new_ns.id().raw(),
             new_ns.level()
+        );
+
+        // F.1 Audit: Emit namespace unshare event
+        let parent_id = new_ns.parent().map(|p| p.id().raw()).unwrap_or(0);
+        let _ = audit::emit(
+            AuditKind::Process,
+            AuditOutcome::Success,
+            get_audit_subject(),
+            AuditObject::Namespace {
+                ns_id: new_ns.id().raw(),
+                ns_type: CLONE_NEWNS as u32,
+                parent_id,
+            },
+            &[272, flags, CLONE_NEWNS], // syscall 272 = unshare, flags, CLONE_NEWNS
+            0,
+            crate::time::current_timestamp_ms(),
         );
     }
 
@@ -3607,6 +3898,26 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
+    // R74-3 FIX: Prevent mount namespace divergence in multi-threaded processes.
+    //
+    // setns(CLONE_NEWNS) cannot be used by multi-threaded processes because
+    // it would cause thread-local namespace divergence. All threads in a
+    // thread group must share the same mount namespace.
+    //
+    // This matches Linux behavior.
+    let tgid = {
+        let proc = proc_arc.lock();
+        proc.tgid
+    };
+    let thread_count = crate::thread_group_size(tgid);
+    if thread_count > 1 {
+        println!(
+            "[sys_setns] CLONE_NEWNS denied: thread group has {} threads (must be 1)",
+            thread_count
+        );
+        return Err(SyscallError::EINVAL);
+    }
+
     // Extract target mount namespace from fd
     let target_ns = {
         let proc = proc_arc.lock();
@@ -3629,12 +3940,34 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
         target_ns.level()
     );
 
+    // Get old namespace for audit before switching
+    let old_ns_id = {
+        let proc = proc_arc.lock();
+        proc.mount_ns.id().raw()
+    };
+
     // Switch current process mount namespace (and future children)
     {
         let mut proc = proc_arc.lock();
         proc.mount_ns = target_ns.clone();
-        proc.mount_ns_for_children = target_ns;
+        proc.mount_ns_for_children = target_ns.clone();
     }
+
+    // F.1 Audit: Emit namespace switch event
+    let parent_id = target_ns.parent().map(|p| p.id().raw()).unwrap_or(0);
+    let _ = audit::emit(
+        AuditKind::Process,
+        AuditOutcome::Success,
+        get_audit_subject(),
+        AuditObject::Namespace {
+            ns_id: target_ns.id().raw(),
+            ns_type: CLONE_NEWNS as u32,
+            parent_id,
+        },
+        &[308, fd as u64, old_ns_id], // syscall 308 = setns, fd, old_ns_id
+        0,
+        crate::time::current_timestamp_ms(),
+    );
 
     Ok(0)
 }
