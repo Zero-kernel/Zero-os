@@ -51,7 +51,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use spin::{Mutex, Once, RwLock};
 
-use cap::CapId;
+use cap::{CapId, NamespaceId};
 use lsm::{
     hook_net_bind, hook_net_connect, hook_net_listen, hook_net_recv, hook_net_send,
     hook_net_shutdown, hook_net_socket, LsmError, NetCtx, ProcessCtx,
@@ -891,6 +891,12 @@ pub struct SocketState {
     pub proto: SocketProtocol,
     /// Security label from creation
     pub label: SocketLabel,
+    /// R75-1 FIX: Network namespace identifier (for CLONE_NEWNET isolation)
+    ///
+    /// Sockets are isolated by network namespace. Port bindings and lookups
+    /// are partitioned by this ID, ensuring that different namespaces can
+    /// bind to the same port independently.
+    pub net_ns_id: NamespaceId,
     /// Reference count for file descriptors referencing this socket.
     ///
     /// Initialized to 1 at creation. Incremented on dup()/fork(), decremented
@@ -934,12 +940,15 @@ impl core::fmt::Debug for SocketState {
 
 impl SocketState {
     /// Create a new socket state.
+    ///
+    /// R75-1 FIX: Now requires net_ns_id parameter for namespace isolation.
     pub fn new(
         id: u64,
         domain: SocketDomain,
         ty: SocketType,
         proto: SocketProtocol,
         label: SocketLabel,
+        net_ns_id: NamespaceId,
     ) -> Self {
         SocketState {
             id,
@@ -947,6 +956,7 @@ impl SocketState {
             ty,
             proto,
             label,
+            net_ns_id,
             refcount: AtomicU64::new(1),
             meta: Mutex::new(SocketMeta::new()),
             rx_queue: Mutex::new(VecDeque::new()),
@@ -1252,6 +1262,8 @@ pub enum SocketError {
     WouldBlock,
     /// Invalid socket state for the requested operation
     InvalidState,
+    /// R76-3 FIX: Per-namespace socket quota exceeded
+    QuotaExceeded,
     /// UDP layer error
     Udp(UdpError),
     /// LSM policy denial
@@ -1279,6 +1291,17 @@ impl From<LsmError> for SocketError {
 /// Global socket table: tracks all sockets and port bindings.
 ///
 /// Thread-safe via RwLock (read-heavy) and Mutex (write operations).
+///
+/// # R75-1 FIX: Network Namespace Isolation
+///
+/// Port bindings (udp_bindings, tcp_bindings) are partitioned by NamespaceId.
+/// Different network namespaces can bind to the same port independently,
+/// providing true CLONE_NEWNET isolation.
+///
+/// # R76-3 FIX: Per-Namespace Socket Quota
+///
+/// Each namespace is limited to MAX_SOCKETS_PER_NS sockets to prevent DoS
+/// attacks where a container exhausts global socket resources.
 pub struct SocketTable {
     /// Next socket ID (monotonically increasing)
     next_socket_id: AtomicU64,
@@ -1286,12 +1309,14 @@ pub struct SocketTable {
     next_ephemeral: AtomicU16,
     /// All active sockets (socket_id -> SocketState)
     sockets: RwLock<BTreeMap<u64, Arc<SocketState>>>,
-    /// UDP port bindings (port -> weak ref to socket)
-    udp_bindings: Mutex<BTreeMap<u16, Weak<SocketState>>>,
-    /// TCP local port bindings
-    tcp_bindings: Mutex<BTreeMap<u16, Weak<SocketState>>>,
+    /// R75-1 FIX: UDP port bindings partitioned by network namespace
+    udp_bindings: Mutex<BTreeMap<(NamespaceId, u16), Weak<SocketState>>>,
+    /// R75-1 FIX: TCP local port bindings partitioned by network namespace
+    tcp_bindings: Mutex<BTreeMap<(NamespaceId, u16), Weak<SocketState>>>,
     /// Active TCP connections keyed by 4-tuple
     tcp_conns: Mutex<BTreeMap<TcpLookupKey, Weak<SocketState>>>,
+    /// R76-3 FIX: Per-namespace socket count for quota enforcement
+    per_ns_counts: Mutex<BTreeMap<NamespaceId, u64>>,
     /// Last observed timestamp (ms) used for TIME_WAIT bookkeeping.
     /// Updated by sweep_time_wait() and used by RX path when transitioning to TIME_WAIT.
     time_wait_clock: AtomicU64,
@@ -1333,11 +1358,38 @@ impl SocketTable {
             udp_bindings: Mutex::new(BTreeMap::new()),
             tcp_bindings: Mutex::new(BTreeMap::new()),
             tcp_conns: Mutex::new(BTreeMap::new()),
+            per_ns_counts: Mutex::new(BTreeMap::new()), // R76-3 FIX
             time_wait_clock: AtomicU64::new(0),
             timer_sweeps_skipped: AtomicU64::new(0),
             created: AtomicU64::new(0),
             closed_count: AtomicU64::new(0),
             bind_count: AtomicU64::new(0),
+        }
+    }
+
+    /// R76-3 FIX: Maximum sockets allowed per network namespace.
+    /// Prevents DoS via socket exhaustion within a single namespace.
+    /// Value allows reasonable server workloads while preventing abuse.
+    pub const MAX_SOCKETS_PER_NS: u64 = 8192;
+
+    /// R76-3 FIX: Try to increment namespace socket count, failing if quota exceeded.
+    fn try_inc_ns_count(&self, ns_id: NamespaceId) -> Result<(), SocketError> {
+        let mut counts = self.per_ns_counts.lock();
+        let count = counts.entry(ns_id).or_insert(0);
+        if *count >= Self::MAX_SOCKETS_PER_NS {
+            return Err(SocketError::QuotaExceeded); // Maps to EAGAIN in syscall layer
+        }
+        *count += 1;
+        Ok(())
+    }
+
+    /// R76-3 FIX: Decrement namespace socket count.
+    fn dec_ns_count(&self, ns_id: NamespaceId) {
+        let mut counts = self.per_ns_counts.lock();
+        if let Some(count) = counts.get_mut(&ns_id) {
+            if *count > 0 {
+                *count -= 1;
+            }
         }
     }
 
@@ -1348,27 +1400,47 @@ impl SocketTable {
     /// - Invokes `hook_net_socket` for LSM policy check
     /// - Captures creator context in socket label
     ///
+    /// # R75-1 FIX: Network Namespace Isolation
+    ///
+    /// The socket is bound to the caller's network namespace via `net_ns_id`.
+    /// Port bindings will be isolated within this namespace.
+    ///
+    /// # R76-3 FIX: Per-Namespace Socket Quota
+    ///
+    /// Enforces MAX_SOCKETS_PER_NS limit to prevent namespace DoS.
+    ///
     /// # Returns
     ///
     /// Arc to the new socket state, ready to be wrapped in a CapEntry.
-    pub fn create_udp_socket(&self, label: SocketLabel) -> Result<Arc<SocketState>, SocketError> {
+    pub fn create_udp_socket(
+        &self,
+        label: SocketLabel,
+        net_ns_id: NamespaceId,
+    ) -> Result<Arc<SocketState>, SocketError> {
+        // R76-3 FIX: Check and increment namespace quota before creating socket
+        self.try_inc_ns_count(net_ns_id)?;
+
         // Build LSM context
         let mut ctx = NetCtx::new(0, UDP_PROTO as u16);
         ctx.cap = Some(CapId::INVALID);
 
         // Check LSM policy
-        hook_net_socket(&label.creator, &ctx)?;
+        if let Err(_e) = hook_net_socket(&label.creator, &ctx) {
+            self.dec_ns_count(net_ns_id); // Rollback quota
+            return Err(SocketError::PermissionDenied);
+        }
 
         // Allocate socket ID
         let id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
 
-        // Create socket state
+        // Create socket state with namespace binding
         let sock = Arc::new(SocketState::new(
             id,
             SocketDomain::Inet4,
             SocketType::Dgram,
             SocketProtocol::Udp,
             label,
+            net_ns_id,
         ));
 
         // Register in table
@@ -1385,27 +1457,47 @@ impl SocketTable {
     /// - Invokes `hook_net_socket` for LSM policy check
     /// - Captures creator context in socket label
     ///
+    /// # R75-1 FIX: Network Namespace Isolation
+    ///
+    /// The socket is bound to the caller's network namespace via `net_ns_id`.
+    /// Port bindings will be isolated within this namespace.
+    ///
+    /// # R76-3 FIX: Per-Namespace Socket Quota
+    ///
+    /// Enforces MAX_SOCKETS_PER_NS limit to prevent namespace DoS.
+    ///
     /// # Returns
     ///
     /// Arc to the new socket state, ready to be wrapped in a CapEntry.
-    pub fn create_tcp_socket(&self, label: SocketLabel) -> Result<Arc<SocketState>, SocketError> {
+    pub fn create_tcp_socket(
+        &self,
+        label: SocketLabel,
+        net_ns_id: NamespaceId,
+    ) -> Result<Arc<SocketState>, SocketError> {
+        // R76-3 FIX: Check and increment namespace quota before creating socket
+        self.try_inc_ns_count(net_ns_id)?;
+
         // Build LSM context
         let mut ctx = NetCtx::new(0, TCP_PROTO as u16);
         ctx.cap = Some(CapId::INVALID);
 
         // Check LSM policy
-        hook_net_socket(&label.creator, &ctx)?;
+        if let Err(_e) = hook_net_socket(&label.creator, &ctx) {
+            self.dec_ns_count(net_ns_id); // Rollback quota
+            return Err(SocketError::PermissionDenied);
+        }
 
         // Allocate socket ID
         let id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
 
-        // Create socket state
+        // Create socket state with namespace binding
         let sock = Arc::new(SocketState::new(
             id,
             SocketDomain::Inet4,
             SocketType::Stream,
             SocketProtocol::Tcp,
             label,
+            net_ns_id,
         ));
 
         // Register in table
@@ -1434,6 +1526,11 @@ impl SocketTable {
     /// - R47-1 FIX: Uses current creds, not creation creds
     /// - R49-3 FIX: Respects NET_BIND_SERVICE capability via flag
     ///
+    /// # R75-1 FIX: Network Namespace Isolation
+    ///
+    /// Port bindings are partitioned by the socket's network namespace.
+    /// Different namespaces can bind to the same port independently.
+    ///
     /// # Returns
     ///
     /// The bound port number on success.
@@ -1457,6 +1554,7 @@ impl SocketTable {
         }
 
         // Determine port
+        // R75-1 FIX: Pass namespace ID for ephemeral port allocation
         let chosen_port = if let Some(p) = port {
             // R49-3 FIX: Privileged port check uses flag from syscall layer
             // This ensures NET_BIND_SERVICE capability is properly honored
@@ -1465,7 +1563,7 @@ impl SocketTable {
             }
             p
         } else {
-            self.alloc_ephemeral_port()?
+            self.alloc_ephemeral_port(sock.net_ns_id)?
         };
 
         // Build LSM context with actual CapId and current context
@@ -1477,20 +1575,23 @@ impl SocketTable {
         // Check LSM policy using CURRENT process context
         hook_net_bind(current, &ctx)?;
 
+        // R75-1 FIX: Use (namespace, port) key for binding
+        let binding_key = (sock.net_ns_id, chosen_port);
+
         // Register port binding
         {
             let mut bindings = self.udp_bindings.lock();
 
             // Check for existing binding (race condition prevention)
-            if let Some(existing) = bindings.get(&chosen_port) {
+            if let Some(existing) = bindings.get(&binding_key) {
                 if existing.upgrade().is_some() {
                     return Err(SocketError::PortInUse);
                 }
                 // R47-3 FIX: Remove stale weak reference
-                bindings.remove(&chosen_port);
+                bindings.remove(&binding_key);
             }
 
-            bindings.insert(chosen_port, Arc::downgrade(sock));
+            bindings.insert(binding_key, Arc::downgrade(sock));
         }
 
         // Update socket state
@@ -1517,6 +1618,10 @@ impl SocketTable {
     ///
     /// - Invokes `hook_net_bind` for LSM policy check
     /// - Privileged ports require root or NET_BIND_SERVICE
+    ///
+    /// # R75-1 FIX: Network Namespace Isolation
+    ///
+    /// Port bindings are partitioned by the socket's network namespace.
     pub fn bind_tcp(
         &self,
         sock: &Arc<SocketState>,
@@ -1537,13 +1642,14 @@ impl SocketTable {
         }
 
         // Determine port
+        // R75-1 FIX: Pass namespace ID for ephemeral port allocation
         let chosen_port = if let Some(p) = port {
             if p < PRIVILEGED_PORT_LIMIT && !can_bind_privileged {
                 return Err(SocketError::PrivilegedPort);
             }
             p
         } else {
-            self.alloc_ephemeral_tcp_port()?
+            self.alloc_ephemeral_tcp_port(sock.net_ns_id)?
         };
 
         // Build LSM context
@@ -1555,19 +1661,22 @@ impl SocketTable {
         // Check LSM policy
         hook_net_bind(current, &ctx)?;
 
+        // R75-1 FIX: Use (namespace, port) key for binding
+        let binding_key = (sock.net_ns_id, chosen_port);
+
         // Register port binding
         {
             let mut bindings = self.tcp_bindings.lock();
 
             // Check for existing binding
-            if let Some(existing) = bindings.get(&chosen_port) {
+            if let Some(existing) = bindings.get(&binding_key) {
                 if existing.upgrade().is_some() {
                     return Err(SocketError::PortInUse);
                 }
-                bindings.remove(&chosen_port);
+                bindings.remove(&binding_key);
             }
 
-            bindings.insert(chosen_port, Arc::downgrade(sock));
+            bindings.insert(binding_key, Arc::downgrade(sock));
         }
 
         // Update socket state
@@ -1645,13 +1754,23 @@ impl SocketTable {
     }
 
     /// Lookup a listening socket by local port (R51-1).
-    fn lookup_tcp_listener(&self, local_port: u16) -> Option<Arc<SocketState>> {
+    ///
+    /// # R75-1 FIX: Network Namespace Isolation
+    ///
+    /// Listener lookup is scoped to the specified network namespace.
+    fn lookup_tcp_listener(
+        &self,
+        net_ns_id: NamespaceId,
+        local_port: u16,
+    ) -> Option<Arc<SocketState>> {
+        // R75-1 FIX: Use namespace-scoped binding key
+        let binding_key = (net_ns_id, local_port);
         let mut bindings = self.tcp_bindings.lock();
-        match bindings.get(&local_port).and_then(|w| w.upgrade()) {
+        match bindings.get(&binding_key).and_then(|w| w.upgrade()) {
             Some(sock) if sock.is_listening() => Some(sock),
             Some(_) => None, // Bound but not listening
             None => {
-                bindings.remove(&local_port); // Clean up stale weak ref
+                bindings.remove(&binding_key); // Clean up stale weak ref
                 None
             }
         }
@@ -1804,9 +1923,10 @@ impl SocketTable {
         }
 
         // Determine local endpoint (bind if needed)
+        // R75-1 FIX: Allocate port within socket's network namespace
         let local_port = match sock.local_port() {
             Some(p) => p,
-            None => self.alloc_ephemeral_tcp_port()?,
+            None => self.alloc_ephemeral_tcp_port(sock.net_ns_id)?,
         };
         let local_ip = sock.local_ip().map(Ipv4Addr).unwrap_or(src_ip);
 
@@ -1837,18 +1957,20 @@ impl SocketTable {
 
         // Register local port binding and connection 4-tuple
         // This is done AFTER LSM check to prevent resource leaks on denial
+        // R75-1 FIX: Use namespace-scoped port binding keys
+        let binding_key = (sock.net_ns_id, local_port);
         let registration_result: Result<(), SocketError> = (|| {
             // Register local port in tcp_bindings
             {
                 let mut bindings = self.tcp_bindings.lock();
-                if let Some(existing) = bindings.get(&local_port) {
+                if let Some(existing) = bindings.get(&binding_key) {
                     if let Some(existing_sock) = existing.upgrade() {
                         if !Arc::ptr_eq(&existing_sock, sock) {
                             return Err(SocketError::PortInUse);
                         }
                     }
                 }
-                bindings.insert(local_port, Arc::downgrade(sock));
+                bindings.insert(binding_key, Arc::downgrade(sock));
                 binding_registered = true;
             }
 
@@ -1882,7 +2004,8 @@ impl SocketTable {
                 self.tcp_conns.lock().remove(&conn_key);
             }
             if binding_registered {
-                self.tcp_bindings.lock().remove(&local_port);
+                // R75-1 FIX: Remove using namespace-scoped key
+                self.tcp_bindings.lock().remove(&binding_key);
             }
             return Err(e);
         }
@@ -1955,7 +2078,9 @@ impl SocketTable {
                     // Connection was reset or failed
                     if matches!(sock.tcp_state(), Some(TcpState::Closed)) {
                         // Clean up on failed connection
-                        self.tcp_bindings.lock().remove(&local_port);
+                        // R75-1 FIX: Use namespace-scoped binding key
+                        let binding_key = (sock.net_ns_id, local_port);
+                        self.tcp_bindings.lock().remove(&binding_key);
                         self.tcp_conns.lock().remove(&conn_key);
                         return Err(SocketError::Closed);
                     }
@@ -1965,7 +2090,9 @@ impl SocketTable {
                 WaitOutcome::TimedOut => {
                     // Timeout - the SYN was sent but no response
                     // Clean up resources to allow retry or close
-                    self.tcp_bindings.lock().remove(&local_port);
+                    // R75-1 FIX: Use namespace-scoped binding key
+                    let binding_key = (sock.net_ns_id, local_port);
+                    self.tcp_bindings.lock().remove(&binding_key);
                     self.tcp_conns.lock().remove(&conn_key);
                     // Reset socket metadata to allow retry after close
                     {
@@ -1978,7 +2105,9 @@ impl SocketTable {
                     return Err(SocketError::Timeout);
                 }
                 WaitOutcome::Closed => {
-                    self.tcp_bindings.lock().remove(&local_port);
+                    // R75-1 FIX: Use namespace-scoped binding key
+                    let binding_key = (sock.net_ns_id, local_port);
+                    self.tcp_bindings.lock().remove(&binding_key);
                     self.tcp_conns.lock().remove(&conn_key);
                     return Err(SocketError::Closed);
                 }
@@ -2436,25 +2565,32 @@ impl SocketTable {
     /// - R47-3 FIX: Cleans up stale port bindings
     /// - R47-4 FIX: Checks queue capacity before copying to prevent DoS
     ///
+    /// # R75-1 FIX: Network Namespace Isolation
+    ///
+    /// Packet delivery is scoped to the caller's network namespace.
+    /// Only sockets bound to the same namespace can receive the packet.
+    ///
     /// # Returns
     ///
     /// `true` if delivered to a socket, `false` if no listener.
     pub fn deliver_udp(
         &self,
+        net_ns_id: NamespaceId,
         dst_port: u16,
         src_ip: Ipv4Addr,
         src_port: u16,
         data: &[u8],
         now_ticks: u64,
     ) -> bool {
-        // Look up bound socket
+        // R75-1 FIX: Look up bound socket within the specified namespace
+        let binding_key = (net_ns_id, dst_port);
         let target = {
             let mut bindings = self.udp_bindings.lock();
-            match bindings.get(&dst_port).and_then(|w| w.upgrade()) {
+            match bindings.get(&binding_key).and_then(|w| w.upgrade()) {
                 Some(sock) => Some(sock),
                 None => {
                     // R47-3 FIX: Clean up stale binding if upgrade failed
-                    bindings.remove(&dst_port);
+                    bindings.remove(&binding_key);
                     None
                 }
             }
@@ -2674,14 +2810,15 @@ impl SocketTable {
 
             let meta = sock.meta_snapshot();
 
-            // Remove port bindings based on protocol
+            // R75-1 FIX: Remove port bindings using namespace-scoped keys
             if let Some(port) = meta.local_port {
+                let binding_key = (sock.net_ns_id, port);
                 match sock.proto {
                     SocketProtocol::Udp => {
-                        self.udp_bindings.lock().remove(&port);
+                        self.udp_bindings.lock().remove(&binding_key);
                     }
                     SocketProtocol::Tcp => {
-                        self.tcp_bindings.lock().remove(&port);
+                        self.tcp_bindings.lock().remove(&binding_key);
                     }
                 }
             }
@@ -2712,6 +2849,10 @@ impl SocketTable {
             for child in children_to_cleanup {
                 self.cleanup_tcp_connection(&child);
             }
+
+            // R76-3 FIX: Decrement per-namespace socket count AFTER releasing sockets lock
+            // to avoid deadlock (Codex review fix: lock ordering with per_ns_counts)
+            self.dec_ns_count(sock.net_ns_id);
         }
 
         // Transmit FIN after releasing locks to avoid blocking critical sections.
@@ -2767,7 +2908,12 @@ impl SocketTable {
     /// Algorithm:
     /// 1. Try random ports from CSPRNG (2x range attempts for good coverage)
     /// 2. Fall back to deterministic sweep if CSPRNG fails or all random ports taken
-    fn alloc_ephemeral_port(&self) -> Result<u16, SocketError> {
+    ///
+    /// # R75-1 FIX: Network Namespace Isolation
+    ///
+    /// Port availability is checked within the given namespace. Different namespaces
+    /// can independently use the same ephemeral port without conflict.
+    fn alloc_ephemeral_port(&self, net_ns_id: NamespaceId) -> Result<u16, SocketError> {
         let range = (EPHEMERAL_PORT_END - EPHEMERAL_PORT_START + 1) as u16;
         let bindings = self.udp_bindings.lock();
 
@@ -2780,7 +2926,8 @@ impl SocketTable {
                 .unwrap_or_else(|_| self.fallback_port_seed());
             let candidate = EPHEMERAL_PORT_START + (seed % range);
 
-            if !bindings.contains_key(&candidate) {
+            // R75-1 FIX: Check namespace-scoped port binding
+            if !bindings.contains_key(&(net_ns_id, candidate)) {
                 return Ok(candidate);
             }
         }
@@ -2788,7 +2935,8 @@ impl SocketTable {
         // Phase 2: Deterministic sweep fallback (guarantees finding free port if one exists)
         for offset in 0..range {
             let candidate = EPHEMERAL_PORT_START + offset;
-            if !bindings.contains_key(&candidate) {
+            // R75-1 FIX: Check namespace-scoped port binding
+            if !bindings.contains_key(&(net_ns_id, candidate)) {
                 return Ok(candidate);
             }
         }
@@ -2800,7 +2948,12 @@ impl SocketTable {
     ///
     /// R59-1 FIX: Use CSPRNG for port randomization to prevent off-path attacks.
     /// Predictable ephemeral ports enable connection hijacking and blind injection.
-    fn alloc_ephemeral_tcp_port(&self) -> Result<u16, SocketError> {
+    ///
+    /// # R75-1 FIX: Network Namespace Isolation
+    ///
+    /// Port availability is checked within the given namespace. Different namespaces
+    /// can independently use the same ephemeral port without conflict.
+    fn alloc_ephemeral_tcp_port(&self, net_ns_id: NamespaceId) -> Result<u16, SocketError> {
         let range = (EPHEMERAL_PORT_END - EPHEMERAL_PORT_START + 1) as u16;
         let tcp_bindings = self.tcp_bindings.lock();
         let tcp_conns = self.tcp_conns.lock();
@@ -2813,11 +2966,12 @@ impl SocketTable {
                 .unwrap_or_else(|_| self.fallback_port_seed());
             let candidate = EPHEMERAL_PORT_START + (seed % range);
 
-            // Check if port is in use by TCP bindings or connections
-            if tcp_bindings.contains_key(&candidate) {
+            // R75-1 FIX: Check namespace-scoped TCP port binding
+            if tcp_bindings.contains_key(&(net_ns_id, candidate)) {
                 continue;
             }
             // Also check if any connection uses this as local port
+            // Note: tcp_conns is not namespace-partitioned as connections are unique by 4-tuple
             let in_use = tcp_conns.keys().any(|(_, port, _, _)| *port == candidate);
             if !in_use {
                 return Ok(candidate);
@@ -2827,7 +2981,8 @@ impl SocketTable {
         // Phase 2: Deterministic sweep fallback
         for offset in 0..range {
             let candidate = EPHEMERAL_PORT_START + offset;
-            if tcp_bindings.contains_key(&candidate) {
+            // R75-1 FIX: Check namespace-scoped TCP port binding
+            if tcp_bindings.contains_key(&(net_ns_id, candidate)) {
                 continue;
             }
             let in_use = tcp_conns.keys().any(|(_, port, _, _)| *port == candidate);
@@ -2911,10 +3066,16 @@ impl SocketTable {
     /// * `payload` - TCP payload (after header)
     /// * `options` - Parsed TCP options (for window scaling, etc.)
     ///
+    /// # R75-1 FIX: Network Namespace Isolation
+    ///
+    /// TCP segment processing is scoped to the specified network namespace.
+    /// Listener lookup and connection matching respect namespace boundaries.
+    ///
     /// # Returns
     /// TCP segment to transmit (ACK or RST) if a response is required.
     pub fn process_tcp_segment(
         &self,
+        net_ns_id: NamespaceId,
         src_ip: Ipv4Addr,
         dst_ip: Ipv4Addr,
         header: &TcpHeader,
@@ -3004,7 +3165,8 @@ impl SocketTable {
 
                 // Pure SYN (without ACK) indicates new connection request
                 if is_syn && !is_ack {
-                    if let Some(listener) = self.lookup_tcp_listener(header.dst_port) {
+                    // R75-1 FIX: Look up listener within the specified namespace
+                    if let Some(listener) = self.lookup_tcp_listener(net_ns_id, header.dst_port) {
                         let mut listen_guard = listener.listen.lock();
                         if let Some(listen_state) = listen_guard.as_mut() {
                             let syn_key = tcp_map_key_from_parts(
@@ -3073,6 +3235,7 @@ impl SocketTable {
                             }
 
                             // Create child socket inheriting listener properties
+                            // R75-1 FIX: Child socket inherits parent listener's network namespace
                             let child_id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
                             let child = Arc::new(SocketState::new(
                                 child_id,
@@ -3080,6 +3243,7 @@ impl SocketTable {
                                 listener.ty,
                                 listener.proto,
                                 listener.label,
+                                listener.net_ns_id,
                             ));
 
                             // Register in socket table
@@ -3209,7 +3373,8 @@ impl SocketTable {
                 let is_syn = header.flags & TCP_FLAG_SYN != 0;
 
                 if is_ack && !is_syn {
-                    if let Some(listener) = self.lookup_tcp_listener(header.dst_port) {
+                    // R75-1 FIX: Look up listener within the specified namespace
+                    if let Some(listener) = self.lookup_tcp_listener(net_ns_id, header.dst_port) {
                         let now_ms = self.time_wait_now();
 
                         // The cookie ISN is (ACK number - 1) since we sent SYN-ACK with ISN,
@@ -3274,6 +3439,7 @@ impl SocketTable {
                             }
 
                             // Create child socket for the connection
+                            // R75-1 FIX: Child socket inherits parent listener's network namespace
                             let child_id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
                             let child = Arc::new(SocketState::new(
                                 child_id,
@@ -3281,6 +3447,7 @@ impl SocketTable {
                                 listener.ty,
                                 listener.proto,
                                 listener.label,
+                                listener.net_ns_id,
                             ));
 
                             self.sockets.write().insert(child_id, child.clone());
@@ -4569,7 +4736,8 @@ impl SocketTable {
 
                 // Handle retransmitted SYN: resend cached SYN-ACK
                 if is_syn && !is_ack {
-                    if let Some(listener) = self.lookup_tcp_listener(header.dst_port) {
+                    // R75-1 FIX: Look up listener within the specified namespace
+                    if let Some(listener) = self.lookup_tcp_listener(net_ns_id, header.dst_port) {
                         let listen_guard = listener.listen.lock();
                         if let Some(listen_state) = listen_guard.as_ref() {
                             if let Some(pending) = listen_state.get_syn(&syn_key) {
@@ -4598,7 +4766,8 @@ impl SocketTable {
 
                     // R51-1 FIX: Remove stale PendingSyn from listener's SYN queue
                     // before cleanup to prevent cached SYN-ACK responses to dead socket
-                    if let Some(listener) = self.lookup_tcp_listener(header.dst_port) {
+                    // R75-1 FIX: Look up listener within the specified namespace
+                    if let Some(listener) = self.lookup_tcp_listener(net_ns_id, header.dst_port) {
                         let mut listen_guard = listener.listen.lock();
                         if let Some(listen_state) = listen_guard.as_mut() {
                             listen_state.take_syn(&syn_key);
@@ -4634,7 +4803,8 @@ impl SocketTable {
                 drop(guard);
 
                 // Remove from SYN queue and add to accept queue
-                if let Some(listener) = self.lookup_tcp_listener(header.dst_port) {
+                // R75-1 FIX: Look up listener within the specified namespace
+                if let Some(listener) = self.lookup_tcp_listener(net_ns_id, header.dst_port) {
                     let mut listen_guard = listener.listen.lock();
                     if let Some(listen_state) = listen_guard.as_mut() {
                         // Remove from SYN queue
@@ -5242,11 +5412,21 @@ impl SocketTable {
         }
 
         // Remove closed sockets from the sockets map
+        // R76-3 FIX (Codex review): Collect namespace IDs first, then decrement AFTER
+        // releasing sockets lock to avoid deadlock with create_* functions which
+        // lock per_ns_counts before sockets.
+        let mut ns_ids_to_decrement: Vec<NamespaceId> = Vec::new();
         if !ids_to_remove.is_empty() {
             let mut sockets = self.sockets.write();
-            for id in ids_to_remove {
-                sockets.remove(&id);
+            for id in &ids_to_remove {
+                if let Some(sock) = sockets.remove(id) {
+                    ns_ids_to_decrement.push(sock.net_ns_id);
+                }
             }
+        }
+        // Decrement namespace counts after releasing sockets lock
+        for ns_id in ns_ids_to_decrement {
+            self.dec_ns_count(ns_id);
         }
 
         // Transmit any pending FIN retransmissions (best-effort)
@@ -5620,12 +5800,14 @@ impl SocketTable {
         // R51-1 FIX: Only remove local port binding if this socket owns it.
         // Child sockets from passive open share the listener's port binding,
         // so we must not unbind the port when cleaning up a child socket.
+        // R75-1 FIX: Use namespace-scoped binding key.
         if let Some(port) = meta.local_port {
+            let binding_key = (sock.net_ns_id, port);
             let mut bindings = self.tcp_bindings.lock();
-            if let Some(weak) = bindings.get(&port) {
+            if let Some(weak) = bindings.get(&binding_key) {
                 // Only remove if this binding points to us (not a listener)
                 if weak.as_ptr() == Arc::as_ptr(sock) {
-                    bindings.remove(&port);
+                    bindings.remove(&binding_key);
                 }
             }
         }

@@ -10,6 +10,7 @@ extern crate drivers;
 // 导出 vga_buffer 模块中的其他公共函数
 pub use drivers::vga_buffer;
 
+pub mod cgroup;
 pub mod elf_loader;
 pub mod fork;
 pub mod ipc_namespace;
@@ -37,9 +38,12 @@ pub use process::{
     current_credentials,
     current_egid,
     current_euid,
-    current_ipc_ns,    // F.1: IPC namespace
-    current_mount_ns,  // F.1: Mount namespace
-    current_net_ns,    // F.1: Network namespace
+    current_ipc_ns,      // F.1: IPC namespace
+    current_ipc_ns_id,   // R75-2: IPC namespace ID for partitioning
+    current_mount_ns,    // F.1: Mount namespace
+    current_net_ns,      // F.1: Network namespace
+    current_net_ns_id,   // R75-1: Network namespace ID for partitioning
+    current_cgroup_id,   // F.2: Cgroup ID for resource accounting
     current_pid,
     current_supplementary_groups,
     current_umask,
@@ -160,6 +164,17 @@ pub use net_namespace::{
     test_is_net_ns_initialized,
 };
 
+// F.2: Cgroup v2 support
+pub use cgroup::{
+    init as init_cgroup, lookup_cgroup, create_cgroup, delete_cgroup,
+    root_cgroup, cgroup_count, migrate_task,
+    get_effective_cpu_weight, check_fork_allowed, account_cpu_time,
+    update_memory_usage, check_memory_allowed, try_charge_memory, uncharge_memory,
+    CgroupNode, CgroupId, CgroupControllers, CgroupLimits,
+    CgroupStats, CgroupStatsSnapshot, CgroupError,
+    MAX_CGROUP_DEPTH, MAX_CGROUPS, ROOT_CGROUP, CGROUP_REGISTRY,
+};
+
 // ============================================================================
 // LSM Context Provider Adapters
 // ============================================================================
@@ -226,6 +241,9 @@ pub fn init() {
 
     // Register OOM killer callbacks (must be after mm initialization)
     process::register_oom_callbacks();
+
+    // F.2: Initialize cgroup v2 subsystem
+    cgroup::init();
 
     println!("Kernel core module initialized");
 }

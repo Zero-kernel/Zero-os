@@ -25,6 +25,7 @@ use core::cell::UnsafeCell;
 use core::cmp;
 use core::sync::atomic::{AtomicU64, Ordering};
 use cpu_local::{current_cpu, current_cpu_id, max_cpus, num_online_cpus, CpuLocal, NO_FPU_OWNER};
+use kernel_core::cgroup;
 use kernel_core::process::{self, Priority, Process, ProcessId, ProcessState};
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -51,6 +52,11 @@ const SCHED_DEBUG: bool = false;
 /// LOAD_IMBALANCE_THRESHOLD: Minimum difference in queue lengths before migrating.
 const LOAD_BALANCE_INTERVAL_TICKS: u64 = 64;
 const LOAD_IMBALANCE_THRESHOLD: usize = 1;
+
+/// F.2 Cgroup: Timer tick duration in nanoseconds
+///
+/// Assumes 1ms tick interval (PIT/APIC timer). Used for cgroup CPU accounting.
+const TICK_NS: u64 = 1_000_000;
 
 /// 调度器调试输出宏
 macro_rules! sched_debug {
@@ -912,6 +918,13 @@ impl Scheduler {
                 // 减少时间片
                 if proc.time_slice > 0 {
                     proc.time_slice -= 1;
+
+                    // F.2 Cgroup: Account CPU time for per-process stats
+                    proc.cpu_time += 1;
+
+                    // F.2 Cgroup: Account CPU time for cgroup controller
+                    // This feeds into cgroup statistics and future cpu.stat accounting
+                    cgroup::account_cpu_time(proc.cgroup_id, TICK_NS);
                 }
 
                 // 时间片已用完，标记为就绪态并降低优先级

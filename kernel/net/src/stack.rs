@@ -61,6 +61,14 @@ use crate::ipv4::{
     IPV4_HEADER_MIN_LEN,
 };
 use crate::socket::socket_table;
+use cap::NamespaceId;
+
+/// R75-1 FIX: Root network namespace ID for incoming packet processing.
+///
+/// When processing incoming network packets at the stack level, we use the root
+/// namespace because physical network devices belong to the root namespace.
+/// Child namespaces only see traffic that's been explicitly forwarded to them.
+const ROOT_NET_NS_ID: NamespaceId = NamespaceId::new(0);
 use crate::tcp::{
     build_tcp_segment, parse_tcp_header, parse_tcp_options, verify_tcp_checksum, TcpError,
     TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_HEADER_MIN_LEN,
@@ -478,7 +486,8 @@ fn process_udp(
     }
 
     // Deliver to socket layer
-    if socket_table().deliver_udp(header.dst_port, ip_hdr.src, header.src_port, data, now_ms) {
+    // R75-1 FIX: Pass root network namespace ID for incoming packet processing
+    if socket_table().deliver_udp(ROOT_NET_NS_ID, header.dst_port, ip_hdr.src, header.src_port, data, now_ms) {
         return ProcessResult::Handled;
     }
 
@@ -697,7 +706,9 @@ fn process_tcp(
     let tcp_options = parse_tcp_options(payload, &tcp_hdr);
 
     // Delegate to socket layer for stateful TCP processing
+    // R75-1 FIX: Pass root network namespace ID for incoming packet processing
     if let Some(resp_seg) = socket_table().process_tcp_segment(
+        ROOT_NET_NS_ID,
         ip_hdr.src,
         ip_hdr.dst,
         &tcp_hdr,

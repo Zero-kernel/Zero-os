@@ -7,10 +7,11 @@
 //! All syscalls are audited with entry and exit events for security monitoring.
 //! Events include: syscall number, arguments, result, and process context.
 
+use crate::cgroup;
 use crate::fork::PAGE_REF_COUNT;
 use crate::process::{
-    cleanup_zombie, create_process, create_process_in_namespace, current_pid, get_process,
-    terminate_process, with_current_cap_table, ProcessId, ProcessState,
+    cleanup_zombie, create_process, create_process_in_namespace, current_net_ns_id, current_pid,
+    get_process, terminate_process, with_current_cap_table, ProcessId, ProcessState,
 };
 use cpu_local::{current_cpu, current_cpu_id, max_cpus};
 use crate::usercopy::UserAccessGuard;
@@ -891,6 +892,7 @@ pub enum SyscallError {
     ENOSYS = -38,    // 功能未实现
     ENOTEMPTY = -39, // 目录非空
     ELOOP = -40,     // 符号链接过多或禁止符号链接
+    ENOSPC = -28,    // 设备无空间 (no space left on device)
     // Socket-related errors (Linux ABI)
     ENOTSOCK = -88,        // 套接字操作目标不是套接字
     EDESTADDRREQ = -89,    // 需要目标地址
@@ -1614,6 +1616,8 @@ fn socket_error_to_syscall(err: net::SocketError) -> SyscallError {
         net::SocketError::InProgress => SyscallError::EINPROGRESS,
         net::SocketError::WouldBlock => SyscallError::EAGAIN,
         net::SocketError::InvalidState => SyscallError::ENOTCONN,
+        // R76-3 FIX: Per-namespace socket quota exceeded maps to EAGAIN (retriable)
+        net::SocketError::QuotaExceeded => SyscallError::EAGAIN,
         net::SocketError::Udp(net::UdpError::PayloadTooLarge) => SyscallError::EMSGSIZE,
         net::SocketError::Udp(_) => SyscallError::EINVAL,
         net::SocketError::Lsm(e) => lsm_error_to_syscall(e),
@@ -2062,6 +2066,13 @@ pub fn syscall_dispatcher(
         ),
         48 => sys_shutdown(arg0 as i32, arg1 as i32),
 
+        // F.2 Cgroup v2 syscalls (Zero-OS specific, 500-504)
+        500 => sys_cgroup_create(arg0 as u64, arg1 as u32),
+        501 => sys_cgroup_destroy(arg0 as u64),
+        502 => sys_cgroup_attach(arg0 as u64),
+        503 => sys_cgroup_set_limit(arg0 as u64, arg1 as u32, arg2),
+        504 => sys_cgroup_get_stats(arg0 as u64, arg1 as *mut CgroupStatsBuf),
+
         _ => Err(SyscallError::ENOSYS),
     };
 
@@ -2171,7 +2182,14 @@ fn sys_fork() -> SyscallResult {
 
             Ok(parent_view_pid)
         }
-        Err(_) => Err(SyscallError::ENOMEM),
+        Err(e) => {
+            // F.2: Map ForkError to appropriate syscall error
+            use crate::fork::ForkError;
+            match e {
+                ForkError::CgroupPidsLimitExceeded => Err(SyscallError::EAGAIN),
+                _ => Err(SyscallError::ENOMEM),
+            }
+        }
     }
 }
 
@@ -2553,6 +2571,11 @@ fn sys_clone(
                 println!("[sys_clone] Failed to create IPC namespace: max depth exceeded");
                 return Err(SyscallError::EAGAIN);
             }
+            // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
+            Err(crate::ipc_namespace::IpcNsError::MaxNamespaces) => {
+                println!("[sys_clone] Failed to create IPC namespace: max namespaces exceeded");
+                return Err(SyscallError::EAGAIN);
+            }
             Err(e) => {
                 println!("[sys_clone] Failed to create IPC namespace: {:?}", e);
                 return Err(SyscallError::ENOMEM);
@@ -2595,6 +2618,11 @@ fn sys_clone(
                 println!("[sys_clone] Failed to create network namespace: max depth exceeded");
                 return Err(SyscallError::EAGAIN);
             }
+            // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
+            Err(crate::net_namespace::NetNsError::MaxNamespaces) => {
+                println!("[sys_clone] Failed to create network namespace: max namespaces exceeded");
+                return Err(SyscallError::EAGAIN);
+            }
             Err(e) => {
                 println!("[sys_clone] Failed to create network namespace: {:?}", e);
                 return Err(SyscallError::ENOMEM);
@@ -2612,6 +2640,8 @@ fn sys_clone(
                 println!("[sys_clone] Failed to create PID namespace: {:?}", e);
                 match e {
                     crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => SyscallError::EAGAIN,
+                    // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
+                    crate::pid_namespace::PidNamespaceError::MaxNamespaces => SyscallError::EAGAIN,
                     _ => SyscallError::ENOMEM,
                 }
             })?;
@@ -3749,6 +3779,10 @@ fn sys_unshare(flags: u64) -> SyscallResult {
                     println!("[sys_unshare] Failed to create PID namespace: {:?}", e);
                     match e {
                         crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => {
+                            SyscallError::EAGAIN
+                        }
+                        // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
+                        crate::pid_namespace::PidNamespaceError::MaxNamespaces => {
                             SyscallError::EAGAIN
                         }
                         _ => SyscallError::ENOMEM,
@@ -4909,6 +4943,15 @@ fn sys_mmap(
 
     let update_next = addr == 0;
 
+    // F.2 Cgroup: Atomically charge memory AFTER all validation passes.
+    // Uses CAS-based try_charge_memory() to close the TOCTOU race between limit
+    // check and usage update. By charging only after validation, early errors
+    // (unaligned address, below MMAP_MIN_ADDR, user-space overflow, overlap)
+    // don't leak phantom usage that could exhaust memory quota.
+    let cgroup_id = proc.cgroup_id;
+    cgroup::try_charge_memory(cgroup_id, length_aligned as u64)
+        .map_err(|_| SyscallError::ENOMEM)?;
+
     // 使用基于当前 CR3 的页表管理器进行映射
     // 使用 tracked vector 记录已映射的页，确保失败时完整回滚，避免帧泄漏
     let map_result: Result<(), SyscallError> = unsafe {
@@ -4967,7 +5010,13 @@ fn sys_mmap(
         })
     };
 
-    map_result?;
+    // F.2 Cgroup: If mapping fails, rollback the memory charge to maintain
+    // correct accounting. Without this, a failed mmap would leave phantom
+    // usage that blocks future allocations.
+    if let Err(e) = map_result {
+        cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
+        return Err(e);
+    }
 
     // 记录映射到进程 PCB（锁仍持有，R65-9 FIX）
     proc.mmap_regions.insert(base, length_aligned);
@@ -4976,6 +5025,9 @@ fn sys_mmap(
     } else if proc.next_mmap_addr < end {
         proc.next_mmap_addr = end;
     }
+
+    // Note: Memory is already atomically charged via try_charge_memory() above.
+    // No need to call update_memory_usage() here.
     drop(proc); // Explicitly drop the lock
 
     println!(
@@ -5079,7 +5131,13 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
 
     // 从进程 PCB 中移除映射记录（锁仍持有，R65-9 FIX）
     proc.mmap_regions.remove(&addr);
+
+    // F.2 Cgroup: Atomically uncharge memory after successful munmap.
+    // Uses the specific region size for accurate accounting rather than
+    // recalculating total usage from scratch.
+    let cgroup_id = proc.cgroup_id;
     drop(proc); // Explicitly drop the lock
+    cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
 
     println!(
         "sys_munmap: pid={}, unmapped {} bytes at 0x{:x}",
@@ -6996,6 +7054,12 @@ fn socket_handle_from_fd(fd: i32) -> Result<(cap::CapId, u64, bool), SyscallErro
 }
 
 /// Helper: Resolve socket state from handle.
+///
+/// # Security (R76-1 FIX)
+/// Enforces network namespace isolation: a process can only access sockets
+/// that belong to its current network namespace. This prevents a process
+/// from using sockets inherited from a parent namespace after calling
+/// clone(CLONE_NEWNET) or setns().
 fn resolve_socket(
     cap_id: cap::CapId,
     socket_id: u64,
@@ -7020,6 +7084,16 @@ fn resolve_socket(
     let sock = net::socket_table()
         .get(socket_id)
         .ok_or(SyscallError::EBADF)?;
+
+    // R76-1 FIX: Enforce network namespace isolation.
+    // A process that has entered a different network namespace (via clone/setns)
+    // must not be able to use sockets from its previous namespace.
+    // This prevents container escape via inherited socket capabilities.
+    let caller_ns_id = current_net_ns_id().ok_or(SyscallError::ESRCH)?;
+    if sock.net_ns_id != caller_ns_id {
+        // Socket belongs to a different namespace - deny access
+        return Err(SyscallError::EACCES);
+    }
 
     Ok((entry, sock))
 }
@@ -7069,13 +7143,17 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
     // Get security label from current process
     let label = net::SocketLabel::from_current(0).ok_or(SyscallError::ESRCH)?;
 
+    // R75-1 FIX: Get current process's network namespace for socket isolation.
+    // Fail-closed: if we can't determine the namespace, refuse to create socket.
+    let net_ns_id = current_net_ns_id().ok_or(SyscallError::ESRCH)?;
+
     // Create socket via socket_table (includes LSM hook_net_socket check)
     let socket = match (ty, proto) {
         (net::SocketType::Dgram, net::SocketProtocol::Udp) => net::socket_table()
-            .create_udp_socket(label)
+            .create_udp_socket(label, net_ns_id)
             .map_err(socket_error_to_syscall)?,
         (net::SocketType::Stream, net::SocketProtocol::Tcp) => net::socket_table()
-            .create_tcp_socket(label)
+            .create_tcp_socket(label, net_ns_id)
             .map_err(socket_error_to_syscall)?,
         _ => return Err(SyscallError::EPROTONOSUPPORT),
     };
@@ -7087,7 +7165,8 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
         cap::CapFlags::empty()
     };
     let cap_entry = cap::CapEntry::with_flags(
-        cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(socket.id))),
+        // R75-1 FIX: Pass network namespace ID to Socket capability for isolation tracking
+        cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(socket.id, socket.net_ns_id.raw()))),
         cap::CapRights::READ | cap::CapRights::WRITE | cap::CapRights::BIND,
         cap_flags,
     );
@@ -7400,8 +7479,9 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
     }
 
     // Allocate capability + fd for child socket
+    // R75-1 FIX: Pass network namespace ID to Socket capability (inherited from listener)
     let cap_entry = cap::CapEntry::with_flags(
-        cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(child.id))),
+        cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(child.id, child.net_ns_id.raw()))),
         cap::CapRights::READ | cap::CapRights::WRITE | cap::CapRights::BIND,
         cap::CapFlags::empty(),
     );
@@ -7898,6 +7978,270 @@ fn sys_shutdown(fd: i32, how: i32) -> SyscallResult {
         Ok(None) => Ok(0), // SHUT_RD or FIN already sent
         Err(e) => Err(socket_error_to_syscall(e)),
     }
+}
+
+// ============================================================================
+// F.2 Cgroup v2 Syscalls
+// ============================================================================
+
+/// Buffer for returning cgroup statistics to userspace.
+///
+/// Must match the layout expected by userspace cgroup tools.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CgroupStatsBuf {
+    /// Cgroup ID
+    pub id: u64,
+    /// Depth in hierarchy (root = 0)
+    pub depth: u32,
+    /// Enabled controllers bitmap (CPU=1, MEMORY=2, PIDS=4)
+    pub controllers: u32,
+    /// Current number of attached tasks
+    pub nr_tasks: u64,
+    /// Cumulative CPU time in nanoseconds
+    pub cpu_time_ns: u64,
+    /// Current memory usage in bytes
+    pub memory_current: u64,
+    /// Number of memory.high exceeded events
+    pub memory_events_high: u64,
+    /// Number of memory.max (OOM) events
+    pub memory_events_max: u64,
+    /// Number of pids.max exceeded events
+    pub pids_events_max: u32,
+    /// Padding for alignment
+    _padding: u32,
+}
+
+/// sys_cgroup_create - Create a child cgroup
+///
+/// # Arguments
+/// * `parent_id` - ID of parent cgroup (0 for root)
+/// * `controllers` - Bitmask of controllers to enable (CPU=1, MEMORY=2, PIDS=4)
+///
+/// # Returns
+/// * On success: New cgroup ID (positive)
+/// * On error: Negative errno
+///
+/// # Security
+/// Requires CAP_SYS_ADMIN (or root) to create cgroups.
+fn sys_cgroup_create(parent_id: u64, controllers: u32) -> Result<usize, SyscallError> {
+    // Security: Only root can create cgroups
+    let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+    if creds.euid != 0 {
+        return Err(SyscallError::EPERM);
+    }
+
+    // Convert u32 controllers to CgroupControllers flags
+    let ctrl_flags = cgroup::CgroupControllers::from_bits_truncate(controllers);
+    if ctrl_flags.is_empty() {
+        return Err(SyscallError::EINVAL);
+    }
+
+    match cgroup::create_cgroup(parent_id, ctrl_flags) {
+        Ok(node) => Ok(node.id() as usize),
+        Err(cgroup::CgroupError::NotFound) => Err(SyscallError::ENOENT),
+        Err(cgroup::CgroupError::DepthLimit) => Err(SyscallError::ENOSPC),
+        Err(cgroup::CgroupError::CgroupLimit) => Err(SyscallError::ENOSPC),
+        Err(cgroup::CgroupError::ControllerDisabled) => Err(SyscallError::EINVAL),
+        Err(_) => Err(SyscallError::EINVAL),
+    }
+}
+
+/// sys_cgroup_destroy - Delete a cgroup
+///
+/// # Arguments
+/// * `cgroup_id` - ID of cgroup to delete
+///
+/// # Returns
+/// * On success: 0
+/// * On error: Negative errno
+///
+/// # Security
+/// Requires CAP_SYS_ADMIN (or root). Cgroup must be empty.
+fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
+    // Security: Only root can destroy cgroups
+    let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+    if creds.euid != 0 {
+        return Err(SyscallError::EPERM);
+    }
+
+    match cgroup::delete_cgroup(cgroup_id) {
+        Ok(()) => Ok(0),
+        Err(cgroup::CgroupError::NotFound) => Err(SyscallError::ENOENT),
+        Err(cgroup::CgroupError::NotEmpty) => Err(SyscallError::EBUSY),
+        Err(cgroup::CgroupError::PermissionDenied) => Err(SyscallError::EPERM),
+        Err(_) => Err(SyscallError::EINVAL),
+    }
+}
+
+/// sys_cgroup_attach - Attach current process to a cgroup
+///
+/// # Arguments
+/// * `cgroup_id` - ID of target cgroup
+///
+/// # Returns
+/// * On success: 0
+/// * On error: Negative errno
+///
+/// # Security
+/// Process can migrate itself. Root can migrate any process (future extension).
+fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
+    let pid = crate::process::current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = crate::process::get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    let old_cgroup_id = {
+        let proc = process.lock();
+        proc.cgroup_id
+    };
+
+    // Migrate task between cgroups
+    match cgroup::migrate_task(pid as u64, old_cgroup_id, cgroup_id) {
+        Ok(()) => {
+            // Update PCB with new cgroup
+            let mut proc = process.lock();
+            proc.cgroup_id = cgroup_id;
+            Ok(0)
+        }
+        Err(cgroup::CgroupError::NotFound) => Err(SyscallError::ENOENT),
+        Err(cgroup::CgroupError::PidsLimitExceeded) => Err(SyscallError::EAGAIN),
+        Err(cgroup::CgroupError::TaskNotAttached) => {
+            // Process not in old cgroup - try direct attach to new cgroup
+            if let Some(target) = cgroup::lookup_cgroup(cgroup_id) {
+                match target.attach_task(pid as u64) {
+                    Ok(()) => {
+                        let mut proc = process.lock();
+                        proc.cgroup_id = cgroup_id;
+                        Ok(0)
+                    }
+                    Err(cgroup::CgroupError::PidsLimitExceeded) => Err(SyscallError::EAGAIN),
+                    Err(_) => Err(SyscallError::EINVAL),
+                }
+            } else {
+                Err(SyscallError::ENOENT)
+            }
+        }
+        Err(_) => Err(SyscallError::EINVAL),
+    }
+}
+
+/// Limit types for sys_cgroup_set_limit
+const CGROUP_LIMIT_CPU_WEIGHT: u32 = 1;
+const CGROUP_LIMIT_CPU_MAX: u32 = 2;
+const CGROUP_LIMIT_MEMORY_MAX: u32 = 3;
+const CGROUP_LIMIT_MEMORY_HIGH: u32 = 4;
+const CGROUP_LIMIT_PIDS_MAX: u32 = 5;
+
+/// sys_cgroup_set_limit - Set a resource limit on a cgroup
+///
+/// # Arguments
+/// * `cgroup_id` - ID of target cgroup
+/// * `limit_type` - Type of limit (1=cpu_weight, 2=cpu_max, 3=memory_max, etc.)
+/// * `value` - Limit value (interpretation depends on limit_type)
+///
+/// For cpu_max: value encodes (max_us << 32) | period_us
+///
+/// # Returns
+/// * On success: 0
+/// * On error: Negative errno
+///
+/// # Security
+/// Requires CAP_SYS_ADMIN (or root) to set limits.
+fn sys_cgroup_set_limit(cgroup_id: u64, limit_type: u32, value: u64) -> Result<usize, SyscallError> {
+    // Security: Only root can set cgroup limits
+    let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+    if creds.euid != 0 {
+        return Err(SyscallError::EPERM);
+    }
+
+    let cgroup_node = cgroup::lookup_cgroup(cgroup_id).ok_or(SyscallError::ENOENT)?;
+
+    let mut limits = cgroup::CgroupLimits::default();
+
+    match limit_type {
+        CGROUP_LIMIT_CPU_WEIGHT => {
+            // value is the weight (1-10000)
+            if value == 0 || value > 10000 {
+                return Err(SyscallError::EINVAL);
+            }
+            limits.cpu_weight = Some(value as u32);
+        }
+        CGROUP_LIMIT_CPU_MAX => {
+            // value encodes (max_us << 32) | period_us
+            let max_us = (value >> 32) as u64;
+            let period_us = (value & 0xFFFFFFFF) as u64;
+            if max_us == 0 || period_us == 0 {
+                return Err(SyscallError::EINVAL);
+            }
+            limits.cpu_max = Some((max_us, period_us));
+        }
+        CGROUP_LIMIT_MEMORY_MAX => {
+            limits.memory_max = Some(value);
+        }
+        CGROUP_LIMIT_MEMORY_HIGH => {
+            limits.memory_high = Some(value);
+        }
+        CGROUP_LIMIT_PIDS_MAX => {
+            limits.pids_max = Some(value);
+        }
+        _ => return Err(SyscallError::EINVAL),
+    }
+
+    match cgroup_node.set_limit(limits) {
+        Ok(()) => Ok(0),
+        Err(cgroup::CgroupError::ControllerDisabled) => Err(SyscallError::ENOENT),
+        Err(cgroup::CgroupError::InvalidLimit) => Err(SyscallError::EINVAL),
+        Err(_) => Err(SyscallError::EINVAL),
+    }
+}
+
+/// sys_cgroup_get_stats - Get cgroup statistics
+///
+/// # Arguments
+/// * `cgroup_id` - ID of target cgroup
+/// * `buf` - Pointer to CgroupStatsBuf to fill
+///
+/// # Returns
+/// * On success: 0
+/// * On error: Negative errno
+fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usize, SyscallError> {
+    use crate::usercopy::{copy_to_user_safe, UserAccessGuard};
+
+    // Validate user pointer
+    if buf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let buf_addr = buf as usize;
+    if buf_addr < crate::usercopy::MMAP_MIN_ADDR || buf_addr >= USER_SPACE_TOP {
+        return Err(SyscallError::EFAULT);
+    }
+
+    let cgroup_node = cgroup::lookup_cgroup(cgroup_id).ok_or(SyscallError::ENOENT)?;
+    let stats = cgroup_node.get_stats();
+
+    let result = CgroupStatsBuf {
+        id: cgroup_node.id(),
+        depth: cgroup_node.depth(),
+        controllers: cgroup_node.controllers().bits(),
+        nr_tasks: stats.pids_current,
+        cpu_time_ns: stats.cpu_time_ns,
+        memory_current: stats.memory_current,
+        memory_events_high: stats.memory_events_high,
+        memory_events_max: stats.memory_events_max,
+        pids_events_max: stats.pids_events_max,
+        _padding: 0,
+    };
+
+    // Copy to userspace with SMAP protection
+    unsafe {
+        let _guard = UserAccessGuard::new();
+        let result_bytes: [u8; core::mem::size_of::<CgroupStatsBuf>()] =
+            core::mem::transmute(result);
+        if copy_to_user_safe(buf as *mut u8, &result_bytes).is_err() {
+            return Err(SyscallError::EFAULT);
+        }
+    }
+
+    Ok(0)
 }
 
 /// 系统调用统计

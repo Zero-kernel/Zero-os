@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-25
+**Last Updated:** 2026-01-26
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -13,7 +13,7 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 ### Current Status: Phase F IN PROGRESS (Resource Governance)
 
 Zero-OS has completed SMP infrastructure and begun resource governance:
-- **72 security audits** with 323+ issues found, ~278 fixed (86.1%)
+- **75 security audits** with 369+ issues found, ~310 fixed (84.0%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -34,11 +34,17 @@ Zero-OS has completed SMP infrastructure and begun resource governance:
   - E.5: Per-CPU scheduler ✅, Load balancing ✅, CPU affinity syscalls ✅
   - E.6: Cpuset CPU isolation ✅ (runtime test added)
 - **Phase F**: IN PROGRESS (Resource Governance)
-  - F.1: Namespaces ✅ **COMPLETE** (PID, Mount, IPC, Network)
-    - PID namespace (CLONE_NEWPID, cascade kill, namespace-local PIDs)
-    - Mount namespace (CLONE_NEWNS, sys_setns, per-namespace mount tables, R74-2 materialization fix)
-    - IPC namespace (CLONE_NEWIPC, isolated message queues/semaphores/shared memory)
-    - Network namespace (CLONE_NEWNET, device management, isolated sockets)
+  - F.1: Namespaces (Complete)
+    - PID namespace ✅ (CLONE_NEWPID, cascade kill, namespace-local PIDs)
+    - Mount namespace ✅ (CLONE_NEWNS, sys_setns, per-namespace mount tables, R74-2 materialization fix)
+    - IPC namespace ✅ (CLONE_NEWIPC, endpoint table partitioned by namespace - R75-2)
+    - Network namespace ✅ (CLONE_NEWNET, socket table partitioned by namespace - R75-1)
+  - F.2: Cgroups v2 (In Progress)
+    - Core infrastructure ✅ (CgroupNode, Registry, limits, stats)
+    - PIDs controller ✅ (fork protection, task tracking)
+    - CPU/Memory controllers ⚪ (API ready, wiring pending)
+- **R75**: move_device permission check ✅, namespace FD refcount ✅, **IPC endpoint isolation ✅**, **Socket table isolation ✅** (ALL 4 FIXED)
+- **R76**: Socket namespace enforcement ✅, Namespace count limits ✅, Per-namespace socket quotas ✅ (ALL 3 FIXED)
 - **R54**: ISN secret auto-upgrade ✅, Challenge ACK rate limiting ✅
 - **R55**: NewReno congestion control ✅ (RFC 6582 partial ACK handling)
 - **R56**: Limited Transmit ✅ (RFC 3042 adapted for immediate-send architecture)
@@ -60,7 +66,7 @@ Zero-OS has completed SMP infrastructure and begun resource governance:
 | **Network** | Full TCP/IP stack | TCP (w/retransmission + NewReno CC + Window Scaling + SYN cookies + Conntrack + Firewall + Options validation), UDP, ICMP | SACK, Timestamps |
 | **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
 | **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
-| **Containers** | Namespaces/Cgroups | PID ✅, Mount ✅, IPC ✅, Network ✅ namespaces | User namespace, Cgroups |
+| **Containers** | Namespaces/Cgroups | PID ✅, Mount ✅, IPC ✅, Network ✅ namespaces; Cgroups v2 PIDs ✅ | User namespace, CPU/Memory cgroups |
 | **Virtualization** | KVM/QEMU | Not started | Future consideration |
 
 ---
@@ -668,12 +674,27 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
   - Audit events: `AuditObject::Namespace` for clone logging
 - [ ] User namespace (UID/GID mapping)
 
-#### F.2 Cgroups v1.5
+#### F.2 Cgroups v2 [IN PROGRESS]
 
-- [ ] cpu controller (shares, quota, burst)
-- [ ] memory controller (hard/soft limits, OOM)
-- [ ] pids controller (process count limit)
+**Core Infrastructure** ✅
+- [x] CgroupNode hierarchy management
+- [x] CGROUP_REGISTRY global state
+- [x] Limits: MAX_CGROUP_DEPTH=8, MAX_CGROUPS=4096
+- [x] CgroupStats (lock-free atomic counters)
+- [x] PCB integration (cgroup_id field, inheritance)
+- [x] Codex security review (3 issues fixed)
+
+**Controllers**
+- [x] pids controller (process count limit in fork path)
+- [ ] cpu controller (shares, quota, burst) - API ready, scheduler wiring pending
+- [ ] memory controller (hard/soft limits, OOM) - API ready, mm wiring pending
 - [ ] io controller (bandwidth limit)
+
+**Syscalls & Interface**
+- [ ] sys_cgroup_create / sys_cgroup_destroy
+- [ ] sys_cgroup_attach / sys_cgroup_detach
+- [ ] sys_cgroup_set_limit / sys_cgroup_get_stats
+- [ ] cgroup2 filesystem (/sys/fs/cgroup)
 
 #### F.3 IOMMU/VT-d
 
@@ -802,14 +823,17 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-22 | 72 | 0 | 0 | CPU affinity syscalls (sched_setaffinity/sched_getaffinity) - **E.5 FEATURE** |
 | 2026-01-25 | 74 | 1 | 1 | Mount namespace materialization (R74-2 eager snapshot) - **F.1 FEATURE** |
 | 2026-01-25 | - | 0 | 0 | Mount namespace runtime test + audit events - **F.1 COMPLETE** |
-| **Total** | **74** | **347** | **296 (85.3%)** | **51 open (R65 SMP + VirtIO IOMMU deferred)** |
+| 2026-01-26 | 75 | 4 | 4 | **Namespace structure** - IPC/Net resource isolation gaps ✅, move_device permission ✅, NS FD refcount ✅ |
+| 2026-01-26 | 76 | 3 | 3 | **Namespace enforcement** - Socket NS check ✅, NS count limits ✅, Socket quotas ✅ (F.1 COMPLETE) |
+| **Total** | **76** | **370** | **316 (85.4%)** | **54 open (R65 SMP + edge cases)** |
 
 ### Current Status
 
-- **Fixed**: 296 issues (85.3%)
-- **Open**: 51 issues (14.7%)
+- **Fixed**: 316 issues (85.4%)
+- **Open**: 54 issues (14.6%)
   - R65 remaining issues (SMP-related, non-blocking)
   - R62-6 (VirtIO IOMMU) deferred to Phase F.3
+  - CF-4 (Socket quota leak edge cases) documented for R77
 - **Phase E Progress**: ✅ **COMPLETE**
   - E.1 Hardware Init: ✅ LAPIC/IOAPIC, AP boot, IPI
   - E.2 TLB Shootdown: ✅ IPI-based, PCID support (batched pending)
@@ -818,13 +842,13 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
   - E.5 Scheduler SMP: ✅ Per-CPU runqueues, load balancing, CPU affinity syscalls
   - E.6 CPU Isolation: ✅ Cpuset with runtime test (R72)
 - **Phase F Progress**: IN PROGRESS
-  - F.1 Namespaces: ✅ PID namespace complete, Mount namespace complete (R74)
-  - F.2 Cgroups: Pending
+  - F.1 Namespaces: ✅ **COMPLETE** - PID/Mount/IPC/Network fully isolated with enforcement and quotas (R75-R76)
+  - F.2 Cgroups v2: 🟡 **IN PROGRESS** - Core infrastructure + PIDs controller complete, CPU/Memory wiring pending
   - F.3 IOMMU: Pending
 - **SMP Ready**: All Phase E components complete, 8-core SMP testing verified
-- **Container Foundation**: PID + Mount namespaces provide basic container isolation
+- **Container Foundation**: ✅ **COMPLETE** - All 4 namespace types provide full isolation
 
-See [qa-2026-01-23.md](review/qa-2026-01-23.md) for latest audit report.
+See [qa-2026-01-26-v2.md](review/qa-2026-01-26-v2.md) for latest audit report.
 
 ---
 

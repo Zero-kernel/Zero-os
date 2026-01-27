@@ -44,6 +44,8 @@ pub enum ForkError {
     PageTableCopyFailed,
     /// 子进程创建失败（内核栈分配等）
     ProcessCreationFailed,
+    /// F.2: Cgroup pids.max limit exceeded
+    CgroupPidsLimitExceeded,
 }
 
 /// 执行fork系统调用
@@ -62,6 +64,15 @@ pub enum ForkError {
 pub fn sys_fork() -> Result<ProcessId, ForkError> {
     let current = current_pid().ok_or(ForkError::NoCurrentProcess)?;
     let parent_process = get_process(current).ok_or(ForkError::ProcessNotFound)?;
+
+    // F.2: Check cgroup pids.max limit BEFORE creating any resources
+    // This prevents fork bombs and ensures cgroup limits are enforced
+    {
+        let parent = parent_process.lock();
+        if !crate::cgroup::check_fork_allowed(parent.cgroup_id) {
+            return Err(ForkError::CgroupPidsLimitExceeded);
+        }
+    }
 
     // 捕获父进程信息后释放锁，避免 create_process 再次获取锁导致潜在问题
     let (parent_root, parent_pid, parent_prio, child_name) = {
@@ -87,6 +98,10 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
 
     // 重新获取父进程锁执行真正的 fork
     let mut parent = parent_process.lock();
+
+    // F.2: Get parent's cgroup_id for child attachment
+    let parent_cgroup_id = parent.cgroup_id;
+
     let result = fork_inner(&mut parent, child_pid, parent_root);
 
     if result.is_err() {
@@ -94,6 +109,20 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
         parent.children.retain(|&pid| pid != child_pid);
         drop(parent);
         cleanup_partial_child(child_pid);
+    } else {
+        // F.2: On success, attach child to parent's cgroup
+        // CODEX FIX: Properly propagate attach failures instead of ignoring
+        // This maintains attach/detach symmetry and prevents pids.max bypass
+        if let Some(cgroup) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+            if let Err(_) = cgroup.attach_task(child_pid as u64) {
+                // Attachment failed (likely TOCTOU race at pids.max boundary)
+                // Must roll back the entire fork to maintain accounting integrity
+                parent.children.retain(|&pid| pid != child_pid);
+                drop(parent);
+                cleanup_partial_child(child_pid);
+                return Err(ForkError::CgroupPidsLimitExceeded);
+            }
+        }
     }
 
     result
@@ -230,6 +259,11 @@ fn fork_inner(
         // 复制 TLS 状态（FS/GS base）
         child.fs_base = parent.fs_base;
         child.gs_base = parent.gs_base;
+
+        // F.2: 继承 Cgroup 成员关系
+        // 子进程继承父进程的 cgroup，并注册到 cgroup 的任务列表
+        child.cgroup_id = parent.cgroup_id;
+        // Note: cgroup task tracking is done after process is fully created
 
         // 继承 Seccomp/Pledge 沙箱状态
         // - SeccompState.filters: Vec<Arc<SeccompFilter>> 通过 Arc 共享，避免深拷贝

@@ -32,7 +32,7 @@
 
 use alloc::{collections::BTreeMap, sync::{Arc, Weak}, vec, vec::Vec};
 use cap::NamespaceId;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 
 use crate::process::{ProcessId, MAX_PID};
@@ -43,6 +43,15 @@ use crate::process::{ProcessId, MAX_PID};
 
 /// Maximum PID namespace nesting depth (Linux default is 32)
 pub const MAX_PID_NS_LEVEL: u8 = 32;
+
+/// R76-2 FIX: Maximum number of PID namespaces allowed system-wide (including root).
+/// Prevents DoS via namespace exhaustion. Value chosen to allow reasonable containerization
+/// while preventing memory exhaustion attacks.
+pub const MAX_PID_NS_COUNT: u32 = 1024;
+
+/// R76-2 FIX: Current PID namespace count (root starts at 1).
+/// Atomic counter to enforce MAX_PID_NS_COUNT limit.
+static PID_NS_COUNT: AtomicU32 = AtomicU32::new(1);
 
 // ============================================================================
 // Error Types
@@ -57,6 +66,8 @@ pub enum PidNamespaceError {
     InitAlreadySet,
     /// Maximum namespace nesting depth exceeded
     MaxDepthExceeded,
+    /// R76-2 FIX: Maximum system-wide namespace count exceeded
+    MaxNamespaces,
     /// Namespace is shutting down
     NamespaceShuttingDown,
     /// Invalid operation on root namespace
@@ -192,6 +203,17 @@ impl PidNamespace {
         // Check nesting depth
         if parent.level >= MAX_PID_NS_LEVEL {
             return Err(PidNamespaceError::MaxDepthExceeded);
+        }
+
+        // R76-2 FIX: Enforce global namespace count limit to prevent DoS.
+        // This prevents an attacker from creating unbounded namespaces and
+        // exhausting kernel memory. We use compare-exchange loop to avoid
+        // TOCTOU race condition between check and increment.
+        let prev = PID_NS_COUNT.fetch_add(1, Ordering::SeqCst);
+        if prev >= MAX_PID_NS_COUNT {
+            // Restore count and fail
+            PID_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
+            return Err(PidNamespaceError::MaxNamespaces);
         }
 
         // Generate unique namespace ID
@@ -604,4 +626,20 @@ pub fn print_pid_chain(chain: &[PidNamespaceMembership]) {
         print!("ns{}:pid{}", m.ns.id().raw(), m.pid);
     }
     println!();
+}
+
+// ============================================================================
+// R76-2 FIX: Namespace Resource Cleanup
+// ============================================================================
+
+/// R76-2 FIX: Decrement global namespace counter when namespace is destroyed.
+/// This ensures that the global namespace count is properly maintained and
+/// prevents counter leaks that could lead to spurious MaxNamespaces errors.
+impl Drop for PidNamespace {
+    fn drop(&mut self) {
+        // Only decrement for non-root namespaces (root is never dropped)
+        if self.level > 0 {
+            PID_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }

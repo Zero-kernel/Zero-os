@@ -454,24 +454,44 @@ impl CapEntry {
 ///
 /// This struct links the capability system to the network socket table.
 /// The socket_id corresponds to the `SocketState.id` field in `socket_table()`.
+///
+/// # R75-1 Enhancement: Network Namespace Isolation
+///
+/// The `net_ns_id` field identifies which network namespace this socket
+/// belongs to. Socket operations validate that the calling process's
+/// network namespace matches the socket's namespace, providing true
+/// network isolation for containerized workloads.
 #[derive(Debug, Clone)]
 pub struct Socket {
     /// Global socket identifier managed by socket_table()
     pub socket_id: u64,
+    /// Network namespace identifier for this socket (R75-1 FIX)
+    pub net_ns_id: u64,
 }
 
 impl Socket {
-    /// Create a socket capability handle for a specific socket ID.
+    /// Create a socket capability handle for a specific socket ID and namespace.
+    ///
+    /// # Arguments
+    ///
+    /// * `socket_id` - Global socket identifier from socket_table()
+    /// * `net_ns_id` - Network namespace ID (from NetNamespace.id().raw())
     #[inline]
-    pub fn new(socket_id: u64) -> Self {
-        Self { socket_id }
+    pub fn new(socket_id: u64, net_ns_id: u64) -> Self {
+        Self {
+            socket_id,
+            net_ns_id,
+        }
     }
 
-    /// Create a placeholder socket (socket_id = 0, invalid).
+    /// Create a placeholder socket (socket_id = 0, net_ns_id = 0, invalid).
     /// Used for legacy compatibility; new code should use `new()`.
     #[inline]
     pub fn placeholder() -> Self {
-        Self { socket_id: 0 }
+        Self {
+            socket_id: 0,
+            net_ns_id: 0,
+        }
     }
 }
 

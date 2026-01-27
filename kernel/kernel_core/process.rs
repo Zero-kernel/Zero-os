@@ -60,7 +60,8 @@ type SchedulerCleanupCallback = fn(ProcessId);
 /// R37-2 FIX (Codex review): Pass both PID and TGID to avoid deadlock.
 /// The callback is called from free_process_resources which already holds the process lock,
 /// so the callback must not try to lock the process again.
-type IpcCleanupCallback = fn(ProcessId, ProcessId); // (pid, tgid)
+/// R75-2 FIX: Also pass IPC namespace ID for per-namespace endpoint cleanup.
+type IpcCleanupCallback = fn(ProcessId, ProcessId, cap::NamespaceId); // (pid, tgid, ipc_ns_id)
 
 /// 调度器添加进程回调类型
 ///
@@ -590,6 +591,14 @@ pub struct Process {
     /// Network namespace for children (set by CLONE_NEWNET)
     pub net_ns_for_children: Arc<crate::net_namespace::NetNamespace>,
 
+    // ========== F.2: Cgroup v2 Support ==========
+    /// Cgroup ID this process belongs to.
+    ///
+    /// Every process is attached to exactly one cgroup. The root cgroup (id=0)
+    /// is the default. Cgroup controllers (CPU/Memory/PIDs) enforce resource
+    /// limits based on this membership.
+    pub cgroup_id: crate::cgroup::CgroupId,
+
     // ========== Seccomp/Pledge 沙箱 ==========
     /// Seccomp 过滤器状态
     /// 包含 BPF 过滤器栈和 no_new_privs 标志
@@ -680,6 +689,8 @@ impl Process {
             // F.1: Network namespace - default to root network namespace
             net_ns: crate::net_namespace::ROOT_NET_NAMESPACE.clone(),
             net_ns_for_children: crate::net_namespace::ROOT_NET_NAMESPACE.clone(),
+            // F.2: Cgroup v2 - default to root cgroup
+            cgroup_id: 0,
             // Seccomp/Pledge 沙箱 (默认无限制)
             seccomp_state: SeccompState::new(),
             pledge_state: None,
@@ -760,8 +771,10 @@ impl Process {
     }
 
     /// 重置时间片
+    ///
+    /// F.2: Now factors in cgroup cpu_weight for resource governance.
     pub fn reset_time_slice(&mut self) {
-        self.time_slice = calculate_time_slice(self.dynamic_priority);
+        self.time_slice = calculate_time_slice_with_cgroup(self.dynamic_priority, self.cgroup_id);
     }
 
     // ========================================================================
@@ -772,13 +785,15 @@ impl Process {
     ///
     /// `dynamic_priority` = min(base_dynamic_priority, min(all pi_boosts))
     /// Returns true if the effective priority changed.
+    ///
+    /// F.2: Now factors in cgroup cpu_weight when recalculating time slice.
     pub fn recompute_effective_priority(&mut self) -> bool {
         let inherited = self.pi_boosts.values().min().copied();
         let base = self.base_dynamic_priority;
         let effective = inherited.map_or(base, |p| core::cmp::min(p, base));
         if effective != self.dynamic_priority {
             self.dynamic_priority = effective;
-            self.time_slice = calculate_time_slice(self.dynamic_priority);
+            self.time_slice = calculate_time_slice_with_cgroup(self.dynamic_priority, self.cgroup_id);
             true
         } else {
             false
@@ -920,6 +935,28 @@ fn calculate_time_slice(priority: Priority) -> u32 {
     } else {
         140 - priority as u32
     }
+}
+
+/// F.2: 根据优先级和 cgroup cpu_weight 计算时间片
+///
+/// Scales base time slice by cgroup weight:
+/// - weight=100 (default): no change
+/// - weight=200: 2x time slice (more CPU time)
+/// - weight=50: 0.5x time slice (less CPU time)
+///
+/// Clamps result to [1, 300]ms to prevent starvation of peer cgroups.
+fn calculate_time_slice_with_cgroup(priority: Priority, cgroup_id: crate::cgroup::CgroupId) -> u32 {
+    let base = calculate_time_slice(priority);
+    let weight = crate::cgroup::get_effective_cpu_weight(cgroup_id);
+
+    // Scale: new_slice = base * weight / 100
+    // Use u64 to avoid overflow during multiplication
+    let scaled = (base as u64 * weight as u64) / 100;
+
+    // Clamp to reasonable range [1, 300]
+    // Upper bound reduced from 1000ms to 300ms to prevent excessive starvation
+    // of peer cgroups when high weights (e.g., 10000) are configured.
+    scaled.clamp(1, 300) as u32
 }
 
 /// 全局进程表
@@ -1379,6 +1416,37 @@ pub fn current_net_ns() -> Option<Arc<crate::net_namespace::NetNamespace>> {
     Some(proc.net_ns.clone())
 }
 
+/// R75-2 FIX: 获取当前进程的 IPC 命名空间 ID
+///
+/// Returns the current process's IPC namespace identifier, used for
+/// partitioning IPC endpoint tables by namespace.
+#[inline]
+pub fn current_ipc_ns_id() -> Option<cap::NamespaceId> {
+    current_ipc_ns().map(|ns| ns.id())
+}
+
+/// R75-1 FIX: 获取当前进程的网络命名空间 ID
+///
+/// Returns the current process's network namespace identifier, used for
+/// partitioning socket tables and port bindings by namespace.
+#[inline]
+pub fn current_net_ns_id() -> Option<cap::NamespaceId> {
+    current_net_ns().map(|ns| ns.id())
+}
+
+/// F.2: 获取当前进程的 Cgroup ID
+///
+/// Returns the current process's cgroup identifier, used for resource
+/// accounting and limit enforcement by cgroup controllers.
+#[inline]
+pub fn current_cgroup_id() -> Option<crate::cgroup::CgroupId> {
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let proc = slot.as_ref()?.lock();
+    Some(proc.cgroup_id)
+}
+
 /// 获取当前进程的附属组列表
 ///
 /// R39-3 FIX: 从共享凭证结构读取
@@ -1763,10 +1831,11 @@ fn notify_scheduler_process_removed(pid: ProcessId) {
 
 /// 通知IPC子系统清理进程端点
 /// R37-2 FIX (Codex review): Pass TGID to avoid re-locking the process in callback.
-fn notify_ipc_process_cleanup(pid: ProcessId, tgid: ProcessId) {
+/// R75-2 FIX: Pass IPC namespace ID for per-namespace endpoint cleanup.
+fn notify_ipc_process_cleanup(pid: ProcessId, tgid: ProcessId, ipc_ns_id: cap::NamespaceId) {
     let callback = *IPC_CLEANUP.lock();
     if let Some(cb) = callback {
-        cb(pid, tgid);
+        cb(pid, tgid, ipc_ns_id);
     }
 }
 
@@ -1841,6 +1910,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         let lsm_egid: u32;
         // F.1: Save namespace info for cleanup
         let pid_ns_chain: Vec<crate::pid_namespace::PidNamespaceMembership>;
+        // F.2: Save cgroup_id for task detachment
+        let cgroup_id: crate::cgroup::CgroupId;
 
         {
             let mut proc = process.lock();
@@ -1863,12 +1934,20 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             lsm_egid = creds.egid;
             // F.1: Copy namespace chain for cleanup
             pid_ns_chain = proc.pid_ns_chain.clone();
+            // F.2: Copy cgroup_id for detachment
+            cgroup_id = proc.cgroup_id;
         }
 
         // R25-7 FIX: Call LSM task_exit hook for forced terminations (kill/seccomp paths)
         // This ensures policy can track ALL process exits, not just normal sys_exit
         let lsm_ctx = LsmProcessCtx::new(pid, tgid, lsm_uid, lsm_gid, lsm_euid, lsm_egid);
         let _ = lsm::hook_task_exit(&lsm_ctx, exit_code);
+
+        // F.2: Detach from cgroup (decrement task count)
+        // This must happen before other cleanup to maintain correct stats
+        if let Some(cgroup) = crate::cgroup::lookup_cgroup(cgroup_id) {
+            let _ = cgroup.detach_task(pid as u64);
+        }
 
         // R69-2 FIX: Clear FPU ownership on all CPUs to prevent use-after-free.
         // If this process was the FPU owner on any CPU, its FPU state would be saved
@@ -2233,7 +2312,9 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
 
     // 通知 IPC 子系统清理进程端点（通过回调避免循环依赖）
     // R37-2 FIX (Codex review): Pass TGID to avoid deadlock from re-locking this process
-    notify_ipc_process_cleanup(proc.pid, proc.tgid);
+    // R75-2 FIX: Pass IPC namespace ID for per-namespace endpoint cleanup
+    let ipc_ns_id = proc.ipc_ns.id();
+    notify_ipc_process_cleanup(proc.pid, proc.tgid, ipc_ns_id);
 
     // E.5 Cpuset: decrement task count when process exits
     notify_cpuset_task_left(proc.cpuset_id);

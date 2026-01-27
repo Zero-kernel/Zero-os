@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 extern crate drivers;
 
 pub use kernel_core::process;
-use kernel_core::{FileOps, SyscallError};
+use kernel_core::{FileOps, NamespaceId, SyscallError};
 
 pub mod futex;
 pub mod ipc;
@@ -338,8 +338,9 @@ fn futex_callback(
 ///
 /// R37-2 FIX (Codex review): Accept TGID directly to avoid re-locking the process.
 /// The caller (free_process_resources) already holds the process lock.
-fn ipc_cleanup(pid: process::ProcessId, tgid: process::ProcessId) {
-    cleanup_process_endpoints(pid);
+/// R75-2 FIX: Accept IPC namespace ID for per-namespace endpoint cleanup.
+fn ipc_cleanup(pid: process::ProcessId, tgid: process::ProcessId, ipc_ns_id: NamespaceId) {
+    cleanup_process_endpoints(ipc_ns_id, pid);
     cleanup_process_futexes(pid, tgid);
 }
 

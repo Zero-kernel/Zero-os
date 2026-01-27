@@ -52,6 +52,13 @@ pub const MAX_NET_NS_LEVEL: u8 = 32;
 /// CLONE_NEWNET flag for clone/unshare
 pub const CLONE_NEWNET: u64 = 0x4000_0000;
 
+/// R76-2 FIX: Maximum number of network namespaces allowed system-wide.
+/// Prevents DoS via namespace exhaustion.
+pub const MAX_NET_NS_COUNT: u32 = 1024;
+
+/// R76-2 FIX: Current network namespace count (root starts at 1).
+static NET_NS_COUNT: AtomicU32 = AtomicU32::new(1);
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -61,6 +68,8 @@ pub const CLONE_NEWNET: u64 = 0x4000_0000;
 pub enum NetNsError {
     /// Maximum namespace depth exceeded
     MaxDepthExceeded,
+    /// R76-2 FIX: Maximum system-wide namespace count exceeded
+    MaxNamespaces,
     /// Namespace not found
     NotFound,
     /// Permission denied
@@ -148,6 +157,13 @@ impl NetNamespace {
     pub fn new_child(parent: Arc<NetNamespace>) -> Result<Arc<Self>, NetNsError> {
         if parent.level >= MAX_NET_NS_LEVEL {
             return Err(NetNsError::MaxDepthExceeded);
+        }
+
+        // R76-2 FIX: Enforce global namespace count limit to prevent DoS.
+        let prev = NET_NS_COUNT.fetch_add(1, Ordering::SeqCst);
+        if prev >= MAX_NET_NS_COUNT {
+            NET_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
+            return Err(NetNsError::MaxNamespaces);
         }
 
         let id = NEXT_NET_NS_ID.fetch_add(1, Ordering::SeqCst);
@@ -301,11 +317,30 @@ pub fn root_net_namespace() -> Arc<NetNamespace> {
 ///
 /// This operation requires CAP_NET_ADMIN in both the source and
 /// destination namespaces.
+///
+/// # R75-3 FIX
+///
+/// Added permission check: requires CAP_ADMIN (CAP_NET_ADMIN equivalent)
+/// or root (euid == 0) to move devices between namespaces. Without this
+/// check, unprivileged processes could hijack network devices from the
+/// host namespace or inject devices into other namespaces.
 pub fn move_device(
     device_idx: u32,
     from: &Arc<NetNamespace>,
     to: &Arc<NetNamespace>,
 ) -> Result<(), NetNsError> {
+    // R75-3 FIX: Security check - require CAP_NET_ADMIN (mapped to ADMIN) or root
+    let has_cap_admin =
+        crate::process::with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN))
+            .unwrap_or(false);
+    // CODEX REVIEW FIX: Use unwrap_or(false) instead of unwrap_or(true) to prevent
+    // permission bypass when current_euid() fails (e.g., no process context).
+    // Fail-closed: if we can't determine euid, assume non-root.
+    let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
+    if !is_root && !has_cap_admin {
+        return Err(NetNsError::PermissionDenied);
+    }
+
     // Remove from source namespace
     from.remove_device(device_idx)?;
 
@@ -316,6 +351,19 @@ pub fn move_device(
             // Rollback: put device back in source
             let _ = from.add_device(device_idx);
             Err(e)
+        }
+    }
+}
+
+// ============================================================================
+// R76-2 FIX: Namespace Resource Cleanup
+// ============================================================================
+
+/// R76-2 FIX: Decrement global namespace counter when namespace is destroyed.
+impl Drop for NetNamespace {
+    fn drop(&mut self) {
+        if self.level > 0 {
+            NET_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -355,6 +403,13 @@ impl Drop for NetNamespaceFd {
 
 impl FileOps for NetNamespaceFd {
     fn clone_box(&self) -> alloc::boxed::Box<dyn FileOps> {
+        // R75-4 FIX: Increment manual refcount when cloning FD.
+        //
+        // Without this, dup()/fork() creates a new FD that shares the same
+        // Arc but doesn't increment the manual refcount. When each copy is
+        // dropped, dec_ref() is called multiple times, causing underflow
+        // (wrapping from 1 to u32::MAX) and breaking reference tracking.
+        self.ns.inc_ref();
         alloc::boxed::Box::new(Self {
             ns: self.ns.clone(),
         })

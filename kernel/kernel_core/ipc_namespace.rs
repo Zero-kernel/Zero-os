@@ -48,6 +48,13 @@ pub const MAX_IPC_NS_LEVEL: u8 = 32;
 /// CLONE_NEWIPC flag for clone/unshare
 pub const CLONE_NEWIPC: u64 = 0x0800_0000;
 
+/// R76-2 FIX: Maximum number of IPC namespaces allowed system-wide.
+/// Prevents DoS via namespace exhaustion.
+pub const MAX_IPC_NS_COUNT: u32 = 1024;
+
+/// R76-2 FIX: Current IPC namespace count (root starts at 1).
+static IPC_NS_COUNT: AtomicU32 = AtomicU32::new(1);
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -57,6 +64,8 @@ pub const CLONE_NEWIPC: u64 = 0x0800_0000;
 pub enum IpcNsError {
     /// Maximum namespace depth exceeded
     MaxDepthExceeded,
+    /// R76-2 FIX: Maximum system-wide namespace count exceeded
+    MaxNamespaces,
     /// Namespace not found
     NotFound,
     /// Permission denied
@@ -133,6 +142,13 @@ impl IpcNamespace {
     pub fn new_child(parent: Arc<IpcNamespace>) -> Result<Arc<Self>, IpcNsError> {
         if parent.level >= MAX_IPC_NS_LEVEL {
             return Err(IpcNsError::MaxDepthExceeded);
+        }
+
+        // R76-2 FIX: Enforce global namespace count limit to prevent DoS.
+        let prev = IPC_NS_COUNT.fetch_add(1, Ordering::SeqCst);
+        if prev >= MAX_IPC_NS_COUNT {
+            IPC_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
+            return Err(IpcNsError::MaxNamespaces);
         }
 
         let id = NEXT_IPC_NS_ID.fetch_add(1, Ordering::SeqCst);
@@ -275,6 +291,13 @@ impl Drop for IpcNamespaceFd {
 
 impl FileOps for IpcNamespaceFd {
     fn clone_box(&self) -> alloc::boxed::Box<dyn FileOps> {
+        // R75-4 FIX: Increment manual refcount when cloning FD.
+        //
+        // Without this, dup()/fork() creates a new FD that shares the same
+        // Arc but doesn't increment the manual refcount. When each copy is
+        // dropped, dec_ref() is called multiple times, causing underflow
+        // (wrapping from 1 to u32::MAX) and breaking reference tracking.
+        self.ns.inc_ref();
         alloc::boxed::Box::new(Self {
             ns: self.ns.clone(),
         })
@@ -321,6 +344,19 @@ impl FileOps for IpcNamespaceFd {
 pub fn test_is_ipc_ns_initialized() -> bool {
     // The root namespace exists if the lazy_static was initialized
     ROOT_IPC_NAMESPACE.id().raw() == 0 && ROOT_IPC_NAMESPACE.is_root()
+}
+
+// ============================================================================
+// R76-2 FIX: Namespace Resource Cleanup
+// ============================================================================
+
+/// R76-2 FIX: Decrement global namespace counter when namespace is destroyed.
+impl Drop for IpcNamespace {
+    fn drop(&mut self) {
+        if self.level > 0 {
+            IPC_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 #[cfg(test)]
