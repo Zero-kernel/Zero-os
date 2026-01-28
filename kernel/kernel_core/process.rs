@@ -591,6 +591,17 @@ pub struct Process {
     /// Network namespace for children (set by CLONE_NEWNET)
     pub net_ns_for_children: Arc<crate::net_namespace::NetNamespace>,
 
+    // ========== F.1: User Namespace Support ==========
+    /// User namespace of this process
+    ///
+    /// Provides UID/GID virtualization. Inside a user namespace, a process
+    /// can appear as root (uid=0) while being unprivileged on the host.
+    /// CLONE_NEWUSER creates an isolated namespace with its own UID/GID mappings.
+    pub user_ns: Arc<crate::user_namespace::UserNamespace>,
+
+    /// User namespace for children (set by CLONE_NEWUSER)
+    pub user_ns_for_children: Arc<crate::user_namespace::UserNamespace>,
+
     // ========== F.2: Cgroup v2 Support ==========
     /// Cgroup ID this process belongs to.
     ///
@@ -689,6 +700,10 @@ impl Process {
             // F.1: Network namespace - default to root network namespace
             net_ns: crate::net_namespace::ROOT_NET_NAMESPACE.clone(),
             net_ns_for_children: crate::net_namespace::ROOT_NET_NAMESPACE.clone(),
+            // F.1: User namespace - default to root user namespace
+            // Unlike other namespaces, CLONE_NEWUSER does not require root/CAP_SYS_ADMIN
+            user_ns: crate::user_namespace::ROOT_USER_NAMESPACE.clone(),
+            user_ns_for_children: crate::user_namespace::ROOT_USER_NAMESPACE.clone(),
             // F.2: Cgroup v2 - default to root cgroup
             cgroup_id: 0,
             // Seccomp/Pledge 沙箱 (默认无限制)

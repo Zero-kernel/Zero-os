@@ -3234,6 +3234,17 @@ impl SocketTable {
                                 return Some(syn_ack);
                             }
 
+                            // R77-4 FIX: Enforce per-namespace socket quota before creating child socket.
+                            // Without this check, TCP listeners could create unlimited child sockets
+                            // bypassing the MAX_SOCKETS_PER_NS quota, leading to DoS via connection
+                            // floods and potential count underflow when sockets are later closed.
+                            if let Err(_) = self.try_inc_ns_count(listener.net_ns_id) {
+                                // Quota exceeded: silently drop SYN like backlog-full scenario.
+                                // This prevents attackers from exhausting socket resources via
+                                // connection floods while appearing as normal packet loss.
+                                return None;
+                            }
+
                             // Create child socket inheriting listener properties
                             // R75-1 FIX: Child socket inherits parent listener's network namespace
                             let child_id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
@@ -3362,6 +3373,8 @@ impl SocketTable {
                             // Cleanup (shouldn't happen given the check above)
                             self.tcp_conns.lock().remove(&syn_key);
                             self.sockets.write().remove(&child_id);
+                            // R77-4 FIX: Rollback quota on failure path
+                            self.dec_ns_count(listener.net_ns_id);
                             return None;
                         }
                     }
@@ -3438,6 +3451,14 @@ impl SocketTable {
                                 }
                             }
 
+                            // R77-4 FIX: Enforce per-namespace socket quota before creating child socket.
+                            // This is the SYN cookie completion path - without this check, validated
+                            // cookies could create unlimited sockets bypassing namespace quotas.
+                            if let Err(_) = self.try_inc_ns_count(listener.net_ns_id) {
+                                // Quota exceeded: behave like accept queue full and send RST
+                                return self.build_tcp_rst(dst_ip, src_ip, header, payload);
+                            }
+
                             // Create child socket for the connection
                             // R75-1 FIX: Child socket inherits parent listener's network namespace
                             let child_id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
@@ -3505,6 +3526,10 @@ impl SocketTable {
                                 // Accept queue became full between check and push
                                 child.mark_closed();
                                 self.cleanup_tcp_connection(&child);
+                                // R77-4 FIX: Rollback namespace quota on failure.
+                                // cleanup_tcp_connection doesn't decrement quota, so we must
+                                // do it here to maintain accounting integrity.
+                                self.dec_ns_count(listener.net_ns_id);
                                 return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                             }
 

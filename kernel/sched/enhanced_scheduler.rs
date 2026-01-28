@@ -206,9 +206,14 @@ impl Scheduler {
     /// * `skip_pid` - 要跳过的进程 PID（用于 yield 时避免选中自己）
     ///
     /// # R70-3 FIX: Use cpu_allowed() for consistent affinity semantics
+    ///
+    /// # F.2: Skip processes in throttled cgroups (cpu.max enforcement)
     fn select_next_locked(queue: &ReadyQueues, skip_pid: Option<Pid>) -> Option<Pid> {
         // Get current CPU ID for affinity check
         let cpu_id = current_cpu_id();
+
+        // F.2 Cgroup: Calculate current time for CPU quota checks
+        let now_ns = kernel_core::get_ticks().saturating_mul(TICK_NS);
 
         // Debug: print all processes in queue
         for (priority, bucket) in queue.iter() {
@@ -234,8 +239,13 @@ impl Scheduler {
                 // R70-3 FIX: Check both state AND CPU affinity using cpu_allowed()
                 // E.5: Use effective_allowed_cpus for cpuset-aware scheduling
                 let effective_mask = Self::effective_allowed_cpus(&proc);
+
+                // F.2 Cgroup: Skip processes in throttled cgroups
+                let throttled = cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some();
+
                 if proc.state == ProcessState::Ready
                     && Self::cpu_allowed(cpu_id, effective_mask)
+                    && !throttled
                 {
                     sched_debug!("[SCHED] selected pid={}", pid);
                     return Some(pid);
@@ -250,8 +260,13 @@ impl Scheduler {
                 // R70-3 FIX: Use cpu_allowed() for consistent semantics
                 // E.5: Use effective_allowed_cpus for cpuset-aware scheduling
                 let effective_mask = Self::effective_allowed_cpus(&proc);
+
+                // F.2 Cgroup: Skip processes in throttled cgroups
+                let throttled = cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some();
+
                 if proc.state == ProcessState::Ready
                     && Self::cpu_allowed(cpu_id, effective_mask)
+                    && !throttled
                 {
                     sched_debug!("[SCHED] fallback to skipped pid={}", skip);
                     return Some(skip);
@@ -925,6 +940,18 @@ impl Scheduler {
                     // F.2 Cgroup: Account CPU time for cgroup controller
                     // This feeds into cgroup statistics and future cpu.stat accounting
                     cgroup::account_cpu_time(proc.cgroup_id, TICK_NS);
+
+                    // F.2 Cgroup: Enforce cpu.max quota and throttle if exceeded
+                    // Calculate current time in nanoseconds for quota accounting
+                    let now_ns = kernel_core::get_ticks().saturating_mul(TICK_NS);
+                    if let cgroup::CpuQuotaStatus::Throttled(_) =
+                        cgroup::charge_cpu_quota(proc.cgroup_id, TICK_NS, now_ns)
+                    {
+                        // Quota exceeded - preempt this process immediately
+                        proc.state = ProcessState::Ready;
+                        proc.reset_time_slice();
+                        current_cpu().set_need_resched();
+                    }
                 }
 
                 // 时间片已用完，标记为就绪态并降低优先级

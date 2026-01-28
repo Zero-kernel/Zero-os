@@ -40,7 +40,7 @@ use alloc::{
 };
 use core::{
     fmt,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use spin::{Lazy, Mutex, RwLock};
 
@@ -91,6 +91,8 @@ bitflags! {
         const MEMORY = 0x02;
         /// PIDs controller: maximum number of tasks in the cgroup.
         const PIDS   = 0x04;
+        /// IO controller: bandwidth and IOPS limits.
+        const IO     = 0x08;
     }
 }
 
@@ -132,6 +134,20 @@ pub struct CgroupLimits {
     /// fork/clone fails with EAGAIN when limit is reached.
     /// Maps to `pids.max` in cgroup v2.
     pub pids_max: Option<u64>,
+
+    /// Aggregate I/O bandwidth limit in bytes per second (read + write).
+    ///
+    /// When exceeded, I/O operations are throttled until tokens refill.
+    /// Uses token bucket algorithm with 4-second burst window.
+    /// Maps to `io.max` (bps) in cgroup v2.
+    pub io_max_bytes_per_sec: Option<u64>,
+
+    /// Aggregate I/O operations per second limit (read + write).
+    ///
+    /// When exceeded, I/O operations are throttled until tokens refill.
+    /// Uses token bucket algorithm with 4-second burst window.
+    /// Maps to `io.max` (iops) in cgroup v2.
+    pub io_max_iops_per_sec: Option<u64>,
 }
 
 // ============================================================================
@@ -161,6 +177,18 @@ pub struct CgroupStats {
 
     /// Number of times pids.max was hit (fork failures).
     pub pids_events_max: AtomicU32,
+
+    // IO controller statistics
+    /// Total bytes read via block I/O.
+    pub io_read_bytes: AtomicU64,
+    /// Total bytes written via block I/O.
+    pub io_write_bytes: AtomicU64,
+    /// Total read I/O operations completed.
+    pub io_read_ios: AtomicU64,
+    /// Total write I/O operations completed.
+    pub io_write_ios: AtomicU64,
+    /// Number of times I/O was throttled due to io.max limit.
+    pub io_throttle_events: AtomicU64,
 }
 
 impl CgroupStats {
@@ -173,6 +201,11 @@ impl CgroupStats {
             memory_events_max: AtomicU64::new(0),
             pids_current: AtomicU64::new(0),
             pids_events_max: AtomicU32::new(0),
+            io_read_bytes: AtomicU64::new(0),
+            io_write_bytes: AtomicU64::new(0),
+            io_read_ios: AtomicU64::new(0),
+            io_write_ios: AtomicU64::new(0),
+            io_throttle_events: AtomicU64::new(0),
         }
     }
 
@@ -185,6 +218,11 @@ impl CgroupStats {
             memory_events_max: self.memory_events_max.load(Ordering::Relaxed),
             pids_current: self.pids_current.load(Ordering::Relaxed),
             pids_events_max: self.pids_events_max.load(Ordering::Relaxed),
+            io_read_bytes: self.io_read_bytes.load(Ordering::Relaxed),
+            io_write_bytes: self.io_write_bytes.load(Ordering::Relaxed),
+            io_read_ios: self.io_read_ios.load(Ordering::Relaxed),
+            io_write_ios: self.io_write_ios.load(Ordering::Relaxed),
+            io_throttle_events: self.io_throttle_events.load(Ordering::Relaxed),
         }
     }
 
@@ -194,10 +232,22 @@ impl CgroupStats {
         self.cpu_time_ns.fetch_add(delta_ns, Ordering::Relaxed);
     }
 
-    /// Updates current memory usage (called by memory controller/sampler).
+    // R77-2 FIX: Removed set_memory_current() which used bare store().
+    // Memory accounting is now exclusively through try_charge_memory()/uncharge_memory()
+    // to prevent CAS overwrites. Use get_memory_current() for read-only access.
+
+    /// Returns current memory usage (read-only snapshot).
+    ///
+    /// # R77-2 FIX
+    ///
+    /// This replaces the old `set_memory_current()` which used bare `store()`
+    /// and could overwrite in-flight CAS updates from `try_charge_memory()`.
+    /// Memory accounting should only be modified through:
+    /// - `try_charge_memory()` for allocations (atomic CAS)
+    /// - `uncharge_memory()` for deallocations (atomic fetch_update)
     #[inline]
-    pub fn set_memory_current(&self, bytes: u64) {
-        self.memory_current.store(bytes, Ordering::Relaxed);
+    pub fn get_memory_current(&self) -> u64 {
+        self.memory_current.load(Ordering::Relaxed)
     }
 
     /// Records a memory.high exceeded event.
@@ -243,6 +293,297 @@ pub struct CgroupStatsSnapshot {
     pub memory_events_max: u64,
     pub pids_current: u64,
     pub pids_events_max: u32,
+    pub io_read_bytes: u64,
+    pub io_write_bytes: u64,
+    pub io_read_ios: u64,
+    pub io_write_ios: u64,
+    pub io_throttle_events: u64,
+}
+
+// ============================================================================
+// F.2: CPU Quota Tracking (cpu.max enforcement)
+// ============================================================================
+
+/// Per-cgroup CPU quota state for cpu.max enforcement.
+///
+/// Tracks per-period CPU usage and throttle state using lock-free atomics.
+/// The quota is enforced by the scheduler: when usage exceeds max within a
+/// period, the cgroup is throttled until the next period.
+///
+/// # Fields
+///
+/// * `period_start_ns` - Start time of the current accounting period
+/// * `period_usage_ns` - Accumulated CPU time used in the current period
+/// * `throttled_until_ns` - End of throttle window (0 = not throttled)
+/// * `throttle_events` - Counter of throttle events for statistics
+#[derive(Debug)]
+struct CpuQuotaState {
+    /// Start of the current quota period in nanoseconds since boot
+    period_start_ns: AtomicU64,
+    /// CPU time consumed in the current period
+    period_usage_ns: AtomicU64,
+    /// If non-zero, the cgroup is throttled until this time
+    throttled_until_ns: AtomicU64,
+    /// Number of times this cgroup has been throttled
+    throttle_events: AtomicU64,
+}
+
+impl CpuQuotaState {
+    /// Creates a new quota state with all fields zeroed.
+    const fn new() -> Self {
+        Self {
+            period_start_ns: AtomicU64::new(0),
+            period_usage_ns: AtomicU64::new(0),
+            throttled_until_ns: AtomicU64::new(0),
+            throttle_events: AtomicU64::new(0),
+        }
+    }
+
+    /// Refresh the quota window if the period has elapsed.
+    ///
+    /// Called before charging or checking throttle state to ensure
+    /// we're accounting against the correct period.
+    #[inline]
+    fn refresh_window(&self, now_ns: u64, period_ns: u64) {
+        let start = self.period_start_ns.load(Ordering::Relaxed);
+        // If this is the first accounting or the period has elapsed,
+        // start a new period with reset usage
+        if start == 0 || now_ns.saturating_sub(start) >= period_ns {
+            self.period_start_ns.store(now_ns, Ordering::Relaxed);
+            self.period_usage_ns.store(0, Ordering::Relaxed);
+            self.throttled_until_ns.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the number of throttle events.
+    #[inline]
+    fn throttle_count(&self) -> u64 {
+        self.throttle_events.load(Ordering::Relaxed)
+    }
+}
+
+/// Result of charging CPU quota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuQuotaStatus {
+    /// No CPU controller or cpu.max is unlimited.
+    Unlimited,
+    /// Quota available, time has been charged.
+    Allowed,
+    /// Quota exceeded; cgroup is throttled until the specified time (ns).
+    Throttled(u64),
+}
+
+// ============================================================================
+// F.2: IO Throttling (io.max enforcement)
+// ============================================================================
+
+/// I/O direction for bandwidth and IOPS accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoDirection {
+    /// Block read operation.
+    Read,
+    /// Block write operation.
+    Write,
+}
+
+/// Result of charging I/O bandwidth tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoThrottleStatus {
+    /// No IO controller or limits configured.
+    Unlimited,
+    /// Tokens available, I/O request permitted.
+    Allowed,
+    /// Tokens exhausted; caller should wait until `until_ns` before retrying.
+    Throttled(u64),
+}
+
+/// Maximum burst window for IO token bucket (seconds).
+///
+/// Allows short bursts of up to 4 seconds worth of tokens, smoothing
+/// out bursty workloads while still enforcing long-term average limits.
+const IO_BURST_SECS: u64 = 4;
+
+/// Nanoseconds per second constant.
+const NS_PER_SEC: u64 = 1_000_000_000;
+
+/// Internal token bucket state for IO bandwidth and IOPS throttling.
+///
+/// Each cgroup has one of these, tracking both bytes/sec and IOPS tokens.
+/// Protected by a mutex in `IoThrottleState`.
+#[derive(Debug)]
+struct IoBucketState {
+    /// Last time tokens were refilled (nanoseconds since boot).
+    last_refill_ns: u64,
+    /// Current available byte tokens (decremented on IO, refilled over time).
+    byte_tokens: u64,
+    /// Current available IOPS tokens (decremented on IO, refilled over time).
+    iops_tokens: u64,
+    /// If non-zero, throttled until this time (nanoseconds since boot).
+    throttle_until_ns: u64,
+}
+
+impl IoBucketState {
+    /// Refill tokens based on elapsed time since last refill.
+    ///
+    /// Token bucket algorithm: tokens accumulate at the configured rate,
+    /// normally capped at `rate * IO_BURST_SECS` to allow bounded bursts.
+    ///
+    /// # CODEX FIX: Stale Token Clamping
+    ///
+    /// When limits change from unlimited to limited, tokens may be at u64::MAX.
+    /// This function now clamps tokens to the cap to prevent limit bypass.
+    ///
+    /// # CODEX FIX: Oversized I/O Support
+    ///
+    /// A single I/O larger than the burst capacity would deadlock because refill
+    /// caps at `rate * burst`. To prevent this, `requested_bytes` extends the
+    /// effective cap so large I/Os can eventually accumulate enough tokens.
+    fn refill(&mut self, limits: &CgroupLimits, now_ns: u64, requested_bytes: u64) {
+        let elapsed = if self.last_refill_ns == 0 {
+            0
+        } else {
+            now_ns.saturating_sub(self.last_refill_ns)
+        };
+
+        // Refill byte tokens
+        if let Some(bps) = limits.io_max_bytes_per_sec {
+            let burst_cap = bps.saturating_mul(IO_BURST_SECS);
+            // Allow cap to grow to requested_bytes to prevent deadlock on large I/O
+            let effective_cap = burst_cap.max(requested_bytes);
+
+            if self.last_refill_ns == 0 {
+                // First refill: grant full burst capacity (not request-extended)
+                self.byte_tokens = burst_cap;
+            } else {
+                // CODEX FIX: Clamp stale tokens when limit tightened or toggled on
+                if self.byte_tokens > effective_cap {
+                    self.byte_tokens = effective_cap;
+                }
+                if elapsed > 0 && self.byte_tokens < effective_cap {
+                    // Proportional refill: tokens = elapsed_secs * rate
+                    let add = ((elapsed as u128 * bps as u128) / NS_PER_SEC as u128) as u64;
+                    self.byte_tokens = core::cmp::min(effective_cap, self.byte_tokens.saturating_add(add));
+                }
+            }
+        } else {
+            self.byte_tokens = u64::MAX;
+        }
+
+        // Refill IOPS tokens
+        if let Some(iops) = limits.io_max_iops_per_sec {
+            let cap = iops.saturating_mul(IO_BURST_SECS);
+            if self.last_refill_ns == 0 {
+                self.iops_tokens = cap;
+            } else {
+                // CODEX FIX: Clamp stale tokens when limit tightened or toggled on
+                if self.iops_tokens > cap {
+                    self.iops_tokens = cap;
+                }
+                if elapsed > 0 && self.iops_tokens < cap {
+                    let add = ((elapsed as u128 * iops as u128) / NS_PER_SEC as u128) as u64;
+                    self.iops_tokens = core::cmp::min(cap, self.iops_tokens.saturating_add(add));
+                }
+            }
+        } else {
+            self.iops_tokens = u64::MAX;
+        }
+
+        // Clear expired throttle
+        if self.throttle_until_ns != 0 && now_ns >= self.throttle_until_ns {
+            self.throttle_until_ns = 0;
+        }
+
+        self.last_refill_ns = now_ns;
+    }
+}
+
+/// Per-cgroup IO throttle state.
+///
+/// Wraps `IoBucketState` in a mutex for thread-safe access.
+/// The mutex is only held during token accounting (microsecond-scale),
+/// never while waiting for IO or rescheduling, avoiding deadlock with
+/// the block layer's device locks.
+#[derive(Debug)]
+struct IoThrottleState {
+    state: Mutex<IoBucketState>,
+}
+
+impl IoThrottleState {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(IoBucketState {
+                last_refill_ns: 0,
+                byte_tokens: 0,
+                iops_tokens: 0,
+                throttle_until_ns: 0,
+            }),
+        }
+    }
+
+    /// Charge IO tokens for a single operation.
+    ///
+    /// Refills tokens based on elapsed time, then attempts to consume tokens
+    /// for the given operation. If insufficient tokens are available, computes
+    /// the time until enough tokens will have accumulated and returns
+    /// `Throttled(until_ns)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `limits` - Current cgroup limits (must be locked by caller)
+    /// * `bytes` - Number of bytes in this I/O operation
+    /// * `now_ns` - Current time in nanoseconds since boot
+    /// * `stats` - Cgroup stats for recording throttle events
+    fn charge(
+        &self,
+        limits: &CgroupLimits,
+        bytes: u64,
+        now_ns: u64,
+        stats: &CgroupStats,
+    ) -> IoThrottleStatus {
+        let mut bucket = self.state.lock();
+        bucket.refill(limits, now_ns, bytes);
+
+        // If still in a throttle window, return immediately
+        if bucket.throttle_until_ns != 0 && now_ns < bucket.throttle_until_ns {
+            return IoThrottleStatus::Throttled(bucket.throttle_until_ns);
+        }
+
+        let mut throttle_until = 0u64;
+
+        // Check byte budget
+        if let Some(bps) = limits.io_max_bytes_per_sec {
+            if bucket.byte_tokens < bytes {
+                // Not enough tokens: compute wait time for deficit to refill
+                let deficit = bytes - bucket.byte_tokens;
+                let wait_ns =
+                    ((deficit as u128 * NS_PER_SEC as u128) + (bps as u128 - 1)) / bps as u128;
+                throttle_until = now_ns.saturating_add(wait_ns as u64);
+            } else {
+                bucket.byte_tokens = bucket.byte_tokens.saturating_sub(bytes);
+            }
+        }
+
+        // Check IOPS budget
+        if let Some(iops) = limits.io_max_iops_per_sec {
+            if bucket.iops_tokens == 0 {
+                // No IOPS tokens: wait for one token to refill
+                let nanos_per_io = NS_PER_SEC
+                    .checked_div(iops.max(1))
+                    .unwrap_or(NS_PER_SEC);
+                throttle_until = throttle_until.max(now_ns.saturating_add(nanos_per_io));
+            } else {
+                bucket.iops_tokens = bucket.iops_tokens.saturating_sub(1);
+            }
+        }
+
+        if throttle_until != 0 {
+            bucket.throttle_until_ns = throttle_until;
+            stats.io_throttle_events.fetch_add(1, Ordering::Relaxed);
+            return IoThrottleStatus::Throttled(throttle_until);
+        }
+
+        IoThrottleStatus::Allowed
+    }
 }
 
 // ============================================================================
@@ -334,6 +675,24 @@ pub struct CgroupNode {
 
     /// Manual reference count for external tracking.
     ref_count: AtomicU32,
+
+    /// R77-1 FIX: Deletion flag to block late attaches after removal is initiated.
+    ///
+    /// This prevents the race where a thread holds an old Arc<CgroupNode> and
+    /// attempts to attach_task() after delete_cgroup() has verified emptiness
+    /// but before removing from the registry. Without this flag, such late
+    /// attaches could create orphaned tasks in an unregistered cgroup.
+    deleted: AtomicBool,
+
+    /// F.2: CPU quota tracking state for cpu.max enforcement.
+    ///
+    /// Tracks per-period CPU usage and throttle state for the CPU controller.
+    cpu_quota: CpuQuotaState,
+
+    /// F.2: IO throttle state for io.max enforcement.
+    ///
+    /// Tracks IO bandwidth and IOPS tokens for the IO controller.
+    io_throttle: IoThrottleState,
 }
 
 impl CgroupNode {
@@ -349,6 +708,9 @@ impl CgroupNode {
             stats: CgroupStats::new(),
             processes: Mutex::new(BTreeSet::new()),
             ref_count: AtomicU32::new(1),
+            deleted: AtomicBool::new(false), // R77-1 FIX
+            cpu_quota: CpuQuotaState::new(), // F.2: CPU quota tracking
+            io_throttle: IoThrottleState::new(), // F.2: IO throttle state
         }
     }
 
@@ -447,6 +809,9 @@ impl CgroupNode {
             stats: CgroupStats::new(),
             processes: Mutex::new(BTreeSet::new()),
             ref_count: AtomicU32::new(1),
+            deleted: AtomicBool::new(false), // R77-1 FIX
+            cpu_quota: CpuQuotaState::new(), // F.2: CPU quota tracking
+            io_throttle: IoThrottleState::new(), // F.2: IO throttle state
         });
 
         // Register in global registry (re-check count under write lock)
@@ -470,9 +835,18 @@ impl CgroupNode {
     ///
     /// # Errors
     ///
+    /// * `NotFound` - Cgroup is being deleted (R77-1 FIX)
     /// * `TaskAlreadyAttached` - Task is already in this cgroup
     /// * `PidsLimitExceeded` - Would exceed pids.max
     pub fn attach_task(&self, task: TaskId) -> Result<(), CgroupError> {
+        // R77-1 FIX: Block attaches once deletion has started.
+        // This prevents the race where a thread holds an old Arc<CgroupNode>
+        // and attempts to attach after delete_cgroup() has checked emptiness
+        // but before removing from registry.
+        if self.deleted.load(Ordering::Acquire) {
+            return Err(CgroupError::NotFound);
+        }
+
         let mut procs = self.processes.lock();
 
         // Check if already attached
@@ -538,6 +912,11 @@ impl CgroupNode {
                 return Err(CgroupError::ControllerDisabled);
             }
         }
+        if updated.io_max_bytes_per_sec.is_some() || updated.io_max_iops_per_sec.is_some() {
+            if !self.controllers.contains(CgroupControllers::IO) {
+                return Err(CgroupError::ControllerDisabled);
+            }
+        }
 
         // Validate CPU weight (1-10000)
         if let Some(weight) = updated.cpu_weight {
@@ -549,6 +928,18 @@ impl CgroupNode {
         // Validate CPU quota (period > 0, max > 0)
         if let Some((max, period)) = updated.cpu_max {
             if period == 0 || max == 0 {
+                return Err(CgroupError::InvalidLimit);
+            }
+        }
+
+        // Validate IO limits (must be non-zero if provided)
+        if let Some(bps) = updated.io_max_bytes_per_sec {
+            if bps == 0 {
+                return Err(CgroupError::InvalidLimit);
+            }
+        }
+        if let Some(iops) = updated.io_max_iops_per_sec {
+            if iops == 0 {
                 return Err(CgroupError::InvalidLimit);
             }
         }
@@ -569,6 +960,12 @@ impl CgroupNode {
         }
         if let Some(v) = updated.pids_max {
             limits.pids_max = Some(v);
+        }
+        if let Some(v) = updated.io_max_bytes_per_sec {
+            limits.io_max_bytes_per_sec = Some(v);
+        }
+        if let Some(v) = updated.io_max_iops_per_sec {
+            limits.io_max_iops_per_sec = Some(v);
         }
 
         Ok(())
@@ -666,6 +1063,12 @@ pub fn create_cgroup(
 /// Previously there was a TOCTOU race between checking emptiness and removing
 /// from the registry. Now we hold the registry write lock throughout the operation,
 /// preventing new tasks from being attached between the check and removal.
+///
+/// # R77-1 FIX: Deletion Flag
+///
+/// Additionally, we set the `deleted` flag before checking emptiness to block
+/// any late attaches from threads holding old Arc<CgroupNode> references.
+/// The attach_task() method checks this flag and rejects attaches to deleted cgroups.
 pub fn delete_cgroup(id: CgroupId) -> Result<(), CgroupError> {
     if id == 0 {
         return Err(CgroupError::PermissionDenied);
@@ -678,12 +1081,23 @@ pub fn delete_cgroup(id: CgroupId) -> Result<(), CgroupError> {
 
     let node = registry.get(&id).cloned().ok_or(CgroupError::NotFound)?;
 
+    // R77-1 FIX: Mark as deleting BEFORE checking emptiness to block any racing
+    // attach_task() callers who hold old Arc<CgroupNode> references.
+    // The deleted flag uses Acquire/Release ordering to ensure proper visibility.
+    node.deleted.store(true, Ordering::Release);
+
     // Check if empty while holding registry write lock
-    // No new tasks can attach because lookup_cgroup needs registry read lock
+    // No new tasks can attach because:
+    // 1. lookup_cgroup needs registry read lock (which we hold as write)
+    // 2. attach_task() checks deleted flag (which we just set)
     if !node.children.lock().is_empty() {
+        // Rollback deleted flag since deletion failed
+        node.deleted.store(false, Ordering::Release);
         return Err(CgroupError::NotEmpty);
     }
     if !node.processes.lock().is_empty() {
+        // Rollback deleted flag since deletion failed
+        node.deleted.store(false, Ordering::Release);
         return Err(CgroupError::NotEmpty);
     }
 
@@ -786,18 +1200,22 @@ pub fn account_cpu_time(cgroup_id: CgroupId, delta_ns: u64) {
 // Memory Controller Integration
 // ============================================================================
 
-/// Updates memory usage for a cgroup.
-pub fn update_memory_usage(cgroup_id: CgroupId, bytes: u64) {
-    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
-        cgroup.stats.set_memory_current(bytes);
-
-        // Check high watermark
-        if let Some(high) = cgroup.limits.lock().memory_high {
-            if bytes > high {
-                cgroup.stats.record_memory_high();
-            }
-        }
-    }
+/// Returns current memory usage for a cgroup (read-only snapshot).
+///
+/// # R77-2 FIX
+///
+/// This replaces the old `update_memory_usage()` which used bare `store()` and
+/// could overwrite in-flight `try_charge_memory()` CAS operations. The memory
+/// accounting model is now exclusively charge/uncharge based:
+///
+/// - **Allocations** (mmap, etc.): Use `try_charge_memory()` with atomic CAS
+/// - **Deallocations** (munmap, etc.): Use `uncharge_memory()` with fetch_update
+/// - **Monitoring**: Use this function for read-only snapshots
+///
+/// This eliminates the race where a background sampler's `store()` would
+/// overwrite concurrent CAS updates, potentially bypassing memory limits.
+pub fn get_memory_usage(cgroup_id: CgroupId) -> Option<u64> {
+    lookup_cgroup(cgroup_id).map(|cgroup| cgroup.stats.get_memory_current())
 }
 
 /// Checks if memory allocation would exceed cgroup limit.
@@ -890,6 +1308,284 @@ pub fn uncharge_memory(cgroup_id: CgroupId, bytes: u64) {
             );
         }
     }
+}
+
+// ============================================================================
+// F.2: IO Controller Integration (io.max enforcement)
+// ============================================================================
+
+/// Charge IO tokens for a cgroup and return throttle status.
+///
+/// Called before issuing a block I/O operation. If the cgroup has io.max
+/// configured and is out of tokens, returns `Throttled(until_ns)` indicating
+/// when the caller should retry.
+///
+/// # Arguments
+///
+/// * `cgroup_id` - The cgroup to charge
+/// * `bytes` - Number of bytes in this I/O operation
+/// * `op` - Read or Write direction
+/// * `now_ns` - Current time in nanoseconds since boot
+///
+/// # Returns
+///
+/// * `Unlimited` - No IO controller or io.max not configured
+/// * `Allowed` - Tokens available, operation permitted
+/// * `Throttled(until_ns)` - Tokens exhausted, retry after specified time
+pub fn charge_io(
+    cgroup_id: CgroupId,
+    bytes: u64,
+    _op: IoDirection,
+    now_ns: u64,
+) -> IoThrottleStatus {
+    if bytes == 0 {
+        return IoThrottleStatus::Allowed;
+    }
+
+    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
+        if cgroup.controllers.contains(CgroupControllers::IO) {
+            let limits = cgroup.limits.lock();
+            if limits.io_max_bytes_per_sec.is_none() && limits.io_max_iops_per_sec.is_none() {
+                return IoThrottleStatus::Unlimited;
+            }
+            return cgroup
+                .io_throttle
+                .charge(&limits, bytes, now_ns, &cgroup.stats);
+        }
+    }
+
+    IoThrottleStatus::Unlimited
+}
+
+/// Block until IO tokens are available (process context only).
+///
+/// Called by the block layer before issuing I/O. This function will yield
+/// the CPU and retry until tokens become available. **Must not be called
+/// from IRQ context** as it may reschedule.
+///
+/// # Arguments
+///
+/// * `cgroup_id` - The cgroup to throttle against
+/// * `bytes` - Number of bytes in this I/O operation
+/// * `op` - Read or Write direction
+///
+/// # Returns
+///
+/// Always returns `Allowed` once tokens are available.
+pub fn wait_for_io_window(
+    cgroup_id: CgroupId,
+    bytes: u64,
+    op: IoDirection,
+) -> IoThrottleStatus {
+    let mut now_ns = crate::current_timestamp_ms().saturating_mul(1_000_000);
+
+    loop {
+        match charge_io(cgroup_id, bytes, op, now_ns) {
+            IoThrottleStatus::Allowed | IoThrottleStatus::Unlimited => {
+                return IoThrottleStatus::Allowed
+            }
+            IoThrottleStatus::Throttled(until) => {
+                // Yield CPU to allow other tasks to run while we wait for tokens.
+                // SAFETY: This is only called from process context (block layer)
+                // where rescheduling is safe.
+                crate::scheduler_hook::force_reschedule();
+
+                // Update timestamp for next check
+                let next = crate::current_timestamp_ms().saturating_mul(1_000_000);
+                now_ns = core::cmp::max(next, now_ns.saturating_add(1_000_000));
+
+                if now_ns < until {
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+/// Record IO completion statistics after a successful transfer.
+///
+/// Called by the block layer after an I/O operation completes successfully.
+/// Updates the read/write byte counters for the cgroup.
+///
+/// # Arguments
+///
+/// * `cgroup_id` - The cgroup that performed the I/O
+/// * `bytes` - Number of bytes transferred
+/// * `op` - Read or Write direction
+pub fn record_io_completion(cgroup_id: CgroupId, bytes: u64, op: IoDirection) {
+    if bytes == 0 {
+        return;
+    }
+
+    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
+        if cgroup.controllers.contains(CgroupControllers::IO) {
+            match op {
+                IoDirection::Read => {
+                    cgroup.stats.io_read_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    cgroup.stats.io_read_ios.fetch_add(1, Ordering::Relaxed);
+                }
+                IoDirection::Write => {
+                    cgroup.stats.io_write_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    cgroup.stats.io_write_ios.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// F.2: CPU Controller Integration (cpu.max enforcement)
+// ============================================================================
+
+/// Charge CPU time and enforce cpu.max quota.
+///
+/// Called from the scheduler's tick handler to account CPU usage against
+/// the cgroup's quota and check for throttling.
+///
+/// # Safety Note
+///
+/// This function is called in IRQ context (timer interrupt handler).
+/// It uses `try_lock()` on the limits mutex to avoid deadlock: if
+/// a process-context thread holds the lock (e.g., setting limits),
+/// the charge is skipped for this tick. This is safe because:
+/// - Missing one tick of enforcement doesn't breach isolation
+/// - The quota will be enforced on subsequent ticks
+///
+/// # Arguments
+///
+/// * `cgroup_id` - The cgroup to charge
+/// * `delta_ns` - CPU time consumed (nanoseconds)
+/// * `now_ns` - Current time (nanoseconds since boot)
+///
+/// # Returns
+///
+/// * `Unlimited` - No CPU controller or cpu.max configured
+/// * `Allowed` - Quota available, time has been charged
+/// * `Throttled(until_ns)` - Quota exceeded, cgroup is throttled until specified time
+pub fn charge_cpu_quota(
+    cgroup_id: CgroupId,
+    delta_ns: u64,
+    now_ns: u64,
+) -> CpuQuotaStatus {
+    if delta_ns == 0 {
+        return CpuQuotaStatus::Allowed;
+    }
+
+    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
+        if cgroup.controllers.contains(CgroupControllers::CPU) {
+            // IRQ-safe: Use try_lock() to avoid deadlock when process-context
+            // code holds the limits lock (e.g., sys_cgroup_set_limit).
+            // If the lock is contended, skip enforcement for this tick.
+            let (max_us, period_us) = match cgroup.limits.try_lock() {
+                Some(limits) => match limits.cpu_max {
+                    Some(v) => v,
+                    None => return CpuQuotaStatus::Unlimited,
+                },
+                None => return CpuQuotaStatus::Allowed, // Lock contended, skip
+            };
+
+            // u64::MAX means "max" (no quota) - mirrors Linux semantics
+            if max_us == u64::MAX {
+                return CpuQuotaStatus::Unlimited;
+            }
+
+            // Convert microseconds to nanoseconds
+            let period_ns = period_us.saturating_mul(1_000);
+            let max_ns = max_us.saturating_mul(1_000);
+            let quota = &cgroup.cpu_quota;
+
+            // Refresh the window if the period has elapsed
+            quota.refresh_window(now_ns, period_ns);
+
+            // Check if currently throttled
+            let throttle_until = quota.throttled_until_ns.load(Ordering::Relaxed);
+            if throttle_until != 0 {
+                if now_ns < throttle_until {
+                    // Still in throttle window
+                    return CpuQuotaStatus::Throttled(throttle_until);
+                }
+                // Throttle window expired, start new period
+                quota.throttled_until_ns.store(0, Ordering::Relaxed);
+                quota.period_usage_ns.store(0, Ordering::Relaxed);
+                quota.period_start_ns.store(now_ns, Ordering::Relaxed);
+            }
+
+            // Charge the time and check if quota exceeded
+            let used = quota
+                .period_usage_ns
+                .fetch_add(delta_ns, Ordering::SeqCst)
+                .saturating_add(delta_ns);
+
+            if used > max_ns {
+                // Quota exceeded - throttle until end of current period
+                let until = quota
+                    .period_start_ns
+                    .load(Ordering::Relaxed)
+                    .saturating_add(period_ns);
+                quota.throttled_until_ns.store(until, Ordering::SeqCst);
+                quota.throttle_events.fetch_add(1, Ordering::Relaxed);
+                return CpuQuotaStatus::Throttled(until);
+            }
+
+            return CpuQuotaStatus::Allowed;
+        }
+    }
+
+    CpuQuotaStatus::Unlimited
+}
+
+/// Fast-path check if a cgroup is currently throttled.
+///
+/// Used by the scheduler before selecting a task to avoid scheduling
+/// tasks from throttled cgroups.
+///
+/// # Safety Note
+///
+/// This function may be called with interrupts disabled (scheduler context).
+/// Uses `try_lock()` on the limits mutex to avoid deadlock.
+/// If the lock is contended, returns `None` (not throttled) - this is
+/// conservative but safe, as the throttle will be detected on the next check.
+///
+/// # Arguments
+///
+/// * `cgroup_id` - The cgroup to check
+/// * `now_ns` - Current time (nanoseconds since boot)
+///
+/// # Returns
+///
+/// * `Some(until_ns)` - Cgroup is throttled until the specified time
+/// * `None` - Cgroup is not throttled (or no CPU controller/quota)
+pub fn cpu_quota_is_throttled(cgroup_id: CgroupId, now_ns: u64) -> Option<u64> {
+    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
+        if cgroup.controllers.contains(CgroupControllers::CPU) {
+            // IRQ-safe: Use try_lock() to avoid deadlock in scheduler context
+            let period_ns = match cgroup.limits.try_lock() {
+                Some(limits) => match limits.cpu_max {
+                    Some((_max, period_us)) => period_us.saturating_mul(1_000),
+                    None => return None,
+                },
+                None => return None, // Lock contended, assume not throttled
+            };
+
+            let quota = &cgroup.cpu_quota;
+
+            // Refresh window first to check if throttle has expired
+            quota.refresh_window(now_ns, period_ns);
+
+            let until = quota.throttled_until_ns.load(Ordering::Relaxed);
+            if until != 0 {
+                if now_ns < until {
+                    // Still throttled
+                    return Some(until);
+                }
+                // Throttle expired, clear state and start new period
+                quota.throttled_until_ns.store(0, Ordering::Relaxed);
+                quota.period_usage_ns.store(0, Ordering::Relaxed);
+                quota.period_start_ns.store(now_ns, Ordering::Relaxed);
+            }
+        }
+    }
+    None
 }
 
 // ============================================================================

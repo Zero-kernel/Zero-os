@@ -19,6 +19,7 @@ pub mod net_namespace;
 pub mod pid_namespace;
 pub mod process;
 pub mod rcu;
+pub mod user_namespace;
 pub mod scheduler_hook;
 pub mod signal;
 pub mod syscall;
@@ -163,13 +164,25 @@ pub use net_namespace::{
     NetNamespaceFd, NetNsError, ROOT_NET_NAMESPACE, MAX_NET_NS_LEVEL, CLONE_NEWNET,
     test_is_net_ns_initialized,
 };
+// F.1: User namespace support
+pub use user_namespace::{
+    clone_user_namespace, init as init_user_namespace, root_user_namespace,
+    print_user_namespace_info, user_ns_count, UserNamespace, UserNamespaceFd,
+    UserNsError, UidGidMapping, ROOT_USER_NAMESPACE, MAX_USER_NS_LEVEL,
+    MAX_MAPPINGS, CLONE_NEWUSER,
+};
 
 // F.2: Cgroup v2 support
 pub use cgroup::{
     init as init_cgroup, lookup_cgroup, create_cgroup, delete_cgroup,
     root_cgroup, cgroup_count, migrate_task,
     get_effective_cpu_weight, check_fork_allowed, account_cpu_time,
-    update_memory_usage, check_memory_allowed, try_charge_memory, uncharge_memory,
+    // R77-2 FIX: Replaced update_memory_usage with read-only get_memory_usage
+    get_memory_usage, check_memory_allowed, try_charge_memory, uncharge_memory,
+    // F.2: CPU quota (cpu.max) enforcement
+    charge_cpu_quota, cpu_quota_is_throttled, CpuQuotaStatus,
+    // F.2: IO throttling (io.max) enforcement
+    charge_io, wait_for_io_window, record_io_completion, IoDirection, IoThrottleStatus,
     CgroupNode, CgroupId, CgroupControllers, CgroupLimits,
     CgroupStats, CgroupStatsSnapshot, CgroupError,
     MAX_CGROUP_DEPTH, MAX_CGROUPS, ROOT_CGROUP, CGROUP_REGISTRY,

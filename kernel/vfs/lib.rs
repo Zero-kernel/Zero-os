@@ -44,6 +44,7 @@ extern crate alloc;
 #[macro_use]
 extern crate drivers;
 
+pub mod cgroupfs;
 pub mod devfs;
 pub mod ext2;
 pub mod initramfs;
@@ -55,6 +56,7 @@ pub mod traits;
 pub mod types;
 
 // Re-exports for convenience
+pub use cgroupfs::CgroupFs;
 pub use devfs::DevFs;
 pub use ext2::{Ext2Fs, Ext2Inode};
 pub use initramfs::Initramfs;

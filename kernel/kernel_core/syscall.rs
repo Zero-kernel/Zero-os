@@ -2223,6 +2223,10 @@ const CLONE_NEWNS: u64 = 0x0002_0000;
 const CLONE_NEWIPC: u64 = crate::CLONE_NEWIPC;
 /// F.1: Create a new network namespace for the child
 const CLONE_NEWNET: u64 = crate::CLONE_NEWNET;
+/// F.1: Create a new user namespace for the child
+/// NOTE: Unlike other namespaces, CLONE_NEWUSER does NOT require CAP_SYS_ADMIN or root.
+/// This is intentional to enable unprivileged container creation.
+const CLONE_NEWUSER: u64 = crate::CLONE_NEWUSER;
 
 /// sys_clone - 创建线程/轻量级进程
 ///
@@ -2268,7 +2272,8 @@ fn sys_clone(
         | CLONE_NEWPID   // F.1: PID namespace support
         | CLONE_NEWNS    // F.1: Mount namespace support
         | CLONE_NEWIPC   // F.1: IPC namespace support
-        | CLONE_NEWNET;  // F.1: Network namespace support
+        | CLONE_NEWNET   // F.1: Network namespace support
+        | CLONE_NEWUSER; // F.1: User namespace support
 
     // 检查不支持的 flags
     // 返回 EINVAL 而不是 ENOSYS，因为这是参数验证失败而非功能未实现
@@ -2356,6 +2361,18 @@ fn sys_clone(
         }
     }
 
+    // F.1: CLONE_NEWUSER cannot be combined with CLONE_THREAD
+    // User namespace is per-process; threads must share the same user namespace
+    if flags & CLONE_NEWUSER != 0 && flags & CLONE_THREAD != 0 {
+        println!("[sys_clone] CLONE_NEWUSER cannot be combined with CLONE_THREAD");
+        return Err(SyscallError::EINVAL);
+    }
+
+    // F.1 Security: CLONE_NEWUSER does NOT require CAP_SYS_ADMIN or root.
+    // This is intentional - user namespaces enable unprivileged container creation.
+    // The only restriction is the system-wide namespace count limit.
+    // Namespace depth is enforced by user_namespace::new_child().
+
     // 验证 parent_tid 指针
     if flags & CLONE_PARENT_SETTID != 0 {
         if parent_tid.is_null() {
@@ -2414,6 +2431,8 @@ fn sys_clone(
         parent_ipc_ns_for_children,  // F.1: IPC namespace for children
         parent_net_ns,               // F.1: Network namespace
         parent_net_ns_for_children,  // F.1: Network namespace for children
+        parent_user_ns,              // F.1: User namespace
+        parent_user_ns_for_children, // F.1: User namespace for children
     ) = {
         let mut parent = parent_arc.lock();
         // 始终从 MSR 同步 fs_base 到 PCB
@@ -2447,6 +2466,8 @@ fn sys_clone(
             parent.ipc_ns_for_children.clone(),  // F.1: IPC namespace for children
             parent.net_ns.clone(),               // F.1: Network namespace
             parent.net_ns_for_children.clone(),  // F.1: Network namespace for children
+            parent.user_ns.clone(),              // F.1: User namespace
+            parent.user_ns_for_children.clone(), // F.1: User namespace for children
         )
     };
 
@@ -2625,6 +2646,51 @@ fn sys_clone(
             }
             Err(e) => {
                 println!("[sys_clone] Failed to create network namespace: {:?}", e);
+                return Err(SyscallError::ENOMEM);
+            }
+        }
+    } else {
+        None
+    };
+
+    // F.1: Handle CLONE_NEWUSER - create new user namespace
+    let new_user_ns = if flags & CLONE_NEWUSER != 0 {
+        match crate::user_namespace::clone_user_namespace(parent_user_ns_for_children.clone()) {
+            Ok(ns) => {
+                println!(
+                    "[sys_clone] Created new user namespace: id={}, level={}",
+                    ns.id().raw(),
+                    ns.level()
+                );
+
+                // Emit audit event for user namespace creation
+                let parent_id = ns.parent().map(|p| p.id().raw()).unwrap_or(0);
+                let _ = audit::emit(
+                    AuditKind::Process,
+                    AuditOutcome::Success,
+                    get_audit_subject(),
+                    AuditObject::Namespace {
+                        ns_id: ns.id().raw(),
+                        ns_type: CLONE_NEWUSER as u32,
+                        parent_id,
+                    },
+                    &[56, flags, CLONE_NEWUSER], // syscall 56 = clone
+                    0,
+                    crate::time::current_timestamp_ms(),
+                );
+
+                Some(ns)
+            }
+            Err(crate::user_namespace::UserNsError::MaxDepthExceeded) => {
+                println!("[sys_clone] Failed to create user namespace: max depth exceeded");
+                return Err(SyscallError::EAGAIN);
+            }
+            Err(crate::user_namespace::UserNsError::MaxNamespaces) => {
+                println!("[sys_clone] Failed to create user namespace: max namespaces exceeded");
+                return Err(SyscallError::EAGAIN);
+            }
+            Err(e) => {
+                println!("[sys_clone] Failed to create user namespace: {:?}", e);
                 return Err(SyscallError::ENOMEM);
             }
         }
@@ -2889,6 +2955,20 @@ fn sys_clone(
             .unwrap_or_else(|| parent_net_ns_for_children.clone());
         child.net_ns = child_net_ns.clone();
         child.net_ns_for_children = child_net_ns;
+
+        // F.1 User Namespace: Assign user namespace to child
+        //
+        // CLONE_NEWUSER: Use the new user namespace created earlier
+        // Without CLONE_NEWUSER: Inherit parent's user_ns_for_children
+        //
+        // Note: User namespace does not require root/CAP_SYS_ADMIN, enabling
+        // unprivileged container creation. UID/GID mappings can be set later
+        // via /proc/[pid]/uid_map and /proc/[pid]/gid_map.
+        let child_user_ns = new_user_ns
+            .clone()
+            .unwrap_or_else(|| parent_user_ns_for_children.clone());
+        child.user_ns = child_user_ns.clone();
+        child.user_ns_for_children = child_user_ns;
 
         // 设置进程状态为就绪
         child.state = ProcessState::Ready;
@@ -4676,6 +4756,9 @@ fn sys_brk(addr: usize) -> SyscallResult {
         return Ok(proc.brk);
     }
 
+    // F.2 Cgroup: Cache cgroup_id for memory accounting
+    let cgroup_id = proc.cgroup_id;
+
     // R29-3 FIX: Call LSM hook for brk operations
     if let Some(ctx) = lsm::ProcessCtx::from_current() {
         if lsm::hook_memory_brk(&ctx, addr as u64).is_err() {
@@ -4708,6 +4791,12 @@ fn sys_brk(addr: usize) -> SyscallResult {
                 // 有重叠，返回旧值
                 return Ok(old_brk);
             }
+        }
+
+        // F.2 Cgroup: Charge memory before heap expansion.
+        // Uses CAS-based try_charge_memory() to atomically check limit and update usage.
+        if cgroup::try_charge_memory(cgroup_id, grow_size as u64).is_err() {
+            return Ok(old_brk); // Quota exceeded, return current brk
         }
 
         // 释放锁后进行映射操作
@@ -4774,7 +4863,9 @@ fn sys_brk(addr: usize) -> SyscallResult {
         };
 
         if map_result.is_err() {
-            // 分配失败，返回旧值
+            // 分配失败，返回旧值并回滚内存计费
+            // F.2 Cgroup: Rollback memory charge on mapping failure
+            cgroup::uncharge_memory(cgroup_id, grow_size as u64);
             return Ok(old_brk);
         }
 
@@ -4785,6 +4876,8 @@ fn sys_brk(addr: usize) -> SyscallResult {
     }
     // 堆收缩
     else if new_top < old_top {
+        let shrink_size = old_top - new_top;
+
         // 释放锁后进行解映射操作
         drop(proc);
 
@@ -4793,7 +4886,7 @@ fn sys_brk(addr: usize) -> SyscallResult {
             with_current_manager(VirtAddr::new(0), |manager| {
                 let mut frame_alloc = FrameAllocator::new();
 
-                for offset in (0..(old_top - new_top)).step_by(PAGE_SIZE) {
+                for offset in (0..shrink_size).step_by(PAGE_SIZE) {
                     let vaddr = VirtAddr::new((new_top + offset) as u64);
                     let page = Page::containing_address(vaddr);
 
@@ -4805,9 +4898,14 @@ fn sys_brk(addr: usize) -> SyscallResult {
             });
         }
 
-        // 更新进程 brk
+        // 更新进程 brk 并释放内存计费
         let mut proc = process.lock();
         proc.brk = addr;
+        drop(proc);
+
+        // F.2 Cgroup: Uncharge memory after successful heap shrink
+        cgroup::uncharge_memory(cgroup_id, shrink_size as u64);
+
         Ok(addr)
     }
     // 同一页内调整，只更新 brk 值
@@ -5027,7 +5125,7 @@ fn sys_mmap(
     }
 
     // Note: Memory is already atomically charged via try_charge_memory() above.
-    // No need to call update_memory_usage() here.
+    // R77-2 FIX: No separate accounting call needed - charge/uncharge model is complete.
     drop(proc); // Explicitly drop the lock
 
     println!(
@@ -7994,7 +8092,7 @@ pub struct CgroupStatsBuf {
     pub id: u64,
     /// Depth in hierarchy (root = 0)
     pub depth: u32,
-    /// Enabled controllers bitmap (CPU=1, MEMORY=2, PIDS=4)
+    /// Enabled controllers bitmap (CPU=1, MEMORY=2, PIDS=4, IO=8)
     pub controllers: u32,
     /// Current number of attached tasks
     pub nr_tasks: u64,
@@ -8010,6 +8108,17 @@ pub struct CgroupStatsBuf {
     pub pids_events_max: u32,
     /// Padding for alignment
     _padding: u32,
+    // F.2: IO controller statistics
+    /// Total bytes read via block I/O
+    pub io_read_bytes: u64,
+    /// Total bytes written via block I/O
+    pub io_write_bytes: u64,
+    /// Total read I/O operations completed
+    pub io_read_ios: u64,
+    /// Total write I/O operations completed
+    pub io_write_ios: u64,
+    /// Number of times I/O was throttled due to io.max limit
+    pub io_throttle_events: u64,
 }
 
 /// sys_cgroup_create - Create a child cgroup
@@ -8130,6 +8239,8 @@ const CGROUP_LIMIT_CPU_MAX: u32 = 2;
 const CGROUP_LIMIT_MEMORY_MAX: u32 = 3;
 const CGROUP_LIMIT_MEMORY_HIGH: u32 = 4;
 const CGROUP_LIMIT_PIDS_MAX: u32 = 5;
+const CGROUP_LIMIT_IO_MAX_BPS: u32 = 6;
+const CGROUP_LIMIT_IO_MAX_IOPS: u32 = 7;
 
 /// sys_cgroup_set_limit - Set a resource limit on a cgroup
 ///
@@ -8183,6 +8294,20 @@ fn sys_cgroup_set_limit(cgroup_id: u64, limit_type: u32, value: u64) -> Result<u
         CGROUP_LIMIT_PIDS_MAX => {
             limits.pids_max = Some(value);
         }
+        CGROUP_LIMIT_IO_MAX_BPS => {
+            // value is bytes per second limit (0 means unlimited)
+            if value == 0 {
+                return Err(SyscallError::EINVAL);
+            }
+            limits.io_max_bytes_per_sec = Some(value);
+        }
+        CGROUP_LIMIT_IO_MAX_IOPS => {
+            // value is IOPS limit (0 means unlimited)
+            if value == 0 {
+                return Err(SyscallError::EINVAL);
+            }
+            limits.io_max_iops_per_sec = Some(value);
+        }
         _ => return Err(SyscallError::EINVAL),
     }
 
@@ -8229,6 +8354,12 @@ fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usiz
         memory_events_max: stats.memory_events_max,
         pids_events_max: stats.pids_events_max,
         _padding: 0,
+        // F.2: IO controller statistics
+        io_read_bytes: stats.io_read_bytes,
+        io_write_bytes: stats.io_write_bytes,
+        io_read_ios: stats.io_read_ios,
+        io_write_ios: stats.io_write_ios,
+        io_throttle_events: stats.io_throttle_events,
     };
 
     // Copy to userspace with SMAP protection

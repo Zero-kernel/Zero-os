@@ -8,6 +8,7 @@
 //! - DAC (Discretionary Access Control) permission enforcement
 //! - LSM (Linux Security Module) hook integration (R25-9 fix)
 
+use crate::cgroupfs::CgroupFs;
 use crate::devfs::DevFs;
 use crate::procfs::ProcFs;
 use crate::ramfs::RamFs;
@@ -360,7 +361,36 @@ impl Vfs {
         self.mount_in_namespace(&root_ns, "/proc", procfs)
             .expect("Failed to mount procfs");
 
-        println!("VFS initialized: ramfs at /, devfs at /dev, procfs at /proc");
+        // Create /sys and /sys/fs/cgroup directory hierarchy for cgroupfs
+        // First create /sys directory
+        if let Err(e) = ramfs.create(&root_inode, "sys", dir_mode) {
+            println!("Warning: failed to create /sys mountpoint: {:?}", e);
+        }
+
+        // Create /sys/fs via sysfs (we mount a ramfs at /sys for now)
+        let sysfs = RamFs::new();
+        self.mount_in_namespace(&root_ns, "/sys", sysfs.clone())
+            .expect("Failed to mount sysfs");
+
+        // Create /sys/fs directory
+        let sys_root = sysfs.root_inode();
+        if let Err(e) = sysfs.create(&sys_root, "fs", dir_mode) {
+            println!("Warning: failed to create /sys/fs directory: {:?}", e);
+        }
+
+        // Get /sys/fs and create cgroup directory
+        if let Ok(fs_inode) = sysfs.lookup(&sys_root, "fs") {
+            if let Err(e) = sysfs.create(&fs_inode, "cgroup", dir_mode) {
+                println!("Warning: failed to create /sys/fs/cgroup directory: {:?}", e);
+            }
+        }
+
+        // Create and mount cgroupfs at /sys/fs/cgroup
+        let cgroupfs = CgroupFs::new();
+        self.mount_in_namespace(&root_ns, "/sys/fs/cgroup", cgroupfs)
+            .expect("Failed to mount cgroupfs");
+
+        println!("VFS initialized: ramfs at /, devfs at /dev, procfs at /proc, cgroupfs at /sys/fs/cgroup");
     }
 
     /// Mount a filesystem at the given path (in current process's namespace)

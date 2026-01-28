@@ -399,8 +399,10 @@ pub fn init() -> usize {
             let virt_offset = match unsafe { map_virtio_pci_regions(&pci_dev.addrs) } {
                 Ok((_, offset)) => offset,
                 Err(e) => {
+                    // R82-4 FIX: Disable bus mastering on MMIO mapping failure
+                    pci::disable_bus_master(&pci_dev.slot);
                     drivers::println!(
-                        "      ! MMIO mapping failed for {:02x}:{:02x}.{}: {:?}",
+                        "      ! MMIO mapping failed for {:02x}:{:02x}.{}: {:?} (bus master disabled)",
                         pci_dev.slot.bus,
                         pci_dev.slot.device,
                         pci_dev.slot.function,
@@ -429,13 +431,20 @@ pub fn init() -> usize {
                             registered += 1;
                         }
                         Err(e) => {
-                            drivers::println!("      ! Failed to register {}: {:?}", name, e);
+                            // R82-4 FIX: Disable bus mastering on registration failure
+                            pci::disable_bus_master(&pci_dev.slot);
+                            drivers::println!(
+                                "      ! Failed to register {}: {:?} (bus master disabled)",
+                                name, e
+                            );
                         }
                     }
                 }
                 Err(e) => {
+                    // R82-4 FIX: Disable bus mastering on driver probe failure
+                    pci::disable_bus_master(&pci_dev.slot);
                     drivers::println!(
-                        "      ! virtio-net probe @ {:02x}:{:02x}.{} failed: {:?}",
+                        "      ! virtio-net probe @ {:02x}:{:02x}.{} failed: {:?} (bus master disabled)",
                         pci_dev.slot.bus,
                         pci_dev.slot.device,
                         pci_dev.slot.function,

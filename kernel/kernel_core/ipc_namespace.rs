@@ -75,6 +75,72 @@ pub enum IpcNsError {
 }
 
 // ============================================================================
+// R77-5 FIX: Namespace Count Guard
+// ============================================================================
+
+/// Guard for atomic namespace count management.
+///
+/// # R77-5 FIX
+///
+/// This guard ensures that the global namespace count is correctly maintained
+/// even if `Arc::new()` fails (OOM) after the count has been incremented.
+/// The guard automatically decrements the count on drop unless `commit()` is called.
+///
+/// ## Problem
+///
+/// Previously, the count was incremented before `Arc::new()`:
+/// ```ignore
+/// let prev = IPC_NS_COUNT.fetch_add(1, ...);  // Count incremented
+/// let child = Arc::new(Self { ... });          // If OOM here, count leaks!
+/// ```
+///
+/// ## Solution
+///
+/// Use RAII pattern to ensure automatic rollback:
+/// ```ignore
+/// let guard = NsCountGuard::new(&IPC_NS_COUNT)?;  // Count incremented
+/// let child = Arc::new(Self { ... });              // If OOM, guard drops and rolls back
+/// guard.commit();                                  // Success - prevent rollback
+/// ```
+struct NsCountGuard {
+    counter: &'static AtomicU32,
+    committed: bool,
+}
+
+impl NsCountGuard {
+    /// Create a new guard, incrementing the counter.
+    ///
+    /// Returns error if the count would exceed the limit.
+    fn new(counter: &'static AtomicU32, max_count: u32) -> Result<Self, IpcNsError> {
+        let prev = counter.fetch_add(1, Ordering::SeqCst);
+        if prev >= max_count {
+            counter.fetch_sub(1, Ordering::SeqCst);
+            return Err(IpcNsError::MaxNamespaces);
+        }
+        Ok(Self {
+            counter,
+            committed: false,
+        })
+    }
+
+    /// Commit the count increment, preventing rollback on drop.
+    ///
+    /// Call this after the namespace has been successfully created.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for NsCountGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Allocation failed - roll back the count increment
+            self.counter.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+// ============================================================================
 // Global State
 // ============================================================================
 
@@ -139,17 +205,20 @@ impl IpcNamespace {
     }
 
     /// Create a new child namespace.
+    ///
+    /// # R77-5 FIX
+    ///
+    /// Uses `NsCountGuard` to ensure the global namespace count is correctly
+    /// maintained even if `Arc::new()` fails (OOM). The guard automatically
+    /// rolls back the count increment on failure.
     pub fn new_child(parent: Arc<IpcNamespace>) -> Result<Arc<Self>, IpcNsError> {
         if parent.level >= MAX_IPC_NS_LEVEL {
             return Err(IpcNsError::MaxDepthExceeded);
         }
 
-        // R76-2 FIX: Enforce global namespace count limit to prevent DoS.
-        let prev = IPC_NS_COUNT.fetch_add(1, Ordering::SeqCst);
-        if prev >= MAX_IPC_NS_COUNT {
-            IPC_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
-            return Err(IpcNsError::MaxNamespaces);
-        }
+        // R77-5 FIX: Use guard pattern to ensure count rollback on allocation failure.
+        // The guard increments the count and will auto-decrement on drop unless committed.
+        let count_guard = NsCountGuard::new(&IPC_NS_COUNT, MAX_IPC_NS_COUNT)?;
 
         let id = NEXT_IPC_NS_ID.fetch_add(1, Ordering::SeqCst);
 
@@ -160,6 +229,9 @@ impl IpcNamespace {
             refcount: AtomicU32::new(1),
             next_key: AtomicU64::new(1),
         });
+
+        // R77-5 FIX: Arc allocation succeeded - commit the guard to prevent rollback.
+        count_guard.commit();
 
         Ok(child)
     }

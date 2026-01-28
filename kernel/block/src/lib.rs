@@ -943,7 +943,7 @@ pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
     }
 
     // Then, try PCI transport (virtio-pci modern)
-    if let Some((pci_addrs, name)) = pci::probe_virtio_blk() {
+    if let Some((pci_id, pci_addrs, name)) = pci::probe_virtio_blk() {
         // Calculate the range of physical addresses that need to be mapped
         let phys_addrs = [
             pci_addrs.common_cfg,
@@ -979,8 +979,11 @@ pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
                 offset as u64
             }
             Err(e) => {
+                // R82-3 FIX: Disable bus mastering on MMIO mapping failure
+                let cmd = pci::pci_config_read32(pci_id.bus, pci_id.device, pci_id.function, 0x04) as u16;
+                pci::pci_config_write16(pci_id.bus, pci_id.device, pci_id.function, 0x04, cmd & !0x04);
                 println!(
-                    "    Failed to map virtio-blk MMIO region {:#x}-{:#x}: {:?}",
+                    "    Failed to map virtio-blk MMIO region {:#x}-{:#x}: {:?} (bus master disabled)",
                     min_phys, max_phys, e
                 );
                 return None;
@@ -993,15 +996,29 @@ pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
                 let sector_size = device.sector_size();
                 let size_mb = (capacity * sector_size as u64) / (1024 * 1024);
                 println!(
-                    "    virtio-blk (pci) /dev/{}: {} MB ({} sectors x {} bytes)",
-                    name, size_mb, capacity, sector_size
+                    "    virtio-blk (pci) /dev/{} @ {:02x}:{:02x}.{}: {} MB ({} sectors x {} bytes)",
+                    name,
+                    pci_id.bus,
+                    pci_id.device,
+                    pci_id.function,
+                    size_mb,
+                    capacity,
+                    sector_size
                 );
                 return Some((device, name));
             }
             Err(e) => {
+                // R82-3 FIX: Disable bus mastering on driver probe failure
+                let cmd = pci::pci_config_read32(pci_id.bus, pci_id.device, pci_id.function, 0x04) as u16;
+                pci::pci_config_write16(pci_id.bus, pci_id.device, pci_id.function, 0x04, cmd & !0x04);
                 println!(
-                    "    Failed to probe virtio-blk (pci caps @ {:#x}): {:?}",
-                    pci_addrs.common_cfg, e
+                    "    Failed to probe virtio-blk /dev/{} @ {:02x}:{:02x}.{} (pci caps @ {:#x}): {:?} (bus master disabled)",
+                    name,
+                    pci_id.bus,
+                    pci_id.device,
+                    pci_id.function,
+                    pci_addrs.common_cfg,
+                    e
                 );
             }
         }

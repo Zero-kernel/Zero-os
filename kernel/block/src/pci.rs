@@ -8,6 +8,7 @@
 use core::arch::asm;
 
 use crate::virtio::VirtioPciAddrs;
+use iommu::{attach_device, PciDeviceId};
 
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
@@ -240,9 +241,9 @@ fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
 /// the PCI capability list to extract virtio-pci configuration addresses.
 ///
 /// # Returns
-/// * `Some((pci_addrs, device_name))` - Found device with modern virtio-pci capabilities
+/// * `Some((pci_id, pci_addrs, device_name))` - Found device with modern virtio-pci capabilities
 /// * `None` - No compatible virtio-blk device found
-pub fn probe_virtio_blk() -> Option<(VirtioPciAddrs, &'static str)> {
+pub fn probe_virtio_blk() -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)> {
     // Scan all PCI buses (0-255)
     for bus in 0u8..=255 {
         for dev in 0u8..32 {
@@ -271,6 +272,16 @@ pub fn probe_virtio_blk() -> Option<(VirtioPciAddrs, &'static str)> {
                     continue;
                 }
 
+                // Attach device to IOMMU before enabling bus mastering (fail-closed)
+                let pci_id = PciDeviceId::from_bdf(bus, dev, func);
+                if let Err(err) = attach_device(pci_id) {
+                    println!(
+                        "    ! IOMMU attach failed for {:02x}:{:02x}.{}: {:?}",
+                        bus, dev, func, err
+                    );
+                    continue;
+                }
+
                 // Enable MEM space access + BUS MASTER for DMA
                 let mut cmd =
                     (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
@@ -292,15 +303,20 @@ pub fn probe_virtio_blk() -> Option<(VirtioPciAddrs, &'static str)> {
                         "    Found virtio-blk ({}) at PCI {:02x}:{:02x}.{}, type={}, common_cfg={:#x}",
                         dev_type, bus, dev, func, subsystem_id, caps.common_cfg
                     );
-                    return Some((caps, "vda"));
+                    return Some((pci_id, caps, "vda"));
                 } else {
+                    // R82-2 FIX: Disable bus mastering if device lacks modern caps
+                    // to prevent orphaned DMA-capable device
+                    let cmd =
+                        (pci_config_read32(bus, dev, func, PCI_COMMAND_OFFSET) & 0xFFFF) as u16;
+                    pci_config_write16(bus, dev, func, PCI_COMMAND_OFFSET, cmd & !0x04);
                     let dev_type = if device == VIRTIO_BLK_MODERN {
                         "modern"
                     } else {
                         "transitional"
                     };
                     println!(
-                        "    virtio-blk ({}) at PCI {:02x}:{:02x}.{} lacks modern capabilities, skipping",
+                        "    virtio-blk ({}) at PCI {:02x}:{:02x}.{} lacks modern capabilities (bus master disabled)",
                         dev_type, bus, dev, func
                     );
                 }

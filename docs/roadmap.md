@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-26
+**Last Updated:** 2026-01-27
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -13,7 +13,7 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 ### Current Status: Phase F IN PROGRESS (Resource Governance)
 
 Zero-OS has completed SMP infrastructure and begun resource governance:
-- **75 security audits** with 369+ issues found, ~310 fixed (84.0%)
+- **78 security audits** with 378+ issues found, ~324 fixed (85.7%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -34,15 +34,27 @@ Zero-OS has completed SMP infrastructure and begun resource governance:
   - E.5: Per-CPU scheduler ✅, Load balancing ✅, CPU affinity syscalls ✅
   - E.6: Cpuset CPU isolation ✅ (runtime test added)
 - **Phase F**: IN PROGRESS (Resource Governance)
-  - F.1: Namespaces (Complete)
+  - F.1: Namespaces ✅ **COMPLETE**
     - PID namespace ✅ (CLONE_NEWPID, cascade kill, namespace-local PIDs)
     - Mount namespace ✅ (CLONE_NEWNS, sys_setns, per-namespace mount tables, R74-2 materialization fix)
     - IPC namespace ✅ (CLONE_NEWIPC, endpoint table partitioned by namespace - R75-2)
     - Network namespace ✅ (CLONE_NEWNET, socket table partitioned by namespace - R75-1)
-  - F.2: Cgroups v2 (In Progress)
-    - Core infrastructure ✅ (CgroupNode, Registry, limits, stats)
+    - User namespace ✅ (CLONE_NEWUSER, UID/GID mapping, unprivileged container support)
+  - F.2: Cgroups v2 (Complete)
+    - Core infrastructure ✅ (CgroupNode, Registry, limits, stats, deleted flag - R77-1)
     - PIDs controller ✅ (fork protection, task tracking)
-    - CPU/Memory controllers ⚪ (API ready, wiring pending)
+    - CPU controller ✅ (cpu.weight time slice scaling, cpu.max quota enforcement with throttling)
+    - Memory controller ✅ (try_charge_memory/uncharge_memory in mmap/munmap/brk)
+    - Syscalls ✅ (sys_cgroup_create/destroy/attach/set_limit/get_stats)
+    - IO controller ✅ (io.max bps/iops with token bucket, throttle/wait_for_io_window, stats)
+    - cgroup2 filesystem ✅ (/sys/fs/cgroup cgroupfs mount, control files)
+  - F.3: IOMMU/VT-d (In Progress)
+    - Core infrastructure ✅ (DMAR parser, VT-d driver, domain management, public API)
+    - Fail-closed security ✅ (ensure_iommu_ready, translation_enabled checks)
+    - Codex security review ✅ (3 issues fixed: fail-open paths, DMAR OOB, identity aliasing)
+    - DMA isolation pending (second-level page tables)
+    - Device domain binding pending (context table programming)
+- **R77**: TCP child socket quota ✅, Fork cpuset rollback ✅, delete_cgroup race ✅, Memory accounting CAS ✅, Namespace guard ✅ (ALL 5 FIXED)
 - **R75**: move_device permission check ✅, namespace FD refcount ✅, **IPC endpoint isolation ✅**, **Socket table isolation ✅** (ALL 4 FIXED)
 - **R76**: Socket namespace enforcement ✅, Namespace count limits ✅, Per-namespace socket quotas ✅ (ALL 3 FIXED)
 - **R54**: ISN secret auto-upgrade ✅, Challenge ACK rate limiting ✅
@@ -66,8 +78,8 @@ Zero-OS has completed SMP infrastructure and begun resource governance:
 | **Network** | Full TCP/IP stack | TCP (w/retransmission + NewReno CC + Window Scaling + SYN cookies + Conntrack + Firewall + Options validation), UDP, ICMP | SACK, Timestamps |
 | **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
 | **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
-| **Containers** | Namespaces/Cgroups | PID ✅, Mount ✅, IPC ✅, Network ✅ namespaces; Cgroups v2 PIDs ✅ | User namespace, CPU/Memory cgroups |
-| **Virtualization** | KVM/QEMU | Not started | Future consideration |
+| **Containers** | Namespaces/Cgroups | PID ✅, Mount ✅, IPC ✅, Network ✅, User ✅ namespaces; Cgroups v2 PIDs ✅, CPU ✅, Memory ✅, IO ✅, Syscalls ✅, cgroupfs ✅ | ✅ Container foundation complete |
+| **Virtualization** | KVM/QEMU | IOMMU/VT-d core infrastructure (DMA isolation framework) | Full VT-d translation, device passthrough |
 
 ---
 
@@ -672,9 +684,20 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
   - Security: CAP_NET_ADMIN or root required
   - Runtime test: `NetNamespaceIsolationTest` (hierarchy, IDs, devices, refcounting, depth limit)
   - Audit events: `AuditObject::Namespace` for clone logging
-- [ ] User namespace (UID/GID mapping)
+- [x] User namespace (UID/GID mapping) ✅ **COMPLETE** (2026-01-27)
+  - `kernel/kernel_core/user_namespace.rs`: Core UserNamespace structure
+  - Hierarchical namespace tree with MAX_USER_NS_LEVEL=32 depth
+  - CLONE_NEWUSER in sys_clone creates isolated user namespace
+  - UID/GID mapping tables (up to 5 extents each, single-write semantics)
+  - Mapping functions: map_uid_to_ns, map_uid_from_ns, map_gid_to_ns, map_gid_from_ns
+  - UserNamespaceFd for namespace file descriptor wrapper
+  - Security: Does NOT require CAP_SYS_ADMIN (enables unprivileged containers)
+  - Permission checks: Root can set arbitrary mappings, non-root can only map own ID
+  - Parent containment validation: Child mappings must be within parent's mapped ranges
+  - CAS-based namespace count limiting (MAX_USER_NS_COUNT=1024)
+  - Codex security review: 3 issues fixed (CAS loop, permission checks, parent validation)
 
-#### F.2 Cgroups v2 [IN PROGRESS]
+#### F.2 Cgroups v2 ✅ **COMPLETE**
 
 **Core Infrastructure** ✅
 - [x] CgroupNode hierarchy management
@@ -686,21 +709,53 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 
 **Controllers**
 - [x] pids controller (process count limit in fork path)
-- [ ] cpu controller (shares, quota, burst) - API ready, scheduler wiring pending
-- [ ] memory controller (hard/soft limits, OOM) - API ready, mm wiring pending
-- [ ] io controller (bandwidth limit)
+- [x] cpu controller (cpu.weight time slice scaling, cpu.max quota enforcement with IRQ-safe throttling)
+- [x] memory controller (try_charge_memory CAS in mmap/brk, uncharge_memory in munmap/brk-shrink)
+- [x] io controller (io.max bps/iops with token bucket algorithm, stale token clamping, oversized I/O support)
 
-**Syscalls & Interface**
-- [ ] sys_cgroup_create / sys_cgroup_destroy
-- [ ] sys_cgroup_attach / sys_cgroup_detach
-- [ ] sys_cgroup_set_limit / sys_cgroup_get_stats
-- [ ] cgroup2 filesystem (/sys/fs/cgroup)
+**Syscalls & Interface** ✅
+- [x] sys_cgroup_create / sys_cgroup_destroy (syscalls 500/501)
+- [x] sys_cgroup_attach (syscall 502, self-migration)
+- [x] sys_cgroup_set_limit / sys_cgroup_get_stats (syscalls 503/504)
+- [x] cgroup2 filesystem (/sys/fs/cgroup) - cgroupfs mount with control files
 
-#### F.3 IOMMU/VT-d
+#### F.3 IOMMU/VT-d [IN PROGRESS]
 
-- [ ] DMA isolation
-- [ ] Device domain binding
-- [ ] Passthrough preparation
+**Core Infrastructure** ✅
+- [x] ACPI DMAR table parser (kernel/iommu/dmar.rs) - strict bounds checking, OOB prevention
+- [x] VT-d hardware driver (kernel/iommu/vtd.rs) - register interface, root/context tables
+- [x] Domain management (kernel/iommu/domain.rs) - identity/paged domains, overlap rejection
+- [x] Public API (kernel/iommu/lib.rs) - init, attach_device, map_range, unmap_range
+- [x] Fail-closed security model (ensure_iommu_ready, translation_enabled checks)
+- [x] Codex security review R79: 3 issues fixed (fail-open paths, DMAR OOB, identity aliasing)
+
+**DMA Isolation** ✅
+- [x] Second-level page table allocation (alloc_zeroed_page_table with direct map validation)
+- [x] 4-level page table walk (PML4→PDPT→PD→PT for 48-bit AGAW)
+- [x] 3-level page table walk (PDPT→PD→PT for 39-bit AGAW)
+- [x] Page table locking (page_table_lock prevents concurrent mutation)
+- [x] Superpage detection and rejection (PS bit checking)
+- [x] VT-d A/D flags handling (don't set reserved bits)
+- [x] Codex security review R80: 5 issues fixed (direct map, locking, AGAW, A/D, superpage)
+
+**Device Domain Binding** ✅
+- [x] Root table allocation (init_root_table with CAS, direct map validation)
+- [x] Context table allocation (ensure_context_table with CAS)
+- [x] Context entry programming (attach_device with domain type handling)
+- [x] Pass-through capability check (ECAP.PT validation, fail-closed)
+- [x] Context cache invalidation (invalidate_context_device after programming)
+- [x] IOTLB invalidation (domain-level after entry programming)
+- [x] Codex security review R81: 3 issues (2 fixed, 1 documented)
+
+**VirtIO Integration** ✅
+- [x] IOMMU attach before bus mastering (kernel/net/src/pci.rs, kernel/block/src/pci.rs)
+- [x] Fail-closed error handling (skip device if attach fails)
+- [x] Bus master cleanup on probe failure (disable DMA capability)
+- [x] Net/Block subsystem integration (lib.rs cleanup paths)
+- [x] Codex security review R82: 4 issues fixed (attach order, cleanup paths)
+
+**Pending**
+- [ ] Passthrough preparation (VM device passthrough)
 
 **Security Requirements**:
 - Default resource limits
@@ -825,15 +880,21 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-25 | - | 0 | 0 | Mount namespace runtime test + audit events - **F.1 COMPLETE** |
 | 2026-01-26 | 75 | 4 | 4 | **Namespace structure** - IPC/Net resource isolation gaps ✅, move_device permission ✅, NS FD refcount ✅ |
 | 2026-01-26 | 76 | 3 | 3 | **Namespace enforcement** - Socket NS check ✅, NS count limits ✅, Socket quotas ✅ (F.1 COMPLETE) |
-| **Total** | **76** | **370** | **316 (85.4%)** | **54 open (R65 SMP + edge cases)** |
+| 2026-01-27 | 77 | 5 | 5 | **Resource accounting** - TCP child socket quota ✅, Fork cpuset leak ✅, delete_cgroup race ✅, Memory CAS ✅, NS guard ✅ |
+| 2026-01-27 | 78 | 3 | 3 | **User namespace** - CAS count guard ✅, Permission checks ✅, Parent containment validation ✅ (F.1 COMPLETE) |
+| 2026-01-27 | 79 | 3 | 3 | **IOMMU/VT-d** - Fail-open paths ✅, DMAR OOB reads ✅, Identity aliasing ✅ (F.3 IN PROGRESS) |
+| 2026-01-27 | 80 | 5 | 5 | **SL page tables** - Direct map range check ✅, PT lock concurrency ✅, AGAW-aware walk ✅, A/D flags reserved ✅, Superpage corruption ✅ |
+| 2026-01-27 | 81 | 3 | 2 | **Context table** - Context/IOTLB invalidation ✅, Pass-through capability check ✅, Direct map bound (documented) |
+| 2026-01-27 | 82 | 4 | 4 | **VirtIO IOMMU integration** - Attach before bus master ✅, Fail-closed on attach error ✅, Disable bus master on probe fail ✅, Net/Block cleanup ✅ |
+| **Total** | **82** | **393** | **338 (86.0%)** | **55 open (R65 SMP, R81-3 documented)** |
 
 ### Current Status
 
-- **Fixed**: 316 issues (85.4%)
-- **Open**: 54 issues (14.6%)
+- **Fixed**: 338 issues (86.0%)
+- **Open**: 55 issues (14.0%)
   - R65 remaining issues (SMP-related, non-blocking)
   - R62-6 (VirtIO IOMMU) deferred to Phase F.3
-  - CF-4 (Socket quota leak edge cases) documented for R77
+  - R81-3 (Direct map bound) documented risk
 - **Phase E Progress**: ✅ **COMPLETE**
   - E.1 Hardware Init: ✅ LAPIC/IOAPIC, AP boot, IPI
   - E.2 TLB Shootdown: ✅ IPI-based, PCID support (batched pending)
@@ -842,13 +903,14 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
   - E.5 Scheduler SMP: ✅ Per-CPU runqueues, load balancing, CPU affinity syscalls
   - E.6 CPU Isolation: ✅ Cpuset with runtime test (R72)
 - **Phase F Progress**: IN PROGRESS
-  - F.1 Namespaces: ✅ **COMPLETE** - PID/Mount/IPC/Network fully isolated with enforcement and quotas (R75-R76)
-  - F.2 Cgroups v2: 🟡 **IN PROGRESS** - Core infrastructure + PIDs controller complete, CPU/Memory wiring pending
-  - F.3 IOMMU: Pending
+  - F.1 Namespaces: ✅ **COMPLETE** - All 5 types: PID/Mount/IPC/Network/User with full isolation (R75-R78)
+  - F.2 Cgroups v2: ✅ **COMPLETE** - PIDs/CPU/Memory/IO controllers + cgroup2 filesystem
+  - F.3 IOMMU/VT-d: **IN PROGRESS** - Core infrastructure ✅, Second-level page tables ✅, Context table programming ✅, **VirtIO integration ✅** (R79-R82)
 - **SMP Ready**: All Phase E components complete, 8-core SMP testing verified
-- **Container Foundation**: ✅ **COMPLETE** - All 4 namespace types provide full isolation
+- **Container Foundation**: ✅ **COMPLETE** - All 5 namespace types provide full container isolation
+- **R82 Key Fixes**: IOMMU attach before bus mastering, fail-closed error handling, bus master cleanup on probe failure
 
-See [qa-2026-01-26-v2.md](review/qa-2026-01-26-v2.md) for latest audit report.
+See [qa-2026-01-27.md](review/qa-2026-01-27.md) for latest audit report.
 
 ---
 

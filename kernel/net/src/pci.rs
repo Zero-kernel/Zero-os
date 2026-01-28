@@ -4,6 +4,7 @@
 
 use alloc::vec::Vec;
 use core::arch::asm;
+use iommu::{attach_device, PciDeviceId};
 use virtio::VirtioPciAddrs;
 
 // ============================================================================
@@ -126,6 +127,19 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
                     subsystem_id
                 );
 
+                // Attach device to IOMMU before enabling bus mastering (fail-closed)
+                let pci_id = PciDeviceId::from_bdf(bus, dev, func);
+                if let Err(err) = attach_device(pci_id) {
+                    drivers::println!(
+                        "    ! IOMMU attach failed for {:02x}:{:02x}.{}: {:?}",
+                        bus,
+                        dev,
+                        func,
+                        err
+                    );
+                    continue;
+                }
+
                 // Enable memory space and bus mastering
                 let cmd = pci_read16(bus, dev, func, PCI_COMMAND);
                 pci_write16(bus, dev, func, PCI_COMMAND, cmd | 0x06);
@@ -151,8 +165,12 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
                         addrs,
                     });
                 } else {
+                    // R82-1 FIX: Disable bus mastering if device lacks modern caps
+                    // to prevent orphaned DMA-capable device
+                    let cmd = pci_read16(bus, dev, func, PCI_COMMAND);
+                    pci_write16(bus, dev, func, PCI_COMMAND, cmd & !0x04);
                     drivers::println!(
-                        "    ! virtio-net @ {:02x}:{:02x}.{} lacks modern capabilities",
+                        "    ! virtio-net @ {:02x}:{:02x}.{} lacks modern capabilities (bus master disabled)",
                         bus,
                         dev,
                         func
@@ -324,4 +342,13 @@ unsafe fn inl(port: u16) -> u32 {
     let val: u32;
     asm!("in eax, dx", out("eax") val, in("dx") port, options(nostack, preserves_flags));
     val
+}
+
+/// Disable bus mastering for a PCI device.
+///
+/// This should be called when a device fails to initialize properly after
+/// bus mastering was enabled, to prevent orphaned DMA-capable devices.
+pub fn disable_bus_master(slot: &PciSlot) {
+    let cmd = pci_read16(slot.bus, slot.device, slot.function, PCI_COMMAND);
+    pci_write16(slot.bus, slot.device, slot.function, PCI_COMMAND, cmd & !0x04);
 }

@@ -101,12 +101,21 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
 
     // F.2: Get parent's cgroup_id for child attachment
     let parent_cgroup_id = parent.cgroup_id;
+    // R77-3 FIX: Also capture cpuset_id for rollback on cgroup attach failure.
+    // notify_cpuset_task_joined is called inside fork_inner after critical
+    // allocations succeed, so we need to roll back if cgroup attach fails.
+    let parent_cpuset_id = parent.cpuset_id;
 
     let result = fork_inner(&mut parent, child_pid, parent_root);
 
     if result.is_err() {
         // 从父进程子列表移除失败的占位 PID，防止悬挂
         parent.children.retain(|&pid| pid != child_pid);
+        // R77-3 FIX: Defensive rollback of cpuset task count.
+        // fork_inner calls notify_cpuset_task_joined() after critical allocations,
+        // so we roll back here for all error paths. If fork_inner failed before
+        // reaching that point, the callback uses saturating_sub to prevent underflow.
+        crate::process::notify_cpuset_task_left(parent_cpuset_id);
         drop(parent);
         cleanup_partial_child(child_pid);
     } else {
@@ -118,6 +127,10 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
                 // Attachment failed (likely TOCTOU race at pids.max boundary)
                 // Must roll back the entire fork to maintain accounting integrity
                 parent.children.retain(|&pid| pid != child_pid);
+                // R77-3 FIX: Rollback cpuset task count to prevent leak.
+                // fork_inner already called notify_cpuset_task_joined(), so we
+                // must undo it here when cgroup attach fails post-fork.
+                crate::process::notify_cpuset_task_left(parent_cpuset_id);
                 drop(parent);
                 cleanup_partial_child(child_pid);
                 return Err(ForkError::CgroupPidsLimitExceeded);

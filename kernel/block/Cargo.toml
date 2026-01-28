@@ -10,3 +10,4 @@ drivers = { path = "../drivers" }
 mm = { path = "../mm" }
 virtio = { path = "../virtio" }
 x86_64 = "0.15"
+iommu = { path = "../iommu" }

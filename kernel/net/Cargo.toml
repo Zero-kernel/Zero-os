@@ -16,3 +16,4 @@ x86_64 = "0.15"
 cap = { path = "../cap" }
 lsm = { path = "../lsm" }
 security = { path = "../security" }
+iommu = { path = "../iommu" }

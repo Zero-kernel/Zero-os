@@ -1,0 +1,15 @@
+[package]
+name = "iommu"
+version = "0.1.0"
+edition = "2021"
+description = "IOMMU/VT-d support for DMA isolation"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+spin = "0.9"
+x86_64 = "0.15"
+bitflags = "2.4"
+drivers = { path = "../drivers" }
+mm = { path = "../mm" }
