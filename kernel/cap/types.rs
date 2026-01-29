@@ -249,6 +249,10 @@ bitflags::bitflags! {
         /// R66-10 FIX: Permission to configure audit subsystem (e.g., set HMAC keys)
         const AUDIT_WRITE = 1 << 41;
 
+        // Observability rights (bit 42)
+        /// Permission to read trace counters, tracepoint listings, watchdog status
+        const TRACE_READ  = 1 << 42;
+
         // Convenience combinations
         const RW          = Self::READ.bits() | Self::WRITE.bits();
         const RWX         = Self::RW.bits() | Self::EXEC.bits();

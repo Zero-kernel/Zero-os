@@ -1,0 +1,16 @@
+[package]
+name = "trace"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-OS kernel observability: tracepoints, counters, watchdog"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+spin = "0.9"
+cpu_local = { path = "../cpu_local" }
+drivers = { path = "../drivers" }
+
+[features]
+default = []

@@ -4003,7 +4003,9 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
     // F.1 Security: Require CAP_SYS_ADMIN (CapRights::ADMIN) or root
     let has_cap_admin =
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
-    let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(true);
+    // R83-2 FIX: Fail-closed - if euid cannot be determined, deny access
+    // Previously used unwrap_or(true) which would grant root access on None
+    let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
     if !is_root && !has_cap_admin {
         println!("[sys_setns] Permission denied: requires CAP_SYS_ADMIN or root");
         return Err(SyscallError::EPERM);

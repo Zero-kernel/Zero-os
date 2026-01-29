@@ -528,7 +528,37 @@ impl Domain {
         // 39-bit AGAW = 3 levels (PDPT->PD->PT), 48-bit AGAW = 4 levels (PML4->PDPT->PD->PT)
         let use_4_level = self.address_width >= 48;
 
-        // Walk and install mappings for each 4KB page
+        // Build leaf entry flags:
+        // - PRESENT: Entry is valid
+        // - WRITE: If write permission requested
+        // - EXECUTE: Allow device instruction fetches (some devices need this)
+        // R80-4 FIX: Don't set ACCESSED/DIRTY - they are reserved on some VT-d hardware
+        // Hardware that supports A/D tracking will update these automatically
+        let mut flags = SlPteFlags::PRESENT | SlPteFlags::EXECUTE;
+        if write {
+            flags |= SlPteFlags::WRITE;
+        }
+        let pte_flags = SlPteFlags::new(flags);
+
+        // R83-1 FIX: Two-phase commit for atomicity
+        //
+        // Previously, we installed leaf PTEs as we walked the range. If a later
+        // page failed (allocation failure, duplicate leaf entry), earlier pages
+        // would already be mapped, creating "ghost" mappings with no tracking.
+        // These ghost mappings would allow device DMA access to memory that the
+        // caller thinks is unmapped, potentially causing memory corruption or
+        // information disclosure.
+        //
+        // Phase 1: Validate all pages and collect staging entries
+        // Phase 2: Commit all entries only if validation passes
+        //
+        // Note: Intermediate tables may still be created during Phase 1 via
+        // get_or_create_table, but without leaf entries they don't enable DMA.
+        let num_pages = (size + IOMMU_PAGE_SIZE - 1) / IOMMU_PAGE_SIZE;
+        let mut staged: alloc::vec::Vec<(*mut SlPageTable, usize, SlPte)> =
+            alloc::vec::Vec::with_capacity(num_pages);
+
+        // Phase 1: Walk and validate mappings for each 4KB page
         for offset in (0..size).step_by(IOMMU_PAGE_SIZE) {
             let cur_iova = iova + offset as u64;
             let cur_phys = phys + offset as u64;
@@ -538,7 +568,7 @@ impl Domain {
             let l2_idx = ((cur_iova >> 21) & 0x1FF) as usize;
             let l1_idx = ((cur_iova >> IOMMU_PAGE_SHIFT) & 0x1FF) as usize;
 
-            // Get the leaf page table
+            // Get the leaf page table (may create intermediate tables)
             let pt = if use_4_level {
                 // 4-level: PML4[47:39] -> PDPT[38:30] -> PD[29:21] -> PT[20:12]
                 let l4_idx = ((cur_iova >> 39) & 0x1FF) as usize;
@@ -555,24 +585,21 @@ impl Domain {
             };
 
             // Check if leaf entry already exists (reject to prevent aliasing)
+            // R83-1 FIX: Do NOT install the entry yet, just validate
             if pt.entry(l1_idx).is_present() {
                 return Err(IommuError::InvalidRange);
             }
 
-            // Build leaf entry flags:
-            // - PRESENT: Entry is valid
-            // - WRITE: If write permission requested
-            // - EXECUTE: Allow device instruction fetches (some devices need this)
-            // R80-4 FIX: Don't set ACCESSED/DIRTY - they are reserved on some VT-d hardware
-            // Hardware that supports A/D tracking will update these automatically
-            let mut flags = SlPteFlags::PRESENT | SlPteFlags::EXECUTE;
+            // Stage the leaf entry for commit after all pages are validated
+            staged.push((pt as *mut SlPageTable, l1_idx, SlPte::new_leaf(cur_phys, pte_flags)));
+        }
 
-            if write {
-                flags |= SlPteFlags::WRITE;
-            }
-
-            // Install the leaf entry
-            pt.set_entry(l1_idx, SlPte::new_leaf(cur_phys, SlPteFlags::new(flags)));
+        // Phase 2: Commit all staged entries (only reached if all validations passed)
+        for (pt_ptr, idx, entry) in staged {
+            // SAFETY: pt_ptr is a valid pointer to a SlPageTable obtained from
+            // get_or_create_table() in the validation loop above. The page_table_lock
+            // is held throughout this function, preventing concurrent modification.
+            unsafe { (*pt_ptr).set_entry(idx, entry) };
         }
 
         Ok(())

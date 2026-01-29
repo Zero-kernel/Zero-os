@@ -854,7 +854,23 @@ impl CgroupNode {
             return Err(CgroupError::TaskAlreadyAttached);
         }
 
-        // Check pids.max limit before inserting
+        // R83-3 FIX: Hierarchical PIDs enforcement (cgroups v2 semantics)
+        //
+        // In cgroups v2, a cgroup's pids.max limit applies to the total number
+        // of processes in that cgroup *and all its descendants*. This prevents
+        // a child cgroup from spawning unlimited tasks to bypass the parent's limit.
+        //
+        // We collect all ancestors and check their pids.max limits against the
+        // current count + 1 (the task being attached). Only if all checks pass,
+        // we increment counts on the target cgroup and all ancestors.
+        let mut ancestors: alloc::vec::Vec<Arc<CgroupNode>> = alloc::vec::Vec::new();
+        let mut cursor = self.parent();
+        while let Some(p) = cursor {
+            ancestors.push(p.clone());
+            cursor = p.parent();
+        }
+
+        // Check pids.max limit on this cgroup
         if self.controllers.contains(CgroupControllers::PIDS) {
             if let Some(limit) = self.limits.lock().pids_max {
                 if (procs.len() as u64) >= limit {
@@ -864,9 +880,28 @@ impl CgroupNode {
             }
         }
 
+        // R83-3 FIX: Check all ancestor limits (hierarchical enforcement)
+        for ancestor in ancestors.iter() {
+            if ancestor.controllers.contains(CgroupControllers::PIDS) {
+                if let Some(limit) = ancestor.limits.lock().pids_max {
+                    // Current count includes all tasks in this cgroup + descendants
+                    let current = ancestor.stats.pids_current.load(Ordering::Relaxed);
+                    if current.saturating_add(1) > limit as u64 {
+                        ancestor.stats.record_pids_max_event();
+                        return Err(CgroupError::PidsLimitExceeded);
+                    }
+                }
+            }
+        }
+
         // Insert and update stats
         procs.insert(task);
         self.stats.increment_pids();
+
+        // R83-3 FIX: Increment ancestor counts for hierarchical tracking
+        for ancestor in ancestors {
+            ancestor.stats.increment_pids();
+        }
 
         Ok(())
     }
@@ -877,6 +912,14 @@ impl CgroupNode {
     ///
     /// * `TaskNotAttached` - Task is not in this cgroup
     pub fn detach_task(&self, task: TaskId) -> Result<(), CgroupError> {
+        // R83-3 FIX: Collect ancestors before detaching for hierarchical count update
+        let mut ancestors: alloc::vec::Vec<Arc<CgroupNode>> = alloc::vec::Vec::new();
+        let mut cursor = self.parent();
+        while let Some(p) = cursor {
+            ancestors.push(p.clone());
+            cursor = p.parent();
+        }
+
         let mut procs = self.processes.lock();
 
         if !procs.remove(&task) {
@@ -884,6 +927,12 @@ impl CgroupNode {
         }
 
         self.stats.decrement_pids();
+
+        // R83-3 FIX: Decrement ancestor counts for hierarchical tracking
+        for ancestor in ancestors {
+            ancestor.stats.decrement_pids();
+        }
+
         Ok(())
     }
 
@@ -1475,13 +1524,30 @@ pub fn charge_cpu_quota(
         if cgroup.controllers.contains(CgroupControllers::CPU) {
             // IRQ-safe: Use try_lock() to avoid deadlock when process-context
             // code holds the limits lock (e.g., sys_cgroup_set_limit).
-            // If the lock is contended, skip enforcement for this tick.
+            //
+            // R83-5 FIX: Fail-closed when lock is contended
+            //
+            // Previously, we returned Allowed when the lock was contended, which
+            // allowed an attacker to bypass quota enforcement by keeping the mutex
+            // busy (e.g., looping on sys_cgroup_set_limit).
+            //
+            // Now we return Throttled with a conservative throttle window. The
+            // LOCK_CONTENTION_THROTTLE_NS value (10ms) is chosen to be:
+            // - Long enough to outlast brief lock contention
+            // - Short enough to not excessively impact legitimate workloads
+            // - Approximately 10 timer ticks, ensuring the lock will be released
+            //
+            // This is a fail-closed approach: when in doubt, throttle.
+            const LOCK_CONTENTION_THROTTLE_NS: u64 = 10_000_000; // 10ms
             let (max_us, period_us) = match cgroup.limits.try_lock() {
                 Some(limits) => match limits.cpu_max {
                     Some(v) => v,
                     None => return CpuQuotaStatus::Unlimited,
                 },
-                None => return CpuQuotaStatus::Allowed, // Lock contended, skip
+                None => {
+                    // R83-5 FIX: Fail-closed with conservative throttle window
+                    return CpuQuotaStatus::Throttled(now_ns.saturating_add(LOCK_CONTENTION_THROTTLE_NS));
+                }
             };
 
             // u64::MAX means "max" (no quota) - mirrors Linux semantics

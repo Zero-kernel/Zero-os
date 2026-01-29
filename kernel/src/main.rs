@@ -21,6 +21,7 @@ extern crate security;
 extern crate vfs;
 #[macro_use]
 extern crate audit;
+extern crate trace;
 
 // A.3 Audit capability gate imports
 use cap::CapRights;
@@ -644,6 +645,34 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             println!("      ! Audit initialization failed: {:?}", e);
         }
     }
+
+    // Phase G.1: Observability subsystem (tracepoints, counters, watchdog)
+    println!("[7.7/8] Initializing observability subsystem...");
+    trace::init();
+    // Install read guard for metrics export (CAP_TRACE_READ or root)
+    let _ = trace::install_read_guard(|| {
+        // Allow during early kernel boot when no process exists
+        let creds = current_credentials();
+        if creds.is_none() {
+            return true; // Early boot - kernel init context
+        }
+        // After boot: Allow root users
+        if let Some(ref c) = creds {
+            if c.euid == 0 {
+                return true;
+            }
+        }
+        // Allow processes with CAP_TRACE_READ capability
+        if let Some(has_cap) =
+            with_current_cap_table(|table| table.has_rights(CapRights::TRACE_READ))
+        {
+            if has_cap {
+                return true;
+            }
+        }
+        false
+    });
+    println!("      ✓ Trace capability gate registered (CAP_TRACE_READ)");
 
     println!("[8/8] Verifying memory management...");
     println!("      ✓ Page table manager compiled");

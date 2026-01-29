@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-27
+**Last Updated:** 2026-01-28
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,10 +10,10 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase F IN PROGRESS (Resource Governance)
+### Current Status: Phase F COMPLETE (Resource Governance)
 
-Zero-OS has completed SMP infrastructure and begun resource governance:
-- **78 security audits** with 378+ issues found, ~324 fixed (85.7%)
+Zero-OS has completed SMP infrastructure and resource governance:
+- **88 security audits** with 415 issues found, 359 fixed (86.5%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -33,14 +33,14 @@ Zero-OS has completed SMP infrastructure and begun resource governance:
   - E.4: RCU ✅ (timer-driven grace periods, callback batching), Lockdep ✅ (dependency graph), **Futex PI ✅** (R72-1, R72-2)
   - E.5: Per-CPU scheduler ✅, Load balancing ✅, CPU affinity syscalls ✅
   - E.6: Cpuset CPU isolation ✅ (runtime test added)
-- **Phase F**: IN PROGRESS (Resource Governance)
+- **Phase F**: ✅ **COMPLETE** (Resource Governance)
   - F.1: Namespaces ✅ **COMPLETE**
     - PID namespace ✅ (CLONE_NEWPID, cascade kill, namespace-local PIDs)
     - Mount namespace ✅ (CLONE_NEWNS, sys_setns, per-namespace mount tables, R74-2 materialization fix)
     - IPC namespace ✅ (CLONE_NEWIPC, endpoint table partitioned by namespace - R75-2)
     - Network namespace ✅ (CLONE_NEWNET, socket table partitioned by namespace - R75-1)
     - User namespace ✅ (CLONE_NEWUSER, UID/GID mapping, unprivileged container support)
-  - F.2: Cgroups v2 (Complete)
+  - F.2: Cgroups v2 ✅ **COMPLETE**
     - Core infrastructure ✅ (CgroupNode, Registry, limits, stats, deleted flag - R77-1)
     - PIDs controller ✅ (fork protection, task tracking)
     - CPU controller ✅ (cpu.weight time slice scaling, cpu.max quota enforcement with throttling)
@@ -48,12 +48,17 @@ Zero-OS has completed SMP infrastructure and begun resource governance:
     - Syscalls ✅ (sys_cgroup_create/destroy/attach/set_limit/get_stats)
     - IO controller ✅ (io.max bps/iops with token bucket, throttle/wait_for_io_window, stats)
     - cgroup2 filesystem ✅ (/sys/fs/cgroup cgroupfs mount, control files)
-  - F.3: IOMMU/VT-d (In Progress)
+  - F.3: IOMMU/VT-d ✅ **COMPLETE**
     - Core infrastructure ✅ (DMAR parser, VT-d driver, domain management, public API)
     - Fail-closed security ✅ (ensure_iommu_ready, translation_enabled checks)
-    - Codex security review ✅ (3 issues fixed: fail-open paths, DMAR OOB, identity aliasing)
-    - DMA isolation pending (second-level page tables)
-    - Device domain binding pending (context table programming)
+    - DMA isolation ✅ (second-level page tables with AGAW support)
+    - Device domain binding ✅ (context table programming with validation)
+    - Interrupt remapping ✅ (IRTE allocation, MSI passthrough)
+    - Fault handling ✅ (FRI rotation, flood mitigation, address redaction)
+    - Device isolation ✅ (bus master disable, PCI config serialization)
+    - Device detach ✅ (atomic domain tracking, multi-segment support)
+    - VM passthrough ✅ (create_vm_domain, assign/unassign_device_to_vm, R88 hardening)
+- **R88**: VM passthrough IR enable ✅, Unassign cleanup order ✅ (ALL 2 FIXED)
 - **R77**: TCP child socket quota ✅, Fork cpuset rollback ✅, delete_cgroup race ✅, Memory accounting CAS ✅, Namespace guard ✅ (ALL 5 FIXED)
 - **R75**: move_device permission check ✅, namespace FD refcount ✅, **IPC endpoint isolation ✅**, **Socket table isolation ✅** (ALL 4 FIXED)
 - **R76**: Socket namespace enforcement ✅, Namespace count limits ✅, Per-namespace socket quotas ✅ (ALL 3 FIXED)
@@ -79,7 +84,7 @@ Zero-OS has completed SMP infrastructure and begun resource governance:
 | **Storage** | ext4/xfs/btrfs/zfs | virtio-blk + ext2 + procfs | Extended FS support needed |
 | **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
 | **Containers** | Namespaces/Cgroups | PID ✅, Mount ✅, IPC ✅, Network ✅, User ✅ namespaces; Cgroups v2 PIDs ✅, CPU ✅, Memory ✅, IO ✅, Syscalls ✅, cgroupfs ✅ | ✅ Container foundation complete |
-| **Virtualization** | KVM/QEMU | IOMMU/VT-d core infrastructure (DMA isolation framework) | Full VT-d translation, device passthrough |
+| **Virtualization** | KVM/QEMU | IOMMU/VT-d ✅ (DMA isolation, device passthrough prep, interrupt remapping, VM domain API) | ✅ IOMMU complete, KVM/hypervisor pending |
 
 ---
 
@@ -754,8 +759,58 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] Net/Block subsystem integration (lib.rs cleanup paths)
 - [x] Codex security review R82: 4 issues fixed (attach order, cleanup paths)
 
-**Pending**
-- [ ] Passthrough preparation (VM device passthrough)
+**Interrupt Remapping** ✅
+- [x] Interrupt Remapping Table Entry (IRTE) structure (kernel/iommu/interrupt.rs)
+- [x] InterruptRemappingTable with bitmap allocator (256 entries default)
+- [x] IrteHandle for MSI/MSI-X address/data programming
+- [x] ECAP.IR hardware support detection
+- [x] IRTA register programming with EIM support
+- [x] GCMD.IRE enable with GSTS.IRES polling
+- [x] Fail-closed when platform DMAR requires IR
+- [x] Graceful degradation when IR not required
+- [x] Codex security review R84: 3 issues fixed (concurrency, cleanup, zeroing), 1 documented (x2APIC)
+
+**Fault Handling** ✅
+- [x] FaultReason/FaultType enums with security-relevant detection
+- [x] FaultRecord structure with BDF parsing
+- [x] read_fault_records() with FRI-based rotation (R85-1)
+- [x] Checked MMIO pointer arithmetic (R85-2)
+- [x] read_and_clear_fault_status() with full W1C (R85-3)
+- [x] Fault flood mitigation with interrupt masking (R85-4)
+- [x] Console/audit logging with address redaction (R85-5)
+- [x] VtdUnit integration (read_fault_records, set_fault_interrupt_enabled)
+- [x] Public API (handle_dma_faults, FaultConfig)
+- [x] Codex security review R85: 5 issues fixed (100% fix rate)
+
+**Device Isolation** ✅
+- [x] PCI configuration space access (legacy I/O port 0xCF8/0xCFC)
+- [x] Bus Master Enable disable with verification read-back
+- [x] Segment validation for multi-segment systems (R86-1)
+- [x] PCI config RMW serialization via global lock (R86-2)
+- [x] IOTLB/context invalidation after isolation (R86-3)
+- [x] Forced console logging in isolation mode (R86-4)
+- [x] VtdUnit get_device_domain() for domain lookup
+- [x] Codex security review R86: 4 issues fixed (100% fix rate)
+
+**Device Detach API** ✅
+- [x] detach_device() public API (kernel/iommu/lib.rs)
+- [x] detach_device_from_domain() for specific domain detach
+- [x] VtdUnit::detach_device() with validation chain
+- [x] VtdUnit::disable_bus_mastering() helper with read-back verification
+- [x] DeviceNotAttached error variant
+- [x] Atomic domain tracking update (R87-1 fix)
+- [x] Multi-segment graceful degradation (R87-2 fix)
+- [x] Codex security review R87: 2 issues fixed (100% fix rate)
+
+**VM Passthrough Preparation** ✅
+- [x] VM domain registry (VM_DOMAINS, VM_DEVICE_IRTES tracking)
+- [x] create_vm_domain() for isolated VM address spaces
+- [x] assign_device_to_vm() with IRTE allocation and rollback
+- [x] unassign_device_from_vm() with detach-first ordering (R88-2)
+- [x] VtdUnit::interrupt_remapping_table() accessor
+- [x] IR enable enforcement for passthrough (R88-1 fix)
+- [x] Device detach priority over IR cleanup (R88-2 fix)
+- [x] Codex security review R88: 2 issues fixed (100% fix rate)
 
 **Security Requirements**:
 - Default resource limits
@@ -770,19 +825,20 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 
 ---
 
-### Phase G: Production Readiness
+### Phase G: Production Readiness [IN PROGRESS]
 
 **Goal**: Observable, compliant, updatable.
 
 **Priority**: Medium
 **Dependencies**: All previous phases
+**Status**: G.1 partially complete (tracepoints, counters, watchdog implemented)
 
-#### G.1 Observability
+#### G.1 Observability [IN PROGRESS]
 
-- [ ] Tracepoints/counters infrastructure
+- [x] Tracepoints/counters infrastructure ✅ (R89 - trace crate with per-CPU counters)
+- [x] Health monitoring (watchdog, hung-task) ✅ (R89 - 512-slot watchdog table)
 - [ ] Sampling profiler
 - [ ] kdump (encrypted, redacted)
-- [ ] Health monitoring (watchdog, hung-task)
 
 #### G.2 Live Patching
 
@@ -886,15 +942,23 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-27 | 80 | 5 | 5 | **SL page tables** - Direct map range check ✅, PT lock concurrency ✅, AGAW-aware walk ✅, A/D flags reserved ✅, Superpage corruption ✅ |
 | 2026-01-27 | 81 | 3 | 2 | **Context table** - Context/IOTLB invalidation ✅, Pass-through capability check ✅, Direct map bound (documented) |
 | 2026-01-27 | 82 | 4 | 4 | **VirtIO IOMMU integration** - Attach before bus master ✅, Fail-closed on attach error ✅, Disable bus master on probe fail ✅, Net/Block cleanup ✅ |
-| **Total** | **82** | **393** | **338 (86.0%)** | **55 open (R65 SMP, R81-3 documented)** |
+| 2026-01-28 | 83 | 5 | 5 | **IOMMU/Cgroup security** - Page table atomicity ✅, setns fail-closed ✅, PIDs hierarchy ✅, AGAW validation ✅, CPU quota contention ✅ |
+| 2026-01-28 | 84 | 4 | 3 | **Interrupt Remapping** - Concurrent setup race ✅, IRTA cleanup ✅, IR table zeroing ✅, x2APIC mode (documented) |
+| 2026-01-28 | 85 | 5 | 5 | **Fault Handling** - FRI rotation ✅, MMIO bounds check ✅, FRI W1C clear ✅, Fault flood mitigation ✅, Address redaction ✅ |
+| 2026-01-28 | 86 | 4 | 4 | **Device Isolation** - Segment validation ✅, PCI RMW serialization ✅, IOTLB quiesce ✅, Forced logging ✅ |
+| 2026-01-28 | 87 | 2 | 2 | **Device Detach API** - Atomic domain tracking ✅, Multi-segment graceful degradation ✅ |
+| 2026-01-28 | 88 | 2 | 2 | **VM Passthrough** - IR enable verification ✅, Unassign cleanup order ✅ |
+| 2026-01-28 | 89 | 4 | 3 | **Observability (G.1)** - Watchdog race ✅, 64-bit generation ✅, transmute fix ✅, counter wrap (documented) |
+| **Total** | **89** | **419** | **362 (86.4%)** | **57 open (R65 SMP, R81-3/R84-4/R89-4 documented)** |
 
 ### Current Status
 
-- **Fixed**: 338 issues (86.0%)
-- **Open**: 55 issues (14.0%)
+- **Fixed**: 362 issues (86.4%)
+- **Open**: 57 issues (13.6%)
   - R65 remaining issues (SMP-related, non-blocking)
-  - R62-6 (VirtIO IOMMU) deferred to Phase F.3
   - R81-3 (Direct map bound) documented risk
+  - R84-4 (x2APIC mode) documented limitation
+  - R89-4 (Counter overflow) documented acceptable risk
 - **Phase E Progress**: ✅ **COMPLETE**
   - E.1 Hardware Init: ✅ LAPIC/IOAPIC, AP boot, IPI
   - E.2 TLB Shootdown: ✅ IPI-based, PCID support (batched pending)
@@ -902,15 +966,18 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
   - E.4 Synchronization: ✅ RCU (R71), Lockdep (R71), Futex PI (R72)
   - E.5 Scheduler SMP: ✅ Per-CPU runqueues, load balancing, CPU affinity syscalls
   - E.6 CPU Isolation: ✅ Cpuset with runtime test (R72)
-- **Phase F Progress**: IN PROGRESS
+- **Phase F Progress**: ✅ **COMPLETE**
   - F.1 Namespaces: ✅ **COMPLETE** - All 5 types: PID/Mount/IPC/Network/User with full isolation (R75-R78)
-  - F.2 Cgroups v2: ✅ **COMPLETE** - PIDs/CPU/Memory/IO controllers + cgroup2 filesystem
-  - F.3 IOMMU/VT-d: **IN PROGRESS** - Core infrastructure ✅, Second-level page tables ✅, Context table programming ✅, **VirtIO integration ✅** (R79-R82)
+  - F.2 Cgroups v2: ✅ **COMPLETE** - PIDs/CPU/Memory/IO controllers + cgroup2 filesystem + R83 hierarchical PIDs
+  - F.3 IOMMU/VT-d: ✅ **COMPLETE** - Core infrastructure ✅, Second-level page tables ✅, Context table ✅, VirtIO integration ✅, Interrupt Remapping ✅ (R84), Fault Handling ✅ (R85), Device Isolation ✅ (R86), Device Detach API ✅ (R87), **VM Passthrough ✅** (R88)
+- **Phase G Progress**: 🔄 **IN PROGRESS**
+  - G.1 Observability: 🔄 Tracepoints ✅, Per-CPU counters ✅, Watchdog ✅ (R89), profiler/kdump pending
 - **SMP Ready**: All Phase E components complete, 8-core SMP testing verified
-- **Container Foundation**: ✅ **COMPLETE** - All 5 namespace types provide full container isolation
-- **R82 Key Fixes**: IOMMU attach before bus mastering, fail-closed error handling, bus master cleanup on probe failure
+- **Container Foundation**: ✅ **COMPLETE** - All 5 namespace types + Cgroups v2 provide full container isolation
+- **Virtualization Foundation**: ✅ **COMPLETE** - IOMMU/VT-d with VM passthrough preparation
+- **R89 Key Fixes**: Watchdog race serialization, 64-bit generation counters, CHERI-safe fn pointer storage
 
-See [qa-2026-01-27.md](review/qa-2026-01-27.md) for latest audit report.
+See [qa-2026-01-28-v7.md](review/qa-2026-01-28-v7.md) for latest audit report.
 
 ---
 

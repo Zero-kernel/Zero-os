@@ -46,6 +46,8 @@ use x86_64::PhysAddr;
 
 use crate::dmar::DrhdEntry;
 use crate::domain::{Domain, DomainId, DomainType};
+use crate::fault::FaultRecord;
+use crate::interrupt::{InterruptRemappingTable, DEFAULT_IR_ENTRIES};
 use crate::{IommuError, IommuResult, PciDeviceId};
 use mm::{buddy_allocator, phys_to_virt};
 
@@ -86,6 +88,9 @@ const VTD_REG_FEDATA: usize = 0x3C;
 /// Fault Event Address Register (32-bit, R/W).
 const VTD_REG_FEADDR: usize = 0x40;
 
+/// Interrupt Remapping Table Address Register (64-bit, R/W).
+const VTD_REG_IRTA: usize = 0xB8;
+
 /// IOTLB Registers offset (varies by capability).
 const VTD_REG_IOTLB_BASE: usize = 0x100;
 
@@ -117,6 +122,9 @@ const GSTS_RTPS: u32 = 1 << 30;
 /// Write Buffer Flush Status (GSTS.WBFS).
 const GSTS_WBFS: u32 = 1 << 27;
 
+/// Interrupt Remapping Enable Status (GSTS.IRES).
+const GSTS_IRES: u32 = 1 << 25;
+
 // ============================================================================
 // Capability Bits
 // ============================================================================
@@ -142,6 +150,10 @@ const CAP_SAGAW_MASK: u64 = 0x1F;
 const CAP_FRO_SHIFT: u64 = 24;
 const CAP_FRO_MASK: u64 = 0x3FF;
 
+/// Number of Fault Recording Registers (CAP.NFR) - bits 47:40.
+const CAP_NFR_SHIFT: u64 = 40;
+const CAP_NFR_MASK: u64 = 0xFF;
+
 // ============================================================================
 // Extended Capability Bits
 // ============================================================================
@@ -155,6 +167,9 @@ const ECAP_QI: u64 = 1 << 1;
 
 /// Device-TLB Support (ECAP.DT).
 const ECAP_DT: u64 = 1 << 2;
+
+/// Interrupt Remapping Support (ECAP.IR).
+const ECAP_IR: u64 = 1 << 3;
 
 /// Pass Through Support (ECAP.PT).
 const ECAP_PT: u64 = 1 << 6;
@@ -373,6 +388,10 @@ pub enum VtdError {
     RootTableAllocFailed,
     /// Context table allocation failed.
     ContextTableAllocFailed,
+    /// Hardware initialization failed.
+    HardwareInitFailed,
+    /// Interrupt remapping table allocation failed.
+    InterruptRemapAllocFailed,
 }
 
 // ============================================================================
@@ -413,6 +432,10 @@ pub struct VtdUnit {
 
     /// Whether translation is enabled.
     translation_enabled: AtomicBool,
+
+    /// Interrupt remapping table (if enabled).
+    /// Wrapped in Arc for safe sharing and Mutex for interior mutability.
+    ir_table: Mutex<Option<Arc<InterruptRemappingTable>>>,
 
     /// Domains attached to this unit.
     attached_domains: Mutex<BTreeSet<DomainId>>,
@@ -475,6 +498,7 @@ impl VtdUnit {
             root_table_phys: AtomicU64::new(0),
             table_lock: Mutex::new(()),
             translation_enabled: AtomicBool::new(false),
+            ir_table: Mutex::new(None),
             attached_domains: Mutex::new(BTreeSet::new()),
             attached_devices: Mutex::new(alloc::collections::BTreeMap::new()),
             iotlb_offset,
@@ -510,10 +534,145 @@ impl VtdUnit {
         self.attached_domains.lock().contains(&domain_id)
     }
 
+    /// Get the domain ID for a device given its source ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_id` - PCI source ID (bus << 8 | device << 3 | function)
+    ///
+    /// # Returns
+    ///
+    /// Domain ID if the device is attached, None otherwise.
+    pub fn get_device_domain(&self, source_id: u16) -> Option<DomainId> {
+        self.attached_devices.lock().get(&source_id).copied()
+    }
+
     /// Check whether translation is currently enabled for this unit.
     #[inline]
     pub fn translation_enabled(&self) -> bool {
         self.translation_enabled.load(Ordering::Acquire)
+    }
+
+    /// Check whether interrupt remapping is supported by hardware.
+    #[inline]
+    pub fn supports_interrupt_remapping(&self) -> bool {
+        self.ecap & ECAP_IR != 0
+    }
+
+    /// Set up interrupt remapping for this VT-d unit.
+    ///
+    /// Interrupt remapping is critical for secure device passthrough as it prevents
+    /// malicious devices from injecting arbitrary interrupts to the host. Without IR,
+    /// a compromised device could trigger arbitrary interrupt vectors, potentially
+    /// escaping VM isolation.
+    ///
+    /// # Arguments
+    ///
+    /// * `required` - If true, failure to enable IR is a fatal error
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` - Interrupt remapping successfully enabled
+    /// * `Ok(false)` - IR not supported and not required (safe to continue without)
+    /// * `Err(VtdError)` - IR required but setup failed (fail-closed)
+    ///
+    /// # Security
+    ///
+    /// - Fail-closed when `required=true`: if platform requires IR, failure aborts initialization
+    /// - Table allocation failure with `required=false` gracefully degrades
+    /// - GCMD.IRE enable failure rolls back and reports error when required
+    ///
+    /// # Hardware Flow
+    ///
+    /// 1. Check ECAP.IR for hardware support
+    /// 2. Allocate interrupt remapping table (256 entries default)
+    /// 3. Program IRTA register with table address
+    /// 4. Set GCMD.IRE to enable interrupt remapping
+    /// 5. Poll GSTS.IRES until set (hardware acknowledgment)
+    pub fn setup_interrupt_remapping(&self, required: bool) -> Result<bool, VtdError> {
+        // R84-1 FIX: Serialize setup to avoid double-programming IRTA/GCMD
+        // and dropping a live table while hardware is racing.
+        // Hold the mutex across the entire setup to prevent concurrent callers.
+        let mut ir_slot = self.ir_table.lock();
+        if ir_slot.is_some() {
+            return Ok(true);
+        }
+
+        // Check hardware support
+        if !self.supports_interrupt_remapping() {
+            return if required {
+                // Platform requires IR but hardware doesn't support it - fail closed
+                Err(VtdError::MissingCapability)
+            } else {
+                // IR not supported but not required - continue without
+                Ok(false)
+            };
+        }
+
+        // Allocate interrupt remapping table
+        // Default 256 entries (4KB, fits in one page)
+        let table = match InterruptRemappingTable::allocate(DEFAULT_IR_ENTRIES) {
+            Ok(t) => t,
+            Err(_) => {
+                return if required {
+                    Err(VtdError::HardwareInitFailed)
+                } else {
+                    // Allocation failed but not required - degrade gracefully
+                    Ok(false)
+                };
+            }
+        };
+
+        // Program IRTA register with table address
+        // x2APIC mode disabled for now (Extended Interrupt Mode)
+        let irta = table.irta_value(false);
+        unsafe {
+            Self::write_reg64(self.reg_base, VTD_REG_IRTA, irta);
+        }
+
+        // Read current GCMD to preserve other enabled features
+        // Note: GCMD is write-only per spec, but GSTS reflects enabled state
+        // We build GCMD from GSTS to preserve TE, SRTP if already set
+        let current_gsts = unsafe { Self::read_reg32(self.reg_base, VTD_REG_GSTS) };
+        let mut gcmd: u32 = 0;
+        if current_gsts & GSTS_TES != 0 {
+            gcmd |= GCMD_TE;
+        }
+        if current_gsts & GSTS_RTPS != 0 {
+            gcmd |= GCMD_SRTP;
+        }
+
+        // Enable interrupt remapping
+        gcmd |= GCMD_IRE;
+        unsafe {
+            Self::write_reg32(self.reg_base, VTD_REG_GCMD, gcmd);
+        }
+
+        // Wait for hardware acknowledgment (GSTS.IRES set)
+        if let Err(e) = self.wait_status(GSTS_IRES) {
+            // R84-2 FIX: Clear both IRE and IRTA on failure.
+            // If we only clear IRE but leave IRTA programmed, and IRE is toggled
+            // later without reprogramming IRTA, hardware could dereference freed memory.
+            gcmd &= !GCMD_IRE;
+            unsafe {
+                Self::write_reg32(self.reg_base, VTD_REG_GCMD, gcmd);
+                // Clear IRTA to avoid hardware dereferencing freed memory
+                Self::write_reg64(self.reg_base, VTD_REG_IRTA, 0);
+            }
+            // Table will be dropped when this function returns
+
+            return if required {
+                Err(e)
+            } else {
+                // Enable failed but not required - degrade gracefully
+                Ok(false)
+            };
+        }
+
+        // Success: publish the table so it remains alive for this unit
+        *ir_slot = Some(Arc::new(table));
+
+        Ok(true)
     }
 
     /// Allocate and initialize the root table if not already present.
@@ -729,6 +888,30 @@ impl VtdUnit {
                 ContextEntry::new_passthrough(domain.id())
             }
             DomainType::PageTable => {
+                // R83-4 FIX: Validate domain AGAW against hardware CAP.SAGAW
+                //
+                // SAGAW bits in Capability Register:
+                //   bit 0: 39-bit AGAW (3-level page table)
+                //   bit 1: 48-bit AGAW (4-level page table)
+                //   bit 2: 57-bit AGAW (5-level page table)
+                //
+                // If the domain's address width is not supported by hardware, the context
+                // entry's AW field would be undefined, leading to DMA faults or translation
+                // bypass. Fail-closed to prevent isolation bypass.
+                //
+                // NOTE: This check is only for PageTable domains. Identity domains use
+                // pass-through mode and don't use the AW field.
+                let sagaw_bits = self.supported_agaw();
+                let domain_agaw_bit = match domain.address_width() {
+                    39 => 1u8 << 0,
+                    48 => 1u8 << 1,
+                    57 => 1u8 << 2,
+                    _ => 0u8, // Unknown/invalid address width
+                };
+                if domain_agaw_bit == 0 || (sagaw_bits & domain_agaw_bit) == 0 {
+                    return Err(IommuError::InvalidRange);
+                }
+
                 // Full translation mode: use domain's second-level page table
                 let slpt = domain.page_table_root();
                 if slpt == 0 {
@@ -769,6 +952,204 @@ impl VtdUnit {
         }
 
         Ok(())
+    }
+
+    /// Detach a device from a domain.
+    ///
+    /// Clears the device's context entry, invalidates caches, and updates
+    /// tracking structures. Bus mastering is disabled before tearing down
+    /// the context to prevent post-detach DMA.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - PCI device identifier
+    /// * `domain_id` - Domain the device is expected to be attached to
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Device successfully detached
+    /// * `Err(IommuError)` - Detachment failed
+    ///
+    /// # Security
+    ///
+    /// - Bus mastering is disabled BEFORE clearing context (prevents post-detach DMA)
+    /// - Context cache and IOTLB are invalidated after clearing entry
+    /// - Validates device is actually attached to the specified domain
+    /// - Fail-closed: returns error if any validation fails
+    pub fn detach_device(&self, device: &PciDeviceId, domain_id: DomainId) -> IommuResult<()> {
+        let source_id = device.source_id();
+
+        // Fail-closed: require root table and translation to be enabled
+        if self.root_table_phys.load(Ordering::Acquire) == 0 || !self.translation_enabled() {
+            return Err(IommuError::NotInitialized);
+        }
+
+        // Validate the device is recorded as attached to the expected domain
+        {
+            let devices = self.attached_devices.lock();
+            match devices.get(&source_id) {
+                Some(&attached_domain) if attached_domain == domain_id => {}
+                _ => return Err(IommuError::DeviceNotAttached),
+            }
+        }
+
+        // Disable bus mastering BEFORE clearing the context entry
+        // This prevents any DMA from completing after we remove the translation
+        // R87-2 FIX: Continue with detach even if bus mastering disable fails on non-zero segments
+        let _bus_master_disabled = match self.disable_bus_mastering(device) {
+            Ok(()) => true,
+            Err(IommuError::PermissionDenied) => {
+                // Non-zero segment - can't use legacy I/O, but still proceed with context teardown
+                // The device may continue DMA until hardware naturally stops, but context is removed
+                println!(
+                    "[IOMMU] WARNING: Cannot disable bus mastering for {:02x}:{:02x}.{} (segment {}), proceeding with context teardown",
+                    device.bus, device.device, device.function, device.segment
+                );
+                false
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Program tables under lock
+        let _table_guard = self.table_lock.lock();
+
+        // Locate context table for this bus
+        let root_phys = self.root_table_phys.load(Ordering::Acquire);
+        if root_phys == 0 {
+            return Err(IommuError::NotInitialized);
+        }
+        if root_phys >= MAX_DIRECT_MAP_PHYS {
+            return Err(IommuError::HardwareInitFailed);
+        }
+        let root_virt = phys_to_virt(PhysAddr::new(root_phys));
+        let root_table = unsafe { &mut *root_virt.as_mut_ptr::<RootTable>() };
+        let root_entry = &root_table.entries[device.bus as usize];
+        if !root_entry.is_present() {
+            return Err(IommuError::DeviceNotAttached);
+        }
+
+        let ctx_phys = root_entry.context_table_addr();
+        if ctx_phys >= MAX_DIRECT_MAP_PHYS {
+            return Err(IommuError::HardwareInitFailed);
+        }
+        let ctx_virt = phys_to_virt(PhysAddr::new(ctx_phys));
+        let context_table = unsafe { &mut *ctx_virt.as_mut_ptr::<ContextTable>() };
+
+        // Calculate context table index: (device << 3) | function
+        let ctx_index = ((device.device as usize) << 3) | (device.function as usize);
+        let entry = &mut context_table.entries[ctx_index];
+
+        // Validate entry matches expected domain
+        if !entry.is_present() || entry.domain_id() != domain_id {
+            return Err(IommuError::DeviceNotAttached);
+        }
+
+        // Clear context entry: drop metadata then present bit with release ordering
+        // This ensures hardware sees consistent state during teardown
+        unsafe {
+            write_volatile(&mut entry.hi, 0);
+            core::sync::atomic::fence(Ordering::Release);
+            write_volatile(&mut entry.lo, ContextEntry::empty().lo);
+        }
+
+        // Invalidate caches after removing the entry
+        // This ensures hardware doesn't use stale cached translations
+        self.invalidate_context_device(device)?;
+        self.invalidate_iotlb_domain(domain_id)?;
+
+        // Drop lock before updating tracking structures
+        drop(_table_guard);
+
+        // R87-1 FIX: Update attached_devices and attached_domains atomically
+        // Hold the devices lock while updating attached_domains to prevent race conditions
+        // where a concurrent attach could add a device to the domain while we're removing it
+        {
+            let mut devices = self.attached_devices.lock();
+            devices.remove(&source_id);
+            let still_used = devices.values().any(|&d| d == domain_id);
+
+            // If no other devices use this domain, remove from attached_domains
+            // Do this while still holding the devices lock to prevent TOCTOU
+            if !still_used {
+                let mut domains = self.attached_domains.lock();
+                domains.remove(&domain_id);
+            }
+            // devices lock dropped here
+        }
+
+        Ok(())
+    }
+
+    /// Disable PCI bus mastering for a device using legacy config space.
+    ///
+    /// This function uses legacy PCI I/O port access (0xCF8/0xCFC) which only
+    /// supports segment 0. Multi-segment systems require ECAM support.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - PCI device to disable bus mastering for
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Bus mastering successfully disabled
+    /// * `Err(IommuError::PermissionDenied)` - Device on unsupported segment
+    /// * `Err(IommuError::DeviceNotFound)` - No device at this address
+    /// * `Err(IommuError::HardwareInitFailed)` - Failed to disable bus mastering
+    ///
+    /// # Security
+    ///
+    /// - Validates device segment (legacy I/O only supports segment 0)
+    /// - Uses global PCI config lock to serialize access
+    /// - Verifies bus mastering was actually disabled via read-back
+    fn disable_bus_mastering(&self, device: &PciDeviceId) -> IommuResult<()> {
+        // Legacy PCI I/O only supports segment 0
+        if device.segment != self.segment || device.segment != 0 {
+            return Err(IommuError::PermissionDenied);
+        }
+
+        // Serialize PCI config space access
+        let _pci_lock = crate::PCI_CONFIG_LOCK.lock();
+
+        // Validate device exists by checking vendor ID
+        let vendor_device = crate::pci_cfg_read32(device.bus, device.device, device.function, 0x00);
+        let vendor = (vendor_device & 0xFFFF) as u16;
+        if vendor == crate::PCI_VENDOR_INVALID {
+            return Err(IommuError::DeviceNotFound);
+        }
+
+        // Read current command register
+        let command = crate::pci_cfg_read16(
+            device.bus,
+            device.device,
+            device.function,
+            crate::PCI_COMMAND_OFFSET,
+        );
+
+        // Clear bus master enable bit
+        let new_command = command & !crate::PCI_COMMAND_BUS_MASTER;
+        crate::pci_cfg_write16(
+            device.bus,
+            device.device,
+            device.function,
+            crate::PCI_COMMAND_OFFSET,
+            new_command,
+        );
+
+        // Verify the write took effect (read-back check)
+        let verify = crate::pci_cfg_read16(
+            device.bus,
+            device.device,
+            device.function,
+            crate::PCI_COMMAND_OFFSET,
+        );
+
+        drop(_pci_lock);
+
+        if verify & crate::PCI_COMMAND_BUS_MASTER == 0 {
+            Ok(())
+        } else {
+            Err(IommuError::HardwareInitFailed)
+        }
     }
 
     /// Invalidate IOTLB entries for a domain.
@@ -1000,6 +1381,96 @@ impl VtdUnit {
     /// Check if pass-through is supported.
     pub fn supports_passthrough(&self) -> bool {
         self.ecap & ECAP_PT != 0
+    }
+
+    /// Get a reference to the interrupt remapping table (if enabled).
+    ///
+    /// Returns `Some(Arc<InterruptRemappingTable>)` if interrupt remapping has been
+    /// set up for this unit, `None` otherwise.
+    pub fn interrupt_remapping_table(&self) -> Option<Arc<InterruptRemappingTable>> {
+        self.ir_table.lock().clone()
+    }
+
+    /// Get the number of fault recording registers.
+    pub fn num_fault_regs(&self) -> usize {
+        // CAP.NFR is zero-based, so add 1
+        (((self.cap >> CAP_NFR_SHIFT) & CAP_NFR_MASK) as usize) + 1
+    }
+
+    /// Read fault records from hardware.
+    ///
+    /// This method reads and clears all pending fault records from the VT-d unit's
+    /// fault recording registers. It should be called in response to a fault interrupt
+    /// or periodically to detect DMA faults.
+    ///
+    /// # Returns
+    ///
+    /// Tuple of (fault_records, overflow_occurred). Empty vector if no faults pending.
+    ///
+    /// # Security
+    ///
+    /// - Processing is bounded to prevent DoS from fault floods
+    /// - Fault records are cleared after reading (W1C semantics)
+    /// - Overflow flag is checked and cleared
+    /// - R85-1: Uses FRI-based rotation to avoid losing faults
+    /// - R85-4: Returns overflow flag to caller for policy decisions
+    pub fn read_fault_records(&self) -> (Vec<FaultRecord>, bool) {
+        use crate::fault;
+
+        // Check and clear fault status first
+        let (overflow, pending, fri) =
+            unsafe { fault::read_and_clear_fault_status(self.reg_base) };
+
+        if overflow {
+            // Log that faults may have been lost due to overflow
+            println!(
+                "[IOMMU] Fault overflow detected on unit (segment={})",
+                self.segment
+            );
+        }
+
+        if !pending && !overflow {
+            // No faults to process
+            return (Vec::new(), overflow);
+        }
+
+        // Read fault records from hardware, starting from FRI
+        let records = unsafe {
+            fault::read_fault_records(
+                self.reg_base,
+                self.fault_offset,
+                self.num_fault_regs(),
+                fri as usize,
+            )
+        };
+
+        // R85-1: Log truncation warning if hardware has more fault slots than we process
+        if self.num_fault_regs() > fault::MAX_FAULT_RECORDS
+            && records.len() == fault::MAX_FAULT_RECORDS
+        {
+            println!(
+                "[IOMMU] Unit {} fault processing truncated at {} records (hardware has {})",
+                self.segment,
+                fault::MAX_FAULT_RECORDS,
+                self.num_fault_regs()
+            );
+        }
+
+        (records, overflow)
+    }
+
+    /// Enable or disable fault event interrupts.
+    ///
+    /// When enabled, the IOMMU will generate an interrupt when a DMA fault occurs.
+    /// The interrupt vector and destination should be configured in the Fault Event
+    /// registers (FEDATA, FEADDR) before enabling.
+    ///
+    /// # Arguments
+    ///
+    /// * `enable` - True to enable fault interrupts, false to disable
+    pub fn set_fault_interrupt_enabled(&self, enable: bool) {
+        use crate::fault;
+        unsafe { fault::set_fault_interrupt_enabled(self.reg_base, enable) };
     }
 
     // ========================================================================
