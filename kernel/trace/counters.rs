@@ -32,7 +32,7 @@ use crate::{ensure_metrics_read_allowed, TraceError};
 // ============================================================================
 
 /// Number of defined trace counters. Matches [`TraceCounter`] variants.
-pub const TRACE_COUNTER_COUNT: usize = 14;
+pub const TRACE_COUNTER_COUNT: usize = 15;
 
 // ============================================================================
 // Counter Enumeration
@@ -47,37 +47,40 @@ pub const TRACE_COUNTER_COUNT: usize = 14;
 pub enum TraceCounter {
     /// Total system call entries.
     SyscallEntry = 0,
+    /// System call exits (after audit/LSM).
+    SyscallExit = 1,
     /// System calls denied by seccomp/LSM.
-    SyscallDenied = 1,
+    SyscallDenied = 2,
     /// Page fault exceptions handled.
-    PageFaults = 2,
+    PageFaults = 3,
     /// IPC messages sent/received.
-    IpcMessages = 3,
+    IpcMessages = 4,
     /// Context switches performed.
-    ContextSwitches = 4,
+    ContextSwitches = 5,
     /// Timer ticks processed by scheduler.
-    SchedulerTicks = 5,
+    SchedulerTicks = 6,
     /// Total hardware interrupts handled.
-    Interrupts = 6,
+    Interrupts = 7,
     /// Tracepoints successfully emitted.
-    TracepointsEmitted = 7,
+    TracepointsEmitted = 8,
     /// Tracepoints dropped (too many args, etc.).
-    TracepointsDropped = 8,
+    TracepointsDropped = 9,
     /// Watchdog timeout trips detected.
-    WatchdogTrips = 9,
+    WatchdogTrips = 10,
     /// Watchdog recoveries (heartbeat after trip).
-    WatchdogRecoveries = 10,
+    WatchdogRecoveries = 11,
     /// Copy-on-write page faults.
-    CowFaults = 11,
+    CowFaults = 12,
     /// Memory allocation failures.
-    AllocFailures = 12,
+    AllocFailures = 13,
     /// Custom counter for module use.
-    Custom0 = 13,
+    Custom0 = 14,
 }
 
 /// Human-readable counter names for diagnostics/procfs export.
 const COUNTER_NAMES: [&str; TRACE_COUNTER_COUNT] = [
     "syscall.entry",
+    "syscall.exit",
     "syscall.denied",
     "mm.page_faults",
     "ipc.messages",

@@ -124,6 +124,12 @@ static IOMMU_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Whether IOMMU initialization has been attempted.
 static IOMMU_INIT_DONE: AtomicBool = AtomicBool::new(false);
 
+/// R90-1 FIX: Whether a previous initialization attempt failed.
+///
+/// Once set, all subsequent IOMMU operations will fail-closed.
+/// This prevents DMA bypass when init fails (e.g., DMAR not found, parse error).
+static IOMMU_INIT_FAILED: AtomicBool = AtomicBool::new(false);
+
 /// Number of IOMMU units discovered.
 static IOMMU_UNIT_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -243,8 +249,9 @@ pub type IommuResult<T> = Result<T, IommuError>;
 /// This should be called early in boot, before PCI devices are initialized.
 /// If IOMMU is not available, the kernel can still operate in bypass mode.
 pub fn init() -> IommuResult<u32> {
-    // Prevent double initialization
-    if IOMMU_INIT_DONE.swap(true, Ordering::SeqCst) {
+    // R90-1 FIX: Prevent double init and fail closed after a previous failure.
+    // Check both flags with Acquire ordering to ensure visibility.
+    if IOMMU_INIT_DONE.load(Ordering::Acquire) || IOMMU_INIT_FAILED.load(Ordering::Acquire) {
         return Err(IommuError::NotInitialized);
     }
 
@@ -255,10 +262,15 @@ pub fn init() -> IommuResult<u32> {
         Ok(d) => d,
         Err(DmarError::NotFound) => {
             println!("[IOMMU] No DMAR table found - IOMMU not available");
+            // R90-1 NOTE: No IOMMU hardware present - allow legacy bypass.
+            // Only mark INIT_FAILED when hardware exists but init fails,
+            // not when hardware is absent (backward compatibility).
             return Err(IommuError::NoDmarTable);
         }
         Err(e) => {
             println!("[IOMMU] DMAR table parse error: {:?}", e);
+            // R90-1 FIX: DMAR exists but parse failed - fail-closed
+            IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
             return Err(IommuError::InvalidDmar);
         }
     };
@@ -315,6 +327,8 @@ pub fn init() -> IommuResult<u32> {
                                 "[IOMMU]   Unit {}: Interrupt remapping required but failed: {:?}",
                                 count, e
                             );
+                            // R90-1 FIX: Mark init as failed before returning
+                            IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
                             return Err(IommuError::HardwareInitFailed);
                         } else {
                             println!(
@@ -342,6 +356,8 @@ pub fn init() -> IommuResult<u32> {
 
     if count == 0 {
         println!("[IOMMU] No IOMMU units initialized");
+        // R90-1 FIX: Mark init as failed to prevent bypass
+        IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
         return Err(IommuError::HardwareInitFailed);
     }
 
@@ -365,6 +381,8 @@ pub fn init() -> IommuResult<u32> {
     }
 
     IOMMU_ENABLED.store(true, Ordering::SeqCst);
+    // R90-1 FIX: Only mark as done on successful initialization
+    IOMMU_INIT_DONE.store(true, Ordering::SeqCst);
     println!("[IOMMU] Initialized {} IOMMU units", count);
 
     Ok(count)
@@ -401,7 +419,16 @@ pub fn unit_count() -> u32 {
 ///
 /// If VT-d units exist but translation is still disabled, return an error to
 /// fail closed instead of silently bypassing DMA isolation.
+///
+/// # R90-1 FIX
+///
+/// Also checks IOMMU_INIT_FAILED to prevent DMA bypass after init failure.
 fn ensure_iommu_ready() -> IommuResult<()> {
+    // R90-1 FIX: Fail closed if init has failed
+    if IOMMU_INIT_FAILED.load(Ordering::Acquire) {
+        return Err(IommuError::NotInitialized);
+    }
+
     if is_enabled() {
         return Ok(());
     }

@@ -34,6 +34,13 @@ use x86_64::instructions::interrupts as x86_interrupts;
 use x86_64::registers::control::{Cr0, Cr0Flags};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
+// G.1 Observability: Per-CPU counter integration
+use trace::counters::{increment_counter, TraceCounter};
+// G.1 Observability: Watchdog polling for hung-task detection
+use trace::watchdog::poll_watchdogs;
+// G.1 Observability: PC sampling profiler
+use trace::profiler::record_pc_sample;
+
 // Serial port for debug output (0x3F8)
 const SERIAL_PORT: u16 = 0x3F8;
 
@@ -813,6 +820,8 @@ extern "x86-interrupt" fn page_fault_handler(
     }
 
     INTERRUPT_STATS.page_fault.fetch_add(1, Ordering::Relaxed);
+    // G.1: Track page faults in per-CPU observability counters
+    increment_counter(TraceCounter::PageFaults, 1);
 
     // 获取导致缺页的地址
     let fault_addr = fault_addr_raw as usize;
@@ -826,6 +835,8 @@ extern "x86-interrupt" fn page_fault_handler(
         if let Some(pid) = kernel_core::process::current_pid() {
             // 尝试处理 COW 缺页
             if unsafe { kernel_core::fork::handle_cow_page_fault(pid, fault_addr).is_ok() } {
+                // G.1: Track successful COW page fault handling
+                increment_counter(TraceCounter::CowFaults, 1);
                 return; // COW 已修复，返回继续执行
             }
         }
@@ -972,6 +983,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     }
 
     INTERRUPT_STATS.timer.fetch_add(1, Ordering::Relaxed);
+    // G.1: Track scheduler ticks and interrupts in per-CPU observability counters
+    increment_counter(TraceCounter::SchedulerTicks, 1);
+    increment_counter(TraceCounter::Interrupts, 1);
 
     // Check if this is BSP (CPU 0) or an AP
     // BSP receives PIT IRQ0 via 8259 PIC, APs receive LAPIC timer interrupts
@@ -1005,9 +1019,30 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
 
     // Only BSP should increment global tick count to avoid time advancing N× faster
     // APs get their own LAPIC timer interrupts but don't maintain wall-clock time
-    if is_bsp {
+    let timestamp_ms = if is_bsp {
         kernel_core::on_timer_tick();
-    }
+
+        // G.1 Observability: Poll watchdogs for hung-task detection.
+        // Only BSP polls to avoid duplicate detections. The poll function
+        // internally fires the hung_task tracepoint for any timed-out tasks
+        // and increments the WatchdogTrips counter.
+        let now_ms = kernel_core::time::current_timestamp_ms();
+        let _tripped = poll_watchdogs(now_ms);
+        now_ms
+    } else {
+        // APs also need a timestamp for profiling
+        kernel_core::time::current_timestamp_ms()
+    };
+
+    // G.1 Observability: Sample RIP for PC profiler on all CPUs.
+    // This captures the instruction pointer where the timer interrupted execution.
+    // Convert timestamp from ms to ns for higher precision in analysis tools.
+    // Note: Use unwrap_or(0) for PID - current_pid() is already called from
+    // IRQ context elsewhere (page fault handler) and the per-CPU mutex is
+    // extremely short-lived, but profiler samples are best-effort anyway.
+    let timestamp_ns = timestamp_ms.saturating_mul(1_000_000);
+    let pid = current_pid().unwrap_or(0) as u64;
+    record_pc_sample(timestamp_ns, pid, stack_frame.instruction_pointer.as_u64());
 
     // 通过钩子调用调度器的时钟 tick 处理
     // 调度器会更新时间片并设置 NEED_RESCHED 标志（如需要）
@@ -1064,6 +1099,8 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     }
 
     INTERRUPT_STATS.keyboard.fetch_add(1, Ordering::Relaxed);
+    // G.1: Track hardware interrupts in per-CPU observability counters
+    increment_counter(TraceCounter::Interrupts, 1);
 
     // 读取键盘扫描码
     let scancode: u8;

@@ -634,6 +634,7 @@ impl NetworkLoopbackTest {
     /// Test UDP packet processing through the network stack
     fn test_udp_loopback(&self) -> Result<(), String> {
         use net::{arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult};
+        use cap::NamespaceId;
 
         // Setup test addresses
         let our_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
@@ -655,7 +656,16 @@ impl NetworkLoopbackTest {
         let now_ms = 1000u64;
 
         // Process the frame
-        let result = net::process_frame(&frame, our_mac, our_ip, &mut arp_cache, &stats, now_ms);
+        // R90-2 FIX: Pass root namespace ID for test
+        let result = net::process_frame(
+            &frame,
+            our_mac,
+            our_ip,
+            &mut arp_cache,
+            &stats,
+            NamespaceId::new(0),
+            now_ms,
+        );
 
         // The frame should be handled (delivered to socket layer) or replied
         // In absence of a listening socket, it should be handled but may generate ICMP unreachable
@@ -676,6 +686,7 @@ impl NetworkLoopbackTest {
             arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult, TCP_FLAG_FIN,
             TCP_FLAG_RST, TCP_FLAG_SYN,
         };
+        use cap::NamespaceId;
 
         let our_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
         let our_ip = Ipv4Addr([10, 0, 0, 1]);
@@ -722,7 +733,16 @@ impl NetworkLoopbackTest {
         let now_ms = 2000u64;
 
         // Process the frame
-        let result = net::process_frame(&frame, our_mac, our_ip, &mut arp_cache, &stats, now_ms);
+        // R90-2 FIX: Pass root namespace ID for test
+        let result = net::process_frame(
+            &frame,
+            our_mac,
+            our_ip,
+            &mut arp_cache,
+            &stats,
+            NamespaceId::new(0),
+            now_ms,
+        );
 
         // Invalid TCP flags should be dropped (or handled without reply)
         match result {
@@ -772,6 +792,7 @@ impl NetworkLoopbackTest {
     /// Test valid TCP SYN packet processing
     fn test_tcp_syn(&self) -> Result<(), String> {
         use net::{arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult, TCP_FLAG_SYN};
+        use cap::NamespaceId;
 
         let our_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
         let our_ip = Ipv4Addr([10, 0, 0, 1]);
@@ -814,7 +835,16 @@ impl NetworkLoopbackTest {
         let now_ms = 3000u64;
 
         // Process the frame
-        let result = net::process_frame(&frame, our_mac, our_ip, &mut arp_cache, &stats, now_ms);
+        // R90-2 FIX: Pass root namespace ID for test
+        let result = net::process_frame(
+            &frame,
+            our_mac,
+            our_ip,
+            &mut arp_cache,
+            &stats,
+            NamespaceId::new(0),
+            now_ms,
+        );
 
         // Valid SYN should be processed (either handled, replied with RST, or dropped if no listener)
         match result {

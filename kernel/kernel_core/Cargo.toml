@@ -21,3 +21,4 @@ cap = { path = "../cap" }
 lsm = { path = "../lsm", features = ["lsm"] }
 security = { path = "../security" }
 net = { path = "../net" }
+trace = { path = "../trace" }

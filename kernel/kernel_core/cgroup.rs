@@ -838,6 +838,11 @@ impl CgroupNode {
     /// * `NotFound` - Cgroup is being deleted (R77-1 FIX)
     /// * `TaskAlreadyAttached` - Task is already in this cgroup
     /// * `PidsLimitExceeded` - Would exceed pids.max
+    ///
+    /// # R90-3 FIX: Atomic pids.max enforcement
+    ///
+    /// Uses fetch_update CAS to atomically check-and-increment pids counters,
+    /// preventing concurrent attach bypassing pids.max limits.
     pub fn attach_task(&self, task: TaskId) -> Result<(), CgroupError> {
         // R77-1 FIX: Block attaches once deletion has started.
         // This prevents the race where a thread holds an old Arc<CgroupNode>
@@ -854,15 +859,15 @@ impl CgroupNode {
             return Err(CgroupError::TaskAlreadyAttached);
         }
 
-        // R83-3 FIX: Hierarchical PIDs enforcement (cgroups v2 semantics)
+        // R83-3 + R90-3 FIX: Hierarchical PIDs enforcement with atomic charging
         //
         // In cgroups v2, a cgroup's pids.max limit applies to the total number
-        // of processes in that cgroup *and all its descendants*. This prevents
-        // a child cgroup from spawning unlimited tasks to bypass the parent's limit.
+        // of processes in that cgroup *and all its descendants*. R90-3 fixes
+        // the race where concurrent attachers could all pass relaxed checks
+        // and then all increment, exceeding pids.max.
         //
-        // We collect all ancestors and check their pids.max limits against the
-        // current count + 1 (the task being attached). Only if all checks pass,
-        // we increment counts on the target cgroup and all ancestors.
+        // Solution: Use fetch_update CAS to atomically check-and-increment.
+        // On any failure, rollback previously charged ancestors.
         let mut ancestors: alloc::vec::Vec<Arc<CgroupNode>> = alloc::vec::Vec::new();
         let mut cursor = self.parent();
         while let Some(p) = cursor {
@@ -870,38 +875,71 @@ impl CgroupNode {
             cursor = p.parent();
         }
 
-        // Check pids.max limit on this cgroup
-        if self.controllers.contains(CgroupControllers::PIDS) {
-            if let Some(limit) = self.limits.lock().pids_max {
-                if (procs.len() as u64) >= limit {
-                    self.stats.record_pids_max_event();
-                    return Err(CgroupError::PidsLimitExceeded);
+        // Snapshot limits (only if PIDs controller enabled)
+        let self_limit = if self.controllers.contains(CgroupControllers::PIDS) {
+            self.limits.lock().pids_max
+        } else {
+            None
+        };
+        let ancestor_limits: alloc::vec::Vec<Option<u64>> = ancestors
+            .iter()
+            .map(|a| {
+                if a.controllers.contains(CgroupControllers::PIDS) {
+                    a.limits.lock().pids_max
+                } else {
+                    None
                 }
+            })
+            .collect();
+
+        // R90-3 FIX: Atomic charge helper using CAS
+        // Returns Ok(()) if charge succeeded, Err(()) if limit would be exceeded
+        let charge = |stats: &CgroupStats, limit: Option<u64>| -> Result<(), ()> {
+            if let Some(limit) = limit {
+                stats
+                    .pids_current
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                        if cur >= limit {
+                            None // Reject: would exceed limit
+                        } else {
+                            Some(cur + 1)
+                        }
+                    })
+                    .map(|_| ())
+                    .map_err(|_| ())
+            } else {
+                // No limit set, always allow
+                stats.pids_current.fetch_add(1, Ordering::SeqCst);
+                Ok(())
             }
+        };
+
+        // Track which stats have been charged for rollback on failure
+        let mut charged: alloc::vec::Vec<&CgroupStats> = alloc::vec::Vec::new();
+
+        // Charge self first
+        if charge(&self.stats, self_limit).is_err() {
+            self.stats.record_pids_max_event();
+            return Err(CgroupError::PidsLimitExceeded);
+        }
+        charged.push(&self.stats);
+
+        // Charge all ancestors, rolling back on failure
+        for (ancestor, limit) in ancestors.iter().zip(ancestor_limits.iter()) {
+            if charge(&ancestor.stats, *limit).is_err() {
+                ancestor.stats.record_pids_max_event();
+                // Rollback all previously charged stats
+                for stats in charged.into_iter() {
+                    stats.pids_current.fetch_sub(1, Ordering::SeqCst);
+                }
+                return Err(CgroupError::PidsLimitExceeded);
+            }
+            charged.push(&ancestor.stats);
         }
 
-        // R83-3 FIX: Check all ancestor limits (hierarchical enforcement)
-        for ancestor in ancestors.iter() {
-            if ancestor.controllers.contains(CgroupControllers::PIDS) {
-                if let Some(limit) = ancestor.limits.lock().pids_max {
-                    // Current count includes all tasks in this cgroup + descendants
-                    let current = ancestor.stats.pids_current.load(Ordering::Relaxed);
-                    if current.saturating_add(1) > limit as u64 {
-                        ancestor.stats.record_pids_max_event();
-                        return Err(CgroupError::PidsLimitExceeded);
-                    }
-                }
-            }
-        }
-
-        // Insert and update stats
+        // All charges succeeded, commit membership
         procs.insert(task);
-        self.stats.increment_pids();
-
-        // R83-3 FIX: Increment ancestor counts for hierarchical tracking
-        for ancestor in ancestors {
-            ancestor.stats.increment_pids();
-        }
+        // Counters already incremented during charging, no additional increment needed
 
         Ok(())
     }
@@ -1176,6 +1214,12 @@ pub fn cgroup_count() -> usize {
 /// This is an atomic operation that detaches from the old cgroup
 /// and attaches to the new cgroup.
 ///
+/// # R90-4 FIX: Migration/Deletion Race
+///
+/// Holds `CGROUP_REGISTRY` read lock throughout the migration to prevent
+/// concurrent `delete_cgroup()` from removing source or target cgroups
+/// between detach and attach, which could leave the task orphaned.
+///
 /// # Errors
 ///
 /// * `NotFound` - Source or target cgroup doesn't exist
@@ -1186,6 +1230,11 @@ pub fn migrate_task(
     from_id: CgroupId,
     to_id: CgroupId,
 ) -> Result<(), CgroupError> {
+    // R90-4 FIX: Hold registry read lock to block concurrent delete_cgroup.
+    // delete_cgroup requires a write lock, so this prevents both source
+    // and target from being deleted during the migration window.
+    let _reg_guard = CGROUP_REGISTRY.read();
+
     let from = lookup_cgroup(from_id).ok_or(CgroupError::NotFound)?;
     let to = lookup_cgroup(to_id).ok_or(CgroupError::NotFound)?;
 

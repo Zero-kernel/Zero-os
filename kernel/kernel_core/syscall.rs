@@ -42,6 +42,9 @@ extern crate cap;
 // Security RNG for cryptographically secure random number generation
 use security::rng;
 
+// G.1 Observability: Per-CPU counter integration
+use trace::counters::{increment_counter, TraceCounter};
+
 /// 最大参数数量（防止恶意用户传递过多参数）
 const MAX_ARG_COUNT: usize = 256;
 
@@ -1817,12 +1820,16 @@ pub fn syscall_dispatcher(
     // Capture timestamp at syscall entry
     let timestamp = crate::time::get_ticks();
 
+    // G.1: Count every syscall entry (per-CPU, lock-free, IRQ-safe)
+    increment_counter(TraceCounter::SyscallEntry, 1);
+
     // Evaluate seccomp/pledge filters before dispatch
     let args = [arg0, arg1, arg2, arg3, arg4, arg5];
     let verdict = crate::process::evaluate_seccomp(syscall_num, &args);
 
     match verdict.action {
         seccomp::SeccompAction::Kill => {
+            increment_counter(TraceCounter::SyscallDenied, 1);
             // R25-4 + R39-2 FIX: Kill process with SIGSYS semantics and NEVER return
             //
             // SECURITY: After terminating the process, we must not return to userspace.
@@ -1853,6 +1860,7 @@ pub fn syscall_dispatcher(
             }
         }
         seccomp::SeccompAction::Trap => {
+            increment_counter(TraceCounter::SyscallDenied, 1);
             // R25-4 + R39-2 FIX: Trap treated as fatal until SIGSYS delivery exists
             //
             // SECURITY: Same rationale as Kill - process is terminated, never return.
@@ -1878,6 +1886,7 @@ pub fn syscall_dispatcher(
             }
         }
         seccomp::SeccompAction::Errno(e) => {
+            increment_counter(TraceCounter::SyscallDenied, 1);
             // Return the error code - audit the violation
             if let Some(creds) = crate::current_credentials() {
                 if let Some(pid) = crate::process::current_pid() {
@@ -1891,6 +1900,7 @@ pub fn syscall_dispatcher(
                     );
                 }
             }
+            increment_counter(TraceCounter::SyscallExit, 1);
             return -(e as i64);
         }
         seccomp::SeccompAction::Log => {
@@ -1919,10 +1929,12 @@ pub fn syscall_dispatcher(
     let lsm_ctx = lsm::SyscallCtx::from_current(syscall_num, &args);
     if let Some(ref ctx) = lsm_ctx {
         if let Err(err) = lsm::hook_syscall_enter(ctx) {
+            increment_counter(TraceCounter::SyscallDenied, 1);
             // LSM denied the syscall - call exit hook and return error
             let errno = lsm_error_to_syscall(err);
             let ret = errno.as_i64();
             let _ = lsm::hook_syscall_exit(ctx, ret as isize);
+            increment_counter(TraceCounter::SyscallExit, 1);
             return ret;
         }
     }
@@ -2107,6 +2119,9 @@ pub fn syscall_dispatcher(
     // 在返回用户态前检查是否需要调度
     // 这是定时器中断设置的 NEED_RESCHED 标志的主要消费点
     crate::reschedule_if_needed();
+
+    // G.1: Count successful syscall exit (after all processing complete)
+    increment_counter(TraceCounter::SyscallExit, 1);
 
     match result {
         Ok(val) => val as i64,

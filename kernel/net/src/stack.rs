@@ -62,13 +62,6 @@ use crate::ipv4::{
 };
 use crate::socket::socket_table;
 use cap::NamespaceId;
-
-/// R75-1 FIX: Root network namespace ID for incoming packet processing.
-///
-/// When processing incoming network packets at the stack level, we use the root
-/// namespace because physical network devices belong to the root namespace.
-/// Child namespaces only see traffic that's been explicitly forwarded to them.
-const ROOT_NET_NS_ID: NamespaceId = NamespaceId::new(0);
 use crate::tcp::{
     build_tcp_segment, parse_tcp_header, parse_tcp_options, verify_tcp_checksum, TcpError,
     TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_HEADER_MIN_LEN,
@@ -248,6 +241,8 @@ pub enum DropReason {
 ///
 /// - Only processes frames addressed to our MAC or broadcast
 /// - Silently drops frames to other destinations (no error logged)
+/// - R90-2 FIX: Network namespace ID is threaded from the receiving device
+///   to socket delivery, ensuring namespace isolation for ingress traffic.
 ///
 /// # Arguments
 /// * `frame` - Raw Ethernet frame bytes
@@ -255,6 +250,7 @@ pub enum DropReason {
 /// * `our_ip` - Our IP address (for filtering and responses)
 /// * `arp_cache` - ARP cache for address resolution
 /// * `stats` - Statistics counters
+/// * `net_ns_id` - Network namespace of the receiving device
 /// * `now_ms` - Current time in milliseconds (for rate limiting)
 ///
 /// # Returns
@@ -265,6 +261,7 @@ pub fn process_frame(
     our_ip: Ipv4Addr,
     arp_cache: &mut ArpCache,
     stats: &NetStats,
+    net_ns_id: NamespaceId,
     now_ms: u64,
 ) -> ProcessResult {
     stats.inc_rx_packets();
@@ -287,7 +284,10 @@ pub fn process_frame(
 
     // Route to protocol handler
     match eth_hdr.ethertype {
-        ETHERTYPE_IPV4 => process_ipv4(eth_payload, &eth_hdr, our_mac, our_ip, stats, now_ms),
+        ETHERTYPE_IPV4 => {
+            // R90-2 FIX: Pass network namespace to IPv4 handler
+            process_ipv4(eth_payload, &eth_hdr, our_mac, our_ip, stats, net_ns_id, now_ms)
+        }
         ETHERTYPE_ARP => {
             // Process ARP packet
             match process_arp(
@@ -311,12 +311,17 @@ pub fn process_frame(
 }
 
 /// Process an IPv4 packet.
+///
+/// # R90-2 FIX
+///
+/// Network namespace ID is threaded to UDP/TCP handlers for proper socket delivery.
 fn process_ipv4(
     packet: &[u8],
     eth_hdr: &EthHeader,
     our_mac: EthAddr,
     our_ip: Ipv4Addr,
     stats: &NetStats,
+    net_ns_id: NamespaceId,
     now_ms: u64,
 ) -> ProcessResult {
     stats.inc_ipv4_rx();
@@ -387,6 +392,7 @@ fn process_ipv4(
                 eth_hdr,
                 stats,
                 is_broadcast_dst,
+                net_ns_id,
                 now_ms,
             )
         }
@@ -398,6 +404,7 @@ fn process_ipv4(
                 eth_hdr,
                 stats,
                 is_broadcast_dst,
+                net_ns_id,
                 now_ms,
             )
         }
@@ -417,12 +424,18 @@ fn process_ipv4(
 /// - Validates checksum strictly (zero checksums rejected)
 /// - Validates length fields
 /// - Delivers to bound sockets via socket_table()
+///
+/// # R90-2 FIX
+///
+/// Uses the provided network namespace ID from the receiving device
+/// instead of hardcoded ROOT_NET_NS_ID, ensuring proper namespace isolation.
 fn process_udp(
     payload: &[u8],
     ip_hdr: &Ipv4Header,
     eth_hdr: &EthHeader,
     stats: &NetStats,
     is_broadcast_dst: bool,
+    net_ns_id: NamespaceId,
     now_ms: u64,
 ) -> ProcessResult {
     stats.udp_stats.inc_rx_packets();
@@ -486,8 +499,8 @@ fn process_udp(
     }
 
     // Deliver to socket layer
-    // R75-1 FIX: Pass root network namespace ID for incoming packet processing
-    if socket_table().deliver_udp(ROOT_NET_NS_ID, header.dst_port, ip_hdr.src, header.src_port, data, now_ms) {
+    // R90-2 FIX: Use namespace ID from receiving device instead of hardcoded root
+    if socket_table().deliver_udp(net_ns_id, header.dst_port, ip_hdr.src, header.src_port, data, now_ms) {
         return ProcessResult::Handled;
     }
 
@@ -629,12 +642,18 @@ fn process_icmp(
 ///   (prevents amplification attacks)
 /// - Validates checksum before processing
 /// - Sends RST for unknown connections
+///
+/// # R90-2 FIX
+///
+/// Uses the provided network namespace ID from the receiving device
+/// instead of hardcoded ROOT_NET_NS_ID, ensuring proper namespace isolation.
 fn process_tcp(
     payload: &[u8],
     ip_hdr: &Ipv4Header,
     eth_hdr: &EthHeader,
     stats: &NetStats,
     is_broadcast_dst: bool,
+    net_ns_id: NamespaceId,
     now_ms: u64,
 ) -> ProcessResult {
     // Security: ignore TCP to broadcast/multicast destinations
@@ -706,9 +725,9 @@ fn process_tcp(
     let tcp_options = parse_tcp_options(payload, &tcp_hdr);
 
     // Delegate to socket layer for stateful TCP processing
-    // R75-1 FIX: Pass root network namespace ID for incoming packet processing
+    // R90-2 FIX: Use namespace ID from receiving device instead of hardcoded root
     if let Some(resp_seg) = socket_table().process_tcp_segment(
-        ROOT_NET_NS_ID,
+        net_ns_id,
         ip_hdr.src,
         ip_hdr.dst,
         &tcp_hdr,

@@ -12,6 +12,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use mm::memory::FrameAllocator;
 use mm::page_table::with_pt_lock;
 use spin::RwLock;
+// G.1 Observability: Watchdog handle type for cleanup_partial_child
+use trace::watchdog::{unregister_watchdog, WatchdogHandle};
 use x86_64::{
     instructions::interrupts,
     registers::control::Cr3,
@@ -317,11 +319,12 @@ fn cleanup_partial_child(child_pid: ProcessId) {
     use crate::process::PROCESS_TABLE;
 
     // 预先收集需要释放的资源，避免长时间持有 PROCESS_TABLE 锁
-    let (kstack, addr_space) = {
+    // G.1: Also extract watchdog handle for unregistration
+    let (kstack, addr_space, watchdog_handle): (Option<VirtAddr>, usize, Option<WatchdogHandle>) = {
         let mut table = PROCESS_TABLE.lock();
         if let Some(slot) = table.get_mut(child_pid) {
             if let Some(process) = slot.take() {
-                let proc = process.lock();
+                let mut proc = process.lock();
                 (
                     if proc.kernel_stack.as_u64() != 0 {
                         Some(proc.kernel_stack)
@@ -329,14 +332,22 @@ fn cleanup_partial_child(child_pid: ProcessId) {
                         None
                     },
                     proc.memory_space,
+                    // G.1: Take watchdog handle to unregister outside lock
+                    proc.watchdog_handle.take(),
                 )
             } else {
-                (None, 0)
+                (None, 0, None)
             }
         } else {
-            (None, 0)
+            (None, 0, None)
         }
     };
+
+    // G.1 Observability: Unregister watchdog before releasing other resources
+    // This prevents false hung-task alerts for the partially-created process
+    if let Some(handle) = watchdog_handle {
+        unregister_watchdog(&handle);
+    }
 
     // 在 PROCESS_TABLE 锁外释放资源
     if let Some(stack_base) = kstack {

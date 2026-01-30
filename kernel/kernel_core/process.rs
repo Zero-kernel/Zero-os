@@ -17,6 +17,8 @@ use mm::memory::FrameAllocator;
 use mm::page_table;
 use seccomp::{PledgeState, SeccompState};
 use spin::{Mutex, RwLock};
+// G.1 Observability: Watchdog integration for hung-task detection
+use trace::watchdog::{register_watchdog, unregister_watchdog, WatchdogConfig, WatchdogHandle};
 use x86_64::{
     registers::control::{Cr3, Cr3Flags},
     structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB},
@@ -52,6 +54,13 @@ const KSTACK_PAGES: usize = 4;
 
 /// 守护页数
 const KSTACK_GUARD_PAGES: usize = 1;
+
+/// G.1: Default watchdog timeout for hung-task detection (10 seconds).
+///
+/// If a task hasn't been scheduled (heartbeat) for this duration, it will
+/// trigger the hung_task tracepoint. 10s is a reasonable default that catches
+/// true hangs while allowing normal blocking operations.
+const WATCHDOG_TIMEOUT_MS: u64 = 10_000;
 
 /// 调度器清理回调类型
 type SchedulerCleanupCallback = fn(ProcessId);
@@ -622,6 +631,13 @@ pub struct Process {
     /// R26-3: 标记当前是否正在安装 seccomp 过滤器
     /// 在安装期间拒绝创建新线程，防止 TSYNC 竞态绕过
     pub seccomp_installing: bool,
+
+    // ========== G.1: Observability ==========
+    /// Watchdog handle for hung-task detection.
+    ///
+    /// If set, the scheduler sends heartbeats during context switches.
+    /// Unregistered on process termination.
+    pub watchdog_handle: Option<WatchdogHandle>,
 }
 
 impl Process {
@@ -711,6 +727,8 @@ impl Process {
             pledge_state: None,
             // R26-3: seccomp 安装状态标志
             seccomp_installing: false,
+            // G.1: Watchdog not registered until process starts running
+            watchdog_handle: None,
         }
     }
 
@@ -1148,6 +1166,27 @@ pub fn create_process(
         notify_cpuset_task_joined(cpuset_id);
     }
 
+    // G.1 Observability: Register watchdog for hung-task detection.
+    // Best-effort registration - failure is logged but doesn't fail process creation.
+    // The 10-second timeout catches true hangs while allowing normal blocking operations.
+    let now_ms = time::current_timestamp_ms();
+    let cfg = WatchdogConfig {
+        task_id: pid as u64,
+        timeout_ms: WATCHDOG_TIMEOUT_MS,
+    };
+    match register_watchdog(cfg, now_ms) {
+        Ok(handle) => {
+            process.lock().watchdog_handle = Some(handle);
+        }
+        Err(_) => {
+            // Watchdog slots full - system under heavy load but not fatal
+            println!(
+                "  Warning: Failed to register watchdog for PID {} (slots full)",
+                pid
+            );
+        }
+    }
+
     println!(
         "Created process: PID={}, Name={}, Priority={}",
         pid, name, priority
@@ -1261,6 +1300,25 @@ pub fn create_process_in_namespace(
     if ppid == 0 {
         let cpuset_id = process.lock().cpuset_id;
         notify_cpuset_task_joined(cpuset_id);
+    }
+
+    // G.1 Observability: Register watchdog for hung-task detection.
+    // Best-effort registration - failure is logged but doesn't fail process creation.
+    let now_ms = time::current_timestamp_ms();
+    let cfg = WatchdogConfig {
+        task_id: pid as u64,
+        timeout_ms: WATCHDOG_TIMEOUT_MS,
+    };
+    match register_watchdog(cfg, now_ms) {
+        Ok(handle) => {
+            process.lock().watchdog_handle = Some(handle);
+        }
+        Err(_) => {
+            println!(
+                "  Warning: Failed to register watchdog for PID {} (slots full)",
+                pid
+            );
+        }
     }
 
     println!(
@@ -1927,6 +1985,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         let pid_ns_chain: Vec<crate::pid_namespace::PidNamespaceMembership>;
         // F.2: Save cgroup_id for task detachment
         let cgroup_id: crate::cgroup::CgroupId;
+        // G.1: Save watchdog handle for unregistration
+        let watchdog_handle: Option<WatchdogHandle>;
 
         {
             let mut proc = process.lock();
@@ -1942,15 +2002,25 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             // 清除 clear_child_tid 避免重复处理
             proc.clear_child_tid = 0;
             // R25-7 + R39-3 FIX: Capture credentials from shared structure
-            let creds = proc.credentials.read();
-            lsm_uid = creds.uid;
-            lsm_gid = creds.gid;
-            lsm_euid = creds.euid;
-            lsm_egid = creds.egid;
+            {
+                let creds = proc.credentials.read();
+                lsm_uid = creds.uid;
+                lsm_gid = creds.gid;
+                lsm_euid = creds.euid;
+                lsm_egid = creds.egid;
+            } // Drop creds read guard before mutable access below
             // F.1: Copy namespace chain for cleanup
             pid_ns_chain = proc.pid_ns_chain.clone();
             // F.2: Copy cgroup_id for detachment
             cgroup_id = proc.cgroup_id;
+            // G.1: Take watchdog handle (process no longer needs it)
+            watchdog_handle = proc.watchdog_handle.take();
+        }
+
+        // G.1 Observability: Unregister watchdog before any other cleanup.
+        // This must happen early to prevent false hung-task alerts during teardown.
+        if let Some(handle) = watchdog_handle {
+            unregister_watchdog(&handle);
         }
 
         // R25-7 FIX: Call LSM task_exit hook for forced terminations (kill/seccomp paths)

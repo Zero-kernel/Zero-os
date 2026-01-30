@@ -40,6 +40,11 @@ use arch::Context as ArchContext;
 use arch::{assert_kernel_context, enter_usermode, save_context, switch_context};
 use arch::{default_kernel_stack_top, set_kernel_stack};
 
+// G.1 Observability: Per-CPU counter integration
+use trace::counters::{increment_counter, TraceCounter};
+// G.1 Observability: Watchdog heartbeat for hung-task detection
+use trace::watchdog::{heartbeat, WatchdogHandle};
+
 /// 调度器调试输出开关
 ///
 /// 设置为 true 启用详细调度日志，设置为 false 禁用
@@ -1278,12 +1283,13 @@ impl Scheduler {
             // R70-4 FIX: Copy context to per-CPU shadow buffer to prevent use-after-unlock.
             // The PCB lock is released at the end of the closure, but we use the shadow
             // buffer's stable pointer for enter_usermode/switch_context.
-            let (new_ctx_ptr, next_kstack_top, next_cs, next_fs_base, next_gs_base): (
+            let (new_ctx_ptr, next_kstack_top, next_cs, next_fs_base, next_gs_base, next_wd_handle): (
                 *const ArchContext,
                 u64,
                 u64,
                 u64,
                 u64,
+                Option<WatchdogHandle>,
             ) = NEXT_CONTEXT_SHADOW.with(|shadow| {
                 let guard = next_pcb.lock();
                 // Copy full context (176 bytes + FPU) to per-CPU shadow while holding lock
@@ -1292,7 +1298,8 @@ impl Scheduler {
                 let cs = guard.context.cs;
                 let fs_base = guard.fs_base;
                 let gs_base = guard.gs_base;
-                (ctx_ptr, kstack_top, cs, fs_base, gs_base)
+                let wd_handle = guard.watchdog_handle;
+                (ctx_ptr, kstack_top, cs, fs_base, gs_base, wd_handle)
             });
 
             // 判断下一个进程是否为用户态进程（Ring 3）
@@ -1326,6 +1333,17 @@ impl Scheduler {
 
             // Debug output for Ring 3 transition (minimal)
             // Uncomment for debugging: println!("[SCHED] -> PID {} (Ring {})", next_pid, if next_is_user { 3 } else { 0 });
+
+            // G.1: Track context switches in per-CPU observability counters
+            increment_counter(TraceCounter::ContextSwitches, 1);
+
+            // G.1 Observability: Send heartbeat for hung-task detection.
+            // This indicates the process is actively being scheduled (not hung).
+            // Lock-free operation - safe even with interrupts disabled.
+            if let Some(ref handle) = next_wd_handle {
+                let now_ms = kernel_core::time::current_timestamp_ms();
+                heartbeat(handle, now_ms);
+            }
 
             process::activate_memory_space(next_space);
 

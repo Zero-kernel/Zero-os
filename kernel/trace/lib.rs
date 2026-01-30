@@ -80,12 +80,17 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 pub mod counters;
+pub mod profiler;
 pub mod watchdog;
 
 // Re-export public API
 pub use counters::{
     counter_name, increment_counter, reset_counter, snapshot_counters, CpuCounterSnapshot,
     TraceCounter, TraceCounterSnapshot, TRACE_COUNTER_COUNT,
+};
+pub use profiler::{
+    profiler_enabled, record_pc_sample, snapshot_profiler, start_profiler, stop_profiler,
+    ProfilerSample, ProfilerSnapshot, PROFILER_RING_CAPACITY,
 };
 pub use watchdog::{
     heartbeat, poll_watchdogs, register_watchdog, snapshot_watchdogs, unregister_watchdog,
