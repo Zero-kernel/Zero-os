@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-28
+**Last Updated:** 2026-01-30
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -13,7 +13,7 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 ### Current Status: Phase F COMPLETE (Resource Governance)
 
 Zero-OS has completed SMP infrastructure and resource governance:
-- **88 security audits** with 415 issues found, 359 fixed (86.5%)
+- **88 security audits** with 426 issues found, 369 fixed (86.6%)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -58,6 +58,8 @@ Zero-OS has completed SMP infrastructure and resource governance:
     - Device isolation ✅ (bus master disable, PCI config serialization)
     - Device detach ✅ (atomic domain tracking, multi-segment support)
     - VM passthrough ✅ (create_vm_domain, assign/unassign_device_to_vm, R88 hardening)
+- **R91**: current_pid() IRQ deadlock ✅, CpuLocal stack overflow ✅, Profiler control race ✅ (ALL 3 FIXED)
+- **R90**: IOMMU fail-closed ✅, Net NS ingress ✅, pids.max CAS ✅, Migrate lock ✅ (ALL 4 FIXED)
 - **R88**: VM passthrough IR enable ✅, Unassign cleanup order ✅ (ALL 2 FIXED)
 - **R77**: TCP child socket quota ✅, Fork cpuset rollback ✅, delete_cgroup race ✅, Memory accounting CAS ✅, Namespace guard ✅ (ALL 5 FIXED)
 - **R75**: move_device permission check ✅, namespace FD refcount ✅, **IPC endpoint isolation ✅**, **Socket table isolation ✅** (ALL 4 FIXED)
@@ -831,14 +833,15 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 
 **Priority**: Medium
 **Dependencies**: All previous phases
-**Status**: G.1 partially complete (tracepoints, counters, watchdog implemented)
+**Status**: ✅ **G.1 COMPLETE** (tracepoints, counters, watchdog, profiler, kdump all implemented)
 
-#### G.1 Observability [IN PROGRESS]
+#### G.1 Observability ✅ **COMPLETE**
 
 - [x] Tracepoints/counters infrastructure ✅ (R89 - trace crate with per-CPU counters)
 - [x] Health monitoring (watchdog, hung-task) ✅ (R89 - 512-slot watchdog table)
-- [ ] Sampling profiler
-- [ ] kdump (encrypted, redacted)
+- [x] Sampling profiler ✅ (R91 - PC sampling with per-CPU ring buffers, seqlock publishing)
+- [x] Counter hot-path integration ✅ (all 15 TraceCounter variants wired to hot paths)
+- [x] kdump (encrypted, redacted) ✅ (R92 - ChaCha20 encryption, KptrGuard redaction, panic-safe)
 
 #### G.2 Live Patching
 
@@ -949,12 +952,15 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-28 | 87 | 2 | 2 | **Device Detach API** - Atomic domain tracking ✅, Multi-segment graceful degradation ✅ |
 | 2026-01-28 | 88 | 2 | 2 | **VM Passthrough** - IR enable verification ✅, Unassign cleanup order ✅ |
 | 2026-01-28 | 89 | 4 | 3 | **Observability (G.1)** - Watchdog race ✅, 64-bit generation ✅, transmute fix ✅, counter wrap (documented) |
-| **Total** | **89** | **419** | **362 (86.4%)** | **57 open (R65 SMP, R81-3/R84-4/R89-4 documented)** |
+| 2026-01-29 | 90 | 4 | 4 | **Cross-subsystem** - IOMMU fail-closed ✅, Net NS ingress ✅, pids.max CAS ✅, Migrate lock ✅ |
+| 2026-01-30 | 91 | 3 | 3 | **Profiler (G.1)** - current_pid() IRQ deadlock ✅, CpuLocal stack overflow ✅, profiler control race ✅ |
+| 2026-01-30 | 92 | 5 | 5 | **kdump (G.1)** - Multi-CPU race ✅, Stack page boundary ✅, ASCII hex redaction ✅, Key cleanup ✅, try_fill_random fallback ✅ |
+| **Total** | **92** | **434** | **377 (86.9%)** | **57 open (R65 SMP, R81-3/R84-4/R89-4 documented)** |
 
 ### Current Status
 
-- **Fixed**: 362 issues (86.4%)
-- **Open**: 57 issues (13.6%)
+- **Fixed**: 377 issues (86.9%)
+- **Open**: 57 issues (13.1%)
   - R65 remaining issues (SMP-related, non-blocking)
   - R81-3 (Direct map bound) documented risk
   - R84-4 (x2APIC mode) documented limitation
@@ -970,14 +976,15 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
   - F.1 Namespaces: ✅ **COMPLETE** - All 5 types: PID/Mount/IPC/Network/User with full isolation (R75-R78)
   - F.2 Cgroups v2: ✅ **COMPLETE** - PIDs/CPU/Memory/IO controllers + cgroup2 filesystem + R83 hierarchical PIDs
   - F.3 IOMMU/VT-d: ✅ **COMPLETE** - Core infrastructure ✅, Second-level page tables ✅, Context table ✅, VirtIO integration ✅, Interrupt Remapping ✅ (R84), Fault Handling ✅ (R85), Device Isolation ✅ (R86), Device Detach API ✅ (R87), **VM Passthrough ✅** (R88)
-- **Phase G Progress**: 🔄 **IN PROGRESS**
-  - G.1 Observability: 🔄 Tracepoints ✅, Per-CPU counters ✅, Watchdog ✅ (R89), profiler/kdump pending
+- **Phase G Progress**: **G.1 COMPLETE**
+  - G.1 Observability: ✅ **COMPLETE** - Tracepoints, Per-CPU counters, Watchdog (R89), Profiler (R91), Counter integration, kdump (R92)
 - **SMP Ready**: All Phase E components complete, 8-core SMP testing verified
-- **Container Foundation**: ✅ **COMPLETE** - All 5 namespace types + Cgroups v2 provide full container isolation
-- **Virtualization Foundation**: ✅ **COMPLETE** - IOMMU/VT-d with VM passthrough preparation
-- **R89 Key Fixes**: Watchdog race serialization, 64-bit generation counters, CHERI-safe fn pointer storage
+- **Container Foundation**: COMPLETE - All 5 namespace types + Cgroups v2 provide full container isolation
+- **Virtualization Foundation**: COMPLETE - IOMMU/VT-d with VM passthrough preparation
+- **R92 Key Fixes**: Multi-CPU race in kdump capture, stack page boundary check, ASCII hex pointer redaction, key material cleanup
+- **R91 Key Fixes**: current_pid() IRQ deadlock (CRITICAL), CpuLocal stack overflow, profiler control race
 
-See [qa-2026-01-28-v7.md](review/qa-2026-01-28-v7.md) for latest audit report.
+See [qa-2026-01-30.md](review/qa-2026-01-30.md) for latest audit report.
 
 ---
 

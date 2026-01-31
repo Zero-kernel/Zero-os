@@ -38,6 +38,8 @@ block = { path = "block" }
 net = { path = "net" }
 iommu = { path = "iommu" }
 trace = { path = "trace" }
+compliance = { path = "compliance" }
+livepatch = { path = "livepatch" }
 
 # 暂时移除 crossbeam-queue，或确保正确配置
 # crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }

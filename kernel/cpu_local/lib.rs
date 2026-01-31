@@ -17,6 +17,9 @@
 
 #![no_std]
 
+extern crate alloc;
+
+use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::null_mut;
@@ -373,11 +376,17 @@ impl PerCpuData {
 ///
 /// Stores one instance of T per CPU, lazily initialized on first access.
 /// Safe to use from interrupt context as long as T's operations are safe.
+///
+/// R91-2 FIX: Slots are heap-allocated via `Box<[MaybeUninit<T>]>` to avoid
+/// placing `[MaybeUninit<T>; MAX_CPUS]` on the stack during `call_once`.
+/// For large per-CPU types like `SampleRing` (~41KB), the previous stack-based
+/// approach would allocate ~2.6MB on the stack (64 * 41KB), causing a
+/// deterministic stack overflow on first access.
 pub struct CpuLocal<T> {
     /// Initialization function for each CPU's slot
     init: fn() -> T,
-    /// Array of per-CPU slots, initialized lazily
-    slots: Once<UnsafeCell<[MaybeUninit<T>; MAX_CPUS]>>,
+    /// Per-CPU slots, heap-allocated and initialized lazily via Once
+    slots: Once<UnsafeCell<Box<[MaybeUninit<T>]>>>,
 }
 
 // Safety: CpuLocal is Send+Sync because each CPU only accesses its own slot
@@ -395,13 +404,16 @@ impl<T> CpuLocal<T> {
         }
     }
 
-    /// Get or initialize the slots array
-    fn get_slots(&self) -> &UnsafeCell<[MaybeUninit<T>; MAX_CPUS]> {
+    /// Get or initialize the slots array.
+    ///
+    /// R91-2 FIX: Allocates on the heap instead of the stack to prevent
+    /// stack overflow for large per-CPU types (e.g., SampleRing ~41KB * 64 CPUs).
+    fn get_slots(&self) -> &UnsafeCell<Box<[MaybeUninit<T>]>> {
         self.slots.call_once(|| {
-            // Safety: We're initializing all slots before returning
-            let mut arr: [MaybeUninit<T>; MAX_CPUS] =
-                unsafe { MaybeUninit::uninit().assume_init() };
-            for slot in &mut arr {
+            // Heap-allocate the slot array. Box::new_uninit_slice creates the
+            // allocation directly on the heap without an intermediate stack copy.
+            let mut arr = Box::new_uninit_slice(MAX_CPUS);
+            for slot in arr.iter_mut() {
                 slot.write((self.init)());
             }
             UnsafeCell::new(arr)
@@ -468,7 +480,7 @@ impl<T> CpuLocal<T> {
     ///
     /// Unlike `with_cpu`, this returns the reference directly instead of via
     /// a closure. The returned reference is `'static` because the underlying
-    /// storage is in a static `Once<UnsafeCell<...>>`.
+    /// storage is owned by a static `Once` (and the heap allocation is never freed).
     ///
     /// # Safety
     ///
@@ -494,9 +506,10 @@ impl<T> CpuLocal<T> {
             match arr.get(cpu_id) {
                 Some(s) => {
                     let ref_with_lifetime = s.assume_init_ref();
-                    // Safety: The slots array is in a static Once<UnsafeCell<...>>,
-                    // so the data lives for 'static. The borrow checker can't see
-                    // this, so we transmute the lifetime.
+                    // Safety: The backing storage is owned by a static Once
+                    // (heap-allocated Box never freed), so the data lives for
+                    // 'static. The borrow checker can't see this, so we
+                    // transmute the lifetime.
                     Some(core::mem::transmute::<&T, &'static T>(ref_with_lifetime))
                 }
                 None => None,

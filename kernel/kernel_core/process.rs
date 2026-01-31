@@ -12,6 +12,7 @@ use alloc::{
 };
 use cap::CapTable;
 use core::any::Any;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lsm::ProcessCtx as LsmProcessCtx; // R25-7 FIX: Import LSM for task_exit hook
 use mm::memory::FrameAllocator;
 use mm::page_table;
@@ -1017,8 +1018,17 @@ lazy_static::lazy_static! {
 /// Each CPU tracks its own currently running process. This prevents race
 /// conditions where multiple CPUs could interfere with each other's
 /// current process state.
-static CURRENT_PID: cpu_local::CpuLocal<Mutex<Option<ProcessId>>> =
-    cpu_local::CpuLocal::new(|| Mutex::new(None));
+///
+/// R91-1 FIX: Uses AtomicUsize instead of Mutex<Option<ProcessId>> to eliminate
+/// IRQ deadlock. Timer ISR calls current_pid() from interrupt context while
+/// syscall path enables interrupts (sti) before dispatcher. If timer fires
+/// while syscall code holds the per-CPU Mutex, the ISR would deadlock trying
+/// to acquire the same non-reentrant spinlock on the same CPU.
+///
+/// Encoding: 0 = no current process, N > 0 = ProcessId N.
+/// PID 0 is never assigned (NEXT_PID starts at 1), so 0 is a safe sentinel.
+static CURRENT_PID: cpu_local::CpuLocal<AtomicUsize> =
+    cpu_local::CpuLocal::new(|| AtomicUsize::new(0));
 
 /// 下一个可用的PID
 static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
@@ -1332,8 +1342,12 @@ pub fn create_process_in_namespace(
 /// 获取当前进程ID
 ///
 /// R67-4 FIX: Reads from per-CPU storage to avoid cross-CPU races.
+///
+/// R91-1 FIX: Lock-free atomic load. Safe to call from any context including
+/// IRQ handlers (timer ISR profiler sampling) without deadlock risk.
 pub fn current_pid() -> Option<ProcessId> {
-    CURRENT_PID.with(|pid| *pid.lock())
+    let raw = CURRENT_PID.with(|pid| pid.load(Ordering::Relaxed));
+    if raw == 0 { None } else { Some(raw) }
 }
 
 /// R25-6 FIX: Get the size of a thread group (number of tasks sharing the same tgid).
@@ -1412,10 +1426,13 @@ pub fn non_thread_group_vm_share_count(memory_space: usize, caller_tgid: Process
 /// 设置当前进程ID
 ///
 /// R67-4 FIX: Writes to per-CPU storage to avoid cross-CPU races.
+///
+/// R91-1 FIX: Lock-free atomic store. Uses Relaxed ordering because this is
+/// per-CPU data only written by the owning CPU's scheduler and read by the
+/// same CPU's IRQ handler. No cross-CPU visibility is needed.
 pub fn set_current_pid(pid: Option<ProcessId>) {
-    CURRENT_PID.with(|current| {
-        *current.lock() = pid;
-    });
+    let raw = pid.unwrap_or(0);
+    CURRENT_PID.with(|current| current.store(raw, Ordering::Relaxed));
 }
 
 // ========== 进程凭证访问 (DAC支持) ==========

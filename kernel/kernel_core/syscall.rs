@@ -45,6 +45,10 @@ use security::rng;
 // G.1 Observability: Per-CPU counter integration
 use trace::counters::{increment_counter, TraceCounter};
 
+// G.3 Compliance: Hardening profiles and FIPS mode
+extern crate compliance;
+extern crate livepatch;
+
 /// 最大参数数量（防止恶意用户传递过多参数）
 const MAX_ARG_COUNT: usize = 256;
 
@@ -2084,6 +2088,17 @@ pub fn syscall_dispatcher(
         502 => sys_cgroup_attach(arg0 as u64),
         503 => sys_cgroup_set_limit(arg0 as u64, arg1 as u32, arg2),
         504 => sys_cgroup_get_stats(arg0 as u64, arg1 as *mut CgroupStatsBuf),
+
+        // G.3 Compliance syscalls (Zero-OS specific, 505-508)
+        505 => sys_compliance_status(arg0 as *mut ComplianceStatusBuf),
+        506 => sys_fips_enable(),
+        507 => sys_compliance_query_algo(arg0 as u32),
+        508 => sys_audit_export(arg0 as *mut u8, arg1 as usize, arg2 as *mut usize),
+
+        // G.2 Live Patching syscalls (Zero-OS specific, 509-511)
+        509 => sys_kpatch_load(arg0 as usize, arg1 as usize),
+        510 => sys_kpatch_enable(arg0 as u64),
+        511 => sys_kpatch_disable(arg0 as u64),
 
         _ => Err(SyscallError::ENOSYS),
     };
@@ -8390,6 +8405,354 @@ fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usiz
     }
 
     Ok(0)
+}
+
+// ============================================================================
+// G.3 Compliance Syscalls
+// ============================================================================
+
+/// Buffer for returning compliance status to userspace.
+///
+/// Must match the layout expected by userspace compliance tools.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ComplianceStatusBuf {
+    /// Hardening profile: 0=Secure, 1=Balanced, 2=Performance
+    pub profile: u8,
+    /// Whether the profile is locked (cannot be changed until reboot)
+    pub profile_locked: u8,
+    /// FIPS state: 0=Disabled, 1=Enabled, 2=Failed
+    pub fips_state: u8,
+    /// Padding for alignment
+    _padding: [u8; 5],
+}
+
+/// sys_compliance_status - Get current compliance status
+///
+/// # Arguments
+/// * `buf` - Pointer to ComplianceStatusBuf in userspace
+///
+/// # Returns
+/// * On success: 0
+/// * On error: Negative errno (EFAULT if pointer invalid)
+fn sys_compliance_status(buf: *mut ComplianceStatusBuf) -> Result<usize, SyscallError> {
+    use crate::usercopy::{copy_to_user_safe, UserAccessGuard};
+
+    // Validate user pointer
+    if buf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let buf_addr = buf as usize;
+    if buf_addr < crate::usercopy::MMAP_MIN_ADDR || buf_addr >= USER_SPACE_TOP {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // Get compliance status from the compliance module
+    let status = compliance::status();
+
+    let result = ComplianceStatusBuf {
+        profile: status.profile as u8,
+        profile_locked: if status.profile_locked { 1 } else { 0 },
+        fips_state: status.fips_state as u8,
+        _padding: [0; 5],
+    };
+
+    // Copy to userspace with SMAP protection
+    unsafe {
+        let _guard = UserAccessGuard::new();
+        let result_bytes: [u8; core::mem::size_of::<ComplianceStatusBuf>()] =
+            core::mem::transmute(result);
+        if copy_to_user_safe(buf as *mut u8, &result_bytes).is_err() {
+            return Err(SyscallError::EFAULT);
+        }
+    }
+
+    Ok(0)
+}
+
+/// sys_fips_enable - Enable FIPS mode (sticky until reboot)
+///
+/// Requires CAP_SYS_ADMIN capability. Once enabled, FIPS mode cannot be
+/// disabled until the next reboot.
+///
+/// # Returns
+/// * On success: 0
+/// * On error: Negative errno
+///   - EPERM: Not privileged (requires CAP_SYS_ADMIN)
+///   - EALREADY: FIPS mode already enabled
+///   - EIO: FIPS self-test failed
+fn sys_fips_enable() -> Result<usize, SyscallError> {
+    // Check privilege: require root or CAP_ADMIN capability
+    let creds = crate::current_credentials().ok_or(SyscallError::ESRCH)?;
+    if creds.euid != 0 {
+        // Check for CAP_ADMIN capability (system administration rights)
+        let has_cap = with_current_cap_table(|table| table.has_rights(cap::CapRights::ADMIN));
+        if has_cap != Some(true) {
+            return Err(SyscallError::EPERM);
+        }
+    }
+
+    // Attempt to enable FIPS mode
+    match compliance::enable_fips_mode() {
+        Ok(()) => Ok(0),
+        Err(compliance::FipsError::AlreadyEnabled) => Err(SyscallError::EALREADY),
+        Err(compliance::FipsError::EnableFailed) => Err(SyscallError::EIO), // R93-1 FIX
+        Err(compliance::FipsError::SelfTestFailed) => Err(SyscallError::EIO),
+        Err(_) => Err(SyscallError::EPERM),
+    }
+}
+
+/// sys_compliance_query_algo - Check if a cryptographic algorithm is permitted
+///
+/// # Arguments
+/// * `algo_id` - Algorithm identifier (matches compliance::CryptoAlgorithm repr)
+///
+/// # Returns
+/// * 1: Algorithm is permitted under current policy
+/// * 0: Algorithm is not permitted (blocked by FIPS)
+/// * Negative errno on error
+fn sys_compliance_query_algo(algo_id: u32) -> Result<usize, SyscallError> {
+    // Convert algo_id to CryptoAlgorithm
+    let algo = match algo_id {
+        0 => compliance::CryptoAlgorithm::Sha256,
+        1 => compliance::CryptoAlgorithm::Sha384,
+        2 => compliance::CryptoAlgorithm::Sha512,
+        3 => compliance::CryptoAlgorithm::Blake2b,
+        4 => compliance::CryptoAlgorithm::HmacSha256,
+        5 => compliance::CryptoAlgorithm::EcdsaP256,
+        6 => compliance::CryptoAlgorithm::EcdsaP384,
+        7 => compliance::CryptoAlgorithm::Ed25519,
+        8 => compliance::CryptoAlgorithm::Aes128Gcm,
+        9 => compliance::CryptoAlgorithm::Aes256Gcm,
+        10 => compliance::CryptoAlgorithm::ChaCha20,
+        11 => compliance::CryptoAlgorithm::ChaCha20Poly1305,
+        _ => return Err(SyscallError::EINVAL),
+    };
+
+    if compliance::is_algorithm_permitted(algo) {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
+}
+
+/// sys_audit_export - Export audit events to userspace buffer
+///
+/// Requires CAP_AUDIT_READ capability or root privilege.
+///
+/// # Arguments
+/// * `buf` - Pointer to buffer in userspace
+/// * `buf_len` - Size of the buffer in bytes
+/// * `out_len` - Pointer to store actual bytes written
+///
+/// # Returns
+/// * On success: 0
+/// * On error: Negative errno
+///   - EPERM: Not privileged
+///   - EFAULT: Invalid pointer
+///   - ENOSPC: Buffer too small (out_len will contain required size)
+fn sys_audit_export(buf: *mut u8, buf_len: usize, out_len: *mut usize) -> Result<usize, SyscallError> {
+    use crate::usercopy::{copy_to_user_safe, UserAccessGuard};
+
+    // Check privilege: require root or CAP_AUDIT_READ
+    let creds = crate::current_credentials().ok_or(SyscallError::ESRCH)?;
+    let caller_is_root = creds.euid == 0; // R93-2 FIX: Track root status for arg redaction
+    if !caller_is_root {
+        let has_cap = with_current_cap_table(|table| table.has_rights(cap::CapRights::AUDIT_READ));
+        if has_cap != Some(true) {
+            return Err(SyscallError::EPERM);
+        }
+    }
+
+    // Validate user pointers
+    if buf.is_null() || out_len.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let buf_addr = buf as usize;
+    let out_len_addr = out_len as usize;
+    if buf_addr < crate::usercopy::MMAP_MIN_ADDR || buf_addr >= USER_SPACE_TOP {
+        return Err(SyscallError::EFAULT);
+    }
+    if out_len_addr < crate::usercopy::MMAP_MIN_ADDR || out_len_addr >= USER_SPACE_TOP {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // Get audit snapshot
+    let snapshot = match audit::snapshot() {
+        Ok(s) => s,
+        Err(_) => return Err(SyscallError::EPERM),
+    };
+
+    // Serialize snapshot to JSON-like format
+    // For MVP, use a simple binary format: [event_count: u32][events...]
+    let events = &snapshot.events;
+    let event_count = events.len();
+
+    // Calculate required size: 4 bytes header + event_count * sizeof(audit event)
+    // Each serialized event: kind(1) + outcome(1) + subject_uid(4) + subject_pid(4) +
+    //                        object_type(1) + errno(4) + timestamp(8) + args[4](32) = 55 bytes
+    const EVENT_SIZE: usize = 55;
+    let required_size: usize = 4 + event_count * EVENT_SIZE;
+
+    // Write required size to out_len
+    {
+        let _guard = UserAccessGuard::new();
+        let size_bytes = (required_size as u64).to_le_bytes();
+        if copy_to_user_safe(out_len as *mut u8, &size_bytes[..core::mem::size_of::<usize>()]).is_err() {
+            return Err(SyscallError::EFAULT);
+        }
+    }
+
+    // Check if buffer is large enough
+    if buf_len < required_size {
+        return Err(SyscallError::ENOSPC);
+    }
+
+    // Serialize events to buffer
+    let mut offset = 0;
+    let mut temp_buf = vec![0u8; required_size];
+
+    // Write event count header
+    let count_bytes = (event_count as u32).to_le_bytes();
+    temp_buf[offset..offset + 4].copy_from_slice(&count_bytes);
+    offset += 4;
+
+    // Write each event
+    for event in events {
+        temp_buf[offset] = event.kind as u8;
+        offset += 1;
+        temp_buf[offset] = event.outcome as u8;
+        offset += 1;
+        temp_buf[offset..offset + 4].copy_from_slice(&event.subject.uid.to_le_bytes());
+        offset += 4;
+        temp_buf[offset..offset + 4].copy_from_slice(&event.subject.pid.to_le_bytes());
+        offset += 4;
+        // Serialize AuditObject to a simple discriminant byte
+        let object_type: u8 = match event.object {
+            audit::AuditObject::None => 0,
+            audit::AuditObject::Path { .. } => 1,
+            audit::AuditObject::Endpoint { .. } => 2,
+            audit::AuditObject::Process { .. } => 3,
+            audit::AuditObject::Socket { .. } => 4,
+            audit::AuditObject::Memory { .. } => 5,
+            audit::AuditObject::Capability { .. } => 6,
+            audit::AuditObject::Namespace { .. } => 7,
+        };
+        temp_buf[offset] = object_type;
+        offset += 1;
+        temp_buf[offset..offset + 4].copy_from_slice(&event.errno.to_le_bytes());
+        offset += 4;
+        temp_buf[offset..offset + 8].copy_from_slice(&event.timestamp.to_le_bytes());
+        offset += 8;
+        // R93-2 FIX: Write first 4 args (32 bytes total). For non-root callers, redact syscall
+        // arguments to avoid cross-process ASLR/user-pointer leakage.
+        let redact_syscall_args =
+            !caller_is_root && matches!(event.kind, audit::AuditKind::Syscall);
+        for i in 0..4 {
+            let arg = if redact_syscall_args {
+                // Keep only syscall number (arg 0), redact pointers in args 1-3
+                if i == 0 { event.args[0] } else { 0 }
+            } else {
+                event.args[i]
+            };
+            temp_buf[offset..offset + 8].copy_from_slice(&arg.to_le_bytes());
+            offset += 8;
+        }
+    }
+
+    // Copy to userspace
+    {
+        let _guard = UserAccessGuard::new();
+        if copy_to_user_safe(buf, &temp_buf).is_err() {
+            return Err(SyscallError::EFAULT);
+        }
+    }
+
+    Ok(0)
+}
+
+// ============================================================================
+// G.2 Live Patching syscalls (509-511)
+// ============================================================================
+
+/// sys_kpatch_load (509): Load a patch image from userspace.
+///
+/// Arguments:
+/// - user_ptr: Pointer to patch image buffer in userspace
+/// - len: Length of patch image in bytes
+///
+/// Returns:
+/// - Positive patch_id on success (as usize)
+/// - Negative errno on failure (EPERM, EFAULT, E2BIG, EINVAL, EACCES, etc.)
+fn sys_kpatch_load(user_ptr: usize, len: usize) -> Result<usize, SyscallError> {
+    // Delegate to livepatch crate which handles privilege check via KernelOps
+    let result = livepatch::sys_kpatch_load(user_ptr, len);
+    if result < 0 {
+        // Convert livepatch errno to SyscallError
+        match result {
+            -1 => Err(SyscallError::EPERM),
+            -2 => Err(SyscallError::ENOENT),
+            -7 => Err(SyscallError::E2BIG),
+            -12 => Err(SyscallError::ENOMEM),
+            -13 => Err(SyscallError::EACCES),
+            -14 => Err(SyscallError::EFAULT),
+            -16 => Err(SyscallError::EBUSY),
+            -17 => Err(SyscallError::EEXIST),
+            -22 => Err(SyscallError::EINVAL),
+            -38 => Err(SyscallError::ENOSYS),
+            _ => Err(SyscallError::EINVAL),
+        }
+    } else {
+        Ok(result as usize)
+    }
+}
+
+/// sys_kpatch_enable (510): Enable a previously loaded patch.
+///
+/// Arguments:
+/// - patch_id: Patch identifier returned by sys_kpatch_load
+///
+/// Returns:
+/// - 0 on success
+/// - Negative errno on failure
+fn sys_kpatch_enable(patch_id: u64) -> Result<usize, SyscallError> {
+    let result = livepatch::sys_kpatch_enable(patch_id);
+    if result < 0 {
+        match result {
+            -1 => Err(SyscallError::EPERM),
+            -2 => Err(SyscallError::ENOENT),
+            -16 => Err(SyscallError::EBUSY),
+            -22 => Err(SyscallError::EINVAL),
+            -38 => Err(SyscallError::ENOSYS),
+            _ => Err(SyscallError::EINVAL),
+        }
+    } else {
+        Ok(0)
+    }
+}
+
+/// sys_kpatch_disable (511): Disable (rollback) a previously enabled patch.
+///
+/// Arguments:
+/// - patch_id: Patch identifier returned by sys_kpatch_load
+///
+/// Returns:
+/// - 0 on success
+/// - Negative errno on failure
+fn sys_kpatch_disable(patch_id: u64) -> Result<usize, SyscallError> {
+    let result = livepatch::sys_kpatch_disable(patch_id);
+    if result < 0 {
+        match result {
+            -1 => Err(SyscallError::EPERM),
+            -2 => Err(SyscallError::ENOENT),
+            -16 => Err(SyscallError::EBUSY),
+            -22 => Err(SyscallError::EINVAL),
+            -38 => Err(SyscallError::ENOSYS),
+            _ => Err(SyscallError::EINVAL),
+        }
+    } else {
+        Ok(0)
+    }
 }
 
 /// 系统调用统计

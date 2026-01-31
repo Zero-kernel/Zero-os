@@ -22,10 +22,27 @@ extern crate vfs;
 #[macro_use]
 extern crate audit;
 extern crate trace;
+extern crate compliance;
 
 // A.3 Audit capability gate imports
 use cap::CapRights;
 use kernel_core::process::{current_credentials, with_current_cap_table};
+// G.1 Observability: Counter integration for allocation failures
+use trace::counters::{increment_counter, TraceCounter};
+
+/// G.1: Guard flag to prevent recursive allocation in alloc_error_handler.
+///
+/// `increment_counter()` uses `CpuLocal` which lazy-initializes via heap
+/// allocation (`Box::new_uninit_slice`). If the very first allocation fails
+/// before counters are initialized, calling `increment_counter` from
+/// `alloc_error_handler` would re-enter the allocator, causing infinite
+/// recursion or `spin::Once` deadlock.
+///
+/// This flag is set to `true` after the first successful counter increment
+/// (which happens during early boot via timer ISR). The alloc_error_handler
+/// only increments the counter when this flag is `true`.
+static COUNTERS_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 // 演示模块
 mod demo;
@@ -231,36 +248,26 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     }
 
     // 安全加固（Phase 0: W^X, NX, Identity Map Cleanup, CSPRNG, kptr guard, Spectre）
+    // G.3 Compliance: Use HardeningProfile to configure security settings
     println!("[2.6/3] Applying security hardening...");
     {
         let mut frame_allocator = mm::memory::FrameAllocator::new();
-        // Phase 0 安全加固配置
-        //
-        // 已启用的安全功能：
-        // - W^X 验证：检测违规（非阻止模式）
-        // - kptr guard：内核指针混淆
-        // - CSPRNG：ChaCha20 + RDRAND/RDSEED
-        // - Spectre/Meltdown 缓解
-        //
-        // Phase 0 安全加固配置
-        //
-        // 递归页表访问已实现（PML4[510]），允许访问任意物理地址的页表帧
-        // - Identity map cleanup: RemoveWritable（将 identity map 设为只读+NX）
-        // - NX enforcement: 需要 4KB 页粒度，bootloader 使用 2MB huge pages
-        //
-        // Phase 0 安全加固：强制 NX + 严格 W^X，违规即 fail-fast
-        // 这是生产环境推荐配置，确保内存保护真正生效
-        let sec_config = security::SecurityConfig {
-            phys_offset: mm::page_table::get_physical_memory_offset(),
-            cleanup_strategy: security::IdentityCleanupStrategy::RemoveWritable,
-            enforce_nx: true,     // 启用 NX 强制执行
-            validate_wxorx: true, // 验证 W^X 策略
-            initialize_rng: true,
-            strict_wxorx: true,               // 严格模式：发现 RWX 即报错
-            enable_kptr_guard: true,          // 启用内核指针混淆
-            enable_spectre_mitigations: true, // 启用 Spectre/Meltdown 缓解
-            run_security_tests: false,        // 安全自测（可选开启）
-        };
+
+        // G.3: Select hardening profile (default: Balanced for development)
+        // In production, this would be set via boot command line: "profile=secure"
+        // For now, use Balanced as default with full security features enabled
+        let profile = compliance::HardeningProfile::Balanced;
+        compliance::set_profile(profile);
+
+        // Generate SecurityConfig from the selected profile
+        let phys_offset = mm::page_table::get_physical_memory_offset();
+        let sec_config = profile.security_config(phys_offset);
+
+        println!(
+            "      Profile: {} (audit_capacity: {})",
+            profile.name(),
+            profile.audit_capacity()
+        );
 
         match security::init(sec_config, &mut frame_allocator) {
             Ok(report) => {
@@ -288,6 +295,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 if let Some(spectre) = &report.spectre_status {
                     println!("        - Spectre mitigations: {}", spectre.summary());
                 }
+
+                // G.3: Lock profile after security initialization
+                compliance::lock_profile();
+                println!("        - Profile locked (immutable until reboot)");
             }
             Err(e) => {
                 println!("      ! Security hardening failed: {:?}", e);
@@ -649,6 +660,11 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // Phase G.1: Observability subsystem (tracepoints, counters, watchdog)
     println!("[7.7/8] Initializing observability subsystem...");
     trace::init();
+    // G.1: Force-initialize per-CPU counter storage and mark counters as ready.
+    // This ensures the CpuLocal<PerCpuCounters> lazy init happens during boot
+    // (when heap is available), not in alloc_error_handler where it could recurse.
+    increment_counter(TraceCounter::Custom0, 0); // no-op increment to trigger init
+    COUNTERS_READY.store(true, core::sync::atomic::Ordering::Release);
     // Install read guard for metrics export (CAP_TRACE_READ or root)
     let _ = trace::install_read_guard(|| {
         // Allow during early kernel boot when no process exists
@@ -751,6 +767,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
+    // G.1: Track allocation failures for observability.
+    // Only attempt if counters are initialized (avoids recursive allocation).
+    if COUNTERS_READY.load(core::sync::atomic::Ordering::Relaxed) {
+        increment_counter(TraceCounter::AllocFailures, 1);
+    }
+
     // Print heap statistics before panicking
     unsafe {
         serial_write_str("ALLOC FAILED: size=");
@@ -780,6 +802,11 @@ fn panic(info: &PanicInfo) -> ! {
     unsafe {
         // 立即禁用中断，防止 panic 期间中断重入
         core::arch::asm!("cli", options(nomem, nostack));
+
+        // G.1 kdump: Capture crash context immediately after cli.
+        // This captures CPU registers, stack, and panic info before any
+        // further state changes. Safe to call multiple times (atomic guard).
+        let crash_dump = trace::kdump::capture_crash_context(info);
 
         serial_write_str("KERNEL PANIC: ");
         if let Some(location) = info.location() {
@@ -819,6 +846,16 @@ fn panic(info: &PanicInfo) -> ! {
             }
         }
         let _ = core::fmt::write(&mut SerialFmt, format_args!("{}\n", info));
+
+        // G.1 kdump: Emit encrypted crash dump over serial.
+        // The dump includes:
+        // - CPU registers (pointer-redacted via KptrGuard)
+        // - Stack contents (pointer-redacted)
+        // - Panic location and message
+        // - ChaCha20 encryption with random nonce
+        // - Base64 encoding for serial transport
+        // Only emits once per boot (atomic guard prevents duplicate dumps).
+        trace::kdump::emit_encrypted_dump(crash_dump);
     }
     loop {
         unsafe {

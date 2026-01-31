@@ -18,6 +18,8 @@ use spin::Mutex;
 
 use crate::process::{self, ProcessId};
 use kernel_core::{current_ipc_ns_id, NamespaceId};
+// G.1 Observability: Per-CPU counter integration for IPC message tracking
+use trace::counters::{increment_counter, TraceCounter};
 
 /// 端点标识符类型
 pub type EndpointId = u64;
@@ -316,7 +318,10 @@ pub fn send_message(endpoint_id: EndpointId, data: Vec<u8>) -> Result<(), IpcErr
         return Err(IpcError::AccessDenied);
     }
 
-    endpoint.push_message(Message { sender, data })
+    endpoint.push_message(Message { sender, data })?;
+    // G.1: Track successful IPC message sends
+    increment_counter(TraceCounter::IpcMessages, 1);
+    Ok(())
 }
 
 /// 接收消息
@@ -354,10 +359,15 @@ pub fn receive_message(endpoint_id: EndpointId) -> Result<Option<ReceivedMessage
         return Err(IpcError::AccessDenied);
     }
 
-    Ok(endpoint.queue.pop_front().map(|msg| ReceivedMessage {
+    let result = endpoint.queue.pop_front().map(|msg| ReceivedMessage {
         sender: msg.sender,
         data: msg.data,
-    }))
+    });
+    // G.1: Track successful IPC message receives
+    if result.is_some() {
+        increment_counter(TraceCounter::IpcMessages, 1);
+    }
+    Ok(result)
 }
 
 /// 授权进程发送权限

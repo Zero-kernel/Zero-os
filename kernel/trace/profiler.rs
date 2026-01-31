@@ -285,6 +285,17 @@ unsafe impl Sync for SampleRing {}
 /// When false, [`record_pc_sample`] returns immediately without recording.
 static PROFILER_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// R91-3 FIX: Mutex serializing profiler control-plane operations.
+///
+/// Prevents races between concurrent `start_profiler`, `stop_profiler`, and
+/// `snapshot_profiler` calls. Without this, `snapshot_profiler`'s
+/// `swap(false)` / restore-if-was-enabled pattern can clobber a concurrent
+/// `stop_profiler`: stop stores `false`, snapshot restores `true`.
+///
+/// The data-plane hot path (`record_pc_sample`) does NOT acquire this lock;
+/// it only reads `PROFILER_ENABLED` with a relaxed atomic load.
+static PROFILER_CONTROL_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 /// Per-CPU ring buffers for samples.
 static PROFILER_RINGS: CpuLocal<SampleRing> = CpuLocal::new(SampleRing::new);
 
@@ -342,6 +353,9 @@ pub fn profiler_enabled() -> bool {
 pub fn start_profiler() -> Result<(), TraceError> {
     ensure_metrics_read_allowed()?;
 
+    // R91-3 FIX: Serialize control-plane operations
+    let _guard = PROFILER_CONTROL_LOCK.lock();
+
     // Clear all per-CPU ring buffers before starting
     let max = cpu_local::max_cpus();
     for cpu in 0..max {
@@ -364,6 +378,10 @@ pub fn start_profiler() -> Result<(), TraceError> {
 /// Returns [`TraceError::AccessDenied`] if the read guard denies access.
 pub fn stop_profiler() -> Result<(), TraceError> {
     ensure_metrics_read_allowed()?;
+
+    // R91-3 FIX: Serialize control-plane operations
+    let _guard = PROFILER_CONTROL_LOCK.lock();
+
     PROFILER_ENABLED.store(false, Ordering::Release);
     Ok(())
 }
@@ -381,8 +399,18 @@ pub fn stop_profiler() -> Result<(), TraceError> {
 /// # Errors
 ///
 /// Returns [`TraceError::AccessDenied`] if the read guard denies access.
+///
+/// # R91-3 FIX
+///
+/// The control lock prevents a concurrent `stop_profiler` from being
+/// clobbered by the restore-if-was-enabled logic.
 pub fn snapshot_profiler() -> Result<ProfilerSnapshot, TraceError> {
     ensure_metrics_read_allowed()?;
+
+    // R91-3 FIX: Serialize control-plane operations.
+    // Lock held for the entire swap-drain-restore sequence to prevent
+    // concurrent start/stop from interfering.
+    let _guard = PROFILER_CONTROL_LOCK.lock();
 
     // Temporarily disable to avoid concurrent writes during drain
     let was_enabled = PROFILER_ENABLED.swap(false, Ordering::AcqRel);

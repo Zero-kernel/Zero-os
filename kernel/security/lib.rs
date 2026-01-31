@@ -54,7 +54,7 @@ pub use kptr::KptrGuard;
 pub use memory_hardening::{
     CleanupOutcome, HardeningError, IdentityCleanupStrategy, NxEnforcementSummary,
 };
-pub use rng::{fill_random, random_u32, random_u64, rdrand64_early, rdrand_available, RngError};
+pub use rng::{fill_random, random_u32, random_u64, rdrand64_early, rdrand_available, try_fill_random, ChaCha20Rng, RngError};
 pub use spectre::{MitigationStatus, SpectreError, VulnerabilityInfo};
 pub use tests::{run_security_tests, SecurityTest, TestContext, TestReport, TestResult};
 pub use wxorx::{PageLevel, ValidationSummary, Violation, WxorxError};

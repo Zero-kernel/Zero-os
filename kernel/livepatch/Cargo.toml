@@ -1,0 +1,18 @@
+[package]
+name = "livepatch"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-OS G.2 live patching: INT3 detour + signature verification"
+
+[lib]
+path = "lib.rs"
+
+[features]
+default = []
+# SECURITY: Development-only. Enables an insecure, non-cryptographic signature check.
+# Never ship this feature enabled in production.
+insecure-ecdsa-stub = []
+
+[dependencies]
+spin = "0.9"
+x86_64 = "0.15"

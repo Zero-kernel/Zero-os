@@ -80,6 +80,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 pub mod counters;
+pub mod kdump;
 pub mod profiler;
 pub mod watchdog;
 

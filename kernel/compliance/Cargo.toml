@@ -1,0 +1,14 @@
+[package]
+name = "compliance"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-OS kernel hardening profiles and FIPS mode compliance"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+spin = "0.9"
+x86_64 = "0.15"
+security = { path = "../security" }
+audit = { path = "../audit" }

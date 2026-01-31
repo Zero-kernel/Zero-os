@@ -142,6 +142,48 @@ pub fn fill_random(out: &mut [u8]) -> Result<(), RngError> {
     Ok(())
 }
 
+/// Try to fill buffer with random bytes from the global CSPRNG without blocking.
+///
+/// This is intended for contexts where spinning on the RNG mutex could deadlock
+/// (e.g., panic paths with interrupts disabled). If the CSPRNG is available, it
+/// is used. Otherwise, falls back to direct hardware entropy (RDSEED/RDRAND)
+/// without taking any locks.
+///
+/// # G.1 kdump
+///
+/// Used by the crash dump subsystem to generate encryption keys/nonces in
+/// panic context where the main RNG lock may already be held.
+///
+/// # R92-5 FIX
+///
+/// Instead of returning `Err(NotInitialized)` when the lock is contended,
+/// we now fall back to direct hardware entropy. This ensures kdump can
+/// always get entropy for encryption, avoiding plaintext dumps.
+pub fn try_fill_random(out: &mut [u8]) -> Result<(), RngError> {
+    // First, try the CSPRNG if it's available without blocking.
+    if let Some(mut guard) = GLOBAL_RNG.try_lock() {
+        if let Some(rng) = guard.as_mut() {
+            // Check if we need to reseed
+            if rng.bytes_generated > RESEED_INTERVAL {
+                // Attempt to reseed (best-effort in panic context)
+                let mut seed = [0u8; 32];
+                if fill_entropy(&mut seed).is_ok() {
+                    rng.mix_in(&seed);
+                    rng.bytes_generated = 0;
+                    explicit_bzero(&mut seed);
+                }
+            }
+
+            rng.fill_bytes(out);
+            return Ok(());
+        }
+    }
+
+    // R92-5 FIX: Fall back to direct hardware entropy (no locks, panic-safe).
+    // This ensures kdump can always encrypt its output even when CSPRNG is unavailable.
+    fill_entropy(out)
+}
+
 /// Get a random 64-bit unsigned integer
 pub fn random_u64() -> Result<u64, RngError> {
     let mut buf = [0u8; 8];

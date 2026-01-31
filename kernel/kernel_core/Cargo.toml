@@ -22,3 +22,5 @@ lsm = { path = "../lsm", features = ["lsm"] }
 security = { path = "../security" }
 net = { path = "../net" }
 trace = { path = "../trace" }
+compliance = { path = "../compliance" }
+livepatch = { path = "../livepatch" }
