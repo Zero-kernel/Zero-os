@@ -1001,8 +1001,17 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
 
         // 复制内核高半区映射（索引 256-511）
         // 这些映射在所有进程间共享
+        // R94-5 FIX: Explicitly clear USER_ACCESSIBLE on kernel high-half entries.
+        // Defense-in-depth: even if parent entries are corrupted with U/S bit,
+        // child address space must not inherit user-accessibility to kernel space.
         for i in 256..512 {
             new_pml4[i] = current_pml4[i].clone();
+            if !new_pml4[i].is_unused() {
+                let addr = new_pml4[i].addr();
+                let mut flags = new_pml4[i].flags();
+                flags.remove(PageTableFlags::USER_ACCESSIBLE);
+                new_pml4[i].set_addr(addr, flags);
+            }
         }
 
         // 【关键修复】设置新页表的递归映射
@@ -1063,12 +1072,19 @@ unsafe fn deep_copy_identity_for_user(
     // Other PDPT entries (1-511) are identity map for physical memory beyond 1GB.
     // Setting USER_ACCESSIBLE on those would expose kernel memory and break SMAP.
     // We copy them as supervisor-only to maintain isolation.
+    // R94-5 FIX: Explicitly clear USER_ACCESSIBLE on all non-PDPT_IDX entries.
+    // Defense-in-depth: prevent propagation even if parent has corrupted flags.
     let current_pdpt = phys_to_virt_table(current_pml4_0.addr());
     let new_pdpt = phys_to_virt_table(new_pdpt_frame.start_address());
     for i in 0..512 {
-        // Copy entries as-is (supervisor-only); USER_ACCESSIBLE is set only
-        // on PDPT[0] below after we process it specially for user space.
         new_pdpt[i] = current_pdpt[i].clone();
+        // R94-5 FIX: Explicitly clear USER_ACCESSIBLE except for PDPT_IDX
+        if i != PDPT_IDX && !new_pdpt[i].is_unused() {
+            let addr = new_pdpt[i].addr();
+            let mut flags = new_pdpt[i].flags();
+            flags.remove(PageTableFlags::USER_ACCESSIBLE);
+            new_pdpt[i].set_addr(addr, flags);
+        }
     }
 
     // 更新新 PML4[0] 指向新 PDPT
@@ -1102,10 +1118,19 @@ unsafe fn deep_copy_identity_for_user(
     // 1. Break SMAP - kernel can't access "user" pages without STAC
     // 2. Expose kernel memory to user space
     // We copy them as supervisor-only; USER_ACCESSIBLE is set on PD[2] below.
+    // R94-5 FIX: Explicitly clear USER_ACCESSIBLE on all non-PD_IDX entries.
+    // Defense-in-depth: prevent propagation even if parent has corrupted flags.
     let current_pd = phys_to_virt_table(current_pdpt_0.addr());
     let new_pd = phys_to_virt_table(new_pd_frame.start_address());
     for i in 0..512 {
         new_pd[i] = current_pd[i].clone();
+        // R94-5 FIX: Explicitly clear USER_ACCESSIBLE except for PD_IDX
+        if i != PD_IDX && !new_pd[i].is_unused() {
+            let addr = new_pd[i].addr();
+            let mut flags = new_pd[i].flags();
+            flags.remove(PageTableFlags::USER_ACCESSIBLE);
+            new_pd[i].set_addr(addr, flags);
+        }
     }
 
     // 更新新 PDPT[0] 指向新 PD
@@ -1141,12 +1166,27 @@ unsafe fn deep_copy_identity_for_user(
         pd_flags.insert(PageTableFlags::USER_ACCESSIBLE);
         new_pd[PD_IDX].set_addr(new_pt_frame.start_address(), pd_flags);
     } else {
-        // PD[2] 已经是 4KB PT，确保有 USER_ACCESSIBLE 且无 NO_EXECUTE
-        let pd_addr = current_pd_entry.addr();
+        // R94-5 FIX: Always allocate a fresh empty PT for the user base region.
+        //
+        // Even if the boot mapping already uses a 4KB PT at PD[2], reusing it risks
+        // sharing page-table pages with the kernel identity map (cross-process corruption
+        // and potential USER_ACCESSIBLE flag escalation).
+        //
+        // Previous code: reused pd_addr from current_pd_entry, which shared the PT
+        // page with the kernel. Now we allocate a fresh empty PT instead.
+        //
+        // Leave the PT empty: ELF loader will populate user mappings.
+        let new_pt_frame = frame_alloc
+            .allocate_frame()
+            .ok_or(ForkError::MemoryAllocationFailed)?;
+        zero_table(new_pt_frame); // PT 保持为空，不填充 identity mapping
+
+        // 【关键修复】添加 USER_ACCESSIBLE，移除 NO_EXECUTE 以允许用户代码执行
+        // NX 位会被 ELF loader 在 PT 级别按需设置
         let mut pd_flags = current_pd_entry.flags();
         pd_flags.remove(PageTableFlags::NO_EXECUTE); // 允许子页按需设置执行权限
         pd_flags.insert(PageTableFlags::USER_ACCESSIBLE);
-        new_pd[PD_IDX].set_addr(pd_addr, pd_flags);
+        new_pd[PD_IDX].set_addr(new_pt_frame.start_address(), pd_flags);
     }
 
     Ok(())

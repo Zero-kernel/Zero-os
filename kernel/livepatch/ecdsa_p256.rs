@@ -25,7 +25,6 @@
 //! - NIST CAVP ECDSA test vectors (186-4ecdsatestvectors.zip)
 //! - RFC 6979 (Deterministic ECDSA - for test vector generation)
 
-use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 // Low-level ECDSA verification API (no sha2 dependency).
@@ -112,51 +111,87 @@ fn ct_is_all_zero(bytes: &[u8]) -> bool {
 /// This function is idempotent and thread-safe. On first call, it runs the KAT.
 /// Subsequent calls observe the cached result. Returns `true` if KAT passed.
 ///
+/// # R94-1 FIX: Deadlock-Free KAT Execution
+///
+/// Previous implementation used `spin_loop()` to wait for a concurrent KAT runner.
+/// On single-core CPUs or with strict priority scheduling, this caused permanent
+/// deadlock: the waiting thread would starve the runner thread, preventing KAT
+/// completion and blocking all livepatch verification indefinitely.
+///
+/// New design: each caller independently runs the KAT and attempts to publish the
+/// result. This is safe because:
+/// - `run_kat()` is a pure computation over constant test vectors (idempotent, no side effects)
+/// - `Fail` is sticky: once any caller observes a KAT failure, it is permanent
+/// - `Pass` is only published if no concurrent caller has already set `Fail`
+/// - No thread ever blocks waiting for another thread
+///
 /// # Behavior
 ///
-/// - If KAT is `Uninit`, the calling thread attempts to take ownership and run the test.
-/// - If KAT is `Running`, the caller spins until the test completes.
 /// - If KAT is `Pass`, returns `true` immediately.
 /// - If KAT is `Fail`, returns `false` immediately.
+/// - If KAT is `Uninit` or `Running`, the caller runs KAT locally and publishes results.
 #[inline]
 fn ensure_kat() -> bool {
     // Fast path: check if KAT already completed.
-    let current = KatState::from_u8(KAT_STATE.load(Ordering::Acquire));
-    match current {
+    match KatState::from_u8(KAT_STATE.load(Ordering::Acquire)) {
         KatState::Pass => return true,
         KatState::Fail => return false,
         _ => {}
     }
 
     // Slow path: KAT not yet complete.
+    //
+    // R94-1 FIX: Never spin_loop() waiting for another thread. On single-core or
+    // with strict priority scheduling, spinning deadlocks the system. Instead, each
+    // caller runs KAT independently and attempts to publish the result.
+
+    // Best-effort: mark KAT as Running for diagnostics. This is not required for
+    // correctness — it merely reduces redundant KAT executions in the common case.
+    let _claimed = KAT_STATE
+        .compare_exchange(
+            KatState::Uninit as u8,
+            KatState::Running as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok();
+
+    // Re-check: a concurrent caller may have published a terminal state while we
+    // attempted the CAS above.
+    match KatState::from_u8(KAT_STATE.load(Ordering::Acquire)) {
+        KatState::Pass => return true,
+        KatState::Fail => return false,
+        _ => {} // Uninit or Running — proceed with local KAT execution
+    }
+
+    // Run KAT locally. This is pure computation over constant test vectors:
+    // safe to run concurrently from multiple threads without side effects.
+    let ok = run_kat();
+
+    if !ok {
+        // Fail-closed: immediately publish failure. This is sticky — once Fail is
+        // set, no subsequent Pass can override it, ensuring fail-closed semantics.
+        KAT_STATE.store(KatState::Fail as u8, Ordering::Release);
+        return false;
+    }
+
+    // Publish Pass, but only if no concurrent caller has already set Fail.
+    // Uses a CAS loop to avoid overwriting a Fail state with Pass.
+    let mut cur = KAT_STATE.load(Ordering::Acquire);
     loop {
-        match KatState::from_u8(KAT_STATE.load(Ordering::Acquire)) {
+        match KatState::from_u8(cur) {
             KatState::Pass => return true,
-            KatState::Fail => return false,
-            KatState::Running => {
-                // Another thread is running KAT; spin and wait.
-                spin_loop();
-                continue;
-            }
-            KatState::Uninit => {
-                // Attempt to become the thread that runs the KAT.
-                if KAT_STATE
-                    .compare_exchange(
-                        KatState::Uninit as u8,
-                        KatState::Running as u8,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    // We own the KAT execution.
-                    let ok = run_kat();
-                    let final_state = if ok { KatState::Pass } else { KatState::Fail };
-                    KAT_STATE.store(final_state as u8, Ordering::Release);
-                    return ok;
+            KatState::Fail => return false, // Respect sticky failure from another caller
+            KatState::Uninit | KatState::Running => {
+                match KAT_STATE.compare_exchange(
+                    cur,
+                    KatState::Pass as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return true,
+                    Err(next) => cur = next, // Retry with updated state
                 }
-                // Lost the race; another thread is now running KAT.
-                continue;
             }
         }
     }
@@ -222,8 +257,33 @@ fn run_kat() -> bool {
         0x4D, 0xC4, 0xAB, 0x2F, 0x84, 0x3A, 0xCD, 0xA8,
     ];
 
-    // Verify using the same path as production verification.
-    verify_prehash_unchecked(&PUBKEY_UNCOMPRESSED, &DIGEST, &SIG_RS).is_ok()
+    // Positive KAT: Valid signature must verify.
+    if verify_prehash_unchecked(&PUBKEY_UNCOMPRESSED, &DIGEST, &SIG_RS).is_err() {
+        return false;
+    }
+
+    // R94-2 FIX: Negative KATs to ensure verifier is not fail-open.
+    //
+    // If verify_prehash_unchecked regresses to always return Ok(), these tests catch it.
+    // Both must fail for the KAT to pass.
+
+    // Negative KAT 1: Corrupted signature must fail.
+    // Flip one bit in the signature - this must invalidate it.
+    let mut corrupted_sig = SIG_RS;
+    corrupted_sig[0] ^= 0x01;
+    if verify_prehash_unchecked(&PUBKEY_UNCOMPRESSED, &DIGEST, &corrupted_sig).is_ok() {
+        return false; // Fail-open detected: corrupted sig should NOT verify
+    }
+
+    // Negative KAT 2: Wrong digest must fail.
+    // Flip one bit in the digest - the signature is for the original digest.
+    let mut wrong_digest = DIGEST;
+    wrong_digest[0] ^= 0x01;
+    if verify_prehash_unchecked(&PUBKEY_UNCOMPRESSED, &wrong_digest, &SIG_RS).is_ok() {
+        return false; // Fail-open detected: wrong digest should NOT verify
+    }
+
+    true
 }
 
 // ============================================================================

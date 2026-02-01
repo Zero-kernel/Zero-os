@@ -273,13 +273,27 @@ pub fn probe_virtio_blk() -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)>
                 }
 
                 // Attach device to IOMMU before enabling bus mastering (fail-closed)
+                // R94-14 FIX: Handle NotAvailable explicitly - proceed with warning
+                // for legacy systems without IOMMU, but fail on other errors.
                 let pci_id = PciDeviceId::from_bdf(bus, dev, func);
-                if let Err(err) = attach_device(pci_id) {
-                    println!(
-                        "    ! IOMMU attach failed for {:02x}:{:02x}.{}: {:?}",
-                        bus, dev, func, err
-                    );
-                    continue;
+                match attach_device(pci_id) {
+                    Ok(()) => {}
+                    Err(iommu::IommuError::NotAvailable) => {
+                        // IOMMU not present - proceed without DMA isolation (legacy mode)
+                        // This is an explicit acknowledgment of the security tradeoff.
+                        println!(
+                            "    ! WARNING: No IOMMU - {:02x}:{:02x}.{} has unprotected DMA access",
+                            bus, dev, func
+                        );
+                    }
+                    Err(err) => {
+                        // Other IOMMU errors - fail closed (skip device)
+                        println!(
+                            "    ! IOMMU attach failed for {:02x}:{:02x}.{}: {:?}",
+                            bus, dev, func, err
+                        );
+                        continue;
+                    }
                 }
 
                 // Enable MEM space access + BUS MASTER for DMA

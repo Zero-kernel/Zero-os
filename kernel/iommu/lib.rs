@@ -423,6 +423,12 @@ pub fn unit_count() -> u32 {
 /// # R90-1 FIX
 ///
 /// Also checks IOMMU_INIT_FAILED to prevent DMA bypass after init failure.
+///
+/// # R94-14 FIX: Fail-Closed on Missing IOMMU
+///
+/// Previously, this function returned Ok(()) when no IOMMU hardware was present,
+/// silently allowing unprotected DMA. Now returns `NotAvailable` to force callers
+/// to explicitly acknowledge the lack of DMA isolation.
 fn ensure_iommu_ready() -> IommuResult<()> {
     // R90-1 FIX: Fail closed if init has failed
     if IOMMU_INIT_FAILED.load(Ordering::Acquire) {
@@ -438,8 +444,10 @@ fn ensure_iommu_ready() -> IommuResult<()> {
         return Err(IommuError::NotInitialized);
     }
 
-    // No IOMMU hardware present - allow bypass (legacy mode)
-    Ok(())
+    // R94-14 FIX: No IOMMU hardware present - fail closed instead of silent bypass.
+    // Callers must explicitly handle the NotAvailable case if they want to proceed
+    // without DMA isolation (e.g., on legacy hardware or VMs without IOMMU).
+    Err(IommuError::NotAvailable)
 }
 
 /// Attach a PCI device to the default kernel domain.
@@ -452,15 +460,26 @@ fn ensure_iommu_ready() -> IommuResult<()> {
 ///
 /// # Returns
 ///
-/// * `Ok(())` - Device successfully attached
-/// * `Err(IommuError)` - Attachment failed
+/// * `Ok(())` - Device successfully attached to IOMMU
+/// * `Err(IommuError::NotAvailable)` - No IOMMU hardware present (R94-14)
+/// * `Err(IommuError)` - Other attachment failures
+///
+/// # R94-14 FIX: Explicit IOMMU Availability Signaling
+///
+/// When no IOMMU hardware is present, this function now returns
+/// `Err(IommuError::NotAvailable)` instead of silently returning `Ok(())`.
+/// This forces callers to explicitly acknowledge that DMA isolation is not
+/// available and decide whether to proceed without it.
+///
+/// Callers should handle `NotAvailable` specially:
+/// - For security-critical systems: reject the device
+/// - For legacy/development systems: log a warning and proceed
 pub fn attach_device(device: PciDeviceId) -> IommuResult<()> {
     ensure_iommu_ready()?;
 
-    // No IOMMU units - allow DMA without isolation (legacy mode)
-    if IOMMU_UNIT_COUNT.load(Ordering::Acquire) == 0 {
-        return Ok(());
-    }
+    // R94-14 FIX: Removed silent Ok(()) bypass when IOMMU_UNIT_COUNT == 0.
+    // ensure_iommu_ready() now returns NotAvailable in that case, so we only
+    // reach here if IOMMU is actually enabled and ready.
 
     attach_device_to_domain(device, KERNEL_DOMAIN_ID)
 }

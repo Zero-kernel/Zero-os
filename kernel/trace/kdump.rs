@@ -35,7 +35,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
-use compliance::is_fips_enabled;
+use compliance::{fips_state, FipsState};
 use security::{try_fill_random, ChaCha20Rng, KptrGuard};
 
 // ============================================================================
@@ -367,28 +367,72 @@ pub fn capture_crash_context(info: &PanicInfo) -> &'static CrashDump {
 /// - The dump is suppressed entirely (fail-closed security design)
 /// - A warning is emitted indicating FIPS-compliant kdump is not yet supported
 /// - Future implementation should add AES-256-GCM for FIPS-compliant encryption
+///
+/// # R94-9 FIX: Post-Emit Scrubbing
+///
+/// After successfully emitting the dump, KDUMP_STORAGE is securely zeroed
+/// to prevent crash data from lingering in memory. This is defense-in-depth
+/// against memory disclosure attacks after panic recovery.
+///
+/// # R94-16 FIX: Empty Dump Handling
+///
+/// Empty/placeholder dumps do NOT consume the emit-once flag. This allows
+/// a subsequent valid dump to be emitted if the first capture failed.
+/// Detection uses structural field checks (tsc==0 && panic_msg_len==0 && stack_len==0)
+/// rather than serialize length, and is performed BEFORE setting KDUMP_EMITTED
+/// to maintain concurrency safety on KDUMP_BUF.
 pub fn emit_encrypted_dump(dump: &CrashDump) {
-    // Only emit once
+    // R94-16 FIX (v2): Check if dump is essentially empty BEFORE consuming emit-once flag.
+    // We detect empty/placeholder dumps by checking structural fields rather than
+    // serialize length (which always includes headers).
+    //
+    // An empty dump has: tsc==0 AND panic_msg_len==0 AND stack_len==0
+    // This covers both KDUMP_EMPTY and failed captures.
+    let is_empty_dump = dump.tsc == 0 && dump.panic_msg_len == 0 && dump.stack_len == 0;
+    if is_empty_dump {
+        // Empty/placeholder dump - don't consume emit-once flag, just return
+        return;
+    }
+
+    // Only emit once - this must be BEFORE any buffer operations to maintain
+    // concurrency safety on KDUMP_BUF (single writer guarantee)
     if KDUMP_EMITTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    // Now we have exclusive access to KDUMP_BUF (emit-once guarantees single writer)
+    let out = unsafe { &mut KDUMP_BUF };
+    let len = dump.serialize_into(out);
+    if len == 0 {
+        // Serialization failed - scrub and return
+        scrub_kdump_storage_if_captured();
         return;
     }
 
     // R93-15 FIX: Suppress dump in FIPS mode (ChaCha20 is not FIPS-approved).
     // In FIPS mode, crash dumps must use FIPS-approved algorithms (AES-GCM).
     // Until an AES implementation is added, we fail closed to maintain compliance.
-    if is_fips_enabled() {
-        serial_write_str("\n[kdump] FIPS mode active - ChaCha20 not permitted\n");
-        serial_write_str("[kdump] Crash dump suppressed for FIPS compliance\n");
-        // Securely zero the dump in memory before returning
-        let out = unsafe { &mut KDUMP_BUF };
-        secure_bzero(out);
-        return;
-    }
-
-    let out = unsafe { &mut KDUMP_BUF };
-    let len = dump.serialize_into(out);
-    if len == 0 {
-        return;
+    //
+    // R94-3 FIX (v3): Also suppress when FIPS state is Failed (corruption/error).
+    // In an indeterminate security state, we must not proceed with potentially
+    // non-compliant crypto operations.
+    match fips_state() {
+        FipsState::Enabled => {
+            serial_write_str("\n[kdump] FIPS mode active - ChaCha20 not permitted\n");
+            serial_write_str("[kdump] Crash dump suppressed for FIPS compliance\n");
+            secure_bzero(&mut out[..len]);
+            scrub_kdump_storage_if_captured();
+            return;
+        }
+        FipsState::Failed => {
+            serial_write_str("\n[kdump] FIPS state corrupted/failed - dump suppressed\n");
+            secure_bzero(&mut out[..len]);
+            scrub_kdump_storage_if_captured();
+            return;
+        }
+        FipsState::Disabled => {
+            // FIPS not enabled, proceed with ChaCha20 encryption
+        }
     }
 
     // R92-4 FIX: Generate key and nonce in a single RNG call to minimize
@@ -401,6 +445,7 @@ pub fn emit_encrypted_dump(dump: &CrashDump) {
     if !rng_ok {
         secure_bzero(&mut seed);
         secure_bzero(&mut out[..len]);
+        scrub_kdump_storage_if_captured();
         serial_write_str("\n[kdump] Encryption failed - dump suppressed for security\n");
         return;
     }
@@ -435,9 +480,13 @@ pub fn emit_encrypted_dump(dump: &CrashDump) {
 
     serial_write_str("--END ZOS-KDUMP--\n");
 
-    // Cleanup
+    // Cleanup sensitive data
     secure_bzero(&mut nonce);
     secure_bzero(&mut out[..len]);
+
+    // R94-9 FIX: Scrub KDUMP_STORAGE after successful emit to prevent
+    // crash data from lingering in memory (defense-in-depth).
+    scrub_kdump_storage_if_captured();
 }
 
 // ============================================================================
@@ -856,4 +905,54 @@ fn secure_bzero(buf: &mut [u8]) {
         unsafe { core::ptr::write_volatile(b, 0); }
     }
     core::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+/// R94-9 FIX: Securely scrub KDUMP_STORAGE after emission.
+///
+/// This function clears sensitive crash data from static storage after
+/// the dump has been emitted or suppressed. It is defense-in-depth against
+/// memory disclosure attacks that could occur after panic recovery.
+///
+/// # Safety
+///
+/// Only called after the dump has been captured (state == 2) or emission
+/// has been attempted. Uses volatile writes to ensure the compiler does
+/// not optimize away the zeroing.
+fn scrub_kdump_storage_if_captured() {
+    // Only scrub if state indicates capture was completed
+    if KDUMP_STATE.load(Ordering::Acquire) == 2 {
+        unsafe {
+            // Zero all sensitive fields in KDUMP_STORAGE
+            let storage = &mut KDUMP_STORAGE;
+
+            // Zero registers
+            let regs_ptr = &mut storage.regs as *mut CpuRegs as *mut u8;
+            for i in 0..core::mem::size_of::<CpuRegs>() {
+                core::ptr::write_volatile(regs_ptr.add(i), 0);
+            }
+
+            // Zero panic file path
+            for b in storage.panic_file.iter_mut() {
+                core::ptr::write_volatile(b, 0);
+            }
+            core::ptr::write_volatile(&mut storage.panic_file_len, 0);
+
+            // Zero panic message
+            for b in storage.panic_msg.iter_mut() {
+                core::ptr::write_volatile(b, 0);
+            }
+            core::ptr::write_volatile(&mut storage.panic_msg_len, 0);
+
+            // Zero stack dump (most sensitive)
+            for b in storage.stack.iter_mut() {
+                core::ptr::write_volatile(b, 0);
+            }
+            core::ptr::write_volatile(&mut storage.stack_len, 0);
+            core::ptr::write_volatile(&mut storage.stack_addr, 0);
+
+            // Zero other metadata
+            core::ptr::write_volatile(&mut storage.tsc, 0);
+        }
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
 }

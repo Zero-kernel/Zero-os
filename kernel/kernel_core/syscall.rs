@@ -2200,11 +2200,16 @@ fn sys_fork() -> SyscallResult {
             //
             // Linux semantics: fork() returns the child's PID as seen from the parent's
             // namespace. This is the same PID used by wait(), kill(), etc.
+            //
+            // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
+            // Falling back to global PID would break PID namespace isolation, allowing
+            // processes to observe kernel-internal PIDs across namespace boundaries.
             let parent_view_pid = {
                 let parent = parent_arc.lock();
                 let owning_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain);
                 if let Some(ns) = owning_ns {
-                    crate::pid_namespace::pid_in_namespace(&ns, child_pid).unwrap_or(child_pid)
+                    crate::pid_namespace::pid_in_namespace(&ns, child_pid)
+                        .ok_or(SyscallError::EFAULT)?
                 } else {
                     child_pid
                 }
@@ -2517,11 +2522,14 @@ fn sys_clone(
                 enforce_lsm_task_fork(parent_pid, child_pid)?;
 
                 // F.1: Translate to parent's namespace view before returning
+                //
+                // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
                 let parent_view_pid = {
                     let parent = parent_arc.lock();
                     let owning_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain);
                     if let Some(ns) = owning_ns {
-                        crate::pid_namespace::pid_in_namespace(&ns, child_pid).unwrap_or(child_pid)
+                        crate::pid_namespace::pid_in_namespace(&ns, child_pid)
+                            .ok_or(SyscallError::EFAULT)?
                     } else {
                         child_pid
                     }
@@ -3014,11 +3022,14 @@ fn sys_clone(
     //
     // For processes in the root namespace, this is the same as the global PID.
     // For processes in child namespaces, the parent sees a different PID.
+    //
+    // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
     let parent_view_pid = {
         let parent = parent_arc.lock();
         let owning_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain);
         if let Some(ns) = owning_ns {
-            crate::pid_namespace::pid_in_namespace(&ns, child_pid).unwrap_or(child_pid)
+            crate::pid_namespace::pid_in_namespace(&ns, child_pid)
+                .ok_or(SyscallError::EFAULT)?
         } else {
             // No namespace chain (shouldn't happen), fall back to global PID
             child_pid
@@ -3031,9 +3042,11 @@ fn sys_clone(
     // This is the child's PID in its owning namespace (the deepest namespace).
     // With CLONE_NEWPID, the child's owning namespace is a new child namespace,
     // where it is PID 1 (the init process of that namespace).
+    // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
     let child_view_pid = {
         let child = child_arc.lock();
-        crate::pid_namespace::pid_in_owning_namespace(&child.pid_ns_chain).unwrap_or(child_pid)
+        crate::pid_namespace::pid_in_owning_namespace(&child.pid_ns_chain)
+            .ok_or(SyscallError::EFAULT)?
     };
 
     // 写入 parent_tid (F.1: use parent's view of child's PID)
@@ -3601,7 +3614,9 @@ fn sys_getpid() -> SyscallResult {
         let proc = proc_arc.lock();
         // F.1: Return the PID from the owning (leaf) namespace
         // The last entry in pid_ns_chain is the owning namespace
-        crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain).unwrap_or(global_pid)
+        // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
+        crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain)
+            .ok_or(SyscallError::EFAULT)?
     };
 
     Ok(ns_pid)
@@ -3655,8 +3670,10 @@ fn sys_gettid() -> SyscallResult {
     let proc = process.lock();
 
     // F.1: Return the TID from the owning namespace (TID == namespace-local PID)
+    // R94-6 FIX: Translation failure returns EFAULT instead of leaking global TID.
     let ns_tid =
-        crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain).unwrap_or(proc.tid);
+        crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain)
+            .ok_or(SyscallError::EFAULT)?;
     Ok(ns_tid)
 }
 
@@ -3689,7 +3706,9 @@ fn sys_set_tid_address(tidptr: *mut i32) -> SyscallResult {
         let mut proc = process.lock();
         proc.clear_child_tid = tidptr as u64;
         // F.1: Return the TID from the owning namespace
-        crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain).unwrap_or(proc.tid)
+        // R94-6 FIX: Translation failure returns EFAULT instead of leaking global TID.
+        crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain)
+            .ok_or(SyscallError::EFAULT)?
     };
 
     // 返回当前 TID (namespace-local)
@@ -8321,20 +8340,23 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
         Err(cgroup::CgroupError::NotFound) => Err(SyscallError::ENOENT),
         Err(cgroup::CgroupError::PidsLimitExceeded) => Err(SyscallError::EAGAIN),
         Err(cgroup::CgroupError::TaskNotAttached) => {
-            // Process not in old cgroup - try direct attach to new cgroup
-            if let Some(target) = cgroup::lookup_cgroup(cgroup_id) {
-                match target.attach_task(pid as u64) {
-                    Ok(()) => {
-                        let mut proc = process.lock();
-                        proc.cgroup_id = cgroup_id;
-                        Ok(0)
-                    }
-                    Err(cgroup::CgroupError::PidsLimitExceeded) => Err(SyscallError::EAGAIN),
-                    Err(_) => Err(SyscallError::EINVAL),
-                }
-            } else {
-                Err(SyscallError::ENOENT)
-            }
+            // R94-11 FIX: TaskNotAttached indicates an inconsistent state between
+            // the PCB's recorded cgroup_id and the actual cgroup membership.
+            // This should not happen in normal operation and may indicate:
+            // - A race condition during cgroup migration
+            // - Memory corruption
+            // - A bug in cgroup bookkeeping
+            //
+            // Previous behavior: Try direct attach to new cgroup as fallback.
+            // This was a security risk because it could bypass cgroup hierarchy
+            // restrictions - a task might escape from a restricted child cgroup
+            // to a less-restricted parent by exploiting this fallback path.
+            //
+            // New behavior: Return EIO to indicate internal inconsistency.
+            // The caller should not retry without understanding the root cause.
+            // This is fail-closed security: we refuse to proceed when state is
+            // indeterminate rather than potentially violating isolation.
+            Err(SyscallError::EIO)
         }
         Err(_) => Err(SyscallError::EINVAL),
     }

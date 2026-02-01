@@ -826,6 +826,25 @@ fn write_event_payload(hasher: &mut Sha256Writer, prev_hash: [u8; 32], event: &A
     hash_object(hasher, &event.object);
 }
 
+/// Securely zero a buffer to scrub sensitive key material.
+///
+/// Uses volatile writes to prevent the compiler from optimizing away the zeroing,
+/// followed by a compiler fence to ensure the writes complete before the function
+/// returns.
+///
+/// # R94-10: Defense-in-depth for key material
+///
+/// HMAC computations create intermediate buffers containing key-derived material
+/// (key_block, inner_pad, outer_pad, inner_digest). These must be scrubbed after
+/// use to minimize the window for key extraction via memory disclosure bugs.
+#[inline(never)]
+fn secure_zeroize(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        unsafe { core::ptr::write_volatile(b, 0); }
+    }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
 /// Compute HMAC-SHA256: H((K' ⊕ opad) || H((K' ⊕ ipad) || message))
 ///
 /// This is the standard HMAC construction per RFC 2104 / FIPS 198-1.
@@ -839,6 +858,11 @@ fn write_event_payload(hasher: &mut Sha256Writer, prev_hash: [u8; 32], event: &A
 /// # Returns
 ///
 /// 32-byte HMAC-SHA256 digest
+///
+/// # R94-10 FIX: Key Material Scrubbing
+///
+/// All intermediate buffers containing key-derived material are securely zeroed
+/// before the function returns to minimize exposure window for memory disclosure.
 fn hmac_sha256<F>(key: &[u8], write_message: F) -> [u8; 32]
 where
     F: FnOnce(&mut Sha256Writer),
@@ -866,13 +890,22 @@ where
     let mut inner = Sha256Writer::new();
     inner.write_bytes(&inner_pad);
     write_message(&mut inner);
-    let inner_digest = inner.finish();
+    let mut inner_digest = inner.finish();
 
     // Outer hash: H((K' XOR opad) || inner_digest)
     let mut outer = Sha256Writer::new();
     outer.write_bytes(&outer_pad);
     outer.write_bytes(&inner_digest);
-    outer.finish()
+    let result = outer.finish();
+
+    // R94-10 FIX: Scrub all key-derived material from the stack before returning.
+    // This minimizes the exposure window for key extraction via memory disclosure bugs.
+    secure_zeroize(&mut key_block);
+    secure_zeroize(&mut inner_pad);
+    secure_zeroize(&mut outer_pad);
+    secure_zeroize(&mut inner_digest);
+
+    result
 }
 
 /// Compute the hash of an audit event (SHA-256 with domain separation)
@@ -2100,6 +2133,65 @@ pub fn verify_chain(events: &[AuditEvent]) -> bool {
 
     for (i, event) in events.iter().enumerate() {
         let expected_hash = hash_event(event.prev_hash, event);
+        if event.hash != expected_hash {
+            return false;
+        }
+
+        // Verify chain continuity (except for first event)
+        if i > 0 && event.prev_hash != events[i - 1].hash {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Verify the hash chain of a sequence of events using HMAC-SHA256.
+///
+/// This function verifies chains that were created with keyed HMAC-SHA256
+/// authentication. It is the keyed counterpart to [`verify_chain`].
+///
+/// # R94-15 FIX: Keyed Chain Verification
+///
+/// The audit subsystem supports both keyless (SHA-256) and keyed (HMAC-SHA256)
+/// hash chains. Prior to this fix, only `verify_chain()` existed for keyless
+/// verification, leaving keyed chains unverifiable through the public API.
+///
+/// # Arguments
+///
+/// * `events` - Slice of audit events in chain order (oldest to newest)
+/// * `key` - The HMAC key used to create the chain (must match the key
+///   used during event generation; empty key is valid but not recommended)
+///
+/// # Returns
+///
+/// `true` if all events have valid keyed hash chains, `false` otherwise.
+///
+/// # Security Properties
+///
+/// HMAC-SHA256 verification provides:
+/// - Tamper evidence (any modification invalidates the chain)
+/// - Authenticity (only parties with the key can create valid chains)
+/// - Protection against length extension attacks
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let key = b"my-audit-signing-key";
+/// let events = export_audit_log();
+/// if verify_chain_hmac(&events, key) {
+///     println!("Audit log integrity verified");
+/// } else {
+///     println!("WARNING: Audit log may have been tampered with!");
+/// }
+/// ```
+pub fn verify_chain_hmac(events: &[AuditEvent], key: &[u8]) -> bool {
+    if events.is_empty() {
+        return true;
+    }
+
+    for (i, event) in events.iter().enumerate() {
+        let expected_hash = hash_event_prefixed(event.prev_hash, event, Some(key));
         if event.hash != expected_hash {
             return false;
         }

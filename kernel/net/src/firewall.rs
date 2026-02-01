@@ -571,6 +571,16 @@ fn ipv4_to_u32(addr: Ipv4Addr) -> u32 {
 // ============================================================================
 
 /// Create the default stateful firewall rule set.
+///
+/// # R94-12 FIX: Default Deny Policy
+///
+/// The firewall now uses a "default deny" (DROP) policy. Only traffic matching
+/// explicit ACCEPT rules will be permitted. This is the security-first approach:
+/// - INVALID packets are dropped (conntrack detected invalid state)
+/// - ESTABLISHED/RELATED packets are accepted (replies to existing connections)
+/// - All other traffic is dropped by default
+///
+/// To permit new inbound/outbound connections, explicit rules must be added.
 fn default_rules() -> Vec<FirewallRule> {
     vec![
         // Rule 1: Drop INVALID packets (high priority)
@@ -587,13 +597,9 @@ fn default_rules() -> Vec<FirewallRule> {
             .action(FirewallAction::Accept)
             .log(false)
             .build(),
-        // Rule 3: Default accept (lowest priority, can be overridden)
-        FirewallRule::builder(1000)
-            .priority(-1)
-            .ct_state(CtStateMask::ANY)
-            .action(FirewallAction::Accept)
-            .log(false)
-            .build(),
+        // R94-12 FIX: Removed catch-all Accept rule.
+        // New connections require explicit ACCEPT rules.
+        // Default policy (DROP) applies to unmatched traffic.
     ]
 }
 
@@ -604,9 +610,14 @@ fn default_rules() -> Vec<FirewallRule> {
 static FIREWALL_TABLE: Once<FirewallTable> = Once::new();
 
 /// Get the global firewall table.
+///
+/// # R94-12 FIX: Default Deny Policy
+///
+/// Uses `FirewallAction::Drop` as the default policy. All traffic not matching
+/// an explicit ACCEPT rule will be dropped. This is fail-closed security design.
 pub fn firewall_table() -> &'static FirewallTable {
     FIREWALL_TABLE
-        .call_once(|| FirewallTable::new_with_rules(FirewallAction::Accept, default_rules()))
+        .call_once(|| FirewallTable::new_with_rules(FirewallAction::Drop, default_rules()))
 }
 
 // ============================================================================

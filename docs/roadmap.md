@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-31
+**Last Updated:** 2026-02-01
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -13,7 +13,8 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 ### Current Status: Phase G IN PROGRESS (Production Readiness)
 
 Zero-OS has completed SMP infrastructure and resource governance:
-- **93 security audits** with 452 issues found, 395 fixed (87.4%)
+- **94 security audits** with 468 issues found, 410 fixed (87.6%)
+- **R94 Security**: 16 issues found, **15 FIXED** (ECDSA KAT, FIPS fail-closed, PID namespace, TLB shootdown, kdump scrub, HMAC key scrub, firewall default DROP, IOMMU legacy signaling, verify_chain_hmac)
 - **R93 Security Debt**: ALL 18 issues FIXED (fork namespace escape, livepatch hardening, fail-open patterns, cgroup escape, kdump, TLB shootdown, FIPS KATs, panic redaction)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
@@ -975,16 +976,18 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-30 | 91 | 3 | 3 | **Profiler (G.1)** - current_pid() IRQ deadlock ✅, CpuLocal stack overflow ✅, profiler control race ✅ |
 | 2026-01-30 | 92 | 5 | 5 | **kdump (G.1)** - Multi-CPU race ✅, Stack page boundary ✅, ASCII hex redaction ✅, Key cleanup ✅, try_fill_random fallback ✅ |
 | 2026-01-31 | 93 | 18 | 18 | **SECURITY DEBT** - Fork NS escape (CRITICAL) ✅, Livepatch guard (CRITICAL) ✅, Fail-open (HIGH) ✅, sys_access (HIGH) ✅, cgroup_attach (HIGH) ✅, ELF cgroup (HIGH) ✅, Identity map (HIGH) ✅, kdump fallback (HIGH) ✅, TLB shootdown (HIGH) ✅, Livepatch address (HIGH) ✅, seal_exec (HIGH) ✅, target mapping (MEDIUM) ✅, kpatch_unload (MEDIUM) ✅, FIPS KATs (MEDIUM) ✅, kdump FIPS (MEDIUM) ✅, panic redact (MEDIUM) ✅, cgroup caps (MEDIUM) ✅, ELF filesz (LOW) ✅ - **ALL 18 FIXED** |
-| **Total** | **93** | **452** | **395 (87.4%)** | **57 open (R65 SMP, R81-3/R84-4/R89-4 documented)** |
+| 2026-02-01 | 94 | 16 | 15 | **SECURITY AUDIT** - Identity map USER_ACCESSIBLE (CRITICAL) ✅, insecure-ecdsa-stub guard (CRITICAL) ✅, ECDSA KAT deadlock (HIGH) ✅, fips_state fail-open (HIGH) ✅, PID translation fail-open (HIGH) ✅, Firewall default DROP (HIGH) ✅, IOMMU legacy signaling (HIGH) ✅, TLB shootdown mailbox (MEDIUM→HIGH) ✅, current_profile fallback (MEDIUM) ✅, KAT negative tests (MEDIUM) ✅, kdump storage scrub (MEDIUM) ✅, HMAC key scrub (MEDIUM) ✅, cgroup TaskNotAttached (MEDIUM) ✅, kdump emit-once (LOW) ✅, verify_chain_hmac (LOW) ✅ - **15 FIXED, 1 DEFERRED (IOMMU arch)** |
+| **Total** | **94** | **468** | **410 (87.6%)** | **58 open (R65 SMP, R81-3/R84-4/R89-4 documented, R94-13 arch)** |
 
 ### Current Status
 
-- **Fixed**: 395 issues (87.4%)
-- **Open**: 57 issues (12.6%)
+- **Fixed**: 410 issues (87.6%)
+- **Open**: 58 issues (12.4%)
   - R65 remaining issues (SMP-related, non-blocking)
   - R81-3 (Direct map bound) documented risk
   - R84-4 (x2APIC mode) documented limitation
   - R89-4 (Counter overflow) documented acceptable risk
+  - R94-13 (IOMMU kernel domain pass-through) - pending architecture decision
 - **Phase E Progress**: ✅ **COMPLETE**
   - E.1 Hardware Init: ✅ LAPIC/IOAPIC, AP boot, IPI
   - E.2 TLB Shootdown: ✅ IPI-based, PCID support (batched pending)
@@ -1005,8 +1008,9 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - **Container Foundation**: COMPLETE - All 5 namespace types + Cgroups v2 provide full container isolation
 - **Virtualization Foundation**: COMPLETE - IOMMU/VT-d with VM passthrough preparation
 - **R93 Key Fixes**: Fork namespace escape (CRITICAL), Livepatch compile guard (CRITICAL), Fail-closed patterns, Cgroup authorization, ELF memory accounting, Identity map isolation, kdump encryption required, TLB shootdown fail-closed, Address validation, seal_exec, kpatch_unload, FIPS KATs, Panic redaction, Cgroup capabilities
+- **R94 Key Fixes**: ECDSA KAT deadlock-free, FIPS/Profile fail-closed, PID namespace fail-closed, TLB shootdown mailbox panic, kdump storage scrub, HMAC key scrub, cgroup attach fail-closed, firewall default DROP, IOMMU legacy fail-closed, verify_chain_hmac
 
-See [qa-2026-01-31.md](review/qa-2026-01-31.md) for latest audit report.
+See [qa-2026-02-01.md](review/qa-2026-02-01.md) for latest audit report.
 
 ---
 

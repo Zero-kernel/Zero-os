@@ -633,11 +633,31 @@ fn enqueue_mailbox(
 ///
 /// Uses `enqueue_mailbox` to add requests to each CPU's queue, allowing
 /// multiple requests to be batched without full serialization.
+///
+/// # R94-8 FIX: Fail-Fast on Missing Mailbox
+///
+/// Previously silently skipped CPUs with missing mailboxes. This created an
+/// inconsistent security gap: no request was posted, so no ACK was expected,
+/// making the shootdown appear to succeed without actually flushing that CPU's
+/// TLB. Stale TLB entries could then point to freed memory → use-after-free.
+///
+/// Now panics if a target CPU's mailbox is missing, since:
+/// 1. Target CPUs are collected from per-address-space tracking (only active CPUs)
+/// 2. Every active CPU must have been initialized with a mailbox
+/// 3. A missing mailbox for an active CPU indicates a critical initialization bug
 fn post_requests(targets: &[usize], cr3: u64, start: u64, len: u64, generation: u64) {
     for &cpu in targets {
-        if let Some(mailbox) = mailbox_for_cpu(cpu) {
-            enqueue_mailbox(mailbox, cr3, start, len, generation);
-        }
+        // R94-8 FIX: A target CPU MUST have an initialized mailbox. If it doesn't,
+        // this is a critical per-CPU initialization failure that would silently skip
+        // TLB flushes, risking use-after-free from stale TLB entries.
+        let mailbox = mailbox_for_cpu(cpu).unwrap_or_else(|| {
+            panic!(
+                "TLB shootdown: CPU {} is in target set but has no mailbox. \
+                 This indicates a critical per-CPU initialization failure.",
+                cpu
+            )
+        });
+        enqueue_mailbox(mailbox, cr3, start, len, generation);
     }
 }
 

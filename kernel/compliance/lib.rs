@@ -173,12 +173,19 @@ pub fn lock_profile() {
 }
 
 /// Get the currently active hardening profile.
+///
+/// # R94-4 FIX: Fail-Closed Fallback
+///
+/// Unknown/corrupted atomic values now fall back to `Secure` instead of `Balanced`.
+/// In memory corruption scenarios, this tightens security posture rather than
+/// relaxing it. The principle: an indeterminate state must never weaken defenses.
 pub fn current_profile() -> HardeningProfile {
     match ACTIVE_PROFILE.load(Ordering::Acquire) {
         0 => HardeningProfile::Secure,
         1 => HardeningProfile::Balanced,
         2 => HardeningProfile::Performance,
-        _ => HardeningProfile::Balanced, // Fallback
+        // R94-4 FIX: Fail-closed — corrupted value falls back to most restrictive profile.
+        _ => HardeningProfile::Secure,
     }
 }
 
@@ -284,18 +291,37 @@ pub fn enable_fips_mode() -> Result<(), FipsError> {
 }
 
 /// Check if FIPS mode is currently enabled.
+///
+/// # R94-3 FIX (v2): Consistent Fail-Closed Behavior
+///
+/// Uses `fips_state()` to get fail-closed semantics. If FIPS_MODE is corrupted
+/// to an unknown value, `fips_state()` returns `Failed`, and this function
+/// returns `false`. However, callers checking `!is_fips_enabled()` to allow
+/// non-FIPS algorithms should use `is_algorithm_permitted()` instead, which
+/// properly blocks all algorithms when FIPS state is `Failed`.
+///
+/// Returns `true` only when FIPS is explicitly Enabled, `false` otherwise.
 #[inline]
 pub fn is_fips_enabled() -> bool {
-    FIPS_MODE.load(Ordering::Acquire) == FipsState::Enabled as u8
+    fips_state() == FipsState::Enabled
 }
 
 /// Get the current FIPS state.
+///
+/// # R94-3 FIX: Fail-Closed on Corruption
+///
+/// Unknown/corrupted atomic values now return `Failed` instead of `Disabled`.
+/// Previously, a corrupted FIPS_MODE value (e.g., from bit-flip or memory corruption)
+/// would fall back to `Disabled`, effectively bypassing FIPS enforcement.
+/// Now, any indeterminate state is treated as a failure, blocking all non-FIPS
+/// algorithms and requiring explicit re-initialization.
 pub fn fips_state() -> FipsState {
     match FIPS_MODE.load(Ordering::Acquire) {
         0 => FipsState::Disabled,
         1 => FipsState::Enabled,
         2 => FipsState::Failed,
-        _ => FipsState::Disabled,
+        // R94-3 FIX: Fail-closed — corrupted value treated as failure, not disabled.
+        _ => FipsState::Failed,
     }
 }
 

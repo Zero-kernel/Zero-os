@@ -37,11 +37,12 @@
 extern crate alloc;
 
 // R93-2 FIX: Never allow the insecure ECDSA stub in production builds.
-// This compile_error! ensures that the insecure-ecdsa-stub feature cannot be
-// combined with the release feature, preventing accidental deployment of
-// unauthenticated livepatch capability to production.
-#[cfg(all(feature = "insecure-ecdsa-stub", feature = "release"))]
-compile_error!("livepatch: feature `insecure-ecdsa-stub` must not be enabled with `release`");
+// R94-7 FIX: Use `not(debug_assertions)` instead of `feature = "release"`.
+// Cargo's `--release` flag does NOT automatically enable a "release" feature,
+// but it DOES disable debug_assertions. This ensures the guard actually fires
+// in production builds regardless of explicit feature configuration.
+#[cfg(all(feature = "insecure-ecdsa-stub", not(any(test, debug_assertions))))]
+compile_error!("livepatch: feature `insecure-ecdsa-stub` must not be enabled in release builds");
 
 use alloc::boxed::Box;
 use alloc::vec;
