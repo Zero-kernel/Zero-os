@@ -1,7 +1,7 @@
 //! Zero-OS G.2 Live Patching (no_std)
 //!
 //! This crate implements a minimal livepatch mechanism:
-//! - Patch authenticity check: **ECDSA P-256 + SHA-256** (ECDSA verify is stubbed)
+//! - Patch authenticity check: **ECDSA P-256 + SHA-256** (KAT-gated verification)
 //! - Detour: overwrite first byte of a target function with **INT3 (0xCC)**
 //! - Redirect: a **#BP** handler rewrites `RIP` to the patch handler address
 //! - Lifecycle: register / enable / disable with an explicit state machine
@@ -36,6 +36,13 @@
 
 extern crate alloc;
 
+// R93-2 FIX: Never allow the insecure ECDSA stub in production builds.
+// This compile_error! ensures that the insecure-ecdsa-stub feature cannot be
+// combined with the release feature, preventing accidental deployment of
+// unauthenticated livepatch capability to production.
+#[cfg(all(feature = "insecure-ecdsa-stub", feature = "release"))]
+compile_error!("livepatch: feature `insecure-ecdsa-stub` must not be enabled with `release`");
+
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -44,6 +51,10 @@ use spin::{Mutex, Once};
 use x86_64::structures::idt::InterruptStackFrame;
 use x86_64::VirtAddr;
 
+// Expose only the KAT function for compliance module, not the full verification API.
+// This minimizes API surface while allowing FIPS self-tests to use the existing ECDSA KAT.
+pub mod ecdsa_p256;
+
 // ============================================================================
 // Public constants / syscall numbers
 // ============================================================================
@@ -51,6 +62,7 @@ use x86_64::VirtAddr;
 pub const SYS_KPATCH_LOAD: u64 = 509;
 pub const SYS_KPATCH_ENABLE: u64 = 510;
 pub const SYS_KPATCH_DISABLE: u64 = 511;
+pub const SYS_KPATCH_UNLOAD: u64 = 512;
 
 // ============================================================================
 // Error model (minimal errno subset)
@@ -103,10 +115,10 @@ pub trait KernelOps: Sync {
 
     /// Tighten permissions on an exec region after initialization (e.g., RW->RX).
     ///
-    /// Default implementation is a no-op for kernels that don't support it yet.
-    unsafe fn seal_exec(&self, _addr: usize, _len: usize) -> Result<(), Errno> {
-        Ok(())
-    }
+    /// R93-11 FIX: This method is now REQUIRED. A no-op implementation would silently
+    /// violate W^X, leaving handler memory both writable and executable.
+    /// Implementations MUST transition the region from RW to RX.
+    unsafe fn seal_exec(&self, addr: usize, len: usize) -> Result<(), Errno>;
 
     /// Free an executable region previously allocated with `alloc_exec`.
     unsafe fn free_exec(&self, addr: usize, len: usize);
@@ -294,6 +306,10 @@ struct PatchSlot {
     // Optional allocated handler blob region.
     exec_addr: AtomicUsize,
     exec_len: AtomicUsize,
+
+    // TSC tick (RDTSC) when the patch transitioned to Enabled; 0 = never/unknown.
+    // Used for panic-time rollback of recently-enabled patches.
+    enabled_tsc: AtomicU64,
 }
 
 impl PatchSlot {
@@ -307,6 +323,7 @@ impl PatchSlot {
             orig_byte: AtomicU8::new(0),
             exec_addr: AtomicUsize::new(0),
             exec_len: AtomicUsize::new(0),
+            enabled_tsc: AtomicU64::new(0),
         }
     }
 }
@@ -354,26 +371,220 @@ pub fn patch_state(id: u64) -> Option<PatchState> {
 }
 
 // ============================================================================
-// Signature verification (SHA-256 + stubbed ECDSA P-256)
+// Panic/fault rollback policy
 // ============================================================================
 
-// Placeholder: kernel should embed/derive a real trusted public key.
-#[allow(dead_code)]
-const TRUSTED_P256_PUBKEY_UNCOMPRESSED: [u8; 65] = [0u8; 65];
+/// Read the Time Stamp Counter (RDTSC) for timestamp tracking.
+///
+/// Returns TSC ticks since CPU reset. This is a monotonic counter on modern x86_64
+/// CPUs with invariant TSC. Used for panic-time rollback window calculation.
+#[inline]
+fn read_tsc() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let low: u32;
+        let high: u32;
+        // SAFETY: RDTSC is a safe instruction on x86_64.
+        unsafe {
+            core::arch::asm!(
+                "rdtsc",
+                out("eax") low,
+                out("edx") high,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        ((high as u64) << 32) | (low as u64)
+    }
 
-/// R94-1 FIX: Default fail-closed — no real ECDSA verifier wired in yet.
-/// To use the development stub, compile with `--features insecure-ecdsa-stub`.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
+/// Best-effort rollback of patches enabled within the last `max_age_ticks` TSC ticks.
+///
+/// Intended for fault/panic paths:
+/// - Does not allocate.
+/// - Uses `try_lock()` to avoid deadlocking if patching is already in progress.
+/// - Skips cross-core sync to avoid hanging while other CPUs may be wedged.
+///
+/// # Arguments
+///
+/// * `max_age_ticks` - Maximum TSC tick age for rollback eligibility.
+///   For ~60s window at 2GHz: 120_000_000_000 (120 billion ticks).
+///
+/// # Returns
+///
+/// Number of patches successfully disabled. Zero if lock acquisition failed
+/// or no recent patches needed rollback.
+///
+/// # Safety Note
+///
+/// Caller must ensure this is called from a fault/panic context where
+/// skipping cross-core TLB/icache sync is acceptable. Without sync_cores(),
+/// other CPUs may retain stale INT3 in their instruction caches.
+///
+/// **Stale INT3 behavior**: If another CPU executes a stale INT3 after rollback,
+/// `breakpoint_dispatch()` will not find an active patch and won't rewrite RIP.
+/// Execution continues at RIP (after INT3), potentially causing a crash.
+/// This is acceptable only if the system is halting or other CPUs are stopped.
+///
+/// **Best-effort guarantee**: Rollback is opportunistic due to try_lock().
+/// It can be suppressed when TEXT_PATCH_LOCK is held during panic.
+pub fn rollback_recent_patches(max_age_ticks: u64) -> usize {
+    let table = match patch_table_get() {
+        Some(t) => t,
+        None => return 0,
+    };
+
+    let ops = match ops() {
+        Ok(ops) => ops,
+        Err(_) => return 0,
+    };
+
+    // Panic-safety: never spin waiting for the text patch lock.
+    // If another thread holds it, we're likely in a deadlock-prone situation.
+    let Some(_guard) = TEXT_PATCH_LOCK.try_lock() else {
+        return 0;
+    };
+
+    // Read TSC AFTER acquiring lock to avoid race where a patch is enabled
+    // between reading TSC and acquiring lock. This prevents TSC skew from
+    // causing recently-enabled patches to appear "ancient" and skip rollback.
+    let now = read_tsc();
+
+    let mut rolled_back = 0usize;
+
+    for slot in table.iter() {
+        let st = PatchState::from_u8(slot.state.load(Ordering::Acquire));
+        if st != PatchState::Enabled {
+            continue;
+        }
+
+        let enabled_at = slot.enabled_tsc.load(Ordering::Acquire);
+        if enabled_at == 0 {
+            // Never recorded enable time (legacy or edge case); skip.
+            continue;
+        }
+
+        // Calculate age with wrapping subtraction (TSC never resets during uptime).
+        let age = now.wrapping_sub(enabled_at);
+        if age > max_age_ticks {
+            // Patch has been enabled too long; it's not a rollback candidate.
+            continue;
+        }
+
+        // Atomically transition to Disabling to claim ownership.
+        if slot
+            .state
+            .compare_exchange(
+                PatchState::Enabled as u8,
+                PatchState::Disabling as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            continue;
+        }
+
+        // Attempt to restore the original byte (panic-safe path, no sync_cores).
+        // SAFETY: We hold TEXT_PATCH_LOCK and have transitioned state.
+        match unsafe { restore_original_byte_inner(slot, ops, false) } {
+            Ok(()) => {
+                slot.enabled_tsc.store(0, Ordering::Release);
+                slot.state.store(PatchState::Disabled as u8, Ordering::Release);
+                rolled_back += 1;
+            }
+            Err(_) => {
+                // Restore to Enabled state so INT3 dispatch continues to work.
+                slot.state.store(PatchState::Enabled as u8, Ordering::Release);
+            }
+        }
+    }
+
+    rolled_back
+}
+
+// ============================================================================
+// Signature verification (SHA-256 + ECDSA P-256)
+// ============================================================================
+
+// Trusted public keys for livepatch signature verification.
+//
+// SECURITY: These are SEC1 uncompressed format (65 bytes: 0x04 || X || Y).
+// Populate with real keys at build time from kernel configuration.
+// All-zero placeholders are rejected at runtime (fail-closed).
+// Multiple keys supported for key rotation scenarios.
+#[allow(dead_code)]
+const TRUSTED_P256_PUBKEYS_UNCOMPRESSED: &[[u8; 65]] = &[
+    [0u8; 65], // Slot 0: Current production key (replace with real key)
+    [0u8; 65], // Slot 1: Next key for staged rotation
+];
+
+/// Production signature verifier: SHA-256 integrity + ECDSA P-256 authenticity.
+///
+/// This function performs:
+/// 1. Integrity check: Verifies patch_data matches the SHA-256 hash in the header.
+/// 2. Authenticity check: Verifies ECDSA-P256(SHA-256(header||patch_data)) signature.
+///
+/// The verification is KAT-gated: signature checks are disabled until the FIPS
+/// Known Answer Test passes (see `ecdsa_p256::ensure_kat()`).
+///
+/// # Security
+///
+/// - Fail-closed: Returns ENOSYS if no valid public keys are configured.
+/// - Constant-time operations where applicable.
+/// - Supports key rotation via multiple trusted keys.
 #[cfg(not(feature = "insecure-ecdsa-stub"))]
-fn verify_patch_authenticity(_img: &PatchImage<'_>) -> Result<(), Errno> {
-    // SECURITY: Fail-closed until a real ECDSA P-256 verifier is integrated.
-    Err(Errno::ENOSYS)
+fn verify_patch_authenticity(img: &PatchImage<'_>) -> Result<(), Errno> {
+    // SECURITY: Fail-closed if all trusted public keys are all-zero placeholders.
+    if TRUSTED_P256_PUBKEYS_UNCOMPRESSED
+        .iter()
+        .all(|k| k.iter().all(|&b| b == 0))
+    {
+        return Err(Errno::ENOSYS);
+    }
+
+    // 1) Integrity check: Verify patch_data matches the SHA-256 hash in the header.
+    let data_hash = sha256::sha256(img.patch_data);
+    if !ct_eq(&data_hash, &img.header.patch_data_sha256) {
+        return Err(Errno::EACCES);
+    }
+
+    // 2) Authenticity check: Verify ECDSA signature over header||patch_data.
+    // The signature covers the concatenation of header and patch_data, prehashed with SHA-256.
+    let mut h = sha256::Sha256::new();
+    h.update(img.raw_header);
+    h.update(img.patch_data);
+    let digest = h.finalize();
+
+    // Verify against any trusted public key (key rotation support).
+    match ecdsa_p256::verify_prehash_any(
+        TRUSTED_P256_PUBKEYS_UNCOMPRESSED,
+        &digest,
+        img.signature,
+    ) {
+        Ok(()) => Ok(()),
+        // Invalid signature = access denied (cryptographic verification failed).
+        Err(ecdsa_p256::VerifyError::SignatureInvalid)
+        | Err(ecdsa_p256::VerifyError::InvalidSignature) => Err(Errno::EACCES),
+        // KAT failure / no trusted keys = crypto subsystem unavailable.
+        Err(ecdsa_p256::VerifyError::KatFailed)
+        | Err(ecdsa_p256::VerifyError::NoTrustedPublicKeys)
+        | Err(ecdsa_p256::VerifyError::InvalidPublicKey) => Err(Errno::ENOSYS),
+    }
 }
 
 /// Insecure development-only verifier. Never enable in production.
 #[cfg(feature = "insecure-ecdsa-stub")]
 fn verify_patch_authenticity(img: &PatchImage<'_>) -> Result<(), Errno> {
     // R94-2 FIX: Refuse to run with an unconfigured (all-zero) public key.
-    if TRUSTED_P256_PUBKEY_UNCOMPRESSED.iter().all(|&b| b == 0) {
+    if TRUSTED_P256_PUBKEYS_UNCOMPRESSED
+        .iter()
+        .all(|k| k.iter().all(|&b| b == 0))
+    {
         return Err(Errno::ENOSYS);
     }
 
@@ -391,7 +602,7 @@ fn verify_patch_authenticity(img: &PatchImage<'_>) -> Result<(), Errno> {
 
     #[allow(deprecated)]
     if !verify_ecdsa_p256_sha256_stub(
-        &TRUSTED_P256_PUBKEY_UNCOMPRESSED,
+        &TRUSTED_P256_PUBKEYS_UNCOMPRESSED[0],
         &digest,
         img.signature,
     ) {
@@ -437,21 +648,26 @@ fn load_patch_from_bytes(patch_bytes: &[u8]) -> Result<LoadedPatch, Errno> {
     let img = PatchImage::parse(patch_bytes)?;
     verify_patch_authenticity(&img)?;
 
-    // R94-4 FIX: Require kernel high-half address for target.
+    // R93-10 FIX: Target must be within the kernel .text section.
     if img.header.target_addr == 0 || !is_kernel_canonical_u64(img.header.target_addr) {
         return Err(Errno::EINVAL);
     }
     let target = img.header.target_addr as usize;
+    validate_patch_target(target)?;
 
     let mut exec_addr = 0usize;
     let mut exec_len = 0usize;
 
     let handler = if img.header.handler_addr != 0 {
-        // R94-4 FIX: Require kernel high-half address for handler.
+        // R93-10 FIX: Explicit handler must be within the kernel .text section.
         if !is_kernel_canonical_u64(img.header.handler_addr) {
             return Err(Errno::EINVAL);
         }
-        img.header.handler_addr as usize
+        let h = img.header.handler_addr as usize;
+        if !is_in_kernel_text(h) {
+            return Err(Errno::EINVAL);
+        }
+        h
     } else {
         // Handler code is provided by patch_data.
         if img.header.patch_data_len == 0 {
@@ -481,13 +697,13 @@ fn load_patch_from_bytes(patch_bytes: &[u8]) -> Result<LoadedPatch, Errno> {
         addr
     };
 
-    // R94-4 FIX: Final handler address validation.
-    if handler == 0 || !is_kernel_canonical_u64(handler as u64) {
+    // R93-10 FIX: Handler must be in kernel .text or within this patch's exec allocation.
+    if let Err(e) = validate_patch_handler(handler, exec_addr, exec_len) {
         if exec_len != 0 {
             let ops = ops()?;
             unsafe { ops.free_exec(exec_addr, exec_len) };
         }
-        return Err(Errno::EINVAL);
+        return Err(e);
     }
 
     Ok(LoadedPatch {
@@ -534,6 +750,7 @@ fn register_loaded_patch(p: &LoadedPatch) -> Result<u64, Errno> {
             slot.exec_len.store(p.exec_len, Ordering::Release);
             slot.orig_valid.store(0, Ordering::Release);
             slot.orig_byte.store(0, Ordering::Release);
+            slot.enabled_tsc.store(0, Ordering::Release);
             slot.state.store(PatchState::Registered as u8, Ordering::Release);
             return Ok(id);
         }
@@ -590,10 +807,13 @@ pub fn kpatch_enable(id: u64) -> Result<(), Errno> {
     let res = unsafe { install_int3_detour(slot) };
     match res {
         Ok(()) => {
+            // Record enable timestamp for rollback policy.
+            slot.enabled_tsc.store(read_tsc(), Ordering::Release);
             slot.state.store(PatchState::Enabled as u8, Ordering::Release);
             Ok(())
         }
         Err(e) => {
+            slot.enabled_tsc.store(0, Ordering::Release);
             slot.state.store(prev as u8, Ordering::Release);
             Err(e)
         }
@@ -633,6 +853,8 @@ pub fn kpatch_disable(id: u64) -> Result<(), Errno> {
     let res = unsafe { restore_original_byte(slot) };
     match res {
         Ok(()) => {
+            // Clear enable timestamp since patch is no longer active.
+            slot.enabled_tsc.store(0, Ordering::Release);
             slot.state.store(PatchState::Disabled as u8, Ordering::Release);
             Ok(())
         }
@@ -641,6 +863,66 @@ pub fn kpatch_disable(id: u64) -> Result<(), Errno> {
             Err(e)
         }
     }
+}
+
+/// R93-13 FIX: Unload a previously disabled patch by id (frees exec allocation and clears slot).
+pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
+    let ops = ops()?;
+    let slot = find_slot_by_id(id).ok_or(Errno::ENOENT)?;
+
+    // R93-13 FIX: Require patch be fully disabled before freeing exec memory / clearing state.
+    let st = PatchState::from_u8(slot.state.load(Ordering::Acquire));
+    match st {
+        PatchState::Disabled => {}
+        PatchState::Registered => {
+            // Never-enabled patches can be unloaded directly; transition to Disabled first.
+            if slot
+                .state
+                .compare_exchange(
+                    PatchState::Registered as u8,
+                    PatchState::Disabled as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err(Errno::EBUSY);
+            }
+        }
+        _ => return Err(Errno::EBUSY),
+    }
+
+    // Block concurrent enable/disable by moving to a busy state while we tear down.
+    if slot
+        .state
+        .compare_exchange(
+            PatchState::Disabled as u8,
+            PatchState::Loading as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return Err(Errno::EBUSY);
+    }
+
+    let exec_addr = slot.exec_addr.swap(0, Ordering::AcqRel);
+    let exec_len = slot.exec_len.swap(0, Ordering::AcqRel);
+
+    slot.id.store(0, Ordering::Release);
+    slot.target.store(0, Ordering::Release);
+    slot.handler.store(0, Ordering::Release);
+    slot.orig_valid.store(0, Ordering::Release);
+    slot.orig_byte.store(0, Ordering::Release);
+    slot.enabled_tsc.store(0, Ordering::Release);
+
+    // Finally, clear the slot.
+    slot.state.store(PatchState::Empty as u8, Ordering::Release);
+
+    if exec_len != 0 {
+        unsafe { ops.free_exec(exec_addr, exec_len) };
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -652,9 +934,9 @@ unsafe fn install_int3_detour(slot: &PatchSlot) -> Result<(), Errno> {
     // R94-5 FIX: Serialize text patching to avoid concurrent page-permission conflicts.
     let _guard = TEXT_PATCH_LOCK.lock();
     let target = slot.target.load(Ordering::Acquire);
-    if target == 0 {
-        return Err(Errno::EINVAL);
-    }
+
+    // R93-12 FIX: Validate target is within mapped kernel .text before dereferencing.
+    validate_patch_target(target)?;
 
     unsafe { ops.make_text_writable(target, 1)? };
 
@@ -691,10 +973,31 @@ unsafe fn restore_original_byte(slot: &PatchSlot) -> Result<(), Errno> {
     let ops = ops()?;
     // R94-5 FIX: Serialize text patching.
     let _guard = TEXT_PATCH_LOCK.lock();
+    // Normal path: sync cores after restoration.
+    unsafe { restore_original_byte_inner(slot, ops, true) }
+}
+
+/// Inner implementation of original byte restoration.
+///
+/// # Arguments
+///
+/// * `slot` - The patch slot to restore.
+/// * `ops` - Kernel operations provider.
+/// * `sync_cores` - Whether to call sync_cores() after restoration.
+///   Set to `false` in panic paths where other CPUs may be wedged.
+///
+/// # Safety
+///
+/// Caller must hold TEXT_PATCH_LOCK.
+unsafe fn restore_original_byte_inner(
+    slot: &PatchSlot,
+    ops: &dyn KernelOps,
+    sync_cores: bool,
+) -> Result<(), Errno> {
     let target = slot.target.load(Ordering::Acquire);
-    if target == 0 {
-        return Err(Errno::EINVAL);
-    }
+
+    // R93-12 FIX: Validate target is within mapped kernel .text before dereferencing.
+    validate_patch_target(target)?;
 
     if slot.orig_valid.load(Ordering::Acquire) == 0 {
         return Err(Errno::EINVAL);
@@ -714,7 +1017,9 @@ unsafe fn restore_original_byte(slot: &PatchSlot) -> Result<(), Errno> {
     unsafe { atomic_write_u8(target, orig) };
 
     ops.flush_icache(target, 1);
-    ops.sync_cores();
+    if sync_cores {
+        ops.sync_cores();
+    }
 
     unsafe { ops.make_text_readonly(target, 1) };
     Ok(())
@@ -870,6 +1175,24 @@ fn do_sys_kpatch_disable(patch_id: u64) -> Result<(), Errno> {
     kpatch_disable(patch_id)
 }
 
+/// sys_kpatch_unload (512): Unload a disabled patch and free any exec allocations.
+pub fn sys_kpatch_unload(patch_id: u64) -> i64 {
+    match do_sys_kpatch_unload(patch_id) {
+        Ok(()) => 0,
+        Err(e) => e.as_i64(),
+    }
+}
+
+fn do_sys_kpatch_unload(patch_id: u64) -> Result<(), Errno> {
+    let ops = ops()?;
+    let _ = patch_table();
+
+    if !ops.is_privileged() {
+        return Err(Errno::EPERM);
+    }
+    kpatch_unload(patch_id)
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -929,6 +1252,66 @@ fn is_canonical_u64(addr: u64) -> bool {
 #[inline]
 fn is_kernel_canonical_u64(addr: u64) -> bool {
     is_canonical_u64(addr) && ((addr >> 63) != 0)
+}
+
+// ============================================================================
+// R93-10/R93-12: Kernel .text bounds validation
+// ============================================================================
+
+// R93-10/R93-12: Kernel .text bounds (from linker script) for address validation.
+extern "C" {
+    // Defined by kernel/kernel.ld
+    static text_start: u8;
+    static text_end: u8;
+}
+
+#[inline]
+fn kernel_text_bounds() -> (usize, usize) {
+    let start = unsafe { core::ptr::addr_of!(text_start) as usize };
+    let end = unsafe { core::ptr::addr_of!(text_end) as usize };
+    (start, end)
+}
+
+/// R93-10 FIX: Check if address is within kernel .text section.
+#[inline]
+fn is_in_kernel_text(addr: usize) -> bool {
+    let (start, end) = kernel_text_bounds();
+    start != 0 && start < end && addr >= start && addr < end
+}
+
+/// R93-10 FIX: Check if address is within a patch's exec allocation.
+#[inline]
+fn is_in_exec_alloc(addr: usize, exec_addr: usize, exec_len: usize) -> bool {
+    if exec_addr == 0 || exec_len == 0 {
+        return false;
+    }
+    match exec_addr.checked_add(exec_len) {
+        Some(end) => addr >= exec_addr && addr < end,
+        None => false,
+    }
+}
+
+/// R93-10/R93-12 FIX: Validate patch target is within mapped kernel .text.
+#[inline]
+fn validate_patch_target(target: usize) -> Result<(), Errno> {
+    // Target must always be within mapped kernel .text.
+    if target == 0 || !is_kernel_canonical_u64(target as u64) || !is_in_kernel_text(target) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+/// R93-10 FIX: Validate handler is in kernel .text or within this patch's exec allocation.
+#[inline]
+fn validate_patch_handler(handler: usize, exec_addr: usize, exec_len: usize) -> Result<(), Errno> {
+    // Handler must be in kernel .text or within this patch's approved exec allocation.
+    if handler == 0 || !is_kernel_canonical_u64(handler as u64) {
+        return Err(Errno::EINVAL);
+    }
+    if is_in_kernel_text(handler) || is_in_exec_alloc(handler, exec_addr, exec_len) {
+        return Ok(());
+    }
+    Err(Errno::EINVAL)
 }
 
 // ============================================================================

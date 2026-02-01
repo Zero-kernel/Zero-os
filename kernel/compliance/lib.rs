@@ -360,15 +360,211 @@ pub enum CryptoAlgorithm {
 
 /// Run FIPS cryptographic self-tests.
 ///
-/// In a real implementation, this would:
-/// - Test SHA-256 with known-answer vectors
-/// - Test HMAC-SHA256 with known-answer vectors
-/// - Test ECDSA signature verification
-/// - Test any other approved algorithms
+/// # R93-14 FIX: Real FIPS 140-2/140-3 Known Answer Tests
+///
+/// This function runs NIST-specified Known Answer Tests (KAT) to verify
+/// correct implementation of cryptographic algorithms before enabling FIPS mode.
+///
+/// Tests include:
+/// - SHA-256: NIST FIPS 180-4 / CAVP test vectors
+/// - HMAC-SHA256: NIST CSRC example values
+///
+/// # Returns
+///
+/// `true` if all self-tests pass, `false` if any test fails.
+/// A failure means FIPS mode cannot be enabled.
 fn run_fips_self_tests() -> bool {
-    // Placeholder: always pass for MVP
-    // TODO: Implement actual known-answer tests
-    true
+    fips_kat::run_all()
+}
+
+// ============================================================================
+// R93-14: FIPS Known Answer Tests (KAT)
+// ============================================================================
+
+mod fips_kat {
+    use audit::crypto;
+
+    // Architectural note:
+    // - We avoid duplicating cryptographic implementations in `compliance`.
+    // - Instead, `compliance` orchestrates KATs implemented by the owning subsystem.
+    //   This keeps a single source of truth (and avoids drift) at the cost of a
+    //   cross-crate dependency.
+    // - If ECDSA becomes broadly used outside `livepatch`, consider extracting the
+    //   verifier/KAT into a shared kernel crypto crate (to decouple from livepatch).
+
+    /// Constant-time byte slice comparison to prevent timing attacks.
+    ///
+    /// Always compares all bytes regardless of early mismatch.
+    #[inline]
+    fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for i in 0..a.len() {
+            diff |= a[i] ^ b[i];
+        }
+        diff == 0
+    }
+
+    /// Run all FIPS KAT tests.
+    ///
+    /// Returns `true` only if ALL tests pass. Fail-closed design.
+    pub(super) fn run_all() -> bool {
+        // Add additional KATs here as crypto primitives are added:
+        // - AES-GCM: When kernel AES implementation exists
+        // - ECDSA P-256: via livepatch::ecdsa_p256 (RFC 6979 A.2.5 KAT)
+        kat_sha256() && kat_hmac_sha256() && kat_ecdsa_p256()
+    }
+
+    // ------------------------------------------------------------------------
+    // SHA-256 KAT (NIST FIPS 180-4 / CAVP)
+    // ------------------------------------------------------------------------
+
+    /// SHA-256 Known Answer Tests using NIST test vectors.
+    ///
+    /// Test vectors from FIPS 180-4 and NIST CAVP:
+    /// - Empty message
+    /// - "abc"
+    /// - 1,000,000 repetitions of 'a' (streaming test)
+    fn kat_sha256() -> bool {
+        // NIST SHA-256 test vector: SHA-256("")
+        const EXPECT_EMPTY: [u8; 32] = [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+            0x78, 0x52, 0xb8, 0x55,
+        ];
+
+        // NIST SHA-256 test vector: SHA-256("abc")
+        const EXPECT_ABC: [u8; 32] = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+
+        // NIST FIPS 180-4 example: SHA-256("a" x 1,000,000)
+        const EXPECT_1M_A: [u8; 32] = [
+            0xcd, 0xc7, 0x6e, 0x5c, 0x99, 0x14, 0xfb, 0x92, 0x81, 0xa1, 0xc7, 0xe2, 0x84, 0xd7,
+            0x3e, 0x67, 0xf1, 0x80, 0x9a, 0x48, 0xa4, 0x97, 0x20, 0x0e, 0x04, 0x6d, 0x39, 0xcc,
+            0xc7, 0x11, 0x2c, 0xd0,
+        ];
+
+        // Test 1: Empty message
+        if !ct_eq(&crypto::sha256_digest(b""), &EXPECT_EMPTY) {
+            return false;
+        }
+
+        // Test 2: Short message "abc"
+        if !ct_eq(&crypto::sha256_digest(b"abc"), &EXPECT_ABC) {
+            return false;
+        }
+
+        // Test 3: Long message (streaming, no heap allocation)
+        // Uses 64-byte blocks to match SHA-256 block size
+        let mut hasher = crypto::StreamingSha256::new();
+        let block = [b'a'; 64];
+        let mut remaining = 1_000_000usize;
+        while remaining >= block.len() {
+            hasher.update(&block);
+            remaining -= block.len();
+        }
+        if remaining != 0 {
+            hasher.update(&block[..remaining]);
+        }
+        if !ct_eq(&hasher.finalize(), &EXPECT_1M_A) {
+            return false;
+        }
+
+        true
+    }
+
+    // ------------------------------------------------------------------------
+    // HMAC-SHA256 KAT (NIST CSRC / RFC 4231)
+    // ------------------------------------------------------------------------
+
+    /// HMAC-SHA256 Known Answer Tests using NIST CSRC example values.
+    ///
+    /// Test vectors from NIST CSRC HMAC_SHA256.pdf:
+    /// - Key length = block length (64 bytes)
+    /// - Key length < block length (32 bytes)
+    /// - Key length > block length (100 bytes, triggers key hashing)
+    fn kat_hmac_sha256() -> bool {
+        // NIST CSRC Test Vector 1:
+        // Key = 0x00..0x3f (64 bytes), Msg = "Sample message for keylen=blocklen"
+        const EXPECT_V1: [u8; 32] = [
+            0x8b, 0xb9, 0xa1, 0xdb, 0x98, 0x06, 0xf2, 0x0d, 0xf7, 0xf7, 0x7b, 0x82, 0x13, 0x8c,
+            0x79, 0x14, 0xd1, 0x74, 0xd5, 0x9e, 0x13, 0xdc, 0x4d, 0x01, 0x69, 0xc9, 0x05, 0x7b,
+            0x13, 0x3e, 0x1d, 0x62,
+        ];
+
+        // NIST CSRC Test Vector 2:
+        // Key = 0x00..0x1f (32 bytes), Msg = "Sample message for keylen<blocklen"
+        const EXPECT_V2: [u8; 32] = [
+            0xa2, 0x8c, 0xf4, 0x31, 0x30, 0xee, 0x69, 0x6a, 0x98, 0xf1, 0x4a, 0x37, 0x67, 0x8b,
+            0x56, 0xbc, 0xfc, 0xbd, 0xd9, 0xe5, 0xcf, 0x69, 0x71, 0x7f, 0xec, 0xf5, 0x48, 0x0f,
+            0x0e, 0xbd, 0xf7, 0x90,
+        ];
+
+        // NIST CSRC Test Vector 3:
+        // Key = 0x00..0x63 (100 bytes), Msg = "Sample message for keylen=blocklen"
+        // This tests the HMAC key > blocksize path (key gets hashed first)
+        const EXPECT_V3: [u8; 32] = [
+            0xbd, 0xcc, 0xb6, 0xc7, 0x2d, 0xde, 0xad, 0xb5, 0x00, 0xae, 0x76, 0x83, 0x86, 0xcb,
+            0x38, 0xcc, 0x41, 0xc6, 0x3d, 0xbb, 0x08, 0x78, 0xdd, 0xb9, 0xc7, 0xa3, 0x8a, 0x43,
+            0x1b, 0x78, 0x37, 0x8d,
+        ];
+
+        // Test 1: Key length = block length (64 bytes)
+        let mut key_64 = [0u8; 64];
+        for (i, b) in key_64.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mac = crypto::hmac_sha256_digest(&key_64, b"Sample message for keylen=blocklen");
+        if !ct_eq(&mac, &EXPECT_V1) {
+            return false;
+        }
+
+        // Test 2: Key length < block length (32 bytes)
+        let mut key_32 = [0u8; 32];
+        for (i, b) in key_32.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mac = crypto::hmac_sha256_digest(&key_32, b"Sample message for keylen<blocklen");
+        if !ct_eq(&mac, &EXPECT_V2) {
+            return false;
+        }
+
+        // Test 3: Key length > block length (100 bytes)
+        // This exercises the HMAC key hashing path
+        let mut key_100 = [0u8; 100];
+        for (i, b) in key_100.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mac = crypto::hmac_sha256_digest(&key_100, b"Sample message for keylen=blocklen");
+        if !ct_eq(&mac, &EXPECT_V3) {
+            return false;
+        }
+
+        true
+    }
+
+    // ------------------------------------------------------------------------
+    // ECDSA P-256 KAT (RFC 6979 Appendix A.2.5)
+    // ------------------------------------------------------------------------
+
+    /// ECDSA P-256 Known Answer Test.
+    ///
+    /// Delegates to the kernel's existing ECDSA P-256 verifier KAT in
+    /// `livepatch::ecdsa_p256` (RFC 6979 Appendix A.2.5).
+    ///
+    /// The livepatch module uses a deterministic ECDSA test vector:
+    /// - Private key d = 0xC9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721
+    /// - Message: "sample"
+    /// - Prehash: SHA-256("sample")
+    /// - The signature (r||s) is verified against the public key derived from d.
+    fn kat_ecdsa_p256() -> bool {
+        livepatch::ecdsa_p256::run_kat_if_needed()
+    }
 }
 
 // ============================================================================

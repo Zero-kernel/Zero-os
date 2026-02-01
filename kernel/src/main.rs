@@ -808,44 +808,64 @@ fn panic(info: &PanicInfo) -> ! {
         // further state changes. Safe to call multiple times (atomic guard).
         let crash_dump = trace::kdump::capture_crash_context(info);
 
-        serial_write_str("KERNEL PANIC: ");
-        if let Some(location) = info.location() {
-            serial_write_str(location.file());
-            serial_write_str(":");
-            // 输出行号
-            let line = location.line();
-            let mut buf = [0u8; 10];
-            let mut n = line;
-            let mut i = 0;
-            loop {
-                buf[i] = b'0' + (n % 10) as u8;
-                n /= 10;
-                i += 1;
-                if n == 0 {
-                    break;
+        // R93-16 FIX: Check hardening profile for panic output redaction.
+        // In Secure profile, suppress detailed panic output to avoid leaking
+        // kernel pointers, file paths, and other sensitive information over serial.
+        // The encrypted kdump still captures full details for offline analysis.
+        let profile = compliance::current_profile();
+        let suppress_details = matches!(profile, compliance::HardeningProfile::Secure);
+
+        serial_write_str("KERNEL PANIC");
+
+        if !suppress_details {
+            // Non-secure profiles: show location for debugging
+            serial_write_str(": ");
+            if let Some(location) = info.location() {
+                serial_write_str(location.file());
+                serial_write_str(":");
+                // 输出行号
+                let line = location.line();
+                let mut buf = [0u8; 10];
+                let mut n = line;
+                let mut i = 0;
+                loop {
+                    buf[i] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    i += 1;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                while i > 0 {
+                    i -= 1;
+                    serial_write_byte(buf[i]);
                 }
             }
-            while i > 0 {
-                i -= 1;
-                serial_write_byte(buf[i]);
-            }
+        } else {
+            // Secure profile: minimal output to avoid info leakage
+            serial_write_str(" [Secure mode: details redacted]");
         }
         serial_write_str("\n");
 
-        // 尝试打印panic消息
-        // 使用 core::fmt::write 来格式化
-        struct SerialFmt;
-        impl core::fmt::Write for SerialFmt {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                for b in s.bytes() {
-                    unsafe {
-                        serial_write_byte(b);
+        // R93-16 FIX: Only print full panic message in non-Secure profiles.
+        // Panic messages can contain formatted kernel pointers, stack traces,
+        // and other sensitive information that could aid exploitation.
+        if !suppress_details {
+            // 尝试打印panic消息
+            // 使用 core::fmt::write 来格式化
+            struct SerialFmt;
+            impl core::fmt::Write for SerialFmt {
+                fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                    for b in s.bytes() {
+                        unsafe {
+                            serial_write_byte(b);
+                        }
                     }
+                    Ok(())
                 }
-                Ok(())
             }
+            let _ = core::fmt::write(&mut SerialFmt, format_args!("{}\n", info));
         }
-        let _ = core::fmt::write(&mut SerialFmt, format_args!("{}\n", info));
 
         // G.1 kdump: Emit encrypted crash dump over serial.
         // The dump includes:

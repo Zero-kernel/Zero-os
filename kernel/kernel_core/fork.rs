@@ -280,6 +280,16 @@ fn fork_inner(
         child.cgroup_id = parent.cgroup_id;
         // Note: cgroup task tracking is done after process is fully created
 
+        // R93-1 FIX: 继承 IPC/Network/User 命名空间（以及 for_children 默认值）
+        // 防止 fork() 产生的子进程意外回落到 root namespace 造成隔离逃逸
+        // 注：PID namespace 和 Mount namespace 已在 create_process() 中继承
+        child.ipc_ns = parent.ipc_ns.clone();
+        child.ipc_ns_for_children = parent.ipc_ns_for_children.clone();
+        child.net_ns = parent.net_ns.clone();
+        child.net_ns_for_children = parent.net_ns_for_children.clone();
+        child.user_ns = parent.user_ns.clone();
+        child.user_ns_for_children = parent.user_ns_for_children.clone();
+
         // 继承 Seccomp/Pledge 沙箱状态
         // - SeccompState.filters: Vec<Arc<SeccompFilter>> 通过 Arc 共享，避免深拷贝
         // - no_new_privs: 粘滞标志，一旦设置不可清除，必须继承
@@ -1020,6 +1030,13 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
 /// 3. 将 PD[2] 的 2MB 大页拆分为 4KB PT（如果需要）
 ///
 /// 这样用户空间可以使用 4KB 页，而内核的恒等映射不受影响。
+///
+/// # R93-7 FIX: USER_ACCESSIBLE Propagation
+///
+/// When copying page table entries, we must ensure USER_ACCESSIBLE is set on
+/// all entries in the path from PML4 down to the leaf page tables that user
+/// space might traverse. Previously, only specific indices were modified,
+/// leaving other entries as supervisor-only which caused spurious #PF.
 unsafe fn deep_copy_identity_for_user(
     current_pml4: &mut PageTable,
     new_pml4: &mut PageTable,
@@ -1042,9 +1059,15 @@ unsafe fn deep_copy_identity_for_user(
     zero_table(new_pdpt_frame);
 
     // 复制 PDPT 条目
+    // R93-7 FIX (revised): Only PDPT[0] needs USER_ACCESSIBLE for user space.
+    // Other PDPT entries (1-511) are identity map for physical memory beyond 1GB.
+    // Setting USER_ACCESSIBLE on those would expose kernel memory and break SMAP.
+    // We copy them as supervisor-only to maintain isolation.
     let current_pdpt = phys_to_virt_table(current_pml4_0.addr());
     let new_pdpt = phys_to_virt_table(new_pdpt_frame.start_address());
     for i in 0..512 {
+        // Copy entries as-is (supervisor-only); USER_ACCESSIBLE is set only
+        // on PDPT[0] below after we process it specially for user space.
         new_pdpt[i] = current_pdpt[i].clone();
     }
 
@@ -1073,6 +1096,12 @@ unsafe fn deep_copy_identity_for_user(
     zero_table(new_pd_frame);
 
     // 复制 PD 条目
+    // R93-7 FIX (revised): Only PD[2] (4MB-6MB region) needs USER_ACCESSIBLE.
+    // Other PD entries are identity-mapped kernel memory (0-4MB, 6MB-1GB).
+    // Setting USER_ACCESSIBLE on those would:
+    // 1. Break SMAP - kernel can't access "user" pages without STAC
+    // 2. Expose kernel memory to user space
+    // We copy them as supervisor-only; USER_ACCESSIBLE is set on PD[2] below.
     let current_pd = phys_to_virt_table(current_pdpt_0.addr());
     let new_pd = phys_to_virt_table(new_pd_frame.start_address());
     for i in 0..512 {

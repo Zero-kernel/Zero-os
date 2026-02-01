@@ -654,12 +654,25 @@ const ACK_TIMEOUT_RETRIES: usize = 3;
 /// Wait for all target CPUs to acknowledge the shootdown request
 ///
 /// Returns true if all ACKs received, false on timeout.
+///
+/// # R93-9 FIX: Fail-Closed ACK Handling
+///
+/// Previously used `.unwrap_or(true)` which treated missing CPU mailboxes as ACKed.
+/// This was a security vulnerability: if a CPU's per-CPU data was not properly
+/// initialized (race condition, memory corruption, etc.), the TLB shootdown would
+/// consider it "done" without actually flushing that CPU's TLB. This could leave
+/// stale TLB entries pointing to freed memory → use-after-free.
+///
+/// Now uses `.unwrap_or(false)` (fail-closed): if we cannot verify a CPU's ACK,
+/// we assume it has NOT acked. Combined with the retry/panic logic in callers,
+/// this ensures we never silently skip a CPU's TLB flush.
 fn wait_for_acks(targets: &[usize], generation: u64) -> bool {
     for _ in 0..IPI_ACK_TIMEOUT_SPINS {
         let all_acked = targets.iter().all(|&cpu| {
             mailbox_for_cpu(cpu)
                 .map(|m| m.ack_gen.load(Ordering::Acquire) >= generation)
-                .unwrap_or(true) // Missing CPU counts as acked
+                // R93-9 FIX: Fail-closed - missing mailbox means NOT acked
+                .unwrap_or(false)
         });
         if all_acked {
             return true;
@@ -670,13 +683,28 @@ fn wait_for_acks(targets: &[usize], generation: u64) -> bool {
 }
 
 /// Get list of CPUs that haven't ACKed yet
+///
+/// # R93-9 FIX: Fail-Closed Missing Mailbox
+///
+/// Previously used `.unwrap_or(false)` which excluded CPUs with missing mailboxes
+/// from the unacked list. This was a security bug that complemented the fail-open
+/// bug in `wait_for_acks`:
+///
+/// 1. wait_for_acks treats missing mailbox as acked (returns early "success")
+/// 2. get_unacked_cpus excludes missing CPUs from unacked list (no retry/warning)
+/// 3. Result: CPU with missing mailbox silently skipped, stale TLB remains
+///
+/// Now uses `.unwrap_or(true)` (fail-closed): if we cannot verify a CPU's ACK
+/// status, we assume it has NOT acked and include it in the unacked list.
+/// This ensures the retry logic and panic path catch the problem.
 fn get_unacked_cpus(targets: &[usize], generation: u64) -> Vec<usize> {
     targets
         .iter()
         .filter(|&&cpu| {
             mailbox_for_cpu(cpu)
                 .map(|m| m.ack_gen.load(Ordering::Relaxed) < generation)
-                .unwrap_or(false)
+                // R93-9 FIX: Fail-closed - missing mailbox means NOT acked
+                .unwrap_or(true)
         })
         .copied()
         .collect()

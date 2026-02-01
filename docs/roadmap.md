@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-01-30
+**Last Updated:** 2026-01-31
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,10 +10,11 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase F COMPLETE (Resource Governance)
+### Current Status: Phase G IN PROGRESS (Production Readiness)
 
 Zero-OS has completed SMP infrastructure and resource governance:
-- **88 security audits** with 426 issues found, 369 fixed (86.6%)
+- **93 security audits** with 452 issues found, 395 fixed (87.4%)
+- **R93 Security Debt**: ALL 18 issues FIXED (fork namespace escape, livepatch hardening, fail-open patterns, cgroup escape, kdump, TLB shootdown, FIPS KATs, panic redaction)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
 - **Thread support** with Clone syscall and TLS inheritance
 - **VFS** with POSIX DAC permissions, procfs, ext2
@@ -61,6 +62,7 @@ Zero-OS has completed SMP infrastructure and resource governance:
 - **R91**: current_pid() IRQ deadlock ✅, CpuLocal stack overflow ✅, Profiler control race ✅ (ALL 3 FIXED)
 - **R90**: IOMMU fail-closed ✅, Net NS ingress ✅, pids.max CAS ✅, Migrate lock ✅ (ALL 4 FIXED)
 - **R88**: VM passthrough IR enable ✅, Unassign cleanup order ✅ (ALL 2 FIXED)
+- **R93**: Fork namespace escape ✅, Livepatch compile guard ✅, Fail-open patterns ✅, Cgroup attach ✅, ELF cgroup ✅, Identity map ✅, kdump fallback ✅, TLB shootdown ✅ (ALL 9 CRITICAL/HIGH FIXED)
 - **R77**: TCP child socket quota ✅, Fork cpuset rollback ✅, delete_cgroup race ✅, Memory accounting CAS ✅, Namespace guard ✅ (ALL 5 FIXED)
 - **R75**: move_device permission check ✅, namespace FD refcount ✅, **IPC endpoint isolation ✅**, **Socket table isolation ✅** (ALL 4 FIXED)
 - **R76**: Socket namespace enforcement ✅, Namespace count limits ✅, Per-namespace socket quotas ✅ (ALL 3 FIXED)
@@ -843,17 +845,34 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - [x] Counter hot-path integration ✅ (all 15 TraceCounter variants wired to hot paths)
 - [x] kdump (encrypted, redacted) ✅ (R92 - ChaCha20 encryption, KptrGuard redaction, panic-safe)
 
-#### G.2 Live Patching
+#### G.2 Live Patching ✅ **SECURITY COMPLETE** (R93 issues fixed)
 
-- [ ] Patch framework
-- [ ] Rollback policy
-- [ ] Signature verification
+**R93 Security Fixes Completed:**
+- [x] Compile-time guard against insecure-ecdsa-stub in release builds (R93-2)
+- [x] Default fail-closed when no ECDSA verifier wired (R93-2)
+- [x] Patch target/handler address validation within kernel .text (R93-10)
+- [x] W^X seal_exec enforcement - required trait method (R93-11)
+- [x] Target mapping validation before volatile access (R93-12)
+- [x] sys_kpatch_unload syscall for patch lifecycle (R93-13)
 
-#### G.3 Compliance
+**Remaining for Production:**
+- [x] Real ECDSA P-256 signature verification ✅ (p256 + ecdsa crates, KAT-gated, RFC 6979 test vector)
+- [x] Rollback policy ✅ (rollback_recent_patches() auto-disables patches within TSC window on fault)
+- [ ] Patch dependency tracking (ordered enable/disable)
 
-- [ ] Hardening profiles (Secure/Balanced/Performance)
-- [ ] Audit remote delivery
-- [ ] FIPS mode preparation
+#### G.3 Compliance ✅ **SECURITY COMPLETE** (R93 issues fixed)
+
+**R93 Security Fixes Completed:**
+- [x] FIPS self-tests with real KATs (R93-14) - SHA-256 + HMAC-SHA256 NIST vectors
+- [x] kdump FIPS cipher selection (R93-15) - fail-closed in FIPS mode
+- [x] Panic output redaction in Secure profile (R93-16)
+- [x] Cgroup capability/namespace model (R93-17) - CAP_SYS_ADMIN checks
+
+**Remaining for Production:**
+- [ ] Hardening profiles policy wiring (Secure/Balanced/Performance)
+- [ ] Audit remote delivery (sys_audit_export)
+- [ ] Cgroup delegation for unprivileged container managers
+- [x] ECDSA KAT when signature verification implemented ✅ (delegates to livepatch::ecdsa_p256 KAT)
 
 **Security Requirements**:
 - Debug interfaces require Cap/LSM authorization
@@ -955,12 +974,13 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-29 | 90 | 4 | 4 | **Cross-subsystem** - IOMMU fail-closed ✅, Net NS ingress ✅, pids.max CAS ✅, Migrate lock ✅ |
 | 2026-01-30 | 91 | 3 | 3 | **Profiler (G.1)** - current_pid() IRQ deadlock ✅, CpuLocal stack overflow ✅, profiler control race ✅ |
 | 2026-01-30 | 92 | 5 | 5 | **kdump (G.1)** - Multi-CPU race ✅, Stack page boundary ✅, ASCII hex redaction ✅, Key cleanup ✅, try_fill_random fallback ✅ |
-| **Total** | **92** | **434** | **377 (86.9%)** | **57 open (R65 SMP, R81-3/R84-4/R89-4 documented)** |
+| 2026-01-31 | 93 | 18 | 18 | **SECURITY DEBT** - Fork NS escape (CRITICAL) ✅, Livepatch guard (CRITICAL) ✅, Fail-open (HIGH) ✅, sys_access (HIGH) ✅, cgroup_attach (HIGH) ✅, ELF cgroup (HIGH) ✅, Identity map (HIGH) ✅, kdump fallback (HIGH) ✅, TLB shootdown (HIGH) ✅, Livepatch address (HIGH) ✅, seal_exec (HIGH) ✅, target mapping (MEDIUM) ✅, kpatch_unload (MEDIUM) ✅, FIPS KATs (MEDIUM) ✅, kdump FIPS (MEDIUM) ✅, panic redact (MEDIUM) ✅, cgroup caps (MEDIUM) ✅, ELF filesz (LOW) ✅ - **ALL 18 FIXED** |
+| **Total** | **93** | **452** | **395 (87.4%)** | **57 open (R65 SMP, R81-3/R84-4/R89-4 documented)** |
 
 ### Current Status
 
-- **Fixed**: 377 issues (86.9%)
-- **Open**: 57 issues (13.1%)
+- **Fixed**: 395 issues (87.4%)
+- **Open**: 57 issues (12.6%)
   - R65 remaining issues (SMP-related, non-blocking)
   - R81-3 (Direct map bound) documented risk
   - R84-4 (x2APIC mode) documented limitation
@@ -976,15 +996,17 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
   - F.1 Namespaces: ✅ **COMPLETE** - All 5 types: PID/Mount/IPC/Network/User with full isolation (R75-R78)
   - F.2 Cgroups v2: ✅ **COMPLETE** - PIDs/CPU/Memory/IO controllers + cgroup2 filesystem + R83 hierarchical PIDs
   - F.3 IOMMU/VT-d: ✅ **COMPLETE** - Core infrastructure ✅, Second-level page tables ✅, Context table ✅, VirtIO integration ✅, Interrupt Remapping ✅ (R84), Fault Handling ✅ (R85), Device Isolation ✅ (R86), Device Detach API ✅ (R87), **VM Passthrough ✅** (R88)
-- **Phase G Progress**: **G.1 COMPLETE**
+- **Phase G Progress**: **G.1/G.2/G.3 SECURITY COMPLETE**
   - G.1 Observability: ✅ **COMPLETE** - Tracepoints, Per-CPU counters, Watchdog (R89), Profiler (R91), Counter integration, kdump (R92)
+  - G.2 Live Patching: ✅ **SECURITY COMPLETE** - R93-2,10,11,12,13 fixed; ECDSA P-256 ✅; Rollback policy ✅; remaining: dependencies
+  - G.3 Compliance: ✅ **SECURITY COMPLETE** - R93-14,15,16,17 fixed; remaining: hardening profiles, audit delivery
+- **R93 Security Debt**: ✅ **FULLY RESOLVED** - All 18 issues fixed (2 CRITICAL, 9 HIGH, 5 MEDIUM, 2 LOW)
 - **SMP Ready**: All Phase E components complete, 8-core SMP testing verified
 - **Container Foundation**: COMPLETE - All 5 namespace types + Cgroups v2 provide full container isolation
 - **Virtualization Foundation**: COMPLETE - IOMMU/VT-d with VM passthrough preparation
-- **R92 Key Fixes**: Multi-CPU race in kdump capture, stack page boundary check, ASCII hex pointer redaction, key material cleanup
-- **R91 Key Fixes**: current_pid() IRQ deadlock (CRITICAL), CpuLocal stack overflow, profiler control race
+- **R93 Key Fixes**: Fork namespace escape (CRITICAL), Livepatch compile guard (CRITICAL), Fail-closed patterns, Cgroup authorization, ELF memory accounting, Identity map isolation, kdump encryption required, TLB shootdown fail-closed, Address validation, seal_exec, kpatch_unload, FIPS KATs, Panic redaction, Cgroup capabilities
 
-See [qa-2026-01-30.md](review/qa-2026-01-30.md) for latest audit report.
+See [qa-2026-01-31.md](review/qa-2026-01-31.md) for latest audit report.
 
 ---
 

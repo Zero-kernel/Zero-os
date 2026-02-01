@@ -9,6 +9,8 @@ path = "lib.rs"
 
 [features]
 default = []
+# R93-2 FIX: Marks production/release builds. Used to forbid insecure stubs.
+release = []
 # SECURITY: Development-only. Enables an insecure, non-cryptographic signature check.
 # Never ship this feature enabled in production.
 insecure-ecdsa-stub = []
@@ -16,3 +18,9 @@ insecure-ecdsa-stub = []
 [dependencies]
 spin = "0.9"
 x86_64 = "0.15"
+
+# P-256 curve arithmetic + SEC1 public key parsing (no ECDSA helpers, no sha2).
+# Using minimal features to avoid pulling in sha2 which has LLVM issues on bare-metal.
+p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+# ECDSA verification only (no signing / no RFC6979). Uses ecdsa::hazmat::verify_prehashed.
+ecdsa = { version = "0.16", default-features = false, features = ["hazmat", "arithmetic"] }

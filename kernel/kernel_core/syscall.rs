@@ -2348,7 +2348,8 @@ fn sys_clone(
     if flags & CLONE_NEWNS != 0 {
         let has_cap_admin =
             with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
-        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(true);
+        // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
+        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
         if !is_root && !has_cap_admin {
             println!("[sys_clone] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
             return Err(SyscallError::EPERM);
@@ -2366,7 +2367,8 @@ fn sys_clone(
     if flags & CLONE_NEWIPC != 0 {
         let has_cap_admin =
             with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
-        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(true);
+        // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
+        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
         if !is_root && !has_cap_admin {
             println!("[sys_clone] CLONE_NEWIPC denied: requires CAP_SYS_ADMIN or root");
             return Err(SyscallError::EPERM);
@@ -2384,7 +2386,8 @@ fn sys_clone(
     if flags & CLONE_NEWNET != 0 {
         let has_cap_admin =
             with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
-        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(true);
+        // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
+        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
         if !is_root && !has_cap_admin {
             println!("[sys_clone] CLONE_NEWNET denied: requires CAP_NET_ADMIN or root");
             return Err(SyscallError::EPERM);
@@ -3923,7 +3926,8 @@ fn sys_unshare(flags: u64) -> SyscallResult {
         // F.1 Security: require CAP_SYS_ADMIN or root
         let has_cap_admin =
             with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
-        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(true);
+        // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
+        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
         if !is_root && !has_cap_admin {
             println!("[sys_unshare] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
             return Err(SyscallError::EPERM);
@@ -6499,8 +6503,9 @@ fn sys_access(path: *const u8, mode: i32) -> SyscallResult {
     }
 
     // 获取当前进程凭证
-    let euid = crate::current_euid().unwrap_or(0);
-    let egid = crate::current_egid().unwrap_or(0);
+    // R93-4 FIX: Fail-closed - return ESRCH if credentials unavailable (was unwrap_or(0))
+    let euid = crate::current_euid().ok_or(SyscallError::ESRCH)?;
+    let egid = crate::current_egid().ok_or(SyscallError::ESRCH)?;
     let sup_groups = crate::current_supplementary_groups().unwrap_or_default();
 
     // root用户拥有所有权限
@@ -8164,11 +8169,20 @@ pub struct CgroupStatsBuf {
 /// * On error: Negative errno
 ///
 /// # Security
-/// Requires CAP_SYS_ADMIN (or root) to create cgroups.
+///
+/// R93-17 FIX: Proper capability-based access control.
+///
+/// Requires CAP_SYS_ADMIN capability to create cgroups. Previously only
+/// checked euid==0 which bypassed the capability model and didn't support
+/// future namespace-aware delegation.
 fn sys_cgroup_create(parent_id: u64, controllers: u32) -> Result<usize, SyscallError> {
-    // Security: Only root can create cgroups
+    // R93-17 FIX: Capability-based access control for cgroup creation
+    // Check for CAP_SYS_ADMIN capability, falling back to root check for compatibility
     let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-    if creds.euid != 0 {
+    let has_cap_admin =
+        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+
+    if !has_cap_admin && creds.euid != 0 {
         return Err(SyscallError::EPERM);
     }
 
@@ -8198,11 +8212,17 @@ fn sys_cgroup_create(parent_id: u64, controllers: u32) -> Result<usize, SyscallE
 /// * On error: Negative errno
 ///
 /// # Security
-/// Requires CAP_SYS_ADMIN (or root). Cgroup must be empty.
+///
+/// R93-17 FIX: Proper capability-based access control.
+///
+/// Requires CAP_SYS_ADMIN capability. Cgroup must be empty.
 fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
-    // Security: Only root can destroy cgroups
+    // R93-17 FIX: Capability-based access control for cgroup destruction
     let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-    if creds.euid != 0 {
+    let has_cap_admin =
+        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+
+    if !has_cap_admin && creds.euid != 0 {
         return Err(SyscallError::EPERM);
     }
 
@@ -8215,6 +8235,34 @@ fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
     }
 }
 
+/// R93-5 FIX: Check if target cgroup is a descendant of ancestor cgroup.
+///
+/// Returns true if `target_id` is the same as `ancestor_id` or is a descendant
+/// (child, grandchild, etc.) of `ancestor_id`. This is used to enforce that
+/// non-root processes can only move to more restricted (deeper) cgroups.
+fn cgroup_is_descendant_of(target_id: u64, ancestor_id: u64) -> bool {
+    // Same cgroup is allowed (no movement)
+    if target_id == ancestor_id {
+        return true;
+    }
+
+    // Walk up from target to see if we reach ancestor
+    let target = match cgroup::lookup_cgroup(target_id) {
+        Some(cg) => cg,
+        None => return false,
+    };
+
+    let mut cursor = target.parent();
+    while let Some(parent) = cursor {
+        if parent.id() == ancestor_id {
+            return true;
+        }
+        cursor = parent.parent();
+    }
+
+    false
+}
+
 /// sys_cgroup_attach - Attach current process to a cgroup
 ///
 /// # Arguments
@@ -8225,7 +8273,15 @@ fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
 /// * On error: Negative errno
 ///
 /// # Security
-/// Process can migrate itself. Root can migrate any process (future extension).
+///
+/// R93-5 FIX: Require privilege to migrate between cgroups.
+///
+/// To prevent unprivileged cgroup escape (moving to a less restricted parent):
+/// 1. Require CAP_SYS_ADMIN or root (euid == 0) to attach
+/// 2. Target cgroup must be a descendant of current cgroup (can only move deeper)
+///
+/// Root users can still move anywhere; non-root with CAP_SYS_ADMIN is restricted
+/// to descendants to prevent accidental privilege escalation.
 fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     let pid = crate::process::current_pid().ok_or(SyscallError::ESRCH)?;
     let process = crate::process::get_process(pid).ok_or(SyscallError::ESRCH)?;
@@ -8234,6 +8290,25 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
         let proc = process.lock();
         proc.cgroup_id
     };
+
+    // R93-5 FIX: Require CAP_SYS_ADMIN or root to attach to cgroups
+    let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+    let is_root = creds.euid == 0;
+
+    if !is_root {
+        // Non-root users need CAP_SYS_ADMIN capability
+        let has_cap_admin =
+            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+        if !has_cap_admin {
+            return Err(SyscallError::EPERM);
+        }
+
+        // R93-5 FIX: Non-root can only move to descendant cgroups to prevent escape
+        // This prevents moving from a restricted child to a less-restricted parent
+        if !cgroup_is_descendant_of(cgroup_id, old_cgroup_id) {
+            return Err(SyscallError::EPERM);
+        }
+    }
 
     // Migrate task between cgroups
     match cgroup::migrate_task(pid as u64, old_cgroup_id, cgroup_id) {
@@ -8288,11 +8363,17 @@ const CGROUP_LIMIT_IO_MAX_IOPS: u32 = 7;
 /// * On error: Negative errno
 ///
 /// # Security
-/// Requires CAP_SYS_ADMIN (or root) to set limits.
+///
+/// R93-17 FIX: Proper capability-based access control.
+///
+/// Requires CAP_SYS_ADMIN capability to set limits.
 fn sys_cgroup_set_limit(cgroup_id: u64, limit_type: u32, value: u64) -> Result<usize, SyscallError> {
-    // Security: Only root can set cgroup limits
+    // R93-17 FIX: Capability-based access control for setting limits
     let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-    if creds.euid != 0 {
+    let has_cap_admin =
+        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+
+    if !has_cap_admin && creds.euid != 0 {
         return Err(SyscallError::EPERM);
     }
 

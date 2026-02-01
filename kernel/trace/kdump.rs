@@ -35,6 +35,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
+use compliance::is_fips_enabled;
 use security::{try_fill_random, ChaCha20Rng, KptrGuard};
 
 // ============================================================================
@@ -352,9 +353,35 @@ pub fn capture_crash_context(info: &PanicInfo) -> &'static CrashDump {
 /// <base64-encoded encrypted dump>
 /// --END ZOS-KDUMP--
 /// ```
+///
+/// # R93-8 FIX: No Plaintext Fallback
+///
+/// If encryption fails (RNG unavailable), the dump is NOT emitted at all.
+/// This prevents sensitive crash data from being leaked in plaintext.
+/// Previous behavior emitted `enc=none` which exposed kernel pointers,
+/// stack contents, and register state in cleartext over serial.
+///
+/// # R93-15 FIX: FIPS Compliance
+///
+/// ChaCha20 is NOT a FIPS 140-2/140-3 approved algorithm. In FIPS mode:
+/// - The dump is suppressed entirely (fail-closed security design)
+/// - A warning is emitted indicating FIPS-compliant kdump is not yet supported
+/// - Future implementation should add AES-256-GCM for FIPS-compliant encryption
 pub fn emit_encrypted_dump(dump: &CrashDump) {
     // Only emit once
     if KDUMP_EMITTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    // R93-15 FIX: Suppress dump in FIPS mode (ChaCha20 is not FIPS-approved).
+    // In FIPS mode, crash dumps must use FIPS-approved algorithms (AES-GCM).
+    // Until an AES implementation is added, we fail closed to maintain compliance.
+    if is_fips_enabled() {
+        serial_write_str("\n[kdump] FIPS mode active - ChaCha20 not permitted\n");
+        serial_write_str("[kdump] Crash dump suppressed for FIPS compliance\n");
+        // Securely zero the dump in memory before returning
+        let out = unsafe { &mut KDUMP_BUF };
+        secure_bzero(out);
         return;
     }
 
@@ -367,44 +394,39 @@ pub fn emit_encrypted_dump(dump: &CrashDump) {
     // R92-4 FIX: Generate key and nonce in a single RNG call to minimize
     // lock contention in panic context.
     let mut seed = [0u8; 44]; // 32 bytes key + 12 bytes nonce
-    let encrypted = try_fill_random(&mut seed).is_ok();
+    let rng_ok = try_fill_random(&mut seed).is_ok();
+
+    // R93-8 FIX: If RNG fails, do NOT emit plaintext dump.
+    // Emitting unencrypted crash data leaks sensitive kernel state.
+    if !rng_ok {
+        secure_bzero(&mut seed);
+        secure_bzero(&mut out[..len]);
+        serial_write_str("\n[kdump] Encryption failed - dump suppressed for security\n");
+        return;
+    }
+
     let mut key = [0u8; 32];
     let mut nonce = [0u8; 12];
-
-    if encrypted {
-        key.copy_from_slice(&seed[..32]);
-        nonce.copy_from_slice(&seed[32..]);
-    }
+    key.copy_from_slice(&seed[..32]);
+    nonce.copy_from_slice(&seed[32..]);
     secure_bzero(&mut seed);
 
-    if encrypted {
-        // Encrypt in place using ChaCha20
-        // R92-4 FIX: Clear key_for_cipher after creating the cipher to minimize exposure.
-        let mut key_for_cipher = key;
-        secure_bzero(&mut key);
+    // Encrypt in place using ChaCha20
+    // R92-4 FIX: Clear key_for_cipher after creating the cipher to minimize exposure.
+    let mut key_for_cipher = key;
+    secure_bzero(&mut key);
 
-        let mut cipher = ChaCha20Rng::new(key_for_cipher, nonce);
-        secure_bzero(&mut key_for_cipher);
-        xor_chacha20(&mut cipher, &mut out[..len]);
-        // Note: ChaCha20Rng internal state remains in memory until panic completes.
-        // This is acceptable in panic context where memory may already be compromised.
-    } else {
-        // Clear sensitive data even on failure
-        secure_bzero(&mut key);
-        secure_bzero(&mut nonce);
-    }
+    let mut cipher = ChaCha20Rng::new(key_for_cipher, nonce);
+    secure_bzero(&mut key_for_cipher);
+    xor_chacha20(&mut cipher, &mut out[..len]);
+    // Note: ChaCha20Rng internal state remains in memory until panic completes.
+    // This is acceptable in panic context where memory may already be compromised.
 
     // Emit header
     serial_write_str("\n--BEGIN ZOS-KDUMP--\n");
-    serial_write_str("v=1 ");
-    if encrypted {
-        serial_write_str("enc=chacha20 nonce=");
-        serial_write_hex_bytes(&nonce);
-        serial_write_str(" ");
-    } else {
-        serial_write_str("enc=none ");
-    }
-    serial_write_str("len=");
+    serial_write_str("v=1 enc=chacha20 nonce=");
+    serial_write_hex_bytes(&nonce);
+    serial_write_str(" len=");
     serial_write_dec_u32(len as u32);
     serial_write_str("\n");
 
@@ -414,9 +436,7 @@ pub fn emit_encrypted_dump(dump: &CrashDump) {
     serial_write_str("--END ZOS-KDUMP--\n");
 
     // Cleanup
-    if encrypted {
-        secure_bzero(&mut nonce);
-    }
+    secure_bzero(&mut nonce);
     secure_bzero(&mut out[..len]);
 }
 

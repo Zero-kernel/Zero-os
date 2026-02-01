@@ -22,6 +22,10 @@ use xmas_elf::{
     ElfFile,
 };
 
+// R93-6 FIX: Import cgroup module for memory accounting
+use crate::cgroup;
+use crate::process::current_cgroup_id;
+
 /// 用户地址空间起始（4MB）
 ///
 /// 用户程序加载在 4MB 处，这是经典的 Linux 用户空间起始地址。
@@ -66,6 +70,8 @@ pub enum ElfLoadError {
     OutOfBounds,
     /// 物理内存不足
     OutOfMemory,
+    /// R93-6 FIX: Cgroup memory limit exceeded
+    CgroupLimitExceeded,
 }
 
 /// ELF 加载结果
@@ -101,6 +107,11 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
     // 验证 ELF 头
     validate_elf_header(&elf)?;
 
+    // R93-6 FIX: Get current process's cgroup ID for memory accounting.
+    // Memory charged during ELF loading counts against the process's cgroup limits.
+    // This prevents cgroup escape by loading large binaries.
+    let cgroup_id = current_cgroup_id().unwrap_or(0);
+
     // Z-10 fix: 追踪所有已映射的页，用于失败时统一回滚
     // 这确保如果段 N 失败，段 0..N-1 的映射也会被清理
     //
@@ -126,18 +137,18 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
                 }
             }
 
-            if let Err(e) = load_segment_tracked(&elf, &ph, &mut all_mappings) {
+            if let Err(e) = load_segment_tracked(&elf, &ph, &mut all_mappings, cgroup_id) {
                 // 回滚所有已成功映射的段
-                rollback_all_mappings(&mut all_mappings);
+                rollback_all_mappings(&mut all_mappings, cgroup_id);
                 return Err(e);
             }
         }
     }
 
     // 分配用户栈
-    if let Err(e) = allocate_user_stack_tracked(&mut all_mappings) {
+    if let Err(e) = allocate_user_stack_tracked(&mut all_mappings, cgroup_id) {
         // 回滚所有已加载的段
-        rollback_all_mappings(&mut all_mappings);
+        rollback_all_mappings(&mut all_mappings, cgroup_id);
         return Err(e);
     }
 
@@ -152,7 +163,7 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
             "ELF loader: brk_start 0x{:x} overlaps with stack at 0x{:x}",
             brk_start, stack_base
         );
-        rollback_all_mappings(&mut all_mappings);
+        rollback_all_mappings(&mut all_mappings, cgroup_id);
         return Err(ElfLoadError::OverlapWithStack);
     }
 
@@ -170,14 +181,14 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
             "ELF loader: invalid entry point 0x{:x} (valid range: 0x{:x}-0x{:x})",
             entry, USER_BASE, USER_STACK_TOP
         );
-        rollback_all_mappings(&mut all_mappings);
+        rollback_all_mappings(&mut all_mappings, cgroup_id);
         return Err(ElfLoadError::SegmentOutOfRange);
     }
     // 验证 canonical（虽然上面的范围检查已经隐含了这一点，但显式检查更安全）
     let sign_extended = ((entry as i64) >> 47) as u64;
     if sign_extended != 0 && sign_extended != 0x1FFFF {
         println!("ELF loader: non-canonical entry point 0x{:x}", entry);
-        rollback_all_mappings(&mut all_mappings);
+        rollback_all_mappings(&mut all_mappings, cgroup_id);
         return Err(ElfLoadError::SegmentOutOfRange);
     }
 
@@ -235,6 +246,7 @@ fn validate_elf_header(elf: &ElfFile) -> Result<(), ElfLoadError> {
 /// * `elf` - ELF 文件引用
 /// * `ph` - 程序头
 /// * `tracked` - 全局映射追踪向量，成功映射的页会被追加到此向量
+/// * `cgroup_id` - R93-6 FIX: Cgroup ID for memory accounting
 ///
 /// # Returns
 ///
@@ -243,6 +255,7 @@ fn load_segment_tracked(
     elf: &ElfFile,
     ph: &xmas_elf::program::ProgramHeader,
     tracked: &mut Vec<MappedEntry>,
+    cgroup_id: cgroup::CgroupId,
 ) -> Result<(), ElfLoadError> {
     let vaddr = ph.virtual_addr() as usize;
     let memsz = ph.mem_size() as usize;
@@ -252,6 +265,14 @@ fn load_segment_tracked(
     // 跳过大小为 0 的段
     if memsz == 0 {
         return Ok(());
+    }
+
+    // R93-18 FIX: Reject malformed ELF with p_filesz > p_memsz.
+    // In valid ELF, filesz <= memsz (the extra memsz - filesz bytes are BSS, zeroed).
+    // If filesz > memsz, the segment is malformed and could cause truncated loads
+    // or buffer overflows when copying file data.
+    if filesz > memsz {
+        return Err(ElfLoadError::OutOfBounds);
     }
 
     // 边界检查
@@ -284,6 +305,18 @@ fn load_segment_tracked(
     let page_offset = vaddr - page_base;
     let map_len = page_offset + memsz;
     let page_count = (map_len + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    // R93-6 FIX: Pre-charge memory for this segment.
+    // This enforces cgroup memory limits during ELF loading, preventing bypass
+    // by loading large binaries that exceed memory.max.
+    let charge_bytes = (page_count * PAGE_SIZE) as u64;
+    if cgroup::try_charge_memory(cgroup_id, charge_bytes).is_err() {
+        println!(
+            "ELF loader: cgroup memory limit exceeded for segment (need {} bytes)",
+            charge_bytes
+        );
+        return Err(ElfLoadError::CgroupLimitExceeded);
+    }
 
     // 确定页权限
     let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
@@ -378,15 +411,30 @@ fn load_segment_tracked(
 /// # Arguments
 ///
 /// * `tracked` - 全局映射追踪向量，成功映射的页会被追加到此向量
+/// * `cgroup_id` - R93-6 FIX: Cgroup ID for memory accounting
 ///
 /// # Returns
 ///
 /// 成功返回 Ok(())，失败时调用方负责使用 tracked 进行全局回滚
-fn allocate_user_stack_tracked(tracked: &mut Vec<MappedEntry>) -> Result<(), ElfLoadError> {
+fn allocate_user_stack_tracked(
+    tracked: &mut Vec<MappedEntry>,
+    cgroup_id: cgroup::CgroupId,
+) -> Result<(), ElfLoadError> {
     let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
     // 【修复】多分配一页，确保 USER_STACK_TOP 所在的页也被映射
     // musl libc 启动时会向上扫描栈查找 auxv 等数据结构
     let page_count = USER_STACK_SIZE / PAGE_SIZE + 1;
+
+    // R93-6 FIX: Pre-charge memory for user stack.
+    // This enforces cgroup memory limits for stack allocation.
+    let charge_bytes = (page_count * PAGE_SIZE) as u64;
+    if cgroup::try_charge_memory(cgroup_id, charge_bytes).is_err() {
+        println!(
+            "ELF loader: cgroup memory limit exceeded for stack (need {} bytes)",
+            charge_bytes
+        );
+        return Err(ElfLoadError::CgroupLimitExceeded);
+    }
 
     let flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
@@ -453,16 +501,23 @@ fn allocate_user_stack_tracked(tracked: &mut Vec<MappedEntry>) -> Result<(), Elf
 /// # Arguments
 ///
 /// * `tracked` - 已追踪的映射向量，函数会清空此向量
+/// * `cgroup_id` - R93-6 FIX: Cgroup ID for memory uncharging
 ///
 /// # Safety
 ///
 /// 必须在当前进程的地址空间上下文中调用（CR3 指向目标页表）
-fn rollback_all_mappings(tracked: &mut Vec<MappedEntry>) {
+fn rollback_all_mappings(tracked: &mut Vec<MappedEntry>, cgroup_id: cgroup::CgroupId) {
     if tracked.is_empty() {
         return;
     }
 
-    println!("ELF loader: rolling back {} mapped pages", tracked.len());
+    let page_count = tracked.len();
+    println!("ELF loader: rolling back {} mapped pages", page_count);
+
+    // R93-6 FIX: Uncharge memory for all pages being rolled back.
+    // This ensures cgroup memory accounting remains accurate on failure.
+    let uncharge_bytes = (page_count * PAGE_SIZE) as u64;
+    cgroup::uncharge_memory(cgroup_id, uncharge_bytes);
 
     let mut frame_alloc = FrameAllocator::new();
 

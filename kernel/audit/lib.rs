@@ -654,6 +654,82 @@ impl Sha256Writer {
     }
 }
 
+// ============================================================================
+// Public Crypto API for FIPS KATs
+// ============================================================================
+
+/// Public crypto API for FIPS Known Answer Tests.
+///
+/// These functions expose the audit subsystem's internal SHA-256 and HMAC-SHA256
+/// implementations so that the compliance module can run self-tests against the
+/// exact same code used for audit log integrity.
+///
+/// # R93-14: FIPS KAT Support
+///
+/// FIPS 140-2/140-3 requires that cryptographic modules run Known Answer Tests
+/// (KAT) at startup before enabling FIPS mode. These APIs allow the compliance
+/// module to test:
+/// - SHA-256 with NIST CAVP test vectors
+/// - HMAC-SHA256 with NIST CSRC example values
+pub mod crypto {
+    use super::Sha256;
+
+    /// Compute SHA-256 digest of a byte slice.
+    ///
+    /// This is the same SHA-256 implementation used for audit log integrity.
+    #[inline]
+    pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
+        Sha256::digest(data)
+    }
+
+    /// Streaming SHA-256 hasher (no allocation, no_std compatible).
+    ///
+    /// Use this for large inputs that cannot be loaded into memory at once.
+    pub struct StreamingSha256 {
+        inner: Sha256,
+    }
+
+    impl StreamingSha256 {
+        /// Create a new streaming hasher.
+        #[inline]
+        pub fn new() -> Self {
+            Self {
+                inner: Sha256::new(),
+            }
+        }
+
+        /// Update the hasher with more data.
+        #[inline]
+        pub fn update(&mut self, data: &[u8]) {
+            self.inner.update(data);
+        }
+
+        /// Finalize the hash and return the 32-byte digest.
+        #[inline]
+        pub fn finalize(self) -> [u8; 32] {
+            self.inner.finalize()
+        }
+    }
+
+    impl Default for StreamingSha256 {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// Compute HMAC-SHA256(key, msg) over raw byte slices.
+    ///
+    /// Delegates to the internal `hmac_sha256()` function to ensure FIPS KATs
+    /// exercise the exact same code path used for audit log integrity chains.
+    /// Implements RFC 2104 / FIPS 198-1.
+    #[inline]
+    pub fn hmac_sha256_digest(key: &[u8], msg: &[u8]) -> [u8; 32] {
+        super::hmac_sha256(key, |w| {
+            w.write_bytes(msg);
+        })
+    }
+}
+
 /// Compute SHA-256 hash of an AuditObject
 fn hash_object(hasher: &mut Sha256Writer, obj: &AuditObject) {
     match obj {
