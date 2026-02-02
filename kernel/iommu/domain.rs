@@ -6,12 +6,14 @@
 //!
 //! # Domain Types
 //!
-//! - **Identity**: IOVA == Physical address. Used for kernel DMA buffers.
-//! - **PageTable**: Full second-level page table translation. Used for VMs.
+//! - **Identity**: VT-d pass-through (untranslated). Unsafe; debug-only.
+//! - **PageTable**: Second-level page table translation. Used for kernel and VMs.
 //!
 //! # Security Model
 //!
-//! - Kernel domain (ID 0) is always identity-mapped
+//! - Kernel domain (ID 0) uses second-level translation by default
+//! - A boot-time identity map of 0-1GiB is pre-installed for early DMA buffers
+//! - Identity/pass-through domains are debug-only (`unsafe_identity_passthrough`)
 //! - Each VM gets its own domain with isolated page tables
 //! - Devices can only access memory mapped in their domain
 //!

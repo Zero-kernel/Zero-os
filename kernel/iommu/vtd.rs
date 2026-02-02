@@ -879,13 +879,24 @@ impl VtdUnit {
         // Build context entry based on domain type
         let ctx_entry = match domain.domain_type() {
             DomainType::Identity => {
-                // R81-2 FIX: Check pass-through support before using TT_PASSTHROUGH
-                // If hardware doesn't support pass-through, fail closed
-                if !self.supports_passthrough() {
-                    return Err(IommuError::HardwareInitFailed);
+                // R94-13 FIX: Identity domains use VT-d pass-through translation,
+                // which allows devices to DMA into arbitrary physical memory.
+                // Only permit this when explicitly opted in via feature flag.
+                #[cfg(not(feature = "unsafe_identity_passthrough"))]
+                {
+                    return Err(IommuError::PermissionDenied);
                 }
-                // Pass-through mode: IOVA == physical address
-                ContextEntry::new_passthrough(domain.id())
+
+                #[cfg(feature = "unsafe_identity_passthrough")]
+                {
+                    // R81-2 FIX: Check pass-through support before using TT_PASSTHROUGH
+                    // If hardware doesn't support pass-through, fail closed
+                    if !self.supports_passthrough() {
+                        return Err(IommuError::HardwareInitFailed);
+                    }
+                    // Pass-through mode: IOVA == physical address
+                    ContextEntry::new_passthrough(domain.id())
+                }
             }
             DomainType::PageTable => {
                 // R83-4 FIX: Validate domain AGAW against hardware CAP.SAGAW

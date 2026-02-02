@@ -7,6 +7,13 @@ description = "IOMMU/VT-d support for DMA isolation"
 [lib]
 path = "lib.rs"
 
+[features]
+default = []
+# Allow identity-mapped VT-d domains using pass-through translation.
+# UNSAFE: Permits devices to DMA into arbitrary physical memory.
+# Intended for debugging only; release builds must not enable this.
+unsafe_identity_passthrough = []
+
 [dependencies]
 spin = "0.9"
 x86_64 = "0.15"

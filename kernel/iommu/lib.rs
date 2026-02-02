@@ -21,7 +21,7 @@
 //!                                 v
 //!    +-----------------------------------------------------------+
 //!    |                    IOMMU Domains                          |
-//!    |  Domain 0: Identity map (kernel DMA buffers)              |
+//!    |  Domain 0: Kernel DMA (page-table, pre-mapped 0-1GiB)     |
 //!    |  Domain 1: VM1 guest memory (future passthrough)          |
 //!    |  Domain 2: VM2 guest memory (future passthrough)          |
 //!    +-----------------------------------------------------------+
@@ -36,7 +36,7 @@
 //!
 //! 1. Call `init()` during kernel boot to discover and initialize IOMMU units
 //! 2. Before enabling bus mastering on a PCI device, call `attach_device()`
-//! 3. Map DMA buffer ranges with `map_range()` (identity map by default)
+//! 3. Map DMA buffer ranges with `map_range()` (kernel domain pre-maps 0-1GiB)
 //!
 //! # Security Model
 //!
@@ -57,6 +57,16 @@ extern crate alloc;
 
 #[macro_use]
 extern crate drivers;
+
+// R94-13 FIX: Prevent accidentally shipping identity-domain pass-through.
+// VT-d pass-through allows devices to DMA into arbitrary physical memory.
+// This feature is intended for debugging only and must never reach production.
+#[cfg(all(feature = "unsafe_identity_passthrough", not(debug_assertions)))]
+compile_error!(concat!(
+    "feature `unsafe_identity_passthrough` enables VT-d pass-through for Identity domains ",
+    "(unrestricted DMA). It is intended for debugging only and must not be enabled in ",
+    "non-debug builds.",
+));
 
 pub mod dmar;
 pub mod domain;
@@ -88,7 +98,7 @@ pub const MAX_IOMMU_UNITS: usize = 8;
 /// Maximum number of domains per IOMMU unit.
 pub const MAX_DOMAINS: usize = 256;
 
-/// Default domain ID for kernel DMA (identity mapped).
+/// Default domain ID for kernel DMA isolation.
 pub const KERNEL_DOMAIN_ID: DomainId = 0;
 
 // ============================================================================
@@ -237,7 +247,7 @@ pub type IommuResult<T> = Result<T, IommuError>;
 /// This function:
 /// 1. Parses the ACPI DMAR table to discover IOMMU units
 /// 2. Initializes each VT-d unit
-/// 3. Creates the default kernel domain (identity mapped)
+/// 3. Creates the default kernel domain (page-table, pre-mapped 0-1GiB)
 ///
 /// # Returns
 ///
@@ -362,11 +372,56 @@ pub fn init() -> IommuResult<u32> {
     }
 
     IOMMU_UNIT_COUNT.store(count, Ordering::SeqCst);
+
+    // R94-13 FIX: Select a common AGAW (address width) supported by all units.
+    // Prefer 48-bit (4-level) when available, fall back to 39-bit (3-level).
+    // CAP.SAGAW bit meanings: bit 0 = 39-bit, bit 1 = 48-bit, bit 2 = 57-bit.
+    let kernel_domain_agaw = {
+        let sagaw = units
+            .iter()
+            .map(|u| u.supported_agaw())
+            .fold(u8::MAX, |acc, bits| acc & bits);
+
+        if (sagaw & (1 << 1)) != 0 {
+            48u8
+        } else if (sagaw & (1 << 0)) != 0 {
+            39u8
+        } else {
+            println!("[IOMMU] No common AGAW supported across all units");
+            IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+            return Err(IommuError::HardwareInitFailed);
+        }
+    };
+
     drop(units);
 
-    // Create default kernel domain with identity mapping
-    let kernel_domain = Domain::new_identity(KERNEL_DOMAIN_ID)?;
-    DOMAINS.write().push(Arc::new(kernel_domain));
+    // R94-13 FIX: Use a translated (page-table) kernel domain instead of
+    // identity/pass-through. This ensures devices can only DMA to explicitly
+    // mapped physical memory, preventing unrestricted access to all of RAM.
+    //
+    // Pre-map the boot direct-map window (0-1GiB) so early DMA buffers
+    // continue to work. Future map_range() calls can extend DMA access.
+    let kernel_domain = Arc::new(Domain::new_paged_with_agaw(
+        KERNEL_DOMAIN_ID,
+        kernel_domain_agaw,
+    )?);
+
+    // Map 0-1GiB in 32MiB chunks to bound temporary allocations during boot.
+    const KERNEL_DMA_PREMAP_SIZE: usize = 1 * 1024 * 1024 * 1024; // 1 GiB
+    const KERNEL_DMA_CHUNK: usize = 32 * 1024 * 1024; // 32 MiB
+
+    for offset in (0..KERNEL_DMA_PREMAP_SIZE).step_by(KERNEL_DMA_CHUNK) {
+        let chunk_size = (KERNEL_DMA_PREMAP_SIZE - offset).min(KERNEL_DMA_CHUNK);
+        let addr = offset as u64;
+        kernel_domain.map_range(addr, addr, chunk_size, true)?;
+    }
+
+    println!(
+        "[IOMMU] Kernel domain 0: page-table (AGAW={}-bit, pre-mapped 0-1GiB)",
+        kernel_domain_agaw
+    );
+
+    DOMAINS.write().push(kernel_domain);
 
     // Handle RMRR (Reserved Memory Region Reporting)
     // These are memory regions that devices may DMA to before OS takes control
@@ -726,7 +781,18 @@ pub fn create_domain(domain_type: DomainType) -> IommuResult<DomainId> {
 
     let id = domains.len() as DomainId;
     let domain = match domain_type {
-        DomainType::Identity => Domain::new_identity(id)?,
+        DomainType::Identity => {
+            // R94-13 FIX: Identity domains are only allowed when the
+            // unsafe_identity_passthrough feature is explicitly enabled.
+            #[cfg(not(feature = "unsafe_identity_passthrough"))]
+            {
+                return Err(IommuError::PermissionDenied);
+            }
+            #[cfg(feature = "unsafe_identity_passthrough")]
+            {
+                Domain::new_identity(id)?
+            }
+        }
         DomainType::PageTable => Domain::new_paged(id)?,
     };
 
