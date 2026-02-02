@@ -7,6 +7,7 @@ extern crate alloc;
 extern crate drivers;
 
 pub mod buddy_allocator;
+pub mod dma;
 pub mod memory;
 pub mod oom_killer;
 pub mod page_cache;

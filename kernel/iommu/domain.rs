@@ -12,10 +12,10 @@
 //! # Security Model
 //!
 //! - Kernel domain (ID 0) uses second-level translation by default
-//! - A boot-time identity map of 0-1GiB is pre-installed for early DMA buffers
+//! - DMA mappings are created on-demand via mm::dma::alloc_dma_buffer()
 //! - Identity/pass-through domains are debug-only (`unsafe_identity_passthrough`)
 //! - Each VM gets its own domain with isolated page tables
-//! - Devices can only access memory mapped in their domain
+//! - Devices can only access memory explicitly mapped in their domain
 //!
 //! # References
 //!
@@ -392,7 +392,7 @@ impl Domain {
     /// Allocates a 4KB-aligned page table root on first call. Uses CAS to handle
     /// concurrent allocation attempts safely, deallocating the redundant frame
     /// if another CPU wins the race.
-    fn ensure_page_table_root(&self) -> Result<(), IommuError> {
+    pub(crate) fn ensure_page_table_root(&self) -> Result<(), IommuError> {
         // Check if already allocated (fast path)
         if self.page_table_root.load(Ordering::Acquire) != 0 {
             return Ok(());

@@ -21,7 +21,7 @@
 //!                                 v
 //!    +-----------------------------------------------------------+
 //!    |                    IOMMU Domains                          |
-//!    |  Domain 0: Kernel DMA (page-table, pre-mapped 0-1GiB)     |
+//!    |  Domain 0: Kernel DMA (page-table, on-demand mappings)    |
 //!    |  Domain 1: VM1 guest memory (future passthrough)          |
 //!    |  Domain 2: VM2 guest memory (future passthrough)          |
 //!    +-----------------------------------------------------------+
@@ -36,7 +36,7 @@
 //!
 //! 1. Call `init()` during kernel boot to discover and initialize IOMMU units
 //! 2. Before enabling bus mastering on a PCI device, call `attach_device()`
-//! 3. Map DMA buffer ranges with `map_range()` (kernel domain pre-maps 0-1GiB)
+//! 3. Use `mm::dma::alloc_dma_buffer()` for on-demand DMA mappings
 //!
 //! # Security Model
 //!
@@ -247,7 +247,9 @@ pub type IommuResult<T> = Result<T, IommuError>;
 /// This function:
 /// 1. Parses the ACPI DMAR table to discover IOMMU units
 /// 2. Initializes each VT-d unit
-/// 3. Creates the default kernel domain (page-table, pre-mapped 0-1GiB)
+/// 3. Creates the kernel domain (page-table with on-demand mappings)
+/// 4. Enables translation on all units
+/// 5. Registers DMA allocation hooks for mm::dma
 ///
 /// # Returns
 ///
@@ -399,25 +401,23 @@ pub fn init() -> IommuResult<u32> {
     // identity/pass-through. This ensures devices can only DMA to explicitly
     // mapped physical memory, preventing unrestricted access to all of RAM.
     //
-    // Pre-map the boot direct-map window (0-1GiB) so early DMA buffers
-    // continue to work. Future map_range() calls can extend DMA access.
+    // ON-DEMAND MAPPING: Unlike the previous implementation that pre-mapped
+    // 0-1GiB, we now use fully on-demand mapping. DMA buffers are mapped
+    // individually when allocated via mm::dma::alloc_dma_buffer().
+    // This provides stricter isolation - devices can only access memory
+    // that has been explicitly allocated for DMA.
     let kernel_domain = Arc::new(Domain::new_paged_with_agaw(
         KERNEL_DOMAIN_ID,
         kernel_domain_agaw,
     )?);
 
-    // Map 0-1GiB in 32MiB chunks to bound temporary allocations during boot.
-    const KERNEL_DMA_PREMAP_SIZE: usize = 1 * 1024 * 1024 * 1024; // 1 GiB
-    const KERNEL_DMA_CHUNK: usize = 32 * 1024 * 1024; // 32 MiB
-
-    for offset in (0..KERNEL_DMA_PREMAP_SIZE).step_by(KERNEL_DMA_CHUNK) {
-        let chunk_size = (KERNEL_DMA_PREMAP_SIZE - offset).min(KERNEL_DMA_CHUNK);
-        let addr = offset as u64;
-        kernel_domain.map_range(addr, addr, chunk_size, true)?;
-    }
+    // Ensure the SLPT root exists before attaching devices.
+    // With on-demand mappings, the kernel domain has no initial mappings,
+    // but attach_device() requires a valid SLPT root (fail-closed if missing).
+    kernel_domain.ensure_page_table_root()?;
 
     println!(
-        "[IOMMU] Kernel domain 0: page-table (AGAW={}-bit, pre-mapped 0-1GiB)",
+        "[IOMMU] Kernel domain 0: page-table (AGAW={}-bit, on-demand mappings)",
         kernel_domain_agaw
     );
 
@@ -435,9 +435,44 @@ pub fn init() -> IommuResult<u32> {
         // TODO: Map RMRR regions in all domains that may contain affected devices
     }
 
+    // R94-13 FIX: Enable DMA translation on all units BEFORE registering hooks.
+    // This ensures is_enabled() returns true and map_range() succeeds.
+    // Without this, on-demand mapping would fail with NotInitialized.
+    let translation_success_count = {
+        let units = IOMMU_UNITS.read();
+        let mut success = 0u32;
+        for (i, unit) in units.iter().enumerate() {
+            if let Err(e) = unit.enable_translation() {
+                println!("[IOMMU] WARNING: Failed to enable translation on unit {}: {:?}", i, e);
+                // Continue with other units - partial enablement is better than none
+            } else {
+                println!("[IOMMU]   Unit {} translation enabled", i);
+                success += 1;
+            }
+        }
+        success
+    };
+
+    // R94-13 FIX: Only register hooks if at least one unit has translation enabled.
+    // If all units failed, don't register hooks to avoid map failures and memory leaks.
+    if translation_success_count == 0 && count > 0 {
+        println!("[IOMMU] ERROR: No units could enable translation, IOMMU not operational");
+        IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
+        return Err(IommuError::HardwareInitFailed);
+    }
+
     IOMMU_ENABLED.store(true, Ordering::SeqCst);
     // R90-1 FIX: Only mark as done on successful initialization
     IOMMU_INIT_DONE.store(true, Ordering::SeqCst);
+
+    // Register IOMMU mapping hooks for the unified DMA allocator.
+    // Drivers can now use mm::dma::alloc_dma_buffer() to get on-demand mappings.
+    mm::dma::register_iommu_ops(mm::dma::IommuOps {
+        kernel_domain_id: KERNEL_DOMAIN_ID,
+        map_range: dma_map_range_hook,
+        unmap_range: dma_unmap_range_hook,
+    });
+
     println!("[IOMMU] Initialized {} IOMMU units", count);
 
     Ok(count)
@@ -1440,4 +1475,32 @@ pub fn handle_dma_faults() -> usize {
     }
 
     total_faults
+}
+
+// ============================================================================
+// DMA Allocator Hooks (mm::dma integration)
+// ============================================================================
+
+/// Hook function for mm::dma to map a DMA buffer.
+///
+/// Converts between IOMMU and DMA error types to avoid circular dependencies.
+fn dma_map_range_hook(
+    domain_id: DomainId,
+    iova: u64,
+    phys: u64,
+    size: usize,
+    write: bool,
+) -> Result<(), mm::dma::DmaError> {
+    map_range(domain_id, iova, phys, size, write).map_err(|_| mm::dma::DmaError::IommuMapFailed)
+}
+
+/// Hook function for mm::dma to unmap a DMA buffer.
+///
+/// Converts between IOMMU and DMA error types to avoid circular dependencies.
+fn dma_unmap_range_hook(
+    domain_id: DomainId,
+    iova: u64,
+    size: usize,
+) -> Result<(), mm::dma::DmaError> {
+    unmap_range(domain_id, iova, size).map_err(|_| mm::dma::DmaError::IommuUnmapFailed)
 }

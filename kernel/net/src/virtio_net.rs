@@ -20,7 +20,7 @@ use crate::{
     BufPool, DeviceCaps, LinkStatus, MacAddress, NetBuf, NetDevice, NetError, OperatingMode,
     RxError, TxError, VIRTIO_NET_HDR_SIZE,
 };
-use mm::{buddy_allocator, PHYSICAL_MEMORY_OFFSET};
+use mm::PHYSICAL_MEMORY_OFFSET;
 use virtio::{
     MmioTransport, VirtQueue, VirtioPciAddrs, VirtioPciTransport, VirtioTransport,
     VIRTIO_DEVICE_NET, VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
@@ -802,21 +802,33 @@ impl NetDevice for VirtioNetDevice {
 // Helper Functions
 // ============================================================================
 
-/// Allocate DMA-compatible memory.
+/// Allocate DMA-compatible memory with on-demand IOMMU mapping.
+///
+/// When IOMMU is enabled, the allocated buffer is automatically mapped in
+/// the kernel DMA domain, ensuring devices can only access this specific
+/// memory region (not the entire 0-1GiB range).
+///
+/// # Security (R94-13 Enhancement)
+///
+/// Unlike the previous implementation that pre-mapped 0-1GiB, this uses
+/// mm::dma::alloc_dma_buffer() for true on-demand mapping. The DmaBuffer
+/// is intentionally leaked (via core::mem::forget) since virtqueue memory
+/// is never freed during device lifetime.
 fn alloc_dma_memory(size: usize) -> Option<u64> {
     if size == 0 {
         return None;
     }
 
-    let pages = (size + 4095) / 4096;
-    let frame = buddy_allocator::alloc_physical_pages(pages)?;
-    let phys_addr = frame.start_address().as_u64();
-
-    // Zero the memory
-    unsafe {
-        let virt = (phys_addr + PHYSICAL_MEMORY_OFFSET) as *mut u8;
-        write_bytes(virt, 0, pages * 4096);
+    // Use the unified DMA allocator which handles IOMMU mapping automatically
+    match mm::dma::alloc_dma_buffer(size) {
+        Ok(buf) => {
+            let phys_addr = buf.phys();
+            // Intentionally leak the DmaBuffer since virtqueue memory is never freed.
+            // This keeps the IOMMU mapping alive for the device's lifetime.
+            // The memory is effectively "permanently" allocated for the device.
+            core::mem::forget(buf);
+            Some(phys_addr)
+        }
+        Err(_) => None,
     }
-
-    Some(phys_addr)
 }

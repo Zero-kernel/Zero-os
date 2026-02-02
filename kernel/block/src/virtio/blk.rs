@@ -19,6 +19,8 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU16, Ordering};
 use spin::Mutex;
 
+use mm::dma::{alloc_dma_buffer, DmaBuffer};
+
 use super::{
     blk_features, blk_status, blk_types, mb, rmb, wmb, MmioTransport, VirtioBlkConfig,
     VirtioBlkReqHeader, VirtioPciAddrs, VirtioPciTransport, VirtioTransport, VringAvail, VringDesc,
@@ -410,6 +412,9 @@ struct RequestBuffer {
 ///
 /// This structure stores all information needed to correctly free resources
 /// when a completion arrives, preventing UAF on stale completions.
+///
+/// R94-13 Enhancement: Uses DmaBuffer for automatic IOMMU mapping management.
+/// When DmaBuffer is dropped, the IOMMU mapping is automatically removed.
 struct RequestMeta {
     /// Head descriptor index (matches used.id from the device).
     head: u16,
@@ -417,12 +422,8 @@ struct RequestMeta {
     desc_chain: [u16; 3],
     /// Number of valid descriptors in desc_chain.
     desc_count: usize,
-    /// Physical address of the header+status DMA buffer.
-    header_status_dma_phys: u64,
-    /// Allocated size of the header+status DMA buffer.
-    header_status_dma_size: usize,
-    /// Virtual address of the header+status DMA buffer.
-    header_status_dma_virt: *mut u8,
+    /// DMA buffer for header + status (replaces raw phys/virt addresses).
+    header_status_dma: DmaBuffer,
     /// Size of the request header in bytes.
     header_size: usize,
     /// Request kind (I/O or flush) with data buffer tracking.
@@ -432,13 +433,18 @@ struct RequestMeta {
 }
 
 /// R39-1 FIX: Type of request for proper resource cleanup.
+/// R94-13 Enhancement: Uses DmaBuffer for automatic IOMMU unmapping on drop.
 enum RequestKind {
     /// I/O request (read or write) with data buffer.
     Io {
-        data_dma_phys: u64,
-        data_dma_len: usize,
-        data_dma_virt: *mut u8,
+        /// DMA buffer for data (with automatic IOMMU mapping).
+        data_dma: DmaBuffer,
+        /// Actual data length in bytes (may be less than data_dma.size() which is page-aligned).
+        /// R94-13 FIX: Must track separately to avoid OOB copy on completion.
+        data_len: usize,
+        /// Pointer to caller's buffer for copy-back on read completion.
         data_buf: *mut u8,
+        /// Whether this is a write operation.
         is_write: bool,
     },
     /// Flush request (no data buffer).
@@ -633,43 +639,42 @@ impl VirtioBlkDevice {
         }))
     }
 
-    /// Allocate DMA-able memory using the kernel's buddy allocator.
+    /// Allocate DMA-able memory using the unified DMA allocator with IOMMU mapping.
     ///
     /// Returns the physical address of the allocated memory.
     /// The memory is zeroed before returning.
+    ///
+    /// # Security (R94-13 Enhancement)
+    ///
+    /// Unlike direct buddy allocator usage, this uses mm::dma::alloc_dma_buffer()
+    /// which creates on-demand IOMMU mappings. The DmaBuffer is intentionally
+    /// leaked (via core::mem::forget) since virtqueue memory is never freed.
     fn alloc_dma_memory(size: usize) -> Result<u64, BlockError> {
-        use mm::buddy_allocator;
-
-        // Calculate number of 4KB pages needed
-        let pages = (size + 4095) / 4096;
-
-        // Allocate from buddy allocator
-        let frame = buddy_allocator::alloc_physical_pages(pages).ok_or(BlockError::NoMem)?;
-
-        let phys_addr = frame.start_address().as_u64();
-
-        // Zero the memory using high-half kernel mapping
-        // Physical memory is mapped at PHYSICAL_MEMORY_OFFSET (0xffffffff80000000)
-        unsafe {
-            let virt_addr = (phys_addr + mm::PHYSICAL_MEMORY_OFFSET) as *mut u8;
-            core::ptr::write_bytes(virt_addr, 0, pages * 4096);
+        match alloc_dma_buffer(size) {
+            Ok(buf) => {
+                let phys_addr = buf.phys();
+                // Intentionally leak the DmaBuffer since virtqueue memory is never freed.
+                // This keeps the IOMMU mapping alive for the device's lifetime.
+                core::mem::forget(buf);
+                Ok(phys_addr)
+            }
+            Err(_) => Err(BlockError::NoMem),
         }
-
-        Ok(phys_addr)
     }
 
     /// Free DMA-able memory previously allocated with `alloc_dma_memory`.
-    fn free_dma_memory(phys_addr: u64, size: usize) {
-        use mm::buddy_allocator;
-        use x86_64::{structures::paging::PhysFrame, PhysAddr};
-
-        if size == 0 {
-            return;
-        }
-
-        let pages = (size + 4095) / 4096;
-        let frame = PhysFrame::containing_address(PhysAddr::new(phys_addr));
-        buddy_allocator::free_physical_pages(frame, pages);
+    ///
+    /// # Note
+    ///
+    /// This function is kept for backward compatibility but is effectively a no-op
+    /// for virtqueue memory (which is leaked via forget). For request buffers,
+    /// DmaBuffer is now stored in RequestMeta and freed automatically on drop.
+    #[allow(dead_code)]
+    fn free_dma_memory(_phys_addr: u64, _size: usize) {
+        // No-op: DmaBuffer handles cleanup automatically when dropped.
+        // This function is kept for code compatibility but virtqueue memory
+        // is intentionally leaked (never freed), and request buffers use
+        // DmaBuffer directly in RequestMeta.
     }
 
     /// Notify the device of new available descriptors.
@@ -684,6 +689,9 @@ impl VirtioBlkDevice {
     /// This method finds the request that corresponds to the given `used.id`,
     /// frees its resources correctly, and returns the completion result.
     /// For abandoned (timed-out) requests, it cleans up silently and returns None.
+    ///
+    /// R94-13 Enhancement: DmaBuffer is now dropped automatically when RequestMeta
+    /// goes out of scope, ensuring IOMMU mappings are cleaned up properly.
     fn complete_used_entry(&self, used: VringUsedElem) -> Option<RequestCompletion> {
         let mut buffers = self.req_buffers.lock();
 
@@ -705,7 +713,7 @@ impl VirtioBlkDevice {
             }
         };
 
-        // Take ownership of the metadata
+        // Take ownership of the metadata (DmaBuffers will be dropped when meta goes out of scope)
         let meta = match buffer.pending.take() {
             Some(m) => m,
             None => {
@@ -721,51 +729,53 @@ impl VirtioBlkDevice {
             head,
             desc_chain,
             desc_count,
-            header_status_dma_phys,
-            header_status_dma_size,
-            header_status_dma_virt,
+            header_status_dma,
             header_size,
             kind,
             abandoned,
         } = meta;
 
         // Read status from DMA buffer
-        let status = unsafe { core::ptr::read(header_status_dma_virt.add(header_size)) };
+        let status = unsafe { core::ptr::read(header_status_dma.virt_ptr().add(header_size)) };
 
         // Process based on request kind
-        let (completion, data_dma_phys, data_dma_len) = match kind {
+        let completion = match kind {
             RequestKind::Io {
-                data_dma_phys,
-                data_dma_len,
-                data_dma_virt,
+                data_dma,
+                data_len,
                 data_buf,
                 is_write,
             } => {
                 // For successful reads on non-abandoned requests, copy data back
+                // R94-13 FIX: Use data_len (actual buffer size) not data_dma.size() (page-aligned)
                 if !abandoned
                     && status == blk_status::VIRTIO_BLK_S_OK
                     && !is_write
-                    && data_dma_len > 0
+                    && data_len > 0
                 {
                     unsafe {
-                        core::ptr::copy_nonoverlapping(data_dma_virt, data_buf, data_dma_len);
+                        core::ptr::copy_nonoverlapping(
+                            data_dma.virt_ptr(),
+                            data_buf,
+                            data_len,
+                        );
                     }
                 }
 
-                let res = if abandoned {
+                if abandoned {
                     None
                 } else {
                     Some(RequestCompletion::Io(match status {
-                        blk_status::VIRTIO_BLK_S_OK => Ok(data_dma_len),
+                        blk_status::VIRTIO_BLK_S_OK => Ok(data_len),
                         blk_status::VIRTIO_BLK_S_IOERR => Err(BlockError::Io),
                         blk_status::VIRTIO_BLK_S_UNSUPP => Err(BlockError::NotSupported),
                         _ => Err(BlockError::Io),
                     }))
-                };
-                (res, data_dma_phys, data_dma_len)
+                }
+                // data_dma is dropped here, automatically unmapping from IOMMU
             }
             RequestKind::Flush => {
-                let res = if abandoned {
+                if abandoned {
                     None
                 } else {
                     Some(RequestCompletion::Flush(match status {
@@ -773,8 +783,7 @@ impl VirtioBlkDevice {
                         blk_status::VIRTIO_BLK_S_UNSUPP => Err(BlockError::NotSupported),
                         _ => Err(BlockError::Io),
                     }))
-                };
-                (res, 0, 0)
+                }
             }
         };
 
@@ -783,11 +792,8 @@ impl VirtioBlkDevice {
             self.queue.free_desc(*idx);
         }
 
-        // Free DMA buffers
-        if data_dma_len > 0 {
-            Self::free_dma_memory(data_dma_phys, data_dma_len);
-        }
-        Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+        // DmaBuffers (header_status_dma and data_dma if I/O) are automatically
+        // dropped here, which triggers IOMMU unmapping via DmaBuffer::drop()
 
         // Release the request buffer slot
         buffer.in_use = false;
@@ -877,23 +883,20 @@ impl VirtioBlkDevice {
             }
         };
 
-        // DMA bounce buffer for header/status: heap buffers don't have correct virt-to-phys mapping
-        // Allocate DMA memory from buddy allocator which provides correct physical addresses
+        // DMA bounce buffer for header/status with on-demand IOMMU mapping (R94-13)
         let header_size = core::mem::size_of::<VirtioBlkReqHeader>();
         let header_status_dma_size = if header_size + 1 < 32 {
             32
         } else {
             header_size + 1
         };
-        let header_status_dma_phys = match Self::alloc_dma_memory(header_status_dma_size) {
-            Ok(p) => p,
-            Err(e) => {
+        let header_status_dma = match alloc_dma_buffer(header_status_dma_size) {
+            Ok(buf) => buf,
+            Err(_) => {
                 self.req_buffers.lock()[buf_idx].in_use = false;
-                return Err(e);
+                return Err(BlockError::NoMem);
             }
         };
-        let header_status_dma_virt =
-            (header_status_dma_phys + mm::PHYSICAL_MEMORY_OFFSET) as *mut u8;
 
         // Copy header to DMA buffer and initialize status to 0xFF (invalid)
         unsafe {
@@ -901,43 +904,43 @@ impl VirtioBlkDevice {
                 let buffers = self.req_buffers.lock();
                 buffers[buf_idx].header
             };
-            core::ptr::write(header_status_dma_virt as *mut VirtioBlkReqHeader, header);
-            core::ptr::write(header_status_dma_virt.add(header_size), 0xFFu8);
+            core::ptr::write(header_status_dma.virt_ptr() as *mut VirtioBlkReqHeader, header);
+            core::ptr::write(header_status_dma.virt_ptr().add(header_size), 0xFFu8);
         }
-        let header_phys = header_status_dma_phys;
-        let status_phys = header_status_dma_phys + header_size as u64;
+        let header_phys = header_status_dma.phys();
+        let status_phys = header_status_dma.phys() + header_size as u64;
 
-        // DMA bounce buffer for data: heap data buffers don't have correct virt-to-phys mapping
-        let dma_phys = match Self::alloc_dma_memory(buf.len()) {
-            Ok(p) => p,
-            Err(e) => {
-                Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+        // DMA bounce buffer for data with on-demand IOMMU mapping (R94-13)
+        let data_dma = match alloc_dma_buffer(buf.len()) {
+            Ok(dma) => dma,
+            Err(_) => {
+                // header_status_dma is dropped automatically here, unmapping from IOMMU
                 self.req_buffers.lock()[buf_idx].in_use = false;
-                return Err(e);
+                return Err(BlockError::NoMem);
             }
         };
-        let dma_virt = (dma_phys + mm::PHYSICAL_MEMORY_OFFSET) as *mut u8;
 
         // For writes: copy from caller buffer into DMA buffer before I/O
         if is_write {
             unsafe {
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), dma_virt, buf.len());
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), data_dma.virt_ptr(), buf.len());
             }
         }
 
         // Allocate 3 descriptors
-        let desc0 = self.queue.alloc_desc().ok_or_else(|| {
-            Self::free_dma_memory(dma_phys, buf.len());
-            Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
-            self.req_buffers.lock()[buf_idx].in_use = false;
-            BlockError::Busy
-        })?;
+        let desc0 = match self.queue.alloc_desc() {
+            Some(d) => d,
+            None => {
+                // DmaBuffers are dropped automatically here
+                self.req_buffers.lock()[buf_idx].in_use = false;
+                return Err(BlockError::Busy);
+            }
+        };
         let desc1 = match self.queue.alloc_desc() {
             Some(d) => d,
             None => {
                 self.queue.free_desc(desc0);
-                Self::free_dma_memory(dma_phys, buf.len());
-                Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+                // DmaBuffers are dropped automatically here
                 self.req_buffers.lock()[buf_idx].in_use = false;
                 return Err(BlockError::Busy);
             }
@@ -947,8 +950,7 @@ impl VirtioBlkDevice {
             None => {
                 self.queue.free_desc(desc0);
                 self.queue.free_desc(desc1);
-                Self::free_dma_memory(dma_phys, buf.len());
-                Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+                // DmaBuffers are dropped automatically here
                 self.req_buffers.lock()[buf_idx].in_use = false;
                 return Err(BlockError::Busy);
             }
@@ -964,7 +966,7 @@ impl VirtioBlkDevice {
 
             // Descriptor 1: Data buffer (use DMA bounce buffer)
             let d1 = self.queue.desc(desc1);
-            d1.addr = dma_phys;
+            d1.addr = data_dma.phys();
             d1.len = buf.len() as u32;
             d1.flags = VRING_DESC_F_NEXT | if is_write { 0 } else { VRING_DESC_F_WRITE };
             d1.next = desc2;
@@ -978,21 +980,18 @@ impl VirtioBlkDevice {
         }
 
         // R39-1 FIX: Store request metadata BEFORE pushing to available ring
-        // This ensures we can properly match completions to requests
+        // R94-13: DmaBuffers are moved into RequestMeta, ownership transferred
         {
             let mut buffers = self.req_buffers.lock();
             buffers[buf_idx].pending = Some(RequestMeta {
                 head: desc0,
                 desc_chain: [desc0, desc1, desc2],
                 desc_count: 3,
-                header_status_dma_phys,
-                header_status_dma_size,
-                header_status_dma_virt,
+                header_status_dma,
                 header_size,
                 kind: RequestKind::Io {
-                    data_dma_phys: dma_phys,
-                    data_dma_len: buf.len(),
-                    data_dma_virt: dma_virt,
+                    data_dma,
+                    data_len: buf.len(), // R94-13 FIX: Track actual buffer length
                     data_buf: buf.as_mut_ptr(),
                     is_write,
                 },
@@ -1248,22 +1247,20 @@ impl BlockDevice for VirtioBlkDevice {
             }
         };
 
-        // DMA buffer for header + status
+        // DMA buffer for header + status with on-demand IOMMU mapping (R94-13)
         let header_size = core::mem::size_of::<VirtioBlkReqHeader>();
         let header_status_dma_size = if header_size + 1 < 32 {
             32
         } else {
             header_size + 1
         };
-        let header_status_dma_phys = match Self::alloc_dma_memory(header_status_dma_size) {
-            Ok(p) => p,
-            Err(e) => {
+        let header_status_dma = match alloc_dma_buffer(header_status_dma_size) {
+            Ok(buf) => buf,
+            Err(_) => {
                 self.req_buffers.lock()[buf_idx].in_use = false;
-                return Err(e);
+                return Err(BlockError::NoMem);
             }
         };
-        let header_status_dma_virt =
-            (header_status_dma_phys + mm::PHYSICAL_MEMORY_OFFSET) as *mut u8;
 
         // Write header and initialize status byte
         unsafe {
@@ -1271,23 +1268,26 @@ impl BlockDevice for VirtioBlkDevice {
                 let buffers = self.req_buffers.lock();
                 buffers[buf_idx].header
             };
-            core::ptr::write(header_status_dma_virt as *mut VirtioBlkReqHeader, header);
-            core::ptr::write(header_status_dma_virt.add(header_size), 0xFFu8);
+            core::ptr::write(header_status_dma.virt_ptr() as *mut VirtioBlkReqHeader, header);
+            core::ptr::write(header_status_dma.virt_ptr().add(header_size), 0xFFu8);
         }
-        let header_phys = header_status_dma_phys;
-        let status_phys = header_status_dma_phys + header_size as u64;
+        let header_phys = header_status_dma.phys();
+        let status_phys = header_status_dma.phys() + header_size as u64;
 
         // Allocate descriptors (header + status, no data buffer for flush)
-        let desc0 = self.queue.alloc_desc().ok_or_else(|| {
-            Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
-            self.req_buffers.lock()[buf_idx].in_use = false;
-            BlockError::Busy
-        })?;
+        let desc0 = match self.queue.alloc_desc() {
+            Some(d) => d,
+            None => {
+                // DmaBuffer is dropped automatically here
+                self.req_buffers.lock()[buf_idx].in_use = false;
+                return Err(BlockError::Busy);
+            }
+        };
         let desc1 = match self.queue.alloc_desc() {
             Some(d) => d,
             None => {
                 self.queue.free_desc(desc0);
-                Self::free_dma_memory(header_status_dma_phys, header_status_dma_size);
+                // DmaBuffer is dropped automatically here
                 self.req_buffers.lock()[buf_idx].in_use = false;
                 return Err(BlockError::Busy);
             }
@@ -1310,15 +1310,14 @@ impl BlockDevice for VirtioBlkDevice {
         }
 
         // R39-1 FIX: Store request metadata BEFORE pushing to available ring
+        // R94-13: DmaBuffer is moved into RequestMeta, ownership transferred
         {
             let mut buffers = self.req_buffers.lock();
             buffers[buf_idx].pending = Some(RequestMeta {
                 head: desc0,
                 desc_chain: [desc0, desc1, 0], // Only 2 descriptors for flush
                 desc_count: 2,
-                header_status_dma_phys,
-                header_status_dma_size,
-                header_status_dma_virt,
+                header_status_dma,
                 header_size,
                 kind: RequestKind::Flush,
                 abandoned: false,
