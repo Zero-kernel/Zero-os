@@ -325,9 +325,36 @@ impl Scheduler {
     /// This function combines the process's cpuset membership with its personal
     /// CPU affinity mask to determine which CPUs the task can actually run on.
     /// The result respects both CPU isolation (cpuset) and user-set affinity.
+    ///
+    /// # R95-6 FIX: Cpuset isolation guarantee
+    ///
+    /// If the task's affinity mask is disjoint from its cpuset, the intersection
+    /// would be empty (0). Since `cpu_allowed()` treats 0 as "all CPUs allowed",
+    /// this would create a cpuset escape. To prevent this, an empty intersection
+    /// falls back to the cpuset-only mask (ignoring the invalid affinity).
+    ///
+    /// Edge case: If the cpuset itself has no online CPUs (misconfiguration or
+    /// hotplug), the fallback would also be 0. We handle this by returning 1
+    /// (only CPU 0 allowed) as a fail-safe - the task will be constrained to
+    /// CPU 0 rather than escaping to all CPUs.
     #[inline]
     fn effective_allowed_cpus(proc: &process::Process) -> u64 {
-        cpuset::effective_cpus(CpusetId(proc.cpuset_id), proc.allowed_cpus)
+        let cpuset_id = CpusetId(proc.cpuset_id);
+        let effective = cpuset::effective_cpus(cpuset_id, proc.allowed_cpus);
+
+        // R95-6 FIX: Never return 0 from a non-empty cpuset constraint.
+        // If affinity is disjoint from cpuset, ignore affinity and use cpuset-only.
+        if effective == 0 {
+            let cpuset_only = cpuset::effective_cpus(cpuset_id, 0);
+            // Edge case: If cpuset itself is empty (misconfiguration), clamp to CPU 0
+            // rather than allowing all CPUs. This is fail-closed behavior.
+            if cpuset_only == 0 {
+                return 1; // Only CPU 0 allowed as fail-safe
+            }
+            return cpuset_only;
+        }
+
+        effective
     }
 
     /// Check whether a CPU is permitted by the affinity mask (bit N = CPU N).

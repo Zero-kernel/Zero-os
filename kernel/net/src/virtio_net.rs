@@ -20,6 +20,8 @@ use crate::{
     BufPool, DeviceCaps, LinkStatus, MacAddress, NetBuf, NetDevice, NetError, OperatingMode,
     RxError, TxError, VIRTIO_NET_HDR_SIZE,
 };
+// R95-7 FIX: Import DmaBuffer to store queue memory ownership
+use mm::dma::DmaBuffer;
 use mm::PHYSICAL_MEMORY_OFFSET;
 use virtio::{
     MmioTransport, VirtQueue, VirtioPciAddrs, VirtioPciTransport, VirtioTransport,
@@ -90,6 +92,10 @@ pub struct VirtioNetDevice {
     rx_queue: VirtQueue,
     /// Transmit virtqueue
     tx_queue: VirtQueue,
+    /// R95-7 FIX: DMA buffer backing the RX queue (owned, not leaked)
+    rx_queue_dma: DmaBuffer,
+    /// R95-7 FIX: DMA buffer backing the TX queue (owned, not leaked)
+    tx_queue_dma: DmaBuffer,
     /// Device MAC address
     mac: MacAddress,
     /// Negotiated features
@@ -229,11 +235,15 @@ impl VirtioNetDevice {
         }
 
         // Setup RX queue (use PHYSICAL_MEMORY_OFFSET for DMA memory mapping)
-        let rx_queue = Self::setup_queue(&transport, QUEUE_RX, PHYSICAL_MEMORY_OFFSET)?;
+        // R95-7 FIX: Store DmaBuffer ownership instead of leaking
+        let (rx_queue, rx_queue_dma) =
+            Self::setup_queue(&transport, QUEUE_RX, PHYSICAL_MEMORY_OFFSET)?;
         let rx_size = rx_queue.size() as usize;
 
         // Setup TX queue
-        let tx_queue = Self::setup_queue(&transport, QUEUE_TX, PHYSICAL_MEMORY_OFFSET)?;
+        // R95-7 FIX: Store DmaBuffer ownership instead of leaking
+        let (tx_queue, tx_queue_dma) =
+            Self::setup_queue(&transport, QUEUE_TX, PHYSICAL_MEMORY_OFFSET)?;
         let tx_size = tx_queue.size() as usize;
 
         // Set DRIVER_OK to indicate we're ready
@@ -269,6 +279,9 @@ impl VirtioNetDevice {
             transport,
             rx_queue,
             tx_queue,
+            // R95-7 FIX: Store DMA buffers to ensure proper cleanup
+            rx_queue_dma,
+            tx_queue_dma,
             mac,
             features: driver_features,
             caps: DeviceCaps {
@@ -287,11 +300,17 @@ impl VirtioNetDevice {
     }
 
     /// Setup a single virtqueue.
+    ///
+    /// # R95-7 FIX: Returns both VirtQueue and DmaBuffer
+    ///
+    /// The DmaBuffer is now returned instead of being leaked via `mem::forget`.
+    /// The caller stores the DmaBuffer in the device struct, ensuring proper
+    /// cleanup when the device is dropped.
     unsafe fn setup_queue(
         transport: &VirtioTransport,
         queue_idx: u16,
         virt_offset: u64,
-    ) -> Result<VirtQueue, NetError> {
+    ) -> Result<(VirtQueue, DmaBuffer), NetError> {
         let max_size = transport.queue_max(queue_idx);
         let queue_size = max_size.min(DEFAULT_QUEUE_SIZE);
 
@@ -300,8 +319,10 @@ impl VirtioNetDevice {
         }
 
         // Allocate DMA memory for the queue
+        // R95-7 FIX: Keep ownership of DmaBuffer instead of leaking
         let mem_size = VirtQueue::layout_size(queue_size);
-        let mem_phys = alloc_dma_memory(mem_size).ok_or(NetError::IoError)?;
+        let dma_buf = mm::dma::alloc_dma_buffer(mem_size).map_err(|_| NetError::IoError)?;
+        let mem_phys = dma_buf.phys();
 
         // Get notify offset
         let notify_off = transport.queue_notify_off(queue_idx);
@@ -321,7 +342,7 @@ impl VirtioNetDevice {
         // Enable the queue
         transport.queue_ready(queue_idx, true);
 
-        Ok(queue)
+        Ok((queue, dma_buf))
     }
 
     /// Free a TX descriptor chain using driver-owned metadata.
@@ -495,6 +516,41 @@ impl VirtioNetDevice {
             return;
         }
         self.rx_ready.push(buf);
+    }
+}
+
+/// R95-7 FIX: Implement Drop to quiesce device before DMA buffers are freed.
+///
+/// This ensures that:
+/// 1. The device is reset (stops DMA operations)
+/// 2. Queues are disabled (no new DMA can be issued)
+/// 3. Then DMA buffers can be safely dropped (IOMMU unmapped + freed)
+///
+/// Without this, the DMA buffers were leaked via mem::forget(), causing
+/// permanent physical memory and IOMMU mapping leaks.
+impl Drop for VirtioNetDevice {
+    fn drop(&mut self) {
+        // SAFETY: These operations are safe as we're the only owner of the device
+        // at this point (we're being dropped), and the device is being torn down.
+        unsafe {
+            // Disable queues first to stop accepting new operations
+            self.transport.queue_ready(QUEUE_RX, false);
+            self.transport.queue_ready(QUEUE_TX, false);
+
+            // Reset the device to stop all DMA operations
+            // This ensures no in-flight DMA transactions will complete after we
+            // free the DMA buffers.
+            self.transport.reset();
+        }
+
+        // Memory fence to ensure all writes are visible before dropping buffers
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
+        // DMA buffers (rx_queue_dma, tx_queue_dma) will be automatically
+        // dropped after this, which will:
+        // 1. Unmap from IOMMU
+        // 2. Scrub the memory
+        // 3. Return pages to buddy allocator
     }
 }
 
@@ -802,33 +858,6 @@ impl NetDevice for VirtioNetDevice {
 // Helper Functions
 // ============================================================================
 
-/// Allocate DMA-compatible memory with on-demand IOMMU mapping.
-///
-/// When IOMMU is enabled, the allocated buffer is automatically mapped in
-/// the kernel DMA domain, ensuring devices can only access this specific
-/// memory region (not the entire 0-1GiB range).
-///
-/// # Security (R94-13 Enhancement)
-///
-/// Unlike the previous implementation that pre-mapped 0-1GiB, this uses
-/// mm::dma::alloc_dma_buffer() for true on-demand mapping. The DmaBuffer
-/// is intentionally leaked (via core::mem::forget) since virtqueue memory
-/// is never freed during device lifetime.
-fn alloc_dma_memory(size: usize) -> Option<u64> {
-    if size == 0 {
-        return None;
-    }
-
-    // Use the unified DMA allocator which handles IOMMU mapping automatically
-    match mm::dma::alloc_dma_buffer(size) {
-        Ok(buf) => {
-            let phys_addr = buf.phys();
-            // Intentionally leak the DmaBuffer since virtqueue memory is never freed.
-            // This keeps the IOMMU mapping alive for the device's lifetime.
-            // The memory is effectively "permanently" allocated for the device.
-            core::mem::forget(buf);
-            Some(phys_addr)
-        }
-        Err(_) => None,
-    }
-}
+// R95-7 FIX: Removed alloc_dma_memory() function that used mem::forget().
+// DMA buffers are now allocated directly in setup_queue() and stored in the
+// VirtioNetDevice struct for proper lifetime management.

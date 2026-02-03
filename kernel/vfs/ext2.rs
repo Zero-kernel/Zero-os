@@ -243,7 +243,10 @@ impl Ext2Fs {
             .map_err(|_| FsError::Io)?;
 
         // Parse superblock
-        let sb: Ext2Superblock = unsafe { core::ptr::read(buf.as_ptr() as *const _) };
+        // R95-3 FIX: Use read_unaligned to avoid UB on unaligned access.
+        // Vec<u8> only guarantees 1-byte alignment, not the 4-byte alignment
+        // that Ext2Superblock requires.
+        let sb: Ext2Superblock = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const _) };
 
         // Validate magic
         if sb.magic != EXT2_SUPER_MAGIC {
@@ -327,10 +330,12 @@ impl Ext2Fs {
             .map_err(|_| FsError::Io)?;
 
         // Parse group descriptors
+        // R95-3 FIX: Use read_unaligned to avoid UB on unaligned access.
         let mut descs = Vec::with_capacity(groups_count as usize);
         for i in 0..groups_count as usize {
             let offset = i * size_of::<Ext2GroupDesc>();
-            let gd: Ext2GroupDesc = unsafe { core::ptr::read(buf[offset..].as_ptr() as *const _) };
+            let gd: Ext2GroupDesc =
+                unsafe { core::ptr::read_unaligned(buf[offset..].as_ptr() as *const _) };
             descs.push(gd);
         }
 
@@ -421,9 +426,20 @@ impl Ext2Fs {
         let mut block_buf = alloc::vec![0u8; self.block_size as usize];
         self.read_block(inode_block, &mut block_buf)?;
 
+        // R95-3 FIX: Bounds check inode read to prevent OOB access.
+        // A crafted inode_size or offset could cause reading past block boundary.
+        let start = offset_in_block as usize;
+        let end = start
+            .checked_add(size_of::<Ext2InodeRaw>())
+            .ok_or(FsError::Invalid)?;
+        if end > block_buf.len() {
+            return Err(FsError::Invalid);
+        }
+
         // Parse inode
+        // R95-3 FIX: Use read_unaligned to avoid UB on unaligned access.
         let inode: Ext2InodeRaw =
-            unsafe { core::ptr::read(block_buf[offset_in_block as usize..].as_ptr() as *const _) };
+            unsafe { core::ptr::read_unaligned(block_buf[start..].as_ptr() as *const _) };
 
         Ok(inode)
     }

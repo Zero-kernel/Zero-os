@@ -6571,8 +6571,11 @@ fn sys_fstatat(dirfd: i32, path: *const u8, statbuf: *mut VfsStat, _flags: i32) 
         return Err(SyscallError::EFAULT);
     }
 
-    // 检查路径是否为绝对路径
-    let first_byte = unsafe { *path };
+    // R95-1 FIX: Use usercopy API instead of direct pointer dereference.
+    // Direct dereference would cause kernel panic if path is unmapped.
+    let mut first = [0u8; 1];
+    crate::usercopy::copy_from_user_safe(&mut first, path).map_err(|_| SyscallError::EFAULT)?;
+    let first_byte = first[0];
 
     if dirfd != AT_FDCWD && first_byte != b'/' {
         // 相对路径 + 非AT_FDCWD: 暂不支持
@@ -6593,7 +6596,11 @@ fn sys_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -> SyscallResu
         return Err(SyscallError::EFAULT);
     }
 
-    let first_byte = unsafe { *path };
+    // R95-1 FIX: Use usercopy API instead of direct pointer dereference.
+    // Direct dereference would cause kernel panic if path is unmapped.
+    let mut first = [0u8; 1];
+    crate::usercopy::copy_from_user_safe(&mut first, path).map_err(|_| SyscallError::EFAULT)?;
+    let first_byte = first[0];
 
     if dirfd != AT_FDCWD && first_byte != b'/' {
         // R72-ENOSYS FIX: Return EOPNOTSUPP (operation not supported) instead of

@@ -604,6 +604,15 @@ impl Domain {
             unsafe { (*pt_ptr).set_entry(idx, entry) };
         }
 
+        // R95-5 FIX: Memory fence to ensure all PTE writes are visible before
+        // returning. The caller (map_range in lib.rs) will issue IOTLB invalidation
+        // via MMIO writes. While x86 provides strong store ordering (stores are
+        // not reordered with other stores), an explicit fence provides:
+        // 1. Defense-in-depth for future non-x86 ports
+        // 2. Clear documentation of the ordering requirement
+        // 3. Ensures PTE writes complete before IOTLB invalidation MMIO
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
         Ok(())
     }
 
@@ -684,6 +693,11 @@ impl Domain {
             // Clear the leaf entry
             pt.set_entry(l1_idx, SlPte::empty());
         }
+
+        // R95-5 FIX: Memory fence to ensure all PTE clears are visible before
+        // returning. The caller will issue IOTLB invalidation after this.
+        // Same rationale as install_mapping.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
         Ok(())
     }

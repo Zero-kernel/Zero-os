@@ -1484,6 +1484,12 @@ pub fn handle_dma_faults() -> usize {
 /// Hook function for mm::dma to map a DMA buffer.
 ///
 /// Converts between IOMMU and DMA error types to avoid circular dependencies.
+///
+/// # R95-4 FIX: Classify errors as "safe" vs "uncertain"
+///
+/// Some IOMMU errors occur before any mapping is installed, meaning it's safe
+/// to free the physical pages. Others occur during mapping and leave the
+/// mapping state uncertain, requiring pages to be leaked.
 fn dma_map_range_hook(
     domain_id: DomainId,
     iova: u64,
@@ -1491,7 +1497,22 @@ fn dma_map_range_hook(
     size: usize,
     write: bool,
 ) -> Result<(), mm::dma::DmaError> {
-    map_range(domain_id, iova, phys, size, write).map_err(|_| mm::dma::DmaError::IommuMapFailed)
+    map_range(domain_id, iova, phys, size, write).map_err(|e| {
+        // R95-4 FIX: Classify errors
+        // Safe to free pages: no mapping was ever installed
+        // Unsafe: mapping state is uncertain (partial mapping possible)
+        match e {
+            // Safe errors: validation rejected before mapping started
+            IommuError::NotInitialized
+            | IommuError::NotAvailable
+            | IommuError::DomainNotFound
+            | IommuError::InvalidRange => mm::dma::DmaError::IommuMapRejected,
+
+            // Unsafe errors: mapping may have been partially installed
+            // or state is otherwise uncertain
+            _ => mm::dma::DmaError::IommuMapFailed,
+        }
+    })
 }
 
 /// Hook function for mm::dma to unmap a DMA buffer.

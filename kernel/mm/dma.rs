@@ -96,7 +96,16 @@ pub enum DmaError {
     /// Allocated memory landed outside the CPU direct-map window (0-1GiB).
     OutOfDirectMapRange,
     /// IOMMU mapping failed (second-level page table error).
+    /// The mapping state is uncertain - pages should be leaked to prevent
+    /// a device from accessing reused memory.
     IommuMapFailed,
+    /// R95-4 FIX: IOMMU mapping was rejected before any mapping was installed.
+    /// This is a "safe" failure where pages can be safely freed because
+    /// no IOMMU mapping was ever created. Examples:
+    /// - IOMMU not initialized
+    /// - Domain not found
+    /// - Invalid address range (validation rejected)
+    IommuMapRejected,
     /// IOMMU unmapping failed.
     IommuUnmapFailed,
 }
@@ -155,6 +164,36 @@ pub fn is_iommu_enabled() -> bool {
 ///
 /// The buffer owns its physical memory and IOMMU mapping. Callers must not
 /// use the physical/IOVA addresses after the buffer is dropped.
+///
+/// # R95-8 FIX: Device Quiescence Requirement
+///
+/// **IMPORTANT**: Drivers MUST quiesce their devices before dropping DmaBuffer.
+///
+/// The Drop implementation unmaps the IOMMU pages, but this only prevents
+/// **new** DMA transactions. It does NOT guarantee that **in-flight** DMA
+/// transactions have completed. If a device has pending DMA operations when
+/// the buffer is dropped:
+///
+/// 1. In-flight reads may complete after unmap but during scrub (defeating scrub)
+/// 2. In-flight writes may corrupt newly-reused memory
+///
+/// To safely drop a DmaBuffer:
+///
+/// ```ignore
+/// // 1. Disable device DMA (e.g., clear bus master enable, reset device)
+/// device.disable_dma();
+/// // or
+/// device.reset();
+///
+/// // 2. Memory fence to ensure writes are visible
+/// core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+///
+/// // 3. Now safe to drop the buffer
+/// drop(dma_buffer);
+/// ```
+///
+/// Failure to quiesce the device before dropping DmaBuffer is a driver bug
+/// that may result in memory corruption or security vulnerabilities.
 #[derive(Debug)]
 pub struct DmaBuffer {
     /// Physical address of the buffer (for tracking).
@@ -366,13 +405,28 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
     // On-demand IOMMU mapping (only if IOMMU ops registered).
     if let Some(ops) = IOMMU_OPS.get() {
         if let Err(e) = (ops.map_range)(domain_id, iova, phys, size, true) {
-            // Mapping failed - scrub and leak pages to avoid reuse under
-            // an unknown IOMMU state. This is fail-safe behavior.
+            // Always scrub before handling error
             scrub_range(phys, alloc_bytes);
-            println!(
-                "[DMA] WARNING: IOMMU map failed for phys={:#x} size={}, leaking pages",
-                phys, size
-            );
+
+            // R95-4 FIX: Classify error and decide whether to free or leak pages
+            match e {
+                DmaError::IommuMapRejected => {
+                    // Safe error: no mapping was installed, we can free the pages
+                    println!(
+                        "[DMA] INFO: IOMMU map rejected for phys={:#x} size={}, freeing pages",
+                        phys, size
+                    );
+                    buddy_allocator::free_physical_pages(frame, pages);
+                }
+                DmaError::IommuMapFailed | _ => {
+                    // Unsafe error: mapping state uncertain, must leak pages
+                    // to prevent device from accessing reused memory
+                    println!(
+                        "[DMA] WARNING: IOMMU map failed for phys={:#x} size={}, leaking pages",
+                        phys, size
+                    );
+                }
+            }
             return Err(e);
         }
     }

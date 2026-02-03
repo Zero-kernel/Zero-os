@@ -572,8 +572,11 @@ impl ConntrackTable {
 
                 self.record_lru(key, last_seen_ms, lru_gen);
 
+                // R95-2 FIX: Propagate actual decision from state machine
+                // instead of hardcoded Established. This prevents firewall
+                // bypass via SYN retransmission seeding a conntrack entry.
                 return CtUpdateResult {
-                    decision: CtDecision::Established,
+                    decision,
                     state: new_state,
                     dir,
                 };
@@ -656,8 +659,10 @@ impl ConntrackTable {
 
             self.record_lru(key, last_seen_ms, lru_gen);
 
+            // R95-2 FIX: Propagate actual decision from state machine
+            // (double-check path after write-lock acquisition).
             return CtUpdateResult {
-                decision: CtDecision::Established,
+                decision,
                 state: new_state,
                 dir,
             };
@@ -718,7 +723,10 @@ impl ConntrackTable {
             (IPPROTO_ICMP, CtProtoState::Icmp(icmp_state)) => {
                 self.icmp_transition(*icmp_state, dir)
             }
-            _ => (entry.state, CtDecision::Established),
+            // R95-2 FIX: Fail-closed instead of fail-open. Protocol/state mismatch
+            // (e.g., TCP proto with UDP state) indicates internal corruption or bug.
+            // Return Invalid to prevent accidental firewall bypass.
+            _ => (entry.state, CtDecision::Invalid),
         }
     }
 
@@ -762,7 +770,39 @@ impl ConntrackTable {
             _ => state,
         };
 
-        (CtProtoState::Tcp(new_state), CtDecision::Established)
+        // R95-2 FIX: Compute decision based on post-transition state.
+        // - SynSent means the connection has not been acknowledged by the peer,
+        //   so the packet is still "New" (firewall should evaluate it against
+        //   NEW rules, not pass it as ESTABLISHED).
+        // - Close/TimeWait and other teardown states are where the connection
+        //   is ending. A SYN during these states indicates tuple reuse, but
+        //   we must NOT classify it as Established or attackers can bypass the
+        //   firewall via RST→Close→SYN. Treat such packets as Invalid.
+        // - None is explicitly invalid.
+        // - All other valid states indicate an active tracked connection.
+        let is_pure_syn = l4.is_syn() && !l4.is_ack();
+        let decision = match (new_state, state) {
+            (TcpCtState::SynSent, _) => CtDecision::New,
+            (TcpCtState::None, _) => CtDecision::Invalid,
+            // R95-2 HARDENING: If we stayed in ANY teardown state and a pure SYN
+            // arrived, reject it. This prevents:
+            // - RST→Close→SYN bypass
+            // - TimeWait tuple reuse bypass
+            // - FinWait/CloseWait/LastAck tuple reuse bypass
+            // A legitimate client should wait for the entry to expire or use
+            // a different ephemeral port.
+            (TcpCtState::Close, TcpCtState::Close)
+            | (TcpCtState::TimeWait, TcpCtState::TimeWait)
+            | (TcpCtState::FinWait, TcpCtState::FinWait)
+            | (TcpCtState::CloseWait, TcpCtState::CloseWait)
+            | (TcpCtState::LastAck, TcpCtState::LastAck)
+                if is_pure_syn =>
+            {
+                CtDecision::Invalid
+            }
+            _ => CtDecision::Established,
+        };
+        (CtProtoState::Tcp(new_state), decision)
     }
 
     /// UDP state machine transition.
@@ -771,7 +811,12 @@ impl ConntrackTable {
             (UdpCtState::Unreplied, ConntrackDir::Reply) => UdpCtState::Replied,
             _ => state,
         };
-        (CtProtoState::Udp(new_state), CtDecision::Established)
+        // R95-2 FIX: Unreplied UDP flows are still New (one-way traffic only).
+        let decision = match new_state {
+            UdpCtState::Unreplied => CtDecision::New,
+            UdpCtState::Replied => CtDecision::Established,
+        };
+        (CtProtoState::Udp(new_state), decision)
     }
 
     /// ICMP state machine transition.
@@ -780,7 +825,12 @@ impl ConntrackTable {
             (IcmpCtState::EchoRequest, ConntrackDir::Reply) => IcmpCtState::EchoReply,
             _ => state,
         };
-        (CtProtoState::Icmp(new_state), CtDecision::Established)
+        // R95-2 FIX: Unreplied ICMP echo is still New.
+        let decision = match new_state {
+            IcmpCtState::EchoRequest => CtDecision::New,
+            IcmpCtState::EchoReply => CtDecision::Established,
+        };
+        (CtProtoState::Icmp(new_state), decision)
     }
 
     /// Remove an entry by key.
