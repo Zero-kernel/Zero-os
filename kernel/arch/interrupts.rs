@@ -800,7 +800,11 @@ extern "x86-interrupt" fn page_fault_handler(
     clac_if_smap();
 
     use kernel_core::usercopy;
-    use x86_64::registers::control::Cr2;
+
+    // X-8 FIX: Suppress unused warnings in release builds
+    // stack_frame is only used in debug_assertions for detailed panic messages
+    #[cfg(not(debug_assertions))]
+    let _ = &stack_frame;
 
     /// 用户空间地址上界
     const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
@@ -811,10 +815,19 @@ extern "x86-interrupt" fn page_fault_handler(
         core::arch::asm!("mov {}, cr2", out(reg) addr, options(nomem, nostack));
         addr
     };
+
+    // X-8 FIX: In release builds, avoid leaking kernel pointers over serial
+    #[cfg(debug_assertions)]
     unsafe {
         serial_write_str("\n[PF ENTRY] CR2=");
         serial_write_hex(fault_addr_raw);
         serial_write_str(" err=");
+        serial_write_hex(error_code.bits());
+        serial_write_str("\n");
+    }
+    #[cfg(not(debug_assertions))]
+    unsafe {
+        serial_write_str("\n[PF ENTRY] err=");
         serial_write_hex(error_code.bits());
         serial_write_str("\n");
     }
@@ -859,10 +872,16 @@ extern "x86-interrupt" fn page_fault_handler(
         }
 
         // 无法识别当前进程时仍保持 panic 以避免静默失败
+        // X-8 FIX: Redact kernel pointers in release builds
+        #[cfg(debug_assertions)]
         panic!(
             "Usercopy page fault at 0x{:x} - TOCTOU detected (no current PID)\n\
              (User memory unmapped during syscall copy)\n{:#?}",
             fault_addr, stack_frame
+        );
+        #[cfg(not(debug_assertions))]
+        panic!(
+            "Usercopy page fault (details redacted) - TOCTOU detected (no current PID)"
         );
     }
 
@@ -890,6 +909,8 @@ extern "x86-interrupt" fn page_fault_handler(
 
     // 内核空间缺页或内核态触发的用户空间缺页是严重的内核 bug
     // 先通过串口输出关键信息（避免VGA/堆访问）
+    // X-8 FIX: In release builds, avoid leaking kernel pointers
+    #[cfg(debug_assertions)]
     unsafe {
         serial_write_str("\n[PAGE FAULT] addr=");
         serial_write_hex(fault_addr as u64);
@@ -899,10 +920,23 @@ extern "x86-interrupt" fn page_fault_handler(
         serial_write_hex(stack_frame.instruction_pointer.as_u64());
         serial_write_str("\n");
     }
+    #[cfg(not(debug_assertions))]
+    unsafe {
+        serial_write_str("\n[PAGE FAULT] error=");
+        serial_write_hex(error_code.bits());
+        serial_write_str("\n");
+    }
 
+    // X-8 FIX: Redact kernel pointers in release builds
+    #[cfg(debug_assertions)]
     panic!(
         "Page fault at 0x{:x} (error={:?}, user_mode={})\n{:#?}",
         fault_addr, error_code, is_user_mode, stack_frame
+    );
+    #[cfg(not(debug_assertions))]
+    panic!(
+        "Page fault (details redacted) (error={:?}, user_mode={})",
+        error_code, is_user_mode
     );
 }
 

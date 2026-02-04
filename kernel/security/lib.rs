@@ -347,19 +347,19 @@ pub fn init(
         println!("    [4/7] Validating W^X policy...");
         match wxorx::validate_active(config.phys_offset) {
             Ok(summary) => {
+                // X-3 FIX: Ok now means zero violations by contract
+                report.wxorx_summary = Some(summary);
+            }
+            Err(WxorxError::PolicyViolation(summary)) => {
+                // X-3 FIX: PolicyViolation now contains the full summary
                 report.wxorx_summary = Some(summary);
                 report.total_violations += summary.violations;
-
-                if summary.violations > 0 {
-                    println!(
-                        "      WARNING: {} W^X violation(s) detected",
-                        summary.violations
-                    );
-                    if config.strict_wxorx {
-                        return Err(SecurityError::Wxorx(WxorxError::PolicyViolation(
-                            summary.violations,
-                        )));
-                    }
+                println!(
+                    "      WARNING: {} W^X violation(s) detected",
+                    summary.violations
+                );
+                if config.strict_wxorx {
+                    return Err(SecurityError::Wxorx(WxorxError::PolicyViolation(summary)));
                 }
             }
             Err(WxorxError::Violation(v)) => {
@@ -472,7 +472,10 @@ pub fn init(
 /// It can be called periodically to detect runtime violations.
 pub fn quick_check(phys_offset: VirtAddr) -> Result<bool, SecurityError> {
     match wxorx::validate_active(phys_offset) {
-        Ok(summary) => Ok(summary.violations == 0),
+        // X-3 FIX: Ok now means zero violations by contract
+        Ok(_) => Ok(true),
+        // X-3 FIX: PolicyViolation means violations found
+        Err(WxorxError::PolicyViolation(_)) => Ok(false),
         Err(e) => Err(SecurityError::Wxorx(e)),
     }
 }

@@ -117,6 +117,11 @@ pub struct VirtioNetDevice {
     rx_chain_next: Vec<Option<u16>>,
     /// Received packets ready for delivery
     rx_ready: Vec<NetBuf>,
+    /// R96-4 FIX: RX buffers waiting to be reposted to the device.
+    ///
+    /// Error and overflow paths place buffers here instead of dropping them,
+    /// preventing the BufPool from being drained under adversarial conditions.
+    rx_recycle: Vec<NetBuf>,
     /// Statistics
     stats: NetStats,
 }
@@ -295,6 +300,7 @@ impl VirtioNetDevice {
             rx_inflight,
             rx_chain_next,
             rx_ready: Vec::new(),
+            rx_recycle: Vec::new(),
             stats: NetStats::default(),
         })
     }
@@ -385,6 +391,30 @@ impl VirtioNetDevice {
         self.rx_queue.free_desc(head);
     }
 
+    /// R96-4 FIX: Recycle an RX buffer for later reposting.
+    ///
+    /// When buffers cannot be delivered (error, invalid length, queue overflow),
+    /// they should be recycled rather than dropped. This prevents the BufPool
+    /// from being drained under adversarial conditions (packet floods, malformed
+    /// packets, etc.).
+    ///
+    /// If a pool is available, return the buffer to it. Otherwise, stash it in
+    /// `rx_recycle` so `replenish_rx()` can repost it later.
+    ///
+    /// The buffer is reset before recycling to ensure clean state for reuse.
+    fn recycle_rx_buffer(&mut self, pool: Option<&BufPool>, mut buf: NetBuf) {
+        buf.reset();
+        if let Some(pool) = pool {
+            pool.free(buf);
+        } else {
+            // Bound the recycle queue to prevent unbounded growth
+            if self.rx_recycle.len() < MAX_RX_READY_QUEUE {
+                self.rx_recycle.push(buf);
+            }
+            // If recycle queue is full, buffer is dropped (NetBuf::Drop frees the page)
+        }
+    }
+
     /// Process one used RX entry.
     ///
     /// # R43-1 FIX: Validates used.id from device before use as array index
@@ -419,11 +449,24 @@ impl VirtioNetDevice {
 
         // Retrieve the buffer and its posted capacity
         // R65-24 FIX: Extract driver-tracked capacity for length clamping
-        let RxInflight { buf, capacity } = self
+        // R96-4 FIX: Release descriptors even if inflight tracking is lost
+        let RxInflight { buf, capacity } = match self
             .rx_inflight
             .get_mut(head as usize)
             .and_then(Option::take)
-            .ok_or(RxError::BufferError)?;
+        {
+            Some(inflight) => inflight,
+            None => {
+                // R96-4 FIX: Bookkeeping mismatch - still release descriptors to
+                // avoid leaking RX queue entries and causing queue stalls.
+                self.stats.rx_errors += 1;
+                if let Some(next) = data_idx {
+                    self.rx_queue.free_desc(next);
+                }
+                self.rx_queue.free_desc(head);
+                return Err(RxError::BufferError);
+            }
+        };
 
         // Calculate payload length (total - header)
         let total_len = used.len as usize;
@@ -437,15 +480,8 @@ impl VirtioNetDevice {
         // new page from the buddy allocator on the next replenish.
         if total_len < VIRTIO_NET_HDR_SIZE {
             self.stats.rx_errors += 1;
-            // Recycle buffer: prefer pool if available, else local rx_ready
-            let mut buf = buf;
-            buf.reset();
-            if let Some(pool) = pool {
-                pool.free(buf);
-            } else {
-                // R48-5 + R66-8: Recycle locally when no pool provided (bounded)
-                self.enqueue_rx_ready(buf);
-            }
+            // R96-4 FIX: Recycle buffer via dedicated method to prevent pool drain
+            self.recycle_rx_buffer(pool, buf);
             // Free descriptors using driver-owned metadata
             if let Some(next) = data_idx {
                 self.rx_queue.free_desc(next);
@@ -476,14 +512,8 @@ impl VirtioNetDevice {
         let mut buf = buf;
         if !buf.set_len(payload_len) {
             self.stats.rx_errors += 1;
-            // R44-2 + R48-5 FIX: Recycle buffer on error
-            buf.reset();
-            if let Some(pool) = pool {
-                pool.free(buf);
-            } else {
-                // R48-5 + R66-8: Recycle locally when no pool provided (bounded)
-                self.enqueue_rx_ready(buf);
-            }
+            // R96-4 FIX: Recycle buffer via dedicated method to prevent pool drain
+            self.recycle_rx_buffer(pool, buf);
             // Free descriptors using driver-owned metadata
             if let Some(next) = data_idx {
                 self.rx_queue.free_desc(next);
@@ -506,13 +536,24 @@ impl VirtioNetDevice {
 
     /// R66-8 FIX: Enqueue a completed RX buffer with bounded queue.
     ///
-    /// Drops excess packets when the queue exceeds MAX_RX_READY_QUEUE to prevent
-    /// unbounded memory growth under packet flood conditions. Dropped packets are
-    /// counted in rx_dropped for monitoring.
-    fn enqueue_rx_ready(&mut self, buf: NetBuf) {
+    /// When the queue exceeds MAX_RX_READY_QUEUE, excess buffers are moved to
+    /// rx_recycle for later reposting rather than dropped. This prevents the
+    /// BufPool from being drained under packet flood conditions.
+    ///
+    /// # R96-4 FIX: Recycle overflow buffers
+    ///
+    /// Previously, overflow buffers were dropped which would eventually drain
+    /// the BufPool. Now they are moved to rx_recycle so replenish_rx() can
+    /// repost them to the device.
+    fn enqueue_rx_ready(&mut self, mut buf: NetBuf) {
         if self.rx_ready.len() >= MAX_RX_READY_QUEUE {
-            // Drop the packet - buffer will be deallocated when it goes out of scope
+            // R96-4 FIX: Recycle instead of drop to prevent pool drain
             self.stats.rx_dropped += 1;
+            buf.reset();
+            if self.rx_recycle.len() < MAX_RX_READY_QUEUE {
+                self.rx_recycle.push(buf);
+            }
+            // If recycle queue is also full, buffer is dropped (NetBuf::Drop frees page)
             return;
         }
         self.rx_ready.push(buf);
@@ -720,10 +761,17 @@ impl NetDevice for VirtioNetDevice {
                 break;
             }
 
-            // Allocate a buffer from the pool
-            let buf = match pool.alloc() {
-                Some(b) => b,
-                None => break,
+            // R96-4 FIX: Prefer recycled buffers to prevent pool drain.
+            // Under packet flood or error conditions, buffers get recycled rather
+            // than returned to pool. Reusing them here closes the lifecycle loop.
+            let buf = if let Some(recycled) = self.rx_recycle.pop() {
+                recycled
+            } else {
+                // Allocate a buffer from the pool
+                match pool.alloc() {
+                    Some(b) => b,
+                    None => break,
+                }
             };
 
             // Verify buffer has enough headroom

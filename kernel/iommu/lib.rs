@@ -640,10 +640,8 @@ pub fn attach_device_to_domain(device: PciDeviceId, domain_id: DomainId) -> Iomm
 pub fn detach_device(device: PciDeviceId) -> IommuResult<()> {
     ensure_iommu_ready()?;
 
-    // No IOMMU units - nothing to detach
-    if IOMMU_UNIT_COUNT.load(Ordering::Acquire) == 0 {
-        return Ok(());
-    }
+    // R96-6 FIX: Removed dead code - ensure_iommu_ready() already returns
+    // Err(NotAvailable) when IOMMU_UNIT_COUNT == 0
 
     detach_device_from_domain(device, KERNEL_DOMAIN_ID)
 }
@@ -671,10 +669,8 @@ pub fn detach_device(device: PciDeviceId) -> IommuResult<()> {
 pub fn detach_device_from_domain(device: PciDeviceId, domain_id: DomainId) -> IommuResult<()> {
     ensure_iommu_ready()?;
 
-    // No IOMMU units - nothing to detach
-    if IOMMU_UNIT_COUNT.load(Ordering::Acquire) == 0 {
-        return Ok(());
-    }
+    // R96-6 FIX: Removed dead code - ensure_iommu_ready() already returns
+    // Err(NotAvailable) when IOMMU_UNIT_COUNT == 0
 
     // Find the IOMMU unit responsible for this device
     let units = IOMMU_UNITS.read();
@@ -734,10 +730,9 @@ pub fn map_range(
 ) -> IommuResult<()> {
     ensure_iommu_ready()?;
 
-    // No IOMMU units - allow DMA without mapping (legacy mode)
-    if IOMMU_UNIT_COUNT.load(Ordering::Acquire) == 0 {
-        return Ok(());
-    }
+    // R96-6 FIX: Removed dead code - ensure_iommu_ready() already returns
+    // Err(NotAvailable) when IOMMU_UNIT_COUNT == 0, so the legacy bypass
+    // check was unreachable and contradicted our fail-closed design.
 
     let domains = DOMAINS.read();
     let domain = domains
@@ -773,10 +768,9 @@ pub fn map_range(
 pub fn unmap_range(domain_id: DomainId, iova: u64, size: usize) -> IommuResult<()> {
     ensure_iommu_ready()?;
 
-    // No IOMMU units - allow DMA without mapping (legacy mode)
-    if IOMMU_UNIT_COUNT.load(Ordering::Acquire) == 0 {
-        return Ok(());
-    }
+    // R96-6 FIX: Removed dead code - ensure_iommu_ready() already returns
+    // Err(NotAvailable) when IOMMU_UNIT_COUNT == 0, so the legacy bypass
+    // check was unreachable and contradicted our fail-closed design.
 
     let domains = DOMAINS.read();
     let domain = domains
@@ -940,10 +934,8 @@ fn require_ir_table(unit: &VtdUnit) -> IommuResult<Arc<InterruptRemappingTable>>
 pub fn create_vm_domain(vm_id: u64) -> IommuResult<DomainId> {
     ensure_iommu_ready()?;
 
-    // VM passthrough requires active IOMMU - no legacy bypass
-    if IOMMU_UNIT_COUNT.load(Ordering::Acquire) == 0 {
-        return Err(IommuError::NotAvailable);
-    }
+    // R96-6 FIX: Removed redundant check - ensure_iommu_ready() already returns
+    // Err(NotAvailable) when IOMMU_UNIT_COUNT == 0
 
     let mut domains = DOMAINS.write();
     if domains.len() >= MAX_DOMAINS {
@@ -996,9 +988,8 @@ pub fn assign_device_to_vm(
 ) -> IommuResult<IrteHandle> {
     ensure_iommu_ready()?;
 
-    if IOMMU_UNIT_COUNT.load(Ordering::Acquire) == 0 {
-        return Err(IommuError::NotAvailable);
-    }
+    // R96-6 FIX: Removed redundant check - ensure_iommu_ready() already returns
+    // Err(NotAvailable) when IOMMU_UNIT_COUNT == 0
 
     // Validate VM domain
     let domain = validate_vm_domain(vm_domain_id)?;
@@ -1084,9 +1075,8 @@ pub fn unassign_device_from_vm(
 ) -> IommuResult<()> {
     ensure_iommu_ready()?;
 
-    if IOMMU_UNIT_COUNT.load(Ordering::Acquire) == 0 {
-        return Err(IommuError::NotAvailable);
-    }
+    // R96-6 FIX: Removed redundant check - ensure_iommu_ready() already returns
+    // Err(NotAvailable) when IOMMU_UNIT_COUNT == 0
 
     // Validate VM domain
     let _domain = validate_vm_domain(vm_domain_id)?;
@@ -1501,12 +1491,18 @@ fn dma_map_range_hook(
         // R95-4 FIX: Classify errors
         // Safe to free pages: no mapping was ever installed
         // Unsafe: mapping state is uncertain (partial mapping possible)
+        //
+        // R96-9 FIX: Expand safe-rejection list to prevent unnecessary DoS.
+        // PageTableAllocFailed is safe: allocation failed before mapping started.
+        // PermissionDenied is safe: validation rejected before mapping started.
         match e {
             // Safe errors: validation rejected before mapping started
             IommuError::NotInitialized
             | IommuError::NotAvailable
             | IommuError::DomainNotFound
-            | IommuError::InvalidRange => mm::dma::DmaError::IommuMapRejected,
+            | IommuError::InvalidRange
+            | IommuError::PageTableAllocFailed
+            | IommuError::PermissionDenied => mm::dma::DmaError::IommuMapRejected,
 
             // Unsafe errors: mapping may have been partially installed
             // or state is otherwise uncertain

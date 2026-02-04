@@ -503,13 +503,66 @@ impl ConntrackTable {
     }
 
     /// R65-3 FIX: Record the latest access for a flow in the LRU heap.
-    fn record_lru(&self, key: FlowKey, last_seen_ms: u64, generation: u64) {
-        let mut heap = self.lru_index.lock();
-        heap.push(Reverse(LruIndexEntry {
-            last_seen_ms,
-            generation,
-            key,
-        }));
+    ///
+    /// # R96-3 FIX: Bounded Heap Growth
+    ///
+    /// The LRU heap receives a push on every packet, not just on flow creation.
+    /// Without compaction, the heap grows O(packets) instead of O(flows), causing
+    /// memory exhaustion under high PPS traffic. This fix periodically rebuilds
+    /// the heap from current entries when it exceeds a threshold.
+    ///
+    /// The threshold is `entries.len() * COMPACT_FACTOR + COMPACT_SLACK` to allow
+    /// some slack for normal operation while bounding worst-case growth.
+    fn record_lru(
+        &self,
+        entries: &BTreeMap<FlowKey, Mutex<ConntrackEntry>>,
+        key: FlowKey,
+        last_seen_ms: u64,
+        generation: u64,
+    ) {
+        // Tuning constants for heap compaction
+        const HEAP_COMPACT_FACTOR: usize = 4;
+        const HEAP_COMPACT_SLACK: usize = 1024;
+
+        let rebuild_threshold = entries
+            .len()
+            .saturating_mul(HEAP_COMPACT_FACTOR)
+            .saturating_add(HEAP_COMPACT_SLACK);
+
+        // Push the new entry and check if rebuild is needed
+        let should_rebuild = {
+            let mut heap = self.lru_index.lock();
+            heap.push(Reverse(LruIndexEntry {
+                last_seen_ms,
+                generation,
+                key,
+            }));
+            heap.len() > rebuild_threshold
+        };
+
+        if !should_rebuild {
+            return;
+        }
+
+        // Rebuild heap from current entries only.
+        // This drops stale entries (flows that were removed or have newer timestamps)
+        // and bounds heap memory to O(flows).
+        //
+        // Lock ordering: We must not hold lru_index while acquiring entry locks
+        // to avoid deadlock. Build the new heap first, then swap.
+        let mut rebuilt: BinaryHeap<Reverse<LruIndexEntry>> =
+            BinaryHeap::with_capacity(entries.len());
+        for (flow_key, entry_lock) in entries.iter() {
+            let entry = entry_lock.lock();
+            rebuilt.push(Reverse(LruIndexEntry {
+                last_seen_ms: entry.last_seen_ms,
+                generation: entry.lru_gen,
+                key: *flow_key,
+            }));
+        }
+
+        // Atomic swap of the heap
+        *self.lru_index.lock() = rebuilt;
     }
 
     /// Look up an entry by flow key.
@@ -570,7 +623,8 @@ impl ConntrackTable {
                 let last_seen_ms = entry.last_seen_ms;
                 drop(entry);
 
-                self.record_lru(key, last_seen_ms, lru_gen);
+                // R96-3 FIX: Pass entries reference for heap compaction
+                self.record_lru(&entries, key, last_seen_ms, lru_gen);
 
                 // R95-2 FIX: Propagate actual decision from state machine
                 // instead of hardcoded Established. This prevents firewall
@@ -657,7 +711,8 @@ impl ConntrackTable {
             let last_seen_ms = entry.last_seen_ms;
             drop(entry);
 
-            self.record_lru(key, last_seen_ms, lru_gen);
+            // R96-3 FIX: Pass entries reference for heap compaction
+            self.record_lru(&*entries, key, last_seen_ms, lru_gen);
 
             // R95-2 FIX: Propagate actual decision from state machine
             // (double-check path after write-lock acquisition).
@@ -700,7 +755,8 @@ impl ConntrackTable {
         self.stats.entries_created.fetch_add(1, Ordering::Relaxed);
         self.stats.current_entries.fetch_add(1, Ordering::Relaxed);
 
-        self.record_lru(key, last_seen_ms, lru_gen);
+        // R96-3 FIX: Pass entries reference for heap compaction
+        self.record_lru(&*entries, key, last_seen_ms, lru_gen);
 
         CtUpdateResult {
             decision: CtDecision::New,

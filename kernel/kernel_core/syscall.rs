@@ -4450,10 +4450,6 @@ fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
         return Err(SyscallError::EFAULT);
     }
 
-    // 获取当前进程
-    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
-
     // 安全复制路径字符串 (Z-3 fix: fault-tolerant usercopy)
     let path_str = {
         let path_bytes = copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
@@ -4464,6 +4460,19 @@ fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
             .map_err(|_| SyscallError::EINVAL)?
             .to_string()
     };
+
+    // R96-5 FIX: Delegate to internal helper to avoid TOCTOU in openat
+    sys_open_internal(&path_str, flags, mode)
+}
+
+/// R96-5 FIX: Internal helper for sys_open that works on already-copied path.
+///
+/// This eliminates TOCTOU window in sys_openat where the path could be modified
+/// between checking the first byte and calling sys_open.
+fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
+    // 获取当前进程
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
     // LSM hook: check file create permission if O_CREAT is set
     let open_flags = flags as u32;
@@ -4567,6 +4576,15 @@ fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
             .to_string()
     };
 
+    // R96-5 FIX: Delegate to internal helper to avoid TOCTOU in fstatat
+    sys_stat_internal(&path_str, statbuf)
+}
+
+/// R96-5 FIX: Internal helper for sys_stat that works on already-copied path.
+///
+/// This eliminates TOCTOU window in sys_fstatat where the path could be modified
+/// between checking the first byte and calling sys_stat.
+fn sys_stat_internal(path_str: &str, statbuf: *mut VfsStat) -> SyscallResult {
     // 获取 VFS stat 回调
     let stat_fn = {
         let callback = VFS_STAT_CALLBACK.lock();
@@ -4574,7 +4592,7 @@ fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
     };
 
     // 调用 VFS stat
-    let stat = stat_fn(&path_str)?;
+    let stat = stat_fn(path_str)?;
 
     // 将结果写入用户空间
     let stat_bytes = unsafe {
@@ -6566,50 +6584,84 @@ fn sys_lstat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
 /// sys_fstatat - 相对路径stat
 ///
 /// 当前仅支持AT_FDCWD或绝对路径。
+///
+/// # R96-5 FIX: TOCTOU Protection
+/// Copies the entire path once and uses the kernel copy for both the
+/// check and the actual operation, eliminating the window where an
+/// attacker could modify the path between check and use.
 fn sys_fstatat(dirfd: i32, path: *const u8, statbuf: *mut VfsStat, _flags: i32) -> SyscallResult {
+    use crate::usercopy::copy_user_cstring;
+
     if path.is_null() {
         return Err(SyscallError::EFAULT);
     }
+    if statbuf.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
 
-    // R95-1 FIX: Use usercopy API instead of direct pointer dereference.
-    // Direct dereference would cause kernel panic if path is unmapped.
-    let mut first = [0u8; 1];
-    crate::usercopy::copy_from_user_safe(&mut first, path).map_err(|_| SyscallError::EFAULT)?;
-    let first_byte = first[0];
+    // R96-5 FIX: Copy the entire path once to eliminate TOCTOU window.
+    // Previously we copied only the first byte, then called sys_stat which
+    // would copy the path again. An attacker could modify the path between
+    // the two copies.
+    let path_str = {
+        let path_bytes = copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+        if path_bytes.is_empty() {
+            return Err(SyscallError::EINVAL);
+        }
+        core::str::from_utf8(&path_bytes)
+            .map_err(|_| SyscallError::EINVAL)?
+            .to_string()
+    };
 
+    // Check from kernel copy - no TOCTOU possible
+    let first_byte = path_str.as_bytes().first().copied().unwrap_or(0);
     if dirfd != AT_FDCWD && first_byte != b'/' {
         // 相对路径 + 非AT_FDCWD: 暂不支持
-        // R72-ENOSYS FIX: Return EOPNOTSUPP (operation not supported) instead of
-        // ENOSYS. The syscall exists but relative path resolution from dirfd is
-        // not yet implemented.
         return Err(SyscallError::EOPNOTSUPP);
     }
 
-    sys_stat(path, statbuf)
+    // Use internal helper with already-copied path
+    sys_stat_internal(&path_str, statbuf)
 }
 
 /// sys_openat - 相对路径打开文件
 ///
 /// 当前仅支持AT_FDCWD或绝对路径。
+///
+/// # R96-5 FIX: TOCTOU Protection
+/// Copies the entire path once and uses the kernel copy for both the
+/// check and the actual operation, eliminating the window where an
+/// attacker could modify the path between check and use.
 fn sys_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -> SyscallResult {
+    use crate::usercopy::copy_user_cstring;
+
     if path.is_null() {
         return Err(SyscallError::EFAULT);
     }
 
-    // R95-1 FIX: Use usercopy API instead of direct pointer dereference.
-    // Direct dereference would cause kernel panic if path is unmapped.
-    let mut first = [0u8; 1];
-    crate::usercopy::copy_from_user_safe(&mut first, path).map_err(|_| SyscallError::EFAULT)?;
-    let first_byte = first[0];
+    // R96-5 FIX: Copy the entire path once to eliminate TOCTOU window.
+    // Previously we copied only the first byte, then called sys_open which
+    // would copy the path again. An attacker could modify the path between
+    // the two copies.
+    let path_str = {
+        let path_bytes = copy_user_cstring(path).map_err(|_| SyscallError::EFAULT)?;
+        if path_bytes.is_empty() {
+            return Err(SyscallError::EINVAL);
+        }
+        core::str::from_utf8(&path_bytes)
+            .map_err(|_| SyscallError::EINVAL)?
+            .to_string()
+    };
 
+    // Check from kernel copy - no TOCTOU possible
+    let first_byte = path_str.as_bytes().first().copied().unwrap_or(0);
     if dirfd != AT_FDCWD && first_byte != b'/' {
-        // R72-ENOSYS FIX: Return EOPNOTSUPP (operation not supported) instead of
-        // ENOSYS. The syscall exists but relative path resolution from dirfd is
-        // not yet implemented.
+        // 相对路径 + 非AT_FDCWD: 暂不支持
         return Err(SyscallError::EOPNOTSUPP);
     }
 
-    sys_open(path, flags, mode)
+    // Use internal helper with already-copied path
+    sys_open_internal(&path_str, flags, mode)
 }
 
 /// sys_openat2 - open with extended flags and resolve options (Linux 5.6+)

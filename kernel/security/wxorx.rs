@@ -73,8 +73,8 @@ pub enum PageLevel {
 pub enum WxorxError {
     /// A W^X violation was detected
     Violation(Violation),
-    /// Multiple violations detected
-    PolicyViolation(usize),
+    /// X-3 FIX: One or more violations detected (includes full scan summary)
+    PolicyViolation(ValidationSummary),
     /// Page table walk failed
     IncompleteWalk(&'static str),
     /// Invalid page table structure
@@ -92,7 +92,9 @@ pub enum WxorxError {
 ///
 /// # Returns
 ///
-/// Validation summary on success, or error with violation details
+/// X-3 FIX: API semantic clarification:
+/// - `Ok(summary)` if no W^X violations are present.
+/// - `Err(WxorxError::PolicyViolation(summary))` if any violations are found.
 ///
 /// # Security Note
 ///
@@ -141,10 +143,10 @@ pub fn validate_active(phys_offset: VirtAddr) -> Result<ValidationSummary, Wxorx
         walk_pdpt(pdpt, virt_base, phys_offset, &mut summary)?;
     }
 
-    // If we found violations, return error with first violation
+    // X-3 FIX: Return Err if violations found, not Ok with violations
+    // This prevents callers from misinterpreting "Ok" as "no violations"
     if summary.violations > 0 {
-        // Note: We collect all violations in the summary but don't track each one
-        // For strict mode, the caller can check summary.violations
+        return Err(WxorxError::PolicyViolation(summary));
     }
 
     Ok(summary)

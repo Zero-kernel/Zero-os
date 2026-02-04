@@ -241,12 +241,11 @@ impl SecurityTest for WxorxFullValidationTest {
 
     fn run(&self, ctx: &TestContext) -> TestResult {
         match wxorx::validate_active(ctx.phys_offset) {
-            Ok(summary) => {
-                if summary.violations == 0 {
-                    TestResult::Pass
-                } else {
-                    TestResult::Fail("Active page tables violate W^X policy")
-                }
+            // X-3 FIX: Ok now means zero violations by contract
+            Ok(_) => TestResult::Pass,
+            // X-3 FIX: PolicyViolation means violations found
+            Err(wxorx::WxorxError::PolicyViolation(_)) => {
+                TestResult::Fail("Active page tables violate W^X policy")
             }
             Err(_) => TestResult::Warning("W^X validation encountered an error"),
         }

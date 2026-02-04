@@ -281,7 +281,16 @@ impl Drop for DmaBuffer {
         }
 
         // Calculate actual allocation size (buddy allocator rounds up to power-of-two).
+        // R96-7 FIX: Check for next_power_of_two overflow.
+        // When pages > isize::MAX, next_power_of_two() returns 0 due to overflow.
+        // This would cause alloc_bytes to be 0, leading to incorrect behavior.
         let alloc_pages = pages.next_power_of_two();
+        if alloc_pages == 0 {
+            // Overflow in next_power_of_two - should never happen with valid buffers.
+            // Scrub and leak pages to be safe.
+            scrub_range(self.phys, self.size);
+            return;
+        }
         let alloc_bytes = match alloc_pages.checked_mul(DMA_PAGE_SIZE) {
             Some(b) => b,
             None => return, // Overflow - leak the pages (shouldn't happen)
@@ -376,10 +385,20 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
     let phys = frame.start_address().as_u64();
 
     // Buddy allocator rounds up to power-of-two pages.
+    // R96-7 FIX: Check for next_power_of_two overflow.
+    // When pages > isize::MAX, next_power_of_two() returns 0 due to overflow.
     let alloc_pages = pages.next_power_of_two();
+    if alloc_pages == 0 {
+        // Overflow in next_power_of_two - free and fail.
+        buddy_allocator::free_physical_pages(frame, pages);
+        return Err(DmaError::InvalidSize);
+    }
     let alloc_bytes = alloc_pages
         .checked_mul(DMA_PAGE_SIZE)
-        .ok_or(DmaError::InvalidSize)?;
+        .ok_or_else(|| {
+            buddy_allocator::free_physical_pages(frame, pages);
+            DmaError::InvalidSize
+        })?;
 
     // Verify the allocation is within the CPU direct-map range.
     let end = phys

@@ -73,6 +73,43 @@ pub const EXT2_APPEND_FL: u32 = 0x00000020;
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(100);
 
 // ============================================================================
+// Safe On-Disk Data Access Helpers
+// ============================================================================
+
+/// Read a little-endian u32 from a byte buffer at the given index.
+///
+/// Ext2 on-disk structures store multi-byte integers in little-endian format.
+/// This function avoids creating an unaligned `&[u32]` view over a `Vec<u8>`
+/// buffer, which would be undefined behavior in Rust (Vec<u8> only guarantees
+/// 1-byte alignment).
+///
+/// # Arguments
+///
+/// * `buf` - The byte buffer to read from
+/// * `index` - The u32 index (not byte offset) within the buffer
+///
+/// # Returns
+///
+/// * `Ok(u32)` - The value at the given index
+/// * `Err(FsError::Invalid)` - Index out of bounds or overflow
+///
+/// # R96-1 Fix
+///
+/// This replaces unsafe `slice::from_raw_parts(buf.as_ptr() as *const u32, ...)`
+/// patterns that created UB from unaligned access.
+#[inline]
+fn read_u32_le(buf: &[u8], index: usize) -> Result<u32, FsError> {
+    let offset = index
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(FsError::Invalid)?;
+    let end = offset
+        .checked_add(core::mem::size_of::<u32>())
+        .ok_or(FsError::Invalid)?;
+    let bytes = buf.get(offset..end).ok_or(FsError::Invalid)?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+// ============================================================================
 // On-disk structures
 // ============================================================================
 
@@ -253,8 +290,11 @@ impl Ext2Fs {
             return Err(FsError::Invalid);
         }
 
-        // Calculate block size
-        let block_size = 1024u32 << sb.log_block_size;
+        // R96-2 FIX: Use checked_shl to prevent overflow on crafted log_block_size.
+        // A malicious superblock with log_block_size >= 22 would cause panic.
+        let block_size = 1024u32
+            .checked_shl(sb.log_block_size)
+            .ok_or(FsError::Invalid)?;
 
         // Validate block size (1K-64K)
         if block_size < 1024 || block_size > 65536 {
@@ -297,7 +337,14 @@ impl Ext2Fs {
         //
         // Maximum practical limit: 64K groups (each group desc is 32 bytes = 2MB total).
         // This allows filesystems up to 64K * 128MB = 8TB (with 128MB per group).
-        let groups_count = (sb.blocks_count + sb.blocks_per_group - 1) / sb.blocks_per_group;
+        //
+        // R96-2 FIX: Use checked arithmetic to prevent overflow on crafted blocks_count.
+        // A malicious superblock with blocks_count near u32::MAX could overflow.
+        let groups_count = sb
+            .blocks_count
+            .checked_add(sb.blocks_per_group - 1)
+            .ok_or(FsError::Invalid)?
+            / sb.blocks_per_group;
         const MAX_GROUPS: u32 = 65536;
         if groups_count > MAX_GROUPS {
             return Err(FsError::Invalid);
@@ -731,11 +778,11 @@ impl Ext2Fs {
             let mut buf = alloc::vec![0u8; self.block_size as usize];
             self.read_block(ind_block, &mut buf)?;
 
-            let ptrs: &[u32] = unsafe {
-                core::slice::from_raw_parts(buf.as_ptr() as *const u32, ptrs_per_block as usize)
-            };
+            // R96-1 Fix: Use safe little-endian read instead of UB from unaligned
+            // slice::from_raw_parts. Vec<u8> only guarantees 1-byte alignment.
+            let ptr = read_u32_le(&buf, file_block as usize)?;
             // R28-5 Fix: Validate data block pointer
-            return self.validate_block(ptrs[file_block as usize]);
+            return self.validate_block(ptr);
         }
 
         let file_block = file_block - ptrs_per_block;
@@ -751,25 +798,24 @@ impl Ext2Fs {
             let mut buf = alloc::vec![0u8; self.block_size as usize];
             self.read_block(dind_block, &mut buf)?;
 
-            let ptrs: &[u32] = unsafe {
-                core::slice::from_raw_parts(buf.as_ptr() as *const u32, ptrs_per_block as usize)
-            };
-
             let ind_index = file_block / ptrs_per_block;
+            // R96-1 Fix: Use safe little-endian read instead of UB from unaligned
+            // slice::from_raw_parts. Vec<u8> only guarantees 1-byte alignment.
+            let ind_ptr = read_u32_le(&buf, ind_index as usize)?;
             // R28-5 Fix: Validate indirect block pointer from double indirect table
-            let ind_block = match self.validate_block(ptrs[ind_index as usize])? {
+            let ind_block = match self.validate_block(ind_ptr)? {
                 Some(b) => b,
                 None => return Ok(None),
             };
 
             self.read_block(ind_block, &mut buf)?;
-            let ptrs: &[u32] = unsafe {
-                core::slice::from_raw_parts(buf.as_ptr() as *const u32, ptrs_per_block as usize)
-            };
 
             let block_index = file_block % ptrs_per_block;
+            // R96-1 Fix: Use safe little-endian read instead of UB from unaligned
+            // slice::from_raw_parts. Vec<u8> only guarantees 1-byte alignment.
+            let ptr = read_u32_le(&buf, block_index as usize)?;
             // R28-5 Fix: Validate data block pointer
-            return self.validate_block(ptrs[block_index as usize]);
+            return self.validate_block(ptr);
         }
 
         // Triple indirect would go here, but for simplicity we return an error
@@ -863,7 +909,11 @@ impl Ext2Inode {
                 break;
             }
 
-            let head: Ext2DirEntryHead = unsafe { core::ptr::read(data.as_ptr() as *const _) };
+            // R96-8 Fix: Use read_unaligned to avoid UB from unaligned access.
+            // Vec<u8> only guarantees 1-byte alignment, but Ext2DirEntryHead
+            // contains u32/u16 fields that may require higher alignment.
+            let head: Ext2DirEntryHead =
+                unsafe { core::ptr::read_unaligned(data.as_ptr() as *const _) };
 
             if head.rec_len == 0 {
                 break;
@@ -1120,7 +1170,11 @@ impl Inode for Ext2Inode {
                 break;
             }
 
-            let head: Ext2DirEntryHead = unsafe { core::ptr::read(data.as_ptr() as *const _) };
+            // R96-8 Fix: Use read_unaligned to avoid UB from unaligned access.
+            // Vec<u8> only guarantees 1-byte alignment, but Ext2DirEntryHead
+            // contains u32/u16 fields that may require higher alignment.
+            let head: Ext2DirEntryHead =
+                unsafe { core::ptr::read_unaligned(data.as_ptr() as *const _) };
 
             if head.rec_len == 0 {
                 break;
