@@ -368,11 +368,16 @@ pub unsafe fn save_context(ctx: *mut Context) {
         // 保存 CS/SS 以便调度器判断当前执行模式
         // 当用户进程在系统调用中被抢占时，CS=0x08（内核）
         // 这使得调度器能正确使用 switch_context 而非 enter_usermode
-        "mov rax, cs",
-        "mov [{ctx} + 0x90], rax",
-        "mov rax, ss",
-        "mov [{ctx} + 0x98], rax",
+        //
+        // FIX: Use {tmp} register instead of rax to avoid clobbering {ctx}
+        // if the compiler allocated {ctx} to rax. This caused CR2=0x98 faults
+        // when ctx pointer was overwritten by "mov rax, cs".
+        "mov {tmp}, cs",
+        "mov [{ctx} + 0x90], {tmp}",
+        "mov {tmp}, ss",
+        "mov [{ctx} + 0x98], {tmp}",
         ctx = in(reg) ctx,
+        tmp = out(reg) _,
         fxoff = const FXSAVE_OFFSET,
     );
 }

@@ -827,6 +827,7 @@ extern "x86-interrupt" fn page_fault_handler(
     }
     #[cfg(not(debug_assertions))]
     unsafe {
+        // X-8: Only show error code in release builds, not CR2 (pointer leak)
         serial_write_str("\n[PF ENTRY] err=");
         serial_write_hex(error_code.bits());
         serial_write_str("\n");

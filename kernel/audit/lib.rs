@@ -282,7 +282,7 @@ pub enum AuditObject {
         inode: u64,
         /// File mode bits
         mode: u32,
-        /// FNV-1a hash of the path string (to avoid storing full path)
+        /// X-1 FIX: SHA-256 (truncated to 64 bits) hash of the path string
         path_hash: u64,
     },
     /// IPC endpoint
@@ -1734,7 +1734,7 @@ pub fn emit(
 /// # Args Layout
 ///
 /// - `args[0]` = `AuditSecurityClass::Lsm`
-/// - `args[1]` = FNV-1a hash of the hook name
+/// - `args[1]` = SHA-256 (truncated to 64 bits) hash of the hook name
 /// - `args[2]` = `AuditLsmReason`
 #[inline]
 pub fn emit_lsm_denial(
@@ -2043,56 +2043,51 @@ macro_rules! audit_security {
 }
 
 // ============================================================================
-// FNV-1a Utility (compact hashing for paths/identifiers)
+// X-1 FIX: SHA-256 Utility (compact hashing for paths/identifiers)
 // ============================================================================
+// Previously used FNV-1a which is not cryptographically secure.
+// Now uses SHA-256 truncated to 64 bits with domain separation.
 
-const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
+/// Domain separation prefix for path hashing
+const PATH_HASH_DOMAIN: &[u8] = b"AUDIT-PATH-SHA256-V1:";
 
-/// FNV-1a 64-bit hasher for lightweight path/identifier hashing
-struct Fnv1a64(u64);
+/// Domain separation prefix for bytes hashing
+const BYTES_HASH_DOMAIN: &[u8] = b"AUDIT-BYTES-SHA256-V1:";
 
-impl Fnv1a64 {
-    #[inline]
-    fn new() -> Self {
-        Self(FNV_OFFSET_BASIS)
-    }
-
-    #[inline]
-    fn write_u8(&mut self, byte: u8) {
-        self.0 ^= byte as u64;
-        self.0 = self.0.wrapping_mul(FNV_PRIME);
-    }
-
-    #[inline]
-    fn finish(self) -> u64 {
-        self.0
-    }
+/// Compute SHA-256 truncated to 64 bits with domain separation
+#[inline]
+fn sha256_trunc64_with_domain(domain: &[u8], data: &[u8]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(data);
+    let digest = hasher.finalize();
+    // Truncate to 64 bits (first 8 bytes of SHA-256)
+    u64::from_be_bytes([
+        digest[0], digest[1], digest[2], digest[3],
+        digest[4], digest[5], digest[6], digest[7],
+    ])
 }
 
 // ============================================================================
 // Path Hashing Utility
 // ============================================================================
 
-/// Compute FNV-1a hash of a path string
+/// Compute a compact SHA-256-derived hash of a path string
+///
+/// X-1 FIX: Now uses SHA-256 (truncated to 64 bits) instead of FNV-1a.
+/// This provides cryptographic strength for tamper detection.
 ///
 /// This is used to avoid storing full path strings in audit events,
 /// while still allowing correlation between related events.
 pub fn hash_path(path: &str) -> u64 {
-    let mut hasher = Fnv1a64::new();
-    for byte in path.bytes() {
-        hasher.write_u8(byte);
-    }
-    hasher.finish()
+    sha256_trunc64_with_domain(PATH_HASH_DOMAIN, path.as_bytes())
 }
 
-/// Compute FNV-1a hash of a byte slice
+/// Compute a compact SHA-256-derived hash of a byte slice
+///
+/// X-1 FIX: Now uses SHA-256 (truncated to 64 bits) instead of FNV-1a.
 pub fn hash_bytes(data: &[u8]) -> u64 {
-    let mut hasher = Fnv1a64::new();
-    for byte in data {
-        hasher.write_u8(*byte);
-    }
-    hasher.finish()
+    sha256_trunc64_with_domain(BYTES_HASH_DOMAIN, data)
 }
 
 /// R41-4 FIX: Compute SHA-256 hash of the first `max_len` bytes of a binary blob.
@@ -2257,16 +2252,8 @@ mod tests {
         assert_eq!(digest, expected);
     }
 
-    #[test]
-    fn test_fnv1a_hash_nonzero() {
-        let mut hasher = Fnv1a64::new();
-        hasher.write_u8(0x12);
-        hasher.write_u8(0x34);
-        hasher.write_u8(0x56);
-        hasher.write_u8(0x78);
-        let hash = hasher.finish();
-        assert_ne!(hash, FNV_OFFSET_BASIS);
-    }
+    // X-1 FIX: Removed obsolete test_fnv1a_hash_nonzero test
+    // FNV-1a has been replaced with SHA-256 for cryptographic strength
 
     #[test]
     fn test_hash_path() {

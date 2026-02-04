@@ -501,13 +501,21 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
 
     // R65-21 FIX: After acquiring the lock, re-check if the page is still COW.
     // Another thread may have resolved this COW fault while we were waiting for the lock.
-    // If COW flag is no longer set, the page has already been resolved - just flush TLB and return.
+    // If COW flag is no longer set, check if the page is now writable:
+    // - If writable: another thread resolved it, flush TLB and return Ok
+    // - If not writable: this was never a COW page, return error to let caller handle it
     if !flags.contains(cow_flag()) {
-        // COW already resolved by another thread, just ensure TLB is consistent
-        // R68-4 FIX: Use cross-CPU shootdown to ensure all CPUs see the resolution.
-        // On SMP, other CPUs sharing this address space may have stale TLB entries.
-        mm::flush_current_as_page(virt);
-        return Ok(());
+        if flags.contains(PageTableFlags::WRITABLE) {
+            // COW already resolved by another thread, just ensure TLB is consistent
+            // R68-4 FIX: Use cross-CPU shootdown to ensure all CPUs see the resolution.
+            // On SMP, other CPUs sharing this address space may have stale TLB entries.
+            mm::flush_current_as_page(virt);
+            return Ok(());
+        } else {
+            // Page is not COW and not writable - this is NOT a COW fault
+            // Return error so caller can handle it appropriately (e.g., SIGSEGV)
+            return Err(ForkError::PageTableCopyFailed);
+        }
     }
 
     // 使用基于当前 CR3 的页表管理器，确保操作正确的地址空间

@@ -15,7 +15,7 @@
 use mm::memory::FrameAllocator;
 use mm::page_table::{
     self, ensure_pte_range, map_mmio, mmio_flags, recursive_pd, recursive_pdpt, recursive_pt,
-    MapError, APIC_MMIO_SIZE, APIC_PHYS_ADDR, VGA_PHYS_ADDR,
+    split_2m_entry, MapError, APIC_MMIO_SIZE, APIC_PHYS_ADDR, VGA_PHYS_ADDR,
 };
 use x86_64::{
     instructions::tlb,
@@ -92,6 +92,13 @@ extern "C" {
 /// VGA MMIO region size (4 KiB)
 const VGA_MMIO_SIZE: usize = 0x1000;
 
+/// SMP trampoline physical address (must match arch/smp.rs TRAMPOLINE_PHYS)
+/// This page needs to remain executable for AP startup.
+const SMP_TRAMPOLINE_PHYS: u64 = 0x8000;
+
+/// SMP trampoline size (covers the code + data area)
+const SMP_TRAMPOLINE_SIZE: usize = 0x1000; // 4KB page
+
 /// Clean up the identity mapping created by the bootloader
 ///
 /// The bootloader creates an identity mapping (physical == virtual) for the
@@ -123,8 +130,6 @@ pub fn cleanup_identity_map(
     unsafe {
         core::arch::asm!("mov {}, rsp", out(reg) current_rsp, options(nomem, nostack));
     }
-    // Calculate the 2MB region containing the stack
-    let stack_pd_base = current_rsp & !0x1FFFFF; // Align to 2MB boundary
 
     unsafe {
         page_table::with_active_level_4_table(|pml4| {
@@ -189,7 +194,8 @@ pub fn cleanup_identity_map(
                                 pd_base,
                                 pdpt_idx,
                                 pd_idx,
-                                stack_pd_base,
+                                current_rsp,
+                                &mut frame_allocator,
                             )?;
                         }
                     }
@@ -518,6 +524,10 @@ where
 /// direct identity-map device access), but:
 /// - VGA is accessible via high-half: PHYSICAL_MEMORY_OFFSET + 0xB8000
 /// - APIC will need dedicated high-half mapping when SMP is implemented
+///
+/// Note: This function is superseded by `harden_identity_pd_entry_recursive` which
+/// properly splits MMIO huge pages. Kept for potential fallback use.
+#[allow(dead_code)]
 fn harden_identity_pd_entry(
     pd_entry: &mut PageTableEntry,
     pd_base: u64,
@@ -535,12 +545,25 @@ fn harden_identity_pd_entry(
     }
 
     // Already 4KB pages, harden each entry preserving MMIO access
+    // Note: This dead code path doesn't have access to RSP, so stack preservation
+    // is not supported. Use harden_identity_pd_entry_recursive instead.
     let pt = unsafe { get_table_from_entry(pd_entry, phys_offset)? };
-    Ok(harden_identity_pt(pt, pd_base))
+    Ok(harden_identity_pt(pt, pd_base, 0)) // 0 = no stack preservation
 }
 
-/// Harden a page table in the identity mapping, preserving MMIO pages
-fn harden_identity_pt(pt: &mut PageTable, pd_base: u64) -> usize {
+/// Harden a page table in the identity mapping, preserving MMIO and stack pages
+///
+/// # L-5 FIX Addendum: SMP Trampoline Handling
+///
+/// The SMP trampoline at 0x8000 must remain executable for AP startup.
+/// We mark it read-only (no write) but keep it executable (no NX).
+///
+/// # L-5 FIX Addendum: Stack Preservation
+///
+/// The bootloader stack must remain writable. When we split MMIO-containing
+/// 2MB regions, we must not accidentally mark stack pages read-only.
+/// We preserve pages containing the current RSP and a few pages below (stack grows down).
+fn harden_identity_pt(pt: &mut PageTable, pd_base: u64, current_rsp: u64) -> usize {
     let mut updated = 0usize;
 
     for (pt_idx, pt_entry) in pt.iter_mut().enumerate() {
@@ -558,6 +581,15 @@ fn harden_identity_pt(pt: &mut PageTable, pd_base: u64) -> usize {
                 mmio.insert(PageTableFlags::GLOBAL);
             }
             flags = mmio;
+        } else if is_smp_trampoline_page(page_vaddr) {
+            // SMP trampoline: read-only but MUST remain executable for AP startup
+            // Do NOT add NO_EXECUTE here - APs need to run code from this page
+            flags.remove(PageTableFlags::WRITABLE);
+            // Explicitly do NOT insert NO_EXECUTE
+        } else if is_stack_page(page_vaddr, current_rsp) {
+            // Stack pages: keep writable but add NX (code shouldn't run from stack)
+            flags.insert(PageTableFlags::NO_EXECUTE);
+            // Explicitly do NOT remove WRITABLE
         } else {
             // Normal pages: make read-only, add NX
             flags.remove(PageTableFlags::WRITABLE);
@@ -571,37 +603,70 @@ fn harden_identity_pt(pt: &mut PageTable, pd_base: u64) -> usize {
     updated
 }
 
+/// Check if a page is part of the bootloader stack region
+///
+/// We conservatively mark pages containing RSP and up to STACK_GUARD_PAGES below
+/// as stack pages. The stack grows downward, so these pages may be used.
+///
+/// # Arguments
+///
+/// * `page_vaddr` - Virtual address of the 4KB page to check
+/// * `current_rsp` - Current RSP value (0 disables stack preservation)
+#[inline]
+fn is_stack_page(page_vaddr: u64, current_rsp: u64) -> bool {
+    // RSP of 0 means "no stack preservation" (e.g., dead code fallback path)
+    if current_rsp == 0 {
+        return false;
+    }
+
+    // Stack guard: preserve the page containing RSP plus 8 pages (32KB) below
+    // This should cover typical bootloader stack usage
+    const STACK_GUARD_PAGES: u64 = 8;
+    const PAGE_SIZE: u64 = 4096;
+
+    let rsp_page = current_rsp & !0xFFF; // Page containing RSP
+    let stack_bottom = rsp_page.saturating_sub(STACK_GUARD_PAGES * PAGE_SIZE);
+
+    // Stack region: from stack_bottom to rsp_page (inclusive)
+    page_vaddr >= stack_bottom && page_vaddr <= rsp_page
+}
+
 /// Harden a single PD entry using recursive page table access
 ///
 /// This version uses the recursive page table mapping (PML4[510]) to access
 /// page table frames at any physical address, bypassing the high-half mapping
 /// limitation.
+///
+/// # L-5 FIX: Split MMIO Huge Pages
+///
+/// When a 2MB huge page contains MMIO regions (VGA, APIC, framebuffer), we
+/// now split it into 512 4KB PTEs instead of marking the entire region writable.
+/// This ensures only actual MMIO pages remain writable, while other pages
+/// (including kernel pages at 0x100000) are marked read-only.
 fn harden_identity_pd_entry_recursive(
     pd_entry: &mut PageTableEntry,
     pd_base: u64,
     pdpt_idx: usize,
     pd_idx: usize,
-    stack_pd_base: u64,
+    current_rsp: u64,
+    frame_allocator: &mut FrameAllocator,
 ) -> Result<usize, HardeningError> {
+    // Calculate the 2MB-aligned base for stack region comparison
+    let stack_pd_base = current_rsp & !0x1FFFFF;
+
     let flags = pd_entry.flags();
     if flags.contains(PageTableFlags::HUGE_PAGE) {
-        // Check if this 2MB region contains MMIO - if so, preserve writability
+        // L-5 FIX: If this 2MB huge page overlaps MMIO, demote to 4KB PTEs
+        // so only the actual MMIO pages remain writable (mmio_flags()).
+        // Previously, the entire 2MB was marked writable, leaving kernel
+        // pages (e.g., at 0x100000) also writable - a security violation.
         if is_mmio_2mb_region(pd_base) {
-            // MMIO region: add NX but keep writable, add uncached flags
-            let mut new_flags = mmio_flags();
-            // Preserve HUGE_PAGE flag
-            new_flags.insert(PageTableFlags::HUGE_PAGE);
-            if flags.contains(PageTableFlags::GLOBAL) {
-                new_flags.insert(PageTableFlags::GLOBAL);
-            }
-            if flags.contains(PageTableFlags::ACCESSED) {
-                new_flags.insert(PageTableFlags::ACCESSED);
-            }
-            if flags.contains(PageTableFlags::DIRTY) {
-                new_flags.insert(PageTableFlags::DIRTY);
-            }
-            pd_entry.set_addr(pd_entry.addr(), new_flags);
-            return Ok(1);
+            // Split the 2MB huge page into 512 4KB PTEs
+            let pt = unsafe { split_2m_entry(pd_entry, frame_allocator) }
+                .map_err(map_error_to_hardening)?;
+            // Now harden each 4KB page individually: MMIO pages get mmio_flags(),
+            // stack pages stay writable, all other pages get RO + NX
+            return Ok(harden_identity_pt(pt, pd_base, current_rsp));
         }
 
         // Check if this 2MB region contains the bootloader stack - preserve writability
@@ -623,7 +688,7 @@ fn harden_identity_pd_entry_recursive(
 
     // 4KB pages - need to access PT via recursive mapping
     let pt = unsafe { recursive_pt(0, pdpt_idx, pd_idx) };
-    Ok(harden_identity_pt(pt, pd_base))
+    Ok(harden_identity_pt(pt, pd_base, current_rsp))
 }
 
 // ============================================================================
@@ -708,6 +773,21 @@ fn is_mmio_page(vaddr: u64) -> bool {
     }
 
     false
+}
+
+/// Check if a page address is the SMP trampoline page
+///
+/// The SMP trampoline is used to boot Application Processors (APs) and must
+/// remain executable. It's located at a fixed low address (0x8000) because
+/// APs start in real mode and can only address the first 1MB.
+#[inline]
+fn is_smp_trampoline_page(vaddr: u64) -> bool {
+    overlaps(
+        vaddr,
+        vaddr.saturating_add(0x1000),
+        SMP_TRAMPOLINE_PHYS,
+        SMP_TRAMPOLINE_PHYS + SMP_TRAMPOLINE_SIZE as u64,
+    )
 }
 
 /// Check if a 2MB region contains any MMIO address

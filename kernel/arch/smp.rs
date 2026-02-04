@@ -560,74 +560,143 @@ static RSDP_PHYS_ADDR: AtomicU64 = AtomicU64::new(0);
 /// Make the trampoline page executable by clearing NX on the identity-mapped region.
 ///
 /// Security hardening sets NX on identity-mapped memory, but the AP trampoline
-/// must be executable for APs to boot. This function clears NX from the first
-/// 2MB PD entry (which contains the trampoline at 0x8000).
+/// must be executable for APs to boot.
+///
+/// # L-5 Compatibility
+///
+/// After L-5 fix, the first 2MB may be split into 4KB pages. In this case:
+/// - PD[0] is a PT pointer (not a huge page)
+/// - The trampoline PTE at 0x8000 should already have NX cleared by memory_hardening
+/// - We still clear NX on the PD entry to ensure the hierarchy allows execution
+/// - Then we also clear NX on the specific trampoline PTE if needed
 ///
 /// # Safety
 ///
-/// This temporarily makes the first 2MB of physical memory executable.
+/// This temporarily makes the trampoline page executable.
 /// The trampoline should only run briefly during AP bring-up.
 fn make_trampoline_executable() {
     unsafe {
+        use mm::page_table::recursive_pt;
+
         // Identity map is in PML4[0]/PDPT[0]; PD[0] covers 0x0-0x200000 (first 2MB)
         // The trampoline at 0x8000 falls within this range
         let pd = recursive_pd(0, 0);
-        let entry = &mut pd[0];
+        let pd_entry = &mut pd[0];
 
-        if entry.is_unused() {
+        if pd_entry.is_unused() {
             drivers::println!("[SMP] WARNING: missing identity mapping for trampoline region");
             return;
         }
 
-        let flags = entry.flags();
-        let addr = entry.addr();
+        let pd_flags = pd_entry.flags();
+        let pd_addr = pd_entry.addr();
+        let is_huge = pd_flags.contains(PageTableFlags::HUGE_PAGE);
+
         drivers::println!(
             "[SMP] PD[0] addr=0x{:x} flags={:?} (huge={})",
-            addr.as_u64(),
-            flags,
-            flags.contains(PageTableFlags::HUGE_PAGE)
+            pd_addr.as_u64(),
+            pd_flags,
+            is_huge
         );
 
-        if flags.contains(PageTableFlags::NO_EXECUTE) {
-            let mut new_flags = flags;
-            new_flags.remove(PageTableFlags::NO_EXECUTE);
-            entry.set_addr(addr, new_flags);
-            tlb::flush_all();
-            drivers::println!("[SMP] Trampoline page made executable");
+        if is_huge {
+            // 2MB huge page: clear NX on the entire region
+            if pd_flags.contains(PageTableFlags::NO_EXECUTE) {
+                let mut new_flags = pd_flags;
+                new_flags.remove(PageTableFlags::NO_EXECUTE);
+                pd_entry.set_addr(pd_addr, new_flags);
+                tlb::flush_all();
+                drivers::println!("[SMP] Trampoline (2MB huge) made executable");
+            } else {
+                drivers::println!("[SMP] Trampoline (2MB huge) already executable");
+            }
         } else {
-            drivers::println!("[SMP] Trampoline page already executable");
+            // L-5 FIX: PD[0] is a PT pointer, need to handle 4KB pages
+            // First, ensure PD entry allows execution (clear NX if set)
+            if pd_flags.contains(PageTableFlags::NO_EXECUTE) {
+                let mut new_flags = pd_flags;
+                new_flags.remove(PageTableFlags::NO_EXECUTE);
+                pd_entry.set_addr(pd_addr, new_flags);
+                drivers::println!("[SMP] PD[0] NX cleared");
+            }
+
+            // Now clear NX on the specific trampoline PTE (0x8000 / 0x1000 = index 8)
+            let pt = recursive_pt(0, 0, 0);
+            let trampoline_pt_idx = (TRAMPOLINE_PHYS / 0x1000) as usize; // 0x8000 / 4096 = 8
+            let pt_entry = &mut pt[trampoline_pt_idx];
+
+            if !pt_entry.is_unused() {
+                let pt_flags = pt_entry.flags();
+                if pt_flags.contains(PageTableFlags::NO_EXECUTE) {
+                    let mut new_flags = pt_flags;
+                    new_flags.remove(PageTableFlags::NO_EXECUTE);
+                    pt_entry.set_addr(pt_entry.addr(), new_flags);
+                    drivers::println!("[SMP] Trampoline PTE[{}] NX cleared", trampoline_pt_idx);
+                } else {
+                    drivers::println!("[SMP] Trampoline PTE[{}] already executable", trampoline_pt_idx);
+                }
+            }
+
+            tlb::flush_all();
+            drivers::println!("[SMP] Trampoline (4KB page) made executable");
         }
     }
 }
 
 /// Restore NX bit on the trampoline page after SMP bring-up is complete.
 ///
-/// This re-enables W^X protection for the first 2MB region after all APs have
+/// This re-enables W^X protection for the trampoline region after all APs have
 /// booted. The trampoline code is no longer needed at this point.
+///
+/// # L-5 Compatibility
+///
+/// Handles both 2MB huge pages and 4KB pages (after L-5 split).
 fn make_trampoline_nonexecutable() {
     unsafe {
-        let pd = recursive_pd(0, 0);
-        let entry = &mut pd[0];
+        use mm::page_table::recursive_pt;
 
-        if entry.is_unused() {
+        let pd = recursive_pd(0, 0);
+        let pd_entry = &mut pd[0];
+
+        if pd_entry.is_unused() {
             return;
         }
 
-        let flags = entry.flags();
-        let addr = entry.addr();
+        let pd_flags = pd_entry.flags();
+        let pd_addr = pd_entry.addr();
+        let is_huge = pd_flags.contains(PageTableFlags::HUGE_PAGE);
 
-        if !flags.contains(PageTableFlags::NO_EXECUTE) {
-            let mut new_flags = flags;
-            new_flags.insert(PageTableFlags::NO_EXECUTE);
-            entry.set_addr(addr, new_flags);
-            // R68-2 FIX: Use cross-CPU TLB shootdown instead of local-only flush.
-            //
-            // After restoring NX on the trampoline page, ALL CPUs must invalidate
-            // their TLB entries for this page. Using local flush_all() leaves remote
-            // CPUs with stale executable mappings, creating a code injection vector
-            // where an attacker could place shellcode in the trampoline area.
-            mm::flush_current_as_all();
+        if is_huge {
+            // 2MB huge page: restore NX on the entire region
+            if !pd_flags.contains(PageTableFlags::NO_EXECUTE) {
+                let mut new_flags = pd_flags;
+                new_flags.insert(PageTableFlags::NO_EXECUTE);
+                pd_entry.set_addr(pd_addr, new_flags);
+            }
+        } else {
+            // L-5 FIX: PD[0] is a PT pointer, need to handle 4KB pages
+            // Restore NX on the specific trampoline PTE
+            let pt = recursive_pt(0, 0, 0);
+            let trampoline_pt_idx = (TRAMPOLINE_PHYS / 0x1000) as usize;
+            let pt_entry = &mut pt[trampoline_pt_idx];
+
+            if !pt_entry.is_unused() {
+                let pt_flags = pt_entry.flags();
+                if !pt_flags.contains(PageTableFlags::NO_EXECUTE) {
+                    let mut new_flags = pt_flags;
+                    new_flags.insert(PageTableFlags::NO_EXECUTE);
+                    pt_entry.set_addr(pt_entry.addr(), new_flags);
+                }
+            }
         }
+
+        // R68-2 FIX: Use cross-CPU TLB shootdown instead of local-only flush.
+        //
+        // After restoring NX on the trampoline page, ALL CPUs must invalidate
+        // their TLB entries for this page. Using local flush_all() leaves remote
+        // CPUs with stale executable mappings, creating a code injection vector
+        // where an attacker could place shellcode in the trampoline area.
+        mm::flush_current_as_all();
     }
 }
 

@@ -667,15 +667,21 @@ impl NetworkLoopbackTest {
             now_ms,
         );
 
-        // The frame should be handled (delivered to socket layer) or replied
-        // In absence of a listening socket, it should be handled but may generate ICMP unreachable
+        // The frame should be handled (delivered to socket layer) or replied.
+        // With R94-12's default-deny firewall, NEW UDP packets may be dropped
+        // before delivery - this is correct security behavior.
         match result {
             ProcessResult::Handled => Ok(()),
-            ProcessResult::Reply(_) => Ok(()), // ICMP port unreachable is valid
+            ProcessResult::Reply(_) => Ok(()), // ICMP port unreachable or firewall REJECT
+            // R94-12: Default policy drop is valid - NEW packets hit default-deny.
+            // Match specifically: rule_id=None (default policy), rejected=false (DROP not REJECT)
+            ProcessResult::Dropped(net::stack::DropReason::Firewall {
+                rule_id: None,
+                rejected: false,
+            }) => Ok(()),
             ProcessResult::Dropped(reason) => {
-                // Firewall drops or other valid reasons are acceptable in test context
-                // But parse errors indicate a problem with frame construction
-                Err(alloc::format!("UDP packet dropped: {:?}", reason))
+                // Parse errors, explicit rule drops, or other unexpected reasons indicate test failure
+                Err(alloc::format!("UDP packet dropped for unexpected reason: {:?}", reason))
             }
         }
     }
