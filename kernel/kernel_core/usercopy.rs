@@ -3,18 +3,16 @@
 //! This module provides safe copy operations between kernel and user space
 //! that can recover from page faults (TOCTOU protection).
 //!
-//! # Design
+//! # Design (H-26 FIX: Exception Table EFAULT Semantics)
 //!
 //! Uses a per-CPU state to track when a user copy is in progress.
 //! If a page fault occurs during a user copy:
-//! 1. The page_fault_handler detects the active copy via `is_in_usercopy()`
-//! 2. Verifies the fault address is within the expected buffer range
-//! 3. Sets the fault flag via `set_usercopy_fault()`
-//! 4. The page_fault_handler terminates the process (cannot recover RIP)
+//! 1. User memory accesses go through small x86_64 assembly helpers
+//! 2. Each faulting instruction has an exception-table entry mapping to a fixup label
+//! 3. The page_fault_handler consults the exception table; on match, rewrites RIP to fixup
+//! 4. The helper returns an error code, and the copy routine returns `Err(())` (EFAULT)
 //!
-//! Note: Due to x86 variable-length instructions, we cannot simply advance
-//! RIP to skip the faulting instruction. Instead, the process is terminated
-//! gracefully with EFAULT semantics.
+//! This allows syscalls to return EFAULT instead of terminating the process.
 //!
 //! # Type-Safe API (A.1 Security Hardening)
 //!
@@ -51,17 +49,110 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use cpu_local::{current_cpu_id, CpuLocal};
 use x86_64::registers::control::{Cr4, Cr4Flags};
 
+// ============================================================================
+// H-26 FIX: Exception-table assisted user accesses (x86_64)
+// ============================================================================
+//
+// x86 has variable-length instructions, so on a fault we can't reliably advance RIP.
+// Instead, we emit a Linux-style exception table that maps the faulting instruction
+// address to a fixup address inside the same helper. The page fault handler rewrites
+// RIP to the fixup, and the helper returns an error to the caller.
+//
+// Assembly helpers use the System V AMD64 ABI:
+// - rdi = first argument (dst for get_u8, dst for put_u8)
+// - rsi = second argument (src for get_u8, val for put_u8)
+// - rax = return value (0 = success, 1 = fault)
+//
+// NOTE: Uses Intel syntax (default for Rust inline assembly on x86_64)
+core::arch::global_asm!(
+    r#"
+    .text
+
+    // Copy one byte from user space [rsi] to kernel space [rdi]
+    // Returns 0 on success, 1 on fault
+    .global __zero_os_usercopy_get_u8
+    .type __zero_os_usercopy_get_u8, @function
+__zero_os_usercopy_get_u8:
+.Lget_u8_access:
+    mov al, [rsi]           // Read byte from user space - may fault here
+    mov [rdi], al           // Write to kernel buffer
+    xor eax, eax            // Return 0 (success)
+    ret
+.Lget_u8_fixup:
+    mov eax, 1              // Return 1 (fault)
+    ret
+    .size __zero_os_usercopy_get_u8, .-__zero_os_usercopy_get_u8
+
+    // Exception table entry for get_u8
+    .pushsection .ex_table,"a"
+    .balign 16
+    .quad .Lget_u8_access, .Lget_u8_fixup
+    .popsection
+
+    // Write one byte (sil) to user space [rdi]
+    // Returns 0 on success, 1 on fault
+    .global __zero_os_usercopy_put_u8
+    .type __zero_os_usercopy_put_u8, @function
+__zero_os_usercopy_put_u8:
+.Lput_u8_access:
+    mov [rdi], sil          // Write byte to user space - may fault here
+    xor eax, eax            // Return 0 (success)
+    ret
+.Lput_u8_fixup:
+    mov eax, 1              // Return 1 (fault)
+    ret
+    .size __zero_os_usercopy_put_u8, .-__zero_os_usercopy_put_u8
+
+    // Exception table entry for put_u8
+    .pushsection .ex_table,"a"
+    .balign 16
+    .quad .Lput_u8_access, .Lput_u8_fixup
+    .popsection
+"#
+);
+
+extern "C" {
+    /// Copy one byte from user space to kernel buffer.
+    /// Returns 0 on success, 1 on fault.
+    fn __zero_os_usercopy_get_u8(dst: *mut u8, src: *const u8) -> u32;
+
+    /// Write one byte to user space.
+    /// Returns 0 on success, 1 on fault.
+    fn __zero_os_usercopy_put_u8(dst: *mut u8, val: u8) -> u32;
+}
+
+/// H-26 FIX: Exception-safe byte read from user space
+#[inline(always)]
+unsafe fn copy_byte_from_user(dst: *mut u8, src: *const u8) -> Result<(), ()> {
+    if __zero_os_usercopy_get_u8(dst, src) == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// H-26 FIX: Exception-safe byte write to user space
+#[inline(always)]
+unsafe fn write_byte_to_user(dst: *mut u8, val: u8) -> Result<(), ()> {
+    if __zero_os_usercopy_put_u8(dst, val) == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 /// User-copy state with PID binding for SMP safety (V-5 fix)
 ///
 /// Each CPU maintains its own copy state via CpuLocal<T>, ensuring that
 /// concurrent user copies on different CPUs do not interfere with each other.
+///
+/// H-26 FIX: Removed the `faulted` flag. Exception table fixups now handle
+/// fault recovery directly in the assembly helpers.
 struct UserCopyState {
     /// True if currently executing a user copy operation
     active: AtomicBool,
     /// PID that owns the active user copy (0 = none/kernel)
     pid: AtomicUsize,
-    /// True if a page fault occurred during the copy
-    faulted: AtomicBool,
     /// Number of bytes remaining to copy (for progress tracking)
     remaining: AtomicUsize,
     /// Inclusive start address of the current user buffer
@@ -76,7 +167,6 @@ impl UserCopyState {
         Self {
             active: AtomicBool::new(false),
             pid: AtomicUsize::new(0),
-            faulted: AtomicBool::new(false),
             remaining: AtomicUsize::new(0),
             start: AtomicUsize::new(0),
             end: AtomicUsize::new(0),
@@ -252,17 +342,8 @@ pub fn is_in_usercopy() -> bool {
     USER_COPY_STATE.with(|s| s.active.load(Ordering::SeqCst) && s.pid.load(Ordering::SeqCst) == pid)
 }
 
-/// Set the fault flag (called from page_fault_handler)
-#[inline]
-pub fn set_usercopy_fault() {
-    USER_COPY_STATE.with(|s| s.faulted.store(true, Ordering::SeqCst));
-}
-
-/// Check if a fault occurred and clear the flag
-#[inline]
-fn check_and_clear_fault() -> bool {
-    USER_COPY_STATE.with(|s| s.faulted.swap(false, Ordering::SeqCst))
-}
+// H-26 FIX: Removed set_usercopy_fault() and check_and_clear_fault()
+// Exception table fixups now handle fault recovery directly in assembly helpers.
 
 /// RAII guard for user copy state with PID binding
 struct UserCopyGuard {
@@ -280,11 +361,14 @@ impl UserCopyGuard {
     /// # V-5 fix
     ///
     /// Uses per-CPU state for SMP safety.
+    ///
+    /// # H-26 FIX
+    ///
+    /// Removed faulted flag initialization - exception table handles faults.
     #[inline]
     fn new(buffer_start: usize, len: usize) -> Self {
         let cpu_id = current_cpu_id();
         USER_COPY_STATE.with(|s| {
-            s.faulted.store(false, Ordering::SeqCst);
             s.pid.store(current_pid_raw(), Ordering::SeqCst);
             s.start.store(buffer_start, Ordering::SeqCst);
             s.end
@@ -423,6 +507,12 @@ fn validate_user_range_aligned(ptr: usize, len: usize, align: usize) -> bool {
 /// re-enable interrupts between chunks. This prevents timer starvation
 /// and scheduler delays during large copies.
 ///
+/// # H-26 FIX: Exception Table EFAULT
+///
+/// Uses exception-safe assembly helpers that return error on fault instead
+/// of terminating the process. The page fault handler rewrites RIP to the
+/// fixup label when a fault occurs in the helper.
+///
 /// # Arguments
 /// * `dst` - Destination kernel buffer
 /// * `src` - Source user space pointer
@@ -447,6 +537,7 @@ pub fn copy_from_user_safe(dst: &mut [u8], src: *const u8) -> Result<(), ()> {
     // Set up the copy state with buffer range tracking
     let _guard = UserCopyGuard::new(src as usize, len);
     USER_COPY_STATE.with(|s| s.remaining.store(len, Ordering::SeqCst));
+    let dst_ptr = dst.as_mut_ptr();
 
     // R65-10 FIX: Copy in chunks to allow interrupt servicing
     let mut offset = 0usize;
@@ -456,22 +547,10 @@ pub fn copy_from_user_safe(dst: &mut [u8], src: *const u8) -> Result<(), ()> {
         // Allow supervisor access to user pages for this chunk
         let _smap_guard = UserAccessGuard::new();
 
-        // Copy this chunk byte by byte
+        // H-26 FIX: Copy using exception-safe helpers
         for i in offset..chunk_end {
-            // Check if a fault occurred in a previous iteration
-            if check_and_clear_fault() {
-                return Err(());
-            }
-
-            // Read one byte from user space
-            let byte = unsafe { core::ptr::read_volatile(src.add(i)) };
-
-            // Check again after the read
-            if check_and_clear_fault() {
-                return Err(());
-            }
-
-            dst[i] = byte;
+            // SAFETY: user range validated; dst is a kernel slice
+            unsafe { copy_byte_from_user(dst_ptr.add(i), src.add(i)) }?;
             USER_COPY_STATE.with(|s| s.remaining.store(len - i - 1, Ordering::SeqCst));
         }
 
@@ -491,6 +570,11 @@ pub fn copy_from_user_safe(dst: &mut [u8], src: *const u8) -> Result<(), ()> {
 /// For large buffers, copy in USERCOPY_CHUNK_SIZE chunks and briefly
 /// re-enable interrupts between chunks. This prevents timer starvation
 /// and scheduler delays during large copies.
+///
+/// # H-26 FIX: Exception Table EFAULT
+///
+/// Uses exception-safe assembly helpers that return error on fault instead
+/// of terminating the process.
 ///
 /// # Arguments
 /// * `dst` - Destination user space pointer
@@ -522,21 +606,9 @@ pub fn copy_to_user_safe(dst: *mut u8, src: &[u8]) -> Result<(), ()> {
         // Allow supervisor access to user pages for this chunk
         let _smap_guard = UserAccessGuard::new();
 
-        // Copy this chunk byte by byte
+        // H-26 FIX: Copy using exception-safe helpers
         for i in offset..chunk_end {
-            if check_and_clear_fault() {
-                return Err(());
-            }
-
-            // Write one byte to user space
-            unsafe {
-                core::ptr::write_volatile(dst.add(i), src[i]);
-            }
-
-            if check_and_clear_fault() {
-                return Err(());
-            }
-
+            unsafe { write_byte_to_user(dst.add(i), src[i]) }?;
             USER_COPY_STATE.with(|s| s.remaining.store(len - i - 1, Ordering::SeqCst));
         }
 
@@ -557,7 +629,7 @@ pub fn copy_to_user_safe(dst: *mut u8, src: &[u8]) -> Result<(), ()> {
 /// * `fault_addr` - The address that caused the fault
 ///
 /// # Returns
-/// * `true` - Fault was in usercopy range; process should be terminated
+/// * `true` - Fault was in usercopy range; page_fault_handler may apply exception-table fixup
 /// * `false` - Not a user copy fault, handle normally
 ///
 /// # PID Binding (H-36 fix)
@@ -569,12 +641,11 @@ pub fn copy_to_user_safe(dst: *mut u8, src: &[u8]) -> Result<(), ()> {
 ///
 /// Uses per-CPU state, ensuring each CPU checks only its own usercopy status.
 ///
-/// # Important
+/// # H-26 FIX: Exception Table EFAULT
 ///
-/// Since x86 has variable-length instructions and we cannot easily determine
-/// the instruction length to advance RIP, when this function returns true,
-/// the page_fault_handler should terminate the current process gracefully
-/// (returning EFAULT semantics to the caller).
+/// When this returns true, the page fault handler should consult the exception table
+/// using the faulting RIP. If a fixup entry is found, rewrite RIP to the fixup and
+/// return so the usercopy helper can return `Err(())` to the syscall layer (EFAULT).
 pub fn try_handle_usercopy_fault(fault_addr: usize) -> bool {
     // Only handle if we're in a user copy for the current process
     // is_in_usercopy() already checks PID binding (H-36 fix)
@@ -602,11 +673,8 @@ pub fn try_handle_usercopy_fault(fault_addr: usize) -> bool {
         return false;
     }
 
-    // Set the fault flag (for completeness, though we'll terminate)
-    set_usercopy_fault();
-
-    // Return true to indicate this is a usercopy fault
-    // The page_fault_handler should terminate the process gracefully
+    // H-26 FIX: No longer set a fault flag.
+    // Exception table fixup in page_fault_handler will rewrite RIP.
     true
 }
 
@@ -653,24 +721,15 @@ pub fn copy_user_cstring(src: *const u8) -> Result<alloc::vec::Vec<u8>, ()> {
     let mut result = Vec::with_capacity(256); // Typical path length
 
     for i in 0..MAX_CSTRING_LEN {
-        // Check if a fault occurred in previous iteration
-        if check_and_clear_fault() {
-            return Err(());
-        }
-
         // Validate each byte address is still in user space
         let byte_addr = match start_addr.checked_add(i) {
             Some(addr) if addr < USER_SPACE_TOP => addr,
             _ => return Err(()),
         };
 
-        // Read one byte from user space
-        let byte = unsafe { core::ptr::read_volatile(byte_addr as *const u8) };
-
-        // Check for fault after read
-        if check_and_clear_fault() {
-            return Err(());
-        }
+        // H-26 FIX: Read using exception-safe helper
+        let mut byte = 0u8;
+        unsafe { copy_byte_from_user(&mut byte as *mut u8, byte_addr as *const u8) }?;
 
         // NUL terminator found - done
         if byte == 0 {
@@ -1107,34 +1166,24 @@ pub fn strncpy_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<usize, User
     USER_COPY_STATE.with(|s| s.remaining.store(max_copy, Ordering::SeqCst));
 
     let mut copied = 0usize;
+    let dst_ptr = dst.as_mut_ptr();
 
     for i in 0..max_copy {
-        // Check for fault from previous iteration
-        if check_and_clear_fault() {
-            return Err(UsercopyError);
-        }
-
         // Calculate byte address with overflow check
         let byte_addr = match start_addr.checked_add(i) {
             Some(addr) if addr < USER_SPACE_TOP => addr,
             _ => return Err(UsercopyError),
         };
 
-        // Read one byte from user space
-        let byte = unsafe { core::ptr::read_volatile(byte_addr as *const u8) };
-
-        // Check for fault after read
-        if check_and_clear_fault() {
-            return Err(UsercopyError);
-        }
+        // H-26 FIX: Read using exception-safe helper
+        unsafe { copy_byte_from_user(dst_ptr.add(i), byte_addr as *const u8) }
+            .map_err(|_| UsercopyError)?;
 
         // NUL terminator found
-        if byte == 0 {
-            dst[i] = 0; // Write NUL to destination
+        if dst[i] == 0 {
             return Ok(copied);
         }
 
-        dst[i] = byte;
         copied += 1;
 
         USER_COPY_STATE.with(|s| {

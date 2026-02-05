@@ -12,6 +12,7 @@ pub use drivers::vga_buffer;
 
 pub mod cgroup;
 pub mod elf_loader;
+pub mod exception_table;
 pub mod fork;
 pub mod ipc_namespace;
 pub mod mount_namespace;
@@ -122,7 +123,6 @@ pub use usercopy::{
     copy_to_user_slice,
     copy_user_cstring,
     is_in_usercopy,
-    set_usercopy_fault,
     strncpy_from_user,
     try_handle_usercopy_fault,
     UserAccessGuard,

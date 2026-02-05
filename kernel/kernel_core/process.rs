@@ -2442,10 +2442,18 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
 ///
 /// # Safety Notes
 ///
-/// 如果当前 CPU 正在使用该栈，则跳过释放以避免自踩栈导致崩溃
+/// SMP 下可能存在其他 CPU 仍在引用该栈（例如其正在进行上下文切换）。
+/// 因此，实际的取消映射与物理帧归还通过 `call_rcu()` 延迟到 RCU grace period
+/// 之后执行，以确保所有 CPU 都已进入过 quiescent state。
+///
+/// 如果当前 CPU 正在使用该栈，则仍跳过释放以避免自踩栈导致崩溃。
 pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
     use core::arch::asm;
     use x86_64::structures::paging::Page;
+
+    // H-25 FIX: call_rcu requires a 'static closure; capture the raw address
+    // and reconstruct VirtAddr inside the deferred callback.
+    let stack_base_u64 = stack_base.as_u64();
 
     // 【关键修复】检查当前 CPU 是否正在使用该栈
     let current_rsp: u64;
@@ -2453,7 +2461,7 @@ pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
         asm!("mov {}, rsp", out(reg) current_rsp, options(nomem, preserves_flags));
     }
 
-    let stack_bottom = stack_base.as_u64();
+    let stack_bottom = stack_base_u64;
     let stack_top = stack_bottom + (KSTACK_PAGES as u64 * PAGE_SIZE);
 
     if current_rsp >= stack_bottom && current_rsp < stack_top {
@@ -2466,26 +2474,31 @@ pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
         return;
     }
 
-    let mut frame_alloc = FrameAllocator::new();
+    // H-25 FIX: Defer unmap + frame reclamation until after a grace period so
+    // all CPUs (including ones that might still be switching away) have passed
+    // a quiescent state.
+    crate::rcu::call_rcu(move || {
+        let stack_base = VirtAddr::new(stack_base_u64);
+        let mut frame_alloc = FrameAllocator::new();
 
-    unsafe {
-        page_table::with_current_manager(VirtAddr::new(0), |mgr| {
-            for i in 0..KSTACK_PAGES {
-                let addr = stack_base + (i as u64 * PAGE_SIZE);
-                let page = Page::containing_address(addr);
+        unsafe {
+            page_table::with_current_manager(VirtAddr::new(0), |mgr| {
+                for i in 0..KSTACK_PAGES {
+                    let addr = stack_base + (i as u64 * PAGE_SIZE);
+                    let page = Page::containing_address(addr);
 
-                if let Ok(frame) = mgr.unmap_page(page) {
-                    frame_alloc.deallocate_frame(frame);
+                    if let Ok(frame) = mgr.unmap_page(page) {
+                        frame_alloc.deallocate_frame(frame);
+                    }
                 }
-            }
-        });
-    }
+            });
+        }
 
-    println!(
-        "  Released kernel stack for PID {} at 0x{:x}",
-        pid,
-        stack_base.as_u64()
-    );
+        println!(
+            "  Released kernel stack for PID {} at 0x{:x}",
+            pid, stack_base_u64
+        );
+    });
 }
 
 /// 释放独立用户地址空间（PML4 物理地址）

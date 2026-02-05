@@ -301,6 +301,19 @@ impl Ext2Fs {
             return Err(FsError::Invalid);
         }
 
+        // R97-2 FIX: Validate first_data_block consistency with block_size.
+        //
+        // Per ext2 specification:
+        // - For 1KiB block size: first_data_block MUST be 1 (boot block + superblock occupy block 0-1)
+        // - For larger block sizes: first_data_block MUST be 0 (superblock fits in block 0)
+        //
+        // Mismatched values indicate either corruption or a malicious image attempting
+        // to exploit groups_count/block allocation calculations.
+        let expected_first_data_block = if block_size == 1024 { 1 } else { 0 };
+        if sb.first_data_block != expected_first_data_block {
+            return Err(FsError::Invalid);
+        }
+
         // R65-EXT2-1 FIX: Validate critical superblock fields to prevent DoS.
         //
         // A malicious superblock can cause:
@@ -891,11 +904,14 @@ impl Ext2Inode {
 
         while offset < file_size {
             // Calculate which block to read
-            let file_block = offset / fs.block_size as u64;
+            let file_block_u64 = offset / fs.block_size as u64;
+            // R97-3 FIX: Use try_from instead of truncating cast to prevent wraparound
+            let file_block =
+                u32::try_from(file_block_u64).map_err(|_| FsError::Invalid)?;
             let offset_in_block = offset % fs.block_size as u64;
 
             // Map to physical block
-            let phys_block = fs.map_file_block(&raw, file_block as u32)?;
+            let phys_block = fs.map_file_block(&raw, file_block)?;
             if let Some(phys) = phys_block {
                 fs.read_block(phys, &mut block_buf)?;
             } else {
@@ -1012,7 +1028,9 @@ impl Ext2Inode {
                         }
 
                         // Calculate which file block and offset within block
-                        let file_block = (global_offset / block_size as u64) as u32;
+                        // R97-3 FIX: Use try_from instead of truncating cast
+                        let file_block = u32::try_from(global_offset / block_size as u64)
+                            .map_err(|_| ())?;
                         let offset_in_block = (global_offset % block_size as u64) as usize;
 
                         // Read the block from disk
@@ -1155,10 +1173,13 @@ impl Inode for Ext2Inode {
         let mut entry_index = 0usize;
 
         while current_offset < file_size {
-            let file_block = current_offset / fs.block_size as u64;
+            let file_block_u64 = current_offset / fs.block_size as u64;
+            // R97-3 FIX: Use try_from instead of truncating cast
+            let file_block =
+                u32::try_from(file_block_u64).map_err(|_| FsError::Invalid)?;
             let offset_in_block = current_offset % fs.block_size as u64;
 
-            let phys_block = fs.map_file_block(&raw, file_block as u32)?;
+            let phys_block = fs.map_file_block(&raw, file_block)?;
             if let Some(phys) = phys_block {
                 fs.read_block(phys, &mut block_buf)?;
             } else {
@@ -1261,7 +1282,9 @@ impl Inode for Ext2Inode {
         let mut cursor = offset;
 
         while written < data.len() {
-            let file_block = (cursor / fs.block_size as u64) as u32;
+            // R97-3 FIX: Use try_from instead of truncating cast
+            let file_block =
+                u32::try_from(cursor / fs.block_size as u64).map_err(|_| FsError::Invalid)?;
             let offset_in_block = (cursor % fs.block_size as u64) as usize;
             let space = block_size - offset_in_block;
             let to_copy = cmp::min(space, data.len() - written);

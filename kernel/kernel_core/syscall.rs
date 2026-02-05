@@ -4379,7 +4379,10 @@ fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
     if iov.is_null() {
         return Err(SyscallError::EFAULT);
     }
-    let iov_size = iovcnt * mem::size_of::<Iovec>();
+    // R97-1 FIX: Use checked_mul to prevent integer overflow
+    let iov_size = iovcnt
+        .checked_mul(mem::size_of::<Iovec>())
+        .ok_or(SyscallError::EFAULT)?;
     validate_user_ptr(iov as *const u8, iov_size)?;
 
     // R24-11 fix: Copy iovec array using fault-tolerant usercopy
@@ -4388,9 +4391,13 @@ fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
     {
         let _guard = UserAccessGuard::new();
         for i in 0..iovcnt {
-            // Calculate offset for this iovec entry
-            let entry_offset = i * mem::size_of::<Iovec>();
-            let entry_ptr = (iov as usize + entry_offset) as *const u8;
+            // R97-1 FIX: Use checked_mul/checked_add to prevent integer overflow
+            let entry_offset = i
+                .checked_mul(mem::size_of::<Iovec>())
+                .ok_or(SyscallError::EFAULT)?;
+            let entry_ptr = (iov as usize)
+                .checked_add(entry_offset)
+                .ok_or(SyscallError::EFAULT)? as *const u8;
 
             // Use fault-tolerant copy for each iovec entry
             let mut entry_bytes = [0u8; mem::size_of::<Iovec>()];
@@ -4399,8 +4406,10 @@ fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
             }
 
             // Safely transmute bytes to Iovec
-            // SAFETY: Iovec is repr(C) and all byte patterns are valid
-            let iov_entry: Iovec = unsafe { core::ptr::read(entry_bytes.as_ptr() as *const Iovec) };
+            // SAFETY: Iovec is repr(C) and all byte patterns are valid.
+            // R97-1 FIX: Use read_unaligned since entry_bytes has only 1-byte alignment.
+            let iov_entry: Iovec =
+                unsafe { core::ptr::read_unaligned(entry_bytes.as_ptr() as *const Iovec) };
             iov_array.push(iov_entry);
         }
     }

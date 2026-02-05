@@ -780,7 +780,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 ///
 /// 处理缺页异常：
 /// 1. COW 缺页：复制页面并恢复执行
-/// 2. 容错用户拷贝中的缺页：终止进程（无法恢复 RIP）
+/// 2. 容错用户拷贝中的缺页：异常表恢复，向系统调用返回 EFAULT (H-26 FIX)
 /// 3. 用户空间缺页（用户态触发）：终止进程
 /// 4. 内核空间缺页或内核态触发的用户空间缺页：内核 bug，panic
 ///
@@ -791,7 +791,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 /// - 内核态访问用户内存的缺页如果在 usercopy 中会被优雅处理
 /// - 其他内核态缺页仍会 panic（内核 bug）
 extern "x86-interrupt" fn page_fault_handler(
-    stack_frame: InterruptStackFrame,
+    mut stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     // S-6 fix: Immediately restore SMAP protection
@@ -799,12 +799,7 @@ extern "x86-interrupt" fn page_fault_handler(
     // We must clear AC before doing anything else to prevent SMAP bypass attacks.
     clac_if_smap();
 
-    use kernel_core::usercopy;
-
-    // X-8 FIX: Suppress unused warnings in release builds
-    // stack_frame is only used in debug_assertions for detailed panic messages
-    #[cfg(not(debug_assertions))]
-    let _ = &stack_frame;
+    use kernel_core::{exception_table, usercopy};
 
     /// 用户空间地址上界
     const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
@@ -856,19 +851,29 @@ extern "x86-interrupt" fn page_fault_handler(
         }
     }
 
-    // 【H-26 修复】检查是否为容错用户拷贝中的缺页
-    // 由于 x86 指令长度可变，无法简单地推进 RIP 跳过故障指令
-    // 采用"标记进程终止 + 请求重调度"的方式优雅处理，避免整个内核 panic
+    // 【H-26 修复】容错 usercopy：异常表（exception table）EFAULT 语义
     //
-    // 已知限制：完整解决方案需要异常表（exception table）将故障地址映射到恢复地址
+    // 如果缺页发生在 usercopy 的受控访问指令上（RIP 命中异常表），将 RIP 重定向到
+    // fixup 代码，让 usercopy helper 返回错误，从而让 syscall 返回 EFAULT。
     if usercopy::try_handle_usercopy_fault(fault_addr) {
-        // 标记进程终止并请求重调度
+        let fault_ip = stack_frame.instruction_pointer.as_u64() as usize;
+        if let Some(fixup_ip) = exception_table::lookup(fault_ip) {
+            // H-26 FIX: Rewrite RIP to the fixup address
+            unsafe {
+                stack_frame.as_mut().update(|frame| {
+                    frame.instruction_pointer = x86_64::VirtAddr::new(fixup_ip as u64);
+                });
+            }
+            return;
+        }
+
+        // Fallback: no exception-table entry for this RIP.
+        // Keep old kill behavior to avoid a user-triggerable kernel panic
+        // if a non-annotated access slips in.
         if let Some(pid) = kernel_core::process::current_pid() {
             // SIGSEGV 的退出码为 128 + 11 = 139
             kernel_core::process::terminate_process(pid, 139);
-            // 设置重调度标志，让调度器在安全点切换进程
             kernel_core::request_resched_from_irq();
-            // 返回让中断框架执行 iret，调度器会选择其他进程
             return;
         }
 

@@ -17,6 +17,11 @@ SECTIONS {
     .rodata : AT(0x100000 + (ADDR(.rodata) - 0xffffffff80100000)) {
         rodata_start = .;
         *(.rodata .rodata.*)
+        /* H-26: Exception table for usercopy fault recovery */
+        . = ALIGN(16);
+        __ex_table_start = .;
+        KEEP(*(.ex_table .ex_table.*))
+        __ex_table_end = .;
         . = ALIGN(4096);  /* 页对齐 */
         rodata_end = .;
     }
