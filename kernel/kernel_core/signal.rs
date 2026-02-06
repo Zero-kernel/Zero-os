@@ -326,20 +326,26 @@ pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, Signa
                 }
             }
             SignalAction::Stop => {
-                // Stop the process regardless of current state
-                // Note: If process was Blocked/Sleeping, it will remain Stopped
-                // until SIGCONT, even if the blocking condition is satisfied
+                // R98-1 FIX: Job-control stop is orthogonal to scheduler state.
+                // Do NOT overwrite Blocked/Sleeping, or we lose the wait condition
+                // and break wait queue invariants (H-34 lost wakeup fix).
                 let was_running = proc.state == ProcessState::Running;
-                proc.state = ProcessState::Stopped;
+                proc.stopped = true;
                 // Need to reschedule if stopping current process
                 if was_running && process::current_pid() == Some(pid) {
                     needs_reschedule = true;
                 }
             }
             SignalAction::Continue => {
-                // Mark for resume - actual resume happens after releasing lock
-                // to properly interact with the scheduler
-                if proc.state == ProcessState::Stopped {
+                // R98-1 FIX: Handle SIGCONT via scheduler resume callback.
+                // We check if the process is stopped but DO NOT clear the flag here.
+                // The scheduler's resume_stopped() will clear `stopped` and handle
+                // the state transition atomically. This avoids a race where we
+                // clear `stopped` but resume_stopped() sees it already false.
+                //
+                // Note: We check BOTH `stopped` (orthogonal flag) AND `ProcessState::Stopped`
+                // (legacy state) to handle both code paths consistently.
+                if proc.stopped || proc.state == ProcessState::Stopped {
                     needs_resume = true;
                 }
                 // Clear the SIGCONT from pending since we handle it immediately

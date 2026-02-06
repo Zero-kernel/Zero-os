@@ -249,6 +249,7 @@ impl Scheduler {
                 let throttled = cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some();
 
                 if proc.state == ProcessState::Ready
+                    && !proc.stopped // R98-1 FIX: Skip job-control stopped processes
                     && Self::cpu_allowed(cpu_id, effective_mask)
                     && !throttled
                 {
@@ -270,6 +271,7 @@ impl Scheduler {
                 let throttled = cgroup::cpu_quota_is_throttled(proc.cgroup_id, now_ns).is_some();
 
                 if proc.state == ProcessState::Ready
+                    && !proc.stopped // R98-1 FIX: Skip job-control stopped processes
                     && Self::cpu_allowed(cpu_id, effective_mask)
                     && !throttled
                 {
@@ -526,7 +528,9 @@ impl Scheduler {
         let mut target: Option<(Priority, Pid)> = None;
         for (&priority, bucket) in queue.iter() {
             for (&pid, pcb) in bucket.iter() {
-                if pcb.lock().state == ProcessState::Ready {
+                // R98-1 FIX: Check both state and stopped flag
+                let p = pcb.lock();
+                if p.state == ProcessState::Ready && !p.stopped {
                     target = Some((priority, pid));
                     break;
                 }
@@ -589,7 +593,8 @@ impl Scheduler {
             }
             if let Some(proc_arc) = Self::find_pcb(&guard, pid) {
                 let mut pcb = proc_arc.lock();
-                if pcb.state != ProcessState::Ready {
+                if pcb.state != ProcessState::Ready || pcb.stopped {
+                    // R98-1 FIX: Also skip job-control stopped processes
                     drop(pcb);
                     candidate = Self::select_next_locked(&guard, Some(pid));
                     continue;
@@ -725,7 +730,8 @@ impl Scheduler {
             if Some(pid) != current_pid {
                 if let Some(proc_arc) = Self::find_pcb(&queue, pid) {
                     let mut pcb = proc_arc.lock();
-                    if pcb.state == ProcessState::Ready {
+                    if pcb.state == ProcessState::Ready && !pcb.stopped {
+                        // R98-1 FIX: Only transition to Running if truly runnable
                         pcb.state = ProcessState::Running;
                         pcb.reset_time_slice();
                         pcb.reset_wait_ticks();
@@ -858,15 +864,38 @@ impl Scheduler {
                 // E.5: Use effective_allowed_cpus for cpuset-aware scheduling
                 let (should_add, priority, allowed_cpus) = {
                     let mut proc = pcb.lock();
-                    if proc.state == ProcessState::Stopped {
-                        proc.state = ProcessState::Ready;
-                        (
-                            true,
-                            proc.dynamic_priority,
-                            Self::effective_allowed_cpus(&proc),
-                        )
-                    } else {
+                    // R98-1 FIX: Handle orthogonal stopped flag.
+                    // Clear stopped, then check if the process is actually runnable.
+                    // If it's Blocked/Sleeping, don't add to ready queue — it will
+                    // be woken by its original wait condition.
+                    let was_stopped = proc.stopped || proc.state == ProcessState::Stopped;
+                    if !was_stopped {
                         (false, 0, 0)
+                    } else {
+                        // R98-1 FIX (race fix): Determine if we should add BEFORE clearing stopped.
+                        // Only Ready or Stopped tasks should be re-enqueued.
+                        let should_add =
+                            proc.state == ProcessState::Ready || proc.state == ProcessState::Stopped;
+
+                        // Clear the stopped flag.
+                        proc.stopped = false;
+
+                        if should_add {
+                            // R98-1 FIX (race fix): Temporarily set state to Blocked to prevent
+                            // another CPU from selecting this task while we migrate queues.
+                            // The lock will be released after this block, but select_next_locked()
+                            // won't select Blocked tasks. enqueue_on_cpu() will set state to Ready.
+                            proc.state = ProcessState::Blocked;
+                            (
+                                true,
+                                proc.dynamic_priority,
+                                Self::effective_allowed_cpus(&proc),
+                            )
+                        } else {
+                            // Blocked/Sleeping/Running: stop cleared but no scheduler action needed.
+                            // Task will be woken by its original wait condition.
+                            (false, 0, 0)
+                        }
                     }
                 };
 
@@ -1006,7 +1035,8 @@ impl Scheduler {
                             continue;
                         }
                         let mut proc = pcb.lock();
-                        if proc.state == ProcessState::Ready {
+                        if proc.state == ProcessState::Ready && !proc.stopped {
+                            // R98-1 FIX: Only count non-stopped ready processes for starvation
                             // 增加等待时间
                             proc.increment_wait_ticks();
                             // 检查并提升饥饿进程的优先级

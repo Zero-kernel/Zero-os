@@ -753,11 +753,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     sched::enhanced_scheduler::Scheduler::reschedule_now(true);
 
     // 主内核循环
+    // R98-3 FIX: Use reschedule_if_needed() instead of direct scheduler calls.
+    // This ensures deferred timer work (TIME_WAIT cleanup, TCP retransmissions)
+    // and RCU callbacks are drained even when the system is idle (no syscalls).
     loop {
-        // 检查是否有进程需要调度
-        if sched::enhanced_scheduler::Scheduler::need_resched() {
-            sched::enhanced_scheduler::Scheduler::reschedule_now(false);
-        }
+        // Drain deferred work and check for reschedule requests
+        kernel_core::reschedule_if_needed();
 
         unsafe {
             core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));

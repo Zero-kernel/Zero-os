@@ -383,6 +383,13 @@ pub struct Process {
     /// 进程状态
     pub state: ProcessState,
 
+    /// R98-1 FIX: 作业控制停止标志（SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU）。
+    ///
+    /// 与 `state` 正交：进程可以同时处于 Blocked/Sleeping 且被 job-control 停止。
+    /// 当 `stopped == true` 时，调度器不会选择该进程运行，但其等待队列位置不变，
+    /// 避免 SIGSTOP 覆盖 Blocked 状态导致丢失唤醒（H-34）。
+    pub stopped: bool,
+
     /// 挂起的信号位图（1-64）
     pub pending_signals: PendingSignals,
 
@@ -654,6 +661,7 @@ impl Process {
             is_thread: false,
             name,
             state: ProcessState::Ready,
+            stopped: false, // R98-1 FIX: Job-control stop flag starts cleared
             pending_signals: PendingSignals::new(),
             priority,
             dynamic_priority: priority,
@@ -2636,14 +2644,17 @@ pub fn get_process_stats() -> ProcessStats {
         if let Some(process) = slot {
             stats.total += 1;
             let proc = process.lock();
+            // R98-1 FIX: Check orthogonal stopped flag before state.
+            // Zombie/Terminated take priority, then stopped flag, then scheduler state.
             match proc.state {
-                ProcessState::Ready => stats.ready += 1,
-                ProcessState::Running => stats.running += 1,
-                ProcessState::Stopped => stats.stopped += 1,
-                ProcessState::Blocked => stats.blocked += 1,
-                ProcessState::Sleeping => stats.sleeping += 1,
                 ProcessState::Zombie => stats.zombie += 1,
                 ProcessState::Terminated => stats.terminated += 1,
+                ProcessState::Stopped => stats.stopped += 1,
+                _ if proc.stopped => stats.stopped += 1,
+                ProcessState::Ready => stats.ready += 1,
+                ProcessState::Running => stats.running += 1,
+                ProcessState::Blocked => stats.blocked += 1,
+                ProcessState::Sleeping => stats.sleeping += 1,
             }
         }
     }

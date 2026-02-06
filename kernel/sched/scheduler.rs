@@ -62,10 +62,22 @@ impl PriorityScheduler {
                 let mut proc = process.lock();
 
                 // 检查进程状态
+                // R98-1 FIX: Also check orthogonal stopped flag
                 match proc.state {
                     ProcessState::Running => {
-                        // 进程仍在运行，检查时间片
-                        if proc.time_slice > 0 {
+                        // R98-1 FIX: Check job-control stop flag first
+                        if proc.stopped {
+                            // Put the task back into the ready queues as Ready-but-stopped
+                            proc.reset_time_slice();
+                            proc.state = ProcessState::Ready;
+                            let priority = proc.dynamic_priority;
+                            drop(proc);
+
+                            self.ready_queues
+                                .entry(priority)
+                                .or_insert_with(alloc::vec::Vec::new)
+                                .push(current_pid);
+                        } else if proc.time_slice > 0 {
                             // 还有时间片，继续运行
                             return Some(current_pid);
                         } else {
@@ -113,7 +125,8 @@ impl PriorityScheduler {
                 let mut proc = process.lock();
 
                 // 确保进程仍然是就绪状态
-                if proc.state == ProcessState::Ready {
+                // R98-1 FIX: Also check orthogonal stopped flag
+                if proc.state == ProcessState::Ready && !proc.stopped {
                     proc.state = ProcessState::Running;
                     proc.reset_time_slice();
                     drop(proc);

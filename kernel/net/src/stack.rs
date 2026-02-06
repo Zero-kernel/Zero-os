@@ -68,6 +68,7 @@ use crate::tcp::{
 };
 use crate::udp::{parse_udp, UdpError, UdpResult, UdpStats};
 use crate::DEFAULT_MTU;
+use mm::dma::{alloc_dma_buffer, DMA_PAGE_SIZE};
 
 // ============================================================================
 // Statistics
@@ -905,21 +906,13 @@ fn build_frame_and_transmit(
     // Build Ethernet frame
     let frame = build_ethernet_frame(dst_mac, cfg.our_mac, ETHERTYPE_IPV4, &ip_packet);
 
-    // Allocate NetBuf and copy frame data
-    let frame_phys = mm::buddy_allocator::alloc_physical_pages(1).ok_or(TxError::InvalidBuffer)?;
-
-    let mut buf = match NetBuf::with_defaults(frame_phys) {
-        Some(b) => b,
-        None => {
-            mm::buddy_allocator::free_physical_pages(frame_phys, 1);
-            return Err(TxError::InvalidBuffer);
-        }
-    };
+    // R98-2 FIX: Allocate NetBuf via DMA buffer (IOMMU-mapped)
+    let dma = alloc_dma_buffer(DMA_PAGE_SIZE).map_err(|_| TxError::InvalidBuffer)?;
+    let mut buf = NetBuf::with_defaults(dma).ok_or(TxError::InvalidBuffer)?;
 
     let data = match buf.push_tail(frame.len()) {
         Some(d) => d,
         None => {
-            // NetBuf Drop will free the frame
             return Err(TxError::InvalidBuffer);
         }
     };

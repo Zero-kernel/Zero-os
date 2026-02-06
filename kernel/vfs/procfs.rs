@@ -1233,21 +1233,15 @@ fn generate_status(pid: u32) -> String {
     match table.get(pid as usize) {
         Some(Some(proc)) => {
             let p = proc.lock();
-            let state_char = match p.state {
-                ProcessState::Ready => 'R',
-                ProcessState::Running => 'R',
-                ProcessState::Blocked => 'S',
-                ProcessState::Sleeping => 'S',
-                ProcessState::Stopped => 'T',
-                ProcessState::Zombie => 'Z',
-                ProcessState::Terminated => 'X',
-            };
-            let state_name = match p.state {
-                ProcessState::Ready | ProcessState::Running => "running",
-                ProcessState::Blocked | ProcessState::Sleeping => "sleeping",
-                ProcessState::Stopped => "stopped",
-                ProcessState::Zombie => "zombie",
-                ProcessState::Terminated => "dead",
+            // R98-1 FIX: Check orthogonal stopped flag before scheduler state.
+            // Zombie/Terminated take priority, then stopped flag, then scheduler state.
+            let (state_char, state_name) = match p.state {
+                ProcessState::Zombie => ('Z', "zombie"),
+                ProcessState::Terminated => ('X', "dead"),
+                ProcessState::Stopped => ('T', "stopped"),
+                _ if p.stopped => ('T', "stopped"),
+                ProcessState::Ready | ProcessState::Running => ('R', "running"),
+                ProcessState::Blocked | ProcessState::Sleeping => ('S', "sleeping"),
             };
             // R39-3 FIX: 使用共享凭证读取 uid/gid/euid/egid
             let creds = p.credentials.read();
@@ -1294,12 +1288,14 @@ fn generate_stat(pid: u32) -> String {
     match table.get(pid as usize) {
         Some(Some(proc)) => {
             let p = proc.lock();
+            // R98-1 FIX: Check orthogonal stopped flag before scheduler state.
             let state_char = match p.state {
-                ProcessState::Ready | ProcessState::Running => 'R',
-                ProcessState::Blocked | ProcessState::Sleeping => 'S',
-                ProcessState::Stopped => 'T',
                 ProcessState::Zombie => 'Z',
                 ProcessState::Terminated => 'X',
+                ProcessState::Stopped => 'T',
+                _ if p.stopped => 'T',
+                ProcessState::Ready | ProcessState::Running => 'R',
+                ProcessState::Blocked | ProcessState::Sleeping => 'S',
             };
             // Minimal stat format: pid (comm) state ppid pgrp session tty_nr ...
             format!(

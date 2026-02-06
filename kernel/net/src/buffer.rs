@@ -6,11 +6,10 @@
 use alloc::vec::Vec;
 use core::slice;
 use spin::Mutex;
-use x86_64::structures::paging::PhysFrame;
 use x86_64::PhysAddr;
 
 use crate::{DEFAULT_HEADROOM, DEFAULT_MTU, DEFAULT_TAILROOM};
-use mm::PHYSICAL_MEMORY_OFFSET;
+use mm::dma::{alloc_dma_buffer, DmaBuffer, DmaError, DMA_PAGE_SIZE};
 
 // ============================================================================
 // NetBuf - Network Packet Buffer
@@ -39,10 +38,8 @@ use mm::PHYSICAL_MEMORY_OFFSET;
 /// slice references. Raw pointer access is only used internally.
 #[derive(Debug)]
 pub struct NetBuf {
-    /// Physical address of the buffer base.
-    phys_base: PhysAddr,
-    /// Virtual address of the buffer base (for CPU access).
-    virt_base: *mut u8,
+    /// R98-2 FIX: DMA buffer backing this packet buffer (IOMMU-mapped).
+    dma: DmaBuffer,
     /// Total buffer size in bytes.
     total_len: usize,
     /// Reserved headroom (bytes before data can start).
@@ -57,76 +54,43 @@ pub struct NetBuf {
 
 // SAFETY: NetBuf owns its memory exclusively and provides synchronized access.
 // The raw pointer is only used for internal buffer access and is derived from
-// a valid physical frame allocation.
+// a valid DMA buffer allocation.
 unsafe impl Send for NetBuf {}
 unsafe impl Sync for NetBuf {}
 
-/// R48-5 FIX: Implement Drop to prevent physical page leaks.
+/// R48-5/R49-1/R98-2 FIX: Prevent leaks and information disclosure on drop.
 ///
-/// When a NetBuf is dropped without being returned to a BufPool (e.g., in error
-/// paths where pool == None), the backing physical page must be freed back to
-/// the buddy allocator. Without this Drop impl, a malicious device could
-/// repeatedly trigger error paths to exhaust physical memory.
-///
-/// # R49-1 FIX: Zero page before release to prevent information leak.
-///
-/// Network buffers may contain sensitive data (credentials, tokens, private
-/// communications). When dropped via error paths (not through BufPool::free
-/// which calls reset()), the page must be zeroed before returning to the
-/// allocator. Otherwise, the next user of this physical page could read
-/// residual network data, causing cross-process information disclosure.
-///
-/// # Safety
-///
-/// This impl assumes that `phys_base` always refers to a valid, owned physical
-/// frame that was allocated from the buddy allocator. This invariant is
-/// maintained by the constructor which only accepts valid PhysFrame values.
+/// `NetBuf` owns a `DmaBuffer`, whose `Drop` implementation handles IOMMU
+/// unmapping (when enabled), scrubbing, and physical page freeing.
 impl Drop for NetBuf {
     fn drop(&mut self) {
-        // R49-1 FIX: Zero the entire page before returning to prevent
-        // information leakage. Network buffers often contain sensitive
-        // data that must not be exposed to subsequent page users.
-        //
-        // Note: Normal recycle path (BufPool::free) already calls reset()
-        // which zeroes the buffer. This is defense-in-depth for error paths.
-        unsafe {
-            let virt = phys_to_virt(self.phys_base);
-            core::ptr::write_bytes(virt, 0, 4096);
-        }
-
-        // Return the zeroed page to the buddy allocator
-        let frame = PhysFrame::containing_address(self.phys_base);
-        mm::buddy_allocator::free_physical_pages(frame, 1);
+        // Cleanup is handled by `DmaBuffer`'s Drop.
     }
 }
 
 impl NetBuf {
-    /// Create a new buffer backed by a physical frame.
+    /// R98-2 FIX: Create a new buffer backed by a DMA buffer (IOMMU-mapped).
     ///
     /// # Arguments
     ///
-    /// * `frame` - Physical frame providing the backing memory
+    /// * `dma` - DMA buffer providing the backing memory (IOMMU-mapped)
     /// * `mtu` - Maximum transmission unit (payload capacity)
     /// * `headroom` - Bytes to reserve at the start for headers
     /// * `tailroom` - Bytes to reserve at the end for trailers
     ///
     /// # Returns
     ///
-    /// `None` if `headroom + mtu + tailroom` exceeds the frame size (4096 bytes).
-    pub fn new(frame: PhysFrame, mtu: usize, headroom: usize, tailroom: usize) -> Option<Self> {
+    /// `None` if `headroom + mtu + tailroom` exceeds the DMA buffer size.
+    pub fn new(dma: DmaBuffer, mtu: usize, headroom: usize, tailroom: usize) -> Option<Self> {
         let total_len = headroom + mtu + tailroom;
 
-        // Validate that the requested layout fits within a single page
-        if total_len > 4096 {
+        // Validate that the requested layout fits within the DMA buffer
+        if total_len > DMA_PAGE_SIZE || total_len > dma.size() {
             return None;
         }
 
-        let phys_base = frame.start_address();
-        let virt_base = phys_to_virt(phys_base);
-
         Some(NetBuf {
-            phys_base,
-            virt_base,
+            dma,
             total_len,
             headroom,
             reserved_tailroom: tailroom,
@@ -137,9 +101,9 @@ impl NetBuf {
 
     /// Create a buffer with default layout (MTU=1500, headroom=64, tailroom=64).
     ///
-    /// Returns `None` if the frame is too small (should never happen with 4K pages).
-    pub fn with_defaults(frame: PhysFrame) -> Option<Self> {
-        Self::new(frame, DEFAULT_MTU, DEFAULT_HEADROOM, DEFAULT_TAILROOM)
+    /// Returns `None` if the DMA buffer is too small.
+    pub fn with_defaults(dma: DmaBuffer) -> Option<Self> {
+        Self::new(dma, DEFAULT_MTU, DEFAULT_HEADROOM, DEFAULT_TAILROOM)
     }
 
     /// Returns the current data length.
@@ -256,7 +220,7 @@ impl NetBuf {
 
         let start = self.data_offset;
         // Create slice before modifying state
-        let slice_ptr = self.virt_base;
+        let slice_ptr = self.dma.virt_ptr();
         self.data_offset += len;
         self.data_len -= len;
 
@@ -286,7 +250,7 @@ impl NetBuf {
         self.data_len -= len;
 
         // SAFETY: We've validated bounds and the buffer owns this memory
-        Some(unsafe { slice::from_raw_parts(self.virt_base.add(start), len) })
+        Some(unsafe { slice::from_raw_parts(self.dma.virt_ptr().add(start), len) })
     }
 
     /// Returns the physical address of the current data start.
@@ -295,7 +259,7 @@ impl NetBuf {
     /// or write packet data.
     #[inline]
     pub fn phys_addr(&self) -> PhysAddr {
-        self.phys_base + self.data_offset as u64
+        PhysAddr::new(self.dma.phys()) + self.data_offset as u64
     }
 
     /// Returns the physical address of the buffer base.
@@ -303,7 +267,7 @@ impl NetBuf {
     /// This is the start of the entire buffer including headroom.
     #[inline]
     pub fn buffer_phys_addr(&self) -> PhysAddr {
-        self.phys_base
+        PhysAddr::new(self.dma.phys())
     }
 
     /// Reset the buffer for reuse.
@@ -320,7 +284,7 @@ impl NetBuf {
         // This ensures no stale data is visible even if tailroom becomes
         // device-accessible in future (e.g., offloads, trailers)
         unsafe {
-            core::ptr::write_bytes(self.virt_base, 0, self.total_len);
+            core::ptr::write_bytes(self.dma.virt_ptr(), 0, self.total_len);
         }
 
         self.data_offset = self.headroom;
@@ -363,7 +327,7 @@ impl NetBuf {
             self.total_len
         );
         // SAFETY: Bounds checked by assert above
-        unsafe { slice::from_raw_parts(self.virt_base.add(offset), len) }
+        unsafe { slice::from_raw_parts(self.dma.virt_ptr().add(offset), len) }
     }
 
     /// Get a mutable slice of the buffer.
@@ -382,7 +346,7 @@ impl NetBuf {
             self.total_len
         );
         // SAFETY: Bounds checked by assert above
-        unsafe { slice::from_raw_parts_mut(self.virt_base.add(offset), len) }
+        unsafe { slice::from_raw_parts_mut(self.dma.virt_ptr().add(offset), len) }
     }
 }
 
@@ -468,7 +432,7 @@ impl BufPool {
     ) -> Option<Self> {
         // Validate layout fits in a page
         let total_len = headroom + mtu + tailroom;
-        if total_len > 4096 {
+        if total_len > DMA_PAGE_SIZE {
             return None;
         }
 
@@ -476,14 +440,14 @@ impl BufPool {
         let mut allocated = 0;
 
         for _ in 0..pool_size {
-            if let Some(frame) = alloc_frame() {
+            if let Ok(dma) = alloc_frame() {
                 // SAFETY: We validated the layout fits in a page above
-                if let Some(buf) = NetBuf::new(frame, mtu, headroom, tailroom) {
+                if let Some(buf) = NetBuf::new(dma, mtu, headroom, tailroom) {
                     buffers.push(buf);
                     allocated += 1;
                 }
             } else {
-                // Memory exhausted, stop allocating
+                // Allocation failed, stop allocating
                 break;
             }
         }
@@ -548,13 +512,10 @@ impl BufPool {
 // Helper Functions
 // ============================================================================
 
-/// Allocate a physical frame from the buddy allocator.
-fn alloc_frame() -> Option<PhysFrame> {
-    mm::buddy_allocator::alloc_physical_pages(1)
-}
-
-/// Convert a physical address to a virtual address.
-#[inline]
-fn phys_to_virt(addr: PhysAddr) -> *mut u8 {
-    (addr.as_u64() + PHYSICAL_MEMORY_OFFSET) as *mut u8
+/// R98-2 FIX: Allocate a DMA-mapped page for packet buffers.
+///
+/// This ensures proper IOMMU mapping when IOMMU is enabled, preventing
+/// IOMMU fault storms when devices perform DMA to these buffers.
+fn alloc_frame() -> Result<DmaBuffer, DmaError> {
+    alloc_dma_buffer(DMA_PAGE_SIZE)
 }
