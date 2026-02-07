@@ -82,7 +82,9 @@ impl NetBuf {
     ///
     /// `None` if `headroom + mtu + tailroom` exceeds the DMA buffer size.
     pub fn new(dma: DmaBuffer, mtu: usize, headroom: usize, tailroom: usize) -> Option<Self> {
-        let total_len = headroom + mtu + tailroom;
+        // R99-3 FIX: Use checked arithmetic to prevent integer overflow from
+        // bypassing the DMA_PAGE_SIZE bound check below.
+        let total_len = headroom.checked_add(mtu)?.checked_add(tailroom)?;
 
         // Validate that the requested layout fits within the DMA buffer
         if total_len > DMA_PAGE_SIZE || total_len > dma.size() {
@@ -431,7 +433,9 @@ impl BufPool {
         tailroom: usize,
     ) -> Option<Self> {
         // Validate layout fits in a page
-        let total_len = headroom + mtu + tailroom;
+        // R99-3 FIX: Use checked arithmetic to prevent integer overflow from
+        // bypassing the DMA_PAGE_SIZE bound check below.
+        let total_len = headroom.checked_add(mtu)?.checked_add(tailroom)?;
         if total_len > DMA_PAGE_SIZE {
             return None;
         }

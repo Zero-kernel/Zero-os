@@ -1,6 +1,6 @@
 # Zero-OS Development Roadmap
 
-**Last Updated:** 2026-02-01
+**Last Updated:** 2026-02-06
 **Architecture:** Security-First Hybrid Kernel
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -13,7 +13,8 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 ### Current Status: Phase G IN PROGRESS (Production Readiness)
 
 Zero-OS has completed SMP infrastructure and resource governance:
-- **94 security audits** with 468 issues found, 411 fixed (87.8%)
+- **99 security audits** with 496 issues found, 454 fixed (91.5%)
+- **R95-R99 Security**: 28 new issues found, 27 fixed in-round + 16 retroactive fixes (ext2 filesystem hardening, conntrack bypass, DMA/VirtIO lifecycle, syscall safety, NetBuf overflow, signal handling)
 - **R94 Security**: 16 issues found, **ALL 16 FIXED** (ECDSA KAT, FIPS fail-closed, PID namespace, TLB shootdown, kdump scrub, HMAC key scrub, firewall default DROP, IOMMU legacy signaling, verify_chain_hmac, **IOMMU kernel domain SLPT**)
 - **R93 Security Debt**: ALL 18 issues FIXED (fork namespace escape, livepatch hardening, fail-open patterns, cgroup escape, kdump, TLB shootdown, FIPS KATs, panic redaction)
 - **Ring 3 user mode** with SYSCALL/SYSRET support
@@ -977,12 +978,17 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 | 2026-01-30 | 92 | 5 | 5 | **kdump (G.1)** - Multi-CPU race ✅, Stack page boundary ✅, ASCII hex redaction ✅, Key cleanup ✅, try_fill_random fallback ✅ |
 | 2026-01-31 | 93 | 18 | 18 | **SECURITY DEBT** - Fork NS escape (CRITICAL) ✅, Livepatch guard (CRITICAL) ✅, Fail-open (HIGH) ✅, sys_access (HIGH) ✅, cgroup_attach (HIGH) ✅, ELF cgroup (HIGH) ✅, Identity map (HIGH) ✅, kdump fallback (HIGH) ✅, TLB shootdown (HIGH) ✅, Livepatch address (HIGH) ✅, seal_exec (HIGH) ✅, target mapping (MEDIUM) ✅, kpatch_unload (MEDIUM) ✅, FIPS KATs (MEDIUM) ✅, kdump FIPS (MEDIUM) ✅, panic redact (MEDIUM) ✅, cgroup caps (MEDIUM) ✅, ELF filesz (LOW) ✅ - **ALL 18 FIXED** |
 | 2026-02-01 | 94 | 16 | 16 | **SECURITY AUDIT** - Identity map USER_ACCESSIBLE (CRITICAL) ✅, insecure-ecdsa-stub guard (CRITICAL) ✅, ECDSA KAT deadlock (HIGH) ✅, fips_state fail-open (HIGH) ✅, PID translation fail-open (HIGH) ✅, Firewall default DROP (HIGH) ✅, IOMMU legacy signaling (HIGH) ✅, IOMMU kernel domain SLPT (HIGH) ✅, TLB shootdown mailbox (MEDIUM→HIGH) ✅, current_profile fallback (MEDIUM) ✅, KAT negative tests (MEDIUM) ✅, kdump storage scrub (MEDIUM) ✅, HMAC key scrub (MEDIUM) ✅, cgroup TaskNotAttached (MEDIUM) ✅, kdump emit-once (LOW) ✅, verify_chain_hmac (LOW) ✅ - **ALL 16 FIXED** |
-| **Total** | **94** | **468** | **411 (87.8%)** | **57 open (R65 SMP, R81-3/R84-4/R89-4 documented)** |
+| 2026-02-02 | 95 | 8 | 8 | **DMA/CONNTRACK/EXT2** - Conntrack bypass (CRITICAL) ✅, Cpuset escape (CRITICAL) ✅, sys_fstatat/sys_openat ptr deref (HIGH) ✅, ext2 unaligned reads (HIGH) ✅, VirtIO DMA leak (HIGH) ✅, DMA leak amplification (MEDIUM) ✅, DMA drop fence (MEDIUM) ✅, IOMMU PTE ordering (LOW) ✅ - **ALL 8 FIXED** |
+| 2026-02-03 | 96 | 9 | 9 | **EXT2/CONNTRACK/VIRTIO** - ext2 indirect block UB (HIGH) ✅, Conntrack LRU growth (HIGH) ✅, VirtIO RX lifecycle (HIGH) ✅, ext2 dir entry UB (HIGH) ✅, ext2 superblock overflow (MEDIUM) ✅, DmaError classification (MEDIUM) ✅, 3 LOW ✅ - **ALL 9 FIXED** |
+| 2026-02-04 | 97 | 4 | 3+1 | **SYSCALL/EXT2** - sys_writev overflow+UB (HIGH) ✅, ext2 file_block truncation (HIGH) ✅, ext2 superblock validation (MEDIUM) ✅, VirtIO-net IOMMU mapping (DESIGN, documented) - **3 FIXED, 1 DOCUMENTED** |
+| 2026-02-05 | 98 | 3 | 3 | **SIGNAL/NET/TIMER** - SIGSTOP/SIGCONT lost wakeups (HIGH) ✅, NetBuf IOMMU fault storm (MEDIUM) ✅, BSP idle loop drain (LOW) ✅ - **ALL 3 FIXED** |
+| 2026-02-06 | 99 | 4 | 4 | **NET/EXT2** - NetBuf integer overflow bypasses size check (HIGH) ✅, ext2 read_block bounds (MEDIUM) ✅, ext2 BGDT overflow (MEDIUM) ✅, ext2 validate_block deadlock (LOW) ✅ - **ALL 4 FIXED** |
+| **Total** | **99** | **496** | **454 (91.5%)** | **42 open (R65 SMP, R81-3/R84-4/R89-4 documented)** |
 
 ### Current Status
 
-- **Fixed**: 411 issues (87.8%)
-- **Open**: 57 issues (12.2%)
+- **Fixed**: 454 issues (91.5%)
+- **Open**: 42 issues (8.5%)
   - R65 remaining issues (SMP-related, non-blocking)
   - R81-3 (Direct map bound) documented risk
   - R84-4 (x2APIC mode) documented limitation
@@ -1008,8 +1014,13 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - **Virtualization Foundation**: COMPLETE - IOMMU/VT-d with VM passthrough preparation
 - **R93 Key Fixes**: Fork namespace escape (CRITICAL), Livepatch compile guard (CRITICAL), Fail-closed patterns, Cgroup authorization, ELF memory accounting, Identity map isolation, kdump encryption required, TLB shootdown fail-closed, Address validation, seal_exec, kpatch_unload, FIPS KATs, Panic redaction, Cgroup capabilities
 - **R94 Key Fixes**: ECDSA KAT deadlock-free, FIPS/Profile fail-closed, PID namespace fail-closed, TLB shootdown mailbox panic, kdump storage scrub, HMAC key scrub, cgroup attach fail-closed, firewall default DROP, IOMMU legacy fail-closed, verify_chain_hmac, **IOMMU kernel domain SLPT**
+- **R95 Key Fixes**: Conntrack state bypass (CRITICAL), Cpuset escape (CRITICAL), sys_fstatat/sys_openat user ptr, ext2 unaligned reads, VirtIO DMA leak, DMA lifecycle
+- **R96 Key Fixes**: ext2 indirect block UB, Conntrack LRU unbounded growth, VirtIO RX lifecycle, ext2 dir entry UB, syscall TOCTOU
+- **R97 Key Fixes**: sys_writev integer overflow + unaligned UB, ext2 file_block u64→u32 truncation, ext2 superblock validation
+- **R98 Key Fixes**: SIGSTOP/SIGCONT state overwrite lost wakeups (H-34), NetBuf IOMMU fault storm, BSP idle loop timer drain
+- **R99 Key Fixes**: NetBuf integer overflow bypasses DMA size check, ext2 read_block bounds validation, ext2 BGDT checked arithmetic, ext2 validate_block lock-free (deadlock fix)
 
-See [qa-2026-02-01.md](review/qa-2026-02-01.md) for latest audit report.
+See [qa-2026-02-06.md](review/qa-2026-02-06.md) for latest audit report.
 
 ---
 

@@ -218,6 +218,10 @@ pub struct Ext2Fs {
     /// Block group descriptor table
     group_descs: RwLock<Vec<Ext2GroupDesc>>,
     block_size: u32,
+    /// R99-4 FIX: Cached immutable copy of `blocks_count` for lock-free block
+    /// validation.  In ext2 the total block count is fixed at mkfs time and
+    /// never changes (only `free_blocks_count` is modified during allocation).
+    blocks_count: u32,
     blocks_per_group: u32,
     inodes_per_group: u32,
     inode_size: u16,
@@ -250,6 +254,7 @@ impl Ext2Fs {
             superblock: RwLock::new(superblock),
             group_descs: RwLock::new(group_descs),
             block_size,
+            blocks_count: superblock.blocks_count,
             blocks_per_group: superblock.blocks_per_group,
             inodes_per_group: superblock.inodes_per_group,
             inode_size,
@@ -366,26 +371,69 @@ impl Ext2Fs {
         Ok((sb, block_size))
     }
 
-    /// Load block group descriptor table
+    /// Load block group descriptor table.
+    ///
+    /// # R99-2 FIX: Defense-in-depth checked arithmetic and BGDT bounds
+    ///
+    /// Although `read_super()` already validates `blocks_per_group >= 8` and
+    /// `blocks_count > 0`, this function re-derives `groups_count` from the
+    /// superblock.  Using checked arithmetic here guards against any future
+    /// caller that bypasses `read_super()` validation, and validates that the
+    /// BGDT itself fits within the filesystem.
     fn load_group_descs(
         dev: &Arc<dyn BlockDevice>,
         sb: &Ext2Superblock,
         block_size: u32,
     ) -> Result<Vec<Ext2GroupDesc>, FsError> {
-        // Calculate number of block groups
-        let groups_count = (sb.blocks_count + sb.blocks_per_group - 1) / sb.blocks_per_group;
+        // R99-2 FIX: Calculate number of block groups using checked arithmetic.
+        // ceil_div(blocks_count, blocks_per_group) without overflow.
+        let bpg_minus_one = sb.blocks_per_group.checked_sub(1).ok_or(FsError::Invalid)?;
+        let groups_count = sb
+            .blocks_count
+            .checked_add(bpg_minus_one)
+            .ok_or(FsError::Invalid)?
+            / sb.blocks_per_group;
 
         // BGDT starts at block 2 for 1K blocks, block 1 for larger blocks
-        let bgdt_block = if block_size == 1024 { 2 } else { 1 };
+        let bgdt_block: u32 = if block_size == 1024 { 2 } else { 1 };
+
+        // R99-2 FIX: Validate that the BGDT start block is within filesystem bounds.
+        if bgdt_block >= sb.blocks_count {
+            return Err(FsError::Invalid);
+        }
+
         let bgdt_offset = bgdt_block as u64 * block_size as u64;
 
         // Read BGDT
-        let bgdt_size = groups_count as usize * size_of::<Ext2GroupDesc>();
-        let sectors_needed =
-            (bgdt_size + dev.sector_size() as usize - 1) / dev.sector_size() as usize;
-        let mut buf = alloc::vec![0u8; sectors_needed * dev.sector_size() as usize];
+        let bgdt_size = (groups_count as usize)
+            .checked_mul(size_of::<Ext2GroupDesc>())
+            .ok_or(FsError::Invalid)?;
+        let sector_size = dev.sector_size() as usize;
+        if sector_size == 0 {
+            return Err(FsError::Invalid);
+        }
+        let sectors_needed = bgdt_size
+            .checked_add(sector_size - 1)
+            .ok_or(FsError::Invalid)?
+            / sector_size;
+        let read_len = sectors_needed
+            .checked_mul(sector_size)
+            .ok_or(FsError::Invalid)?;
 
-        let start_sector = bgdt_offset / dev.sector_size() as u64;
+        // R99-2 FIX: Ensure the BGDT does not extend beyond the filesystem.
+        let fs_byte_size = (sb.blocks_count as u64)
+            .checked_mul(block_size as u64)
+            .ok_or(FsError::Invalid)?;
+        let bgdt_end = bgdt_offset
+            .checked_add(read_len as u64)
+            .ok_or(FsError::Invalid)?;
+        if bgdt_end > fs_byte_size {
+            return Err(FsError::Invalid);
+        }
+
+        let mut buf = alloc::vec![0u8; read_len];
+
+        let start_sector = bgdt_offset / sector_size as u64;
         dev.read_sync(start_sector, &mut buf)
             .map_err(|_| FsError::Io)?;
 
@@ -402,11 +450,29 @@ impl Ext2Fs {
         Ok(descs)
     }
 
-    /// Read a block from the device
+    /// Read a block from the device.
+    ///
+    /// # R99-1 FIX: Defense-in-depth bounds validation
+    ///
+    /// Mirror `write_block()` by calling `validate_block()` before issuing I/O.
+    /// Block 0 is treated as a sparse block (zero-filled) rather than performing
+    /// a device read at offset 0.
     fn read_block(&self, block_no: u32, buf: &mut [u8]) -> Result<(), FsError> {
         if buf.len() < self.block_size as usize {
             return Err(FsError::Invalid);
         }
+
+        // R99-1 FIX: Validate block number against filesystem bounds.
+        // validate_block returns None for block 0 (sparse), Some(n) for valid,
+        // or Err for out-of-bounds.  Deadlock-safe (R99-4: uses cached blocks_count).
+        let block_no = match self.validate_block(block_no)? {
+            Some(b) => b,
+            None => {
+                // Sparse block: zero-fill the buffer instead of reading
+                buf[..self.block_size as usize].fill(0);
+                return Ok(());
+            }
+        };
 
         let sector_size = self.dev.sector_size() as u64;
         let block_offset = block_no as u64 * self.block_size as u64;
@@ -756,12 +822,20 @@ impl Ext2Fs {
         (group, index)
     }
 
-    /// R28-5 Fix: Validate block number against filesystem bounds
+    /// R28-5 Fix: Validate block number against filesystem bounds.
+    ///
+    /// # R99-4 FIX: Lock-free block validation via cached `blocks_count`
+    ///
+    /// Previously this function used `self.superblock.read()` which caused a
+    /// deadlock when called from `write_block()` → `allocate_block()` (the
+    /// latter holds `superblock.write()`).  Since `blocks_count` is immutable
+    /// after mkfs, we cache it in `Ext2Fs` at mount time and check against
+    /// the cached copy — no lock required.
     #[inline]
     fn validate_block(&self, block: u32) -> Result<Option<u32>, FsError> {
         if block == 0 {
             Ok(None)
-        } else if block >= self.superblock.read().blocks_count {
+        } else if block >= self.blocks_count {
             Err(FsError::Invalid)
         } else {
             Ok(Some(block))
