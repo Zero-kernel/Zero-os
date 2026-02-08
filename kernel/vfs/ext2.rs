@@ -241,7 +241,22 @@ impl Ext2Fs {
         let group_descs = Self::load_group_descs(&dev, &superblock, block_size)?;
 
         let inode_size = if superblock.rev_level >= 1 {
-            superblock.inode_size
+            let raw = superblock.inode_size;
+            let raw32 = raw as u32;
+
+            // R100-3 FIX: Validate on-disk inode_size from untrusted superblock.
+            //  - Must be at least the base on-disk inode structure (128 bytes)
+            //  - Must not exceed block_size (inodes cannot span blocks)
+            //  - block_size must be evenly divisible by inode_size (no partial
+            //    inodes at end of inode-table block)
+            if raw32 < size_of::<Ext2InodeRaw>() as u32
+                || raw32 > block_size
+                || block_size % raw32 != 0
+            {
+                return Err(FsError::Invalid);
+            }
+
+            raw
         } else {
             128 // Rev 0 uses fixed 128-byte inodes
         };

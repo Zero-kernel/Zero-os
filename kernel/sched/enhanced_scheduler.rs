@@ -1268,11 +1268,15 @@ impl Scheduler {
                     {
                         use x86_64::registers::model_specific::Msr;
                         const MSR_FS_BASE: u32 = 0xC000_0100;
-                        const MSR_GS_BASE: u32 = 0xC000_0101;
+                        // R100-2 FIX: 调度器在 SWAPGS 后运行，此时：
+                        //   IA32_GS_BASE (0xC0000101) = 内核 per-CPU 指针
+                        //   IA32_KERNEL_GS_BASE (0xC0000102) = 用户态 GS 基址
+                        // 必须读写 0xC0000102 以保存/恢复用户态 GS
+                        const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
                         unsafe {
                             let fs_msr = Msr::new(MSR_FS_BASE);
-                            let gs_msr = Msr::new(MSR_GS_BASE);
+                            let gs_msr = Msr::new(MSR_KERNEL_GS_BASE);
                             guard.fs_base = fs_msr.read();
                             guard.gs_base = gs_msr.read();
                         }
@@ -1434,12 +1438,14 @@ impl Scheduler {
                     {
                         use x86_64::registers::model_specific::Msr;
                         const MSR_FS_BASE: u32 = 0xC000_0100;
-                        const MSR_GS_BASE: u32 = 0xC000_0101;
+                        // R100-2 FIX: 写入 IA32_KERNEL_GS_BASE (0xC0000102)
+                        // 以便 enter_usermode 中的 SWAPGS 将其交换为用户 GS
+                        const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
                         let mut fs_msr = Msr::new(MSR_FS_BASE);
                         fs_msr.write(next_fs_base);
 
-                        let mut gs_msr = Msr::new(MSR_GS_BASE);
+                        let mut gs_msr = Msr::new(MSR_KERNEL_GS_BASE);
                         gs_msr.write(next_gs_base);
                     }
 

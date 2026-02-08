@@ -426,7 +426,18 @@ pub fn alloc_physical_pages(count: usize) -> Option<PhysFrame> {
 /// * `frame` - 要释放的物理帧
 /// * `count` - 页面数量
 pub fn free_physical_pages(frame: PhysFrame, count: usize) {
-    let order = count.next_power_of_two().trailing_zeros() as usize;
+    // R100-4 FIX: count=0 must be a no-op; 0.next_power_of_two() == 1
+    // which would silently free 1 page.
+    if count == 0 {
+        return;
+    }
+
+    // Use checked variant to avoid panic on overflow in debug builds
+    let pages = match count.checked_next_power_of_two() {
+        Some(p) => p,
+        None => return, // count too large to represent as power-of-two order
+    };
+    let order = pages.trailing_zeros() as usize;
 
     if let Some(allocator) = BUDDY_ALLOCATOR.lock().as_mut() {
         allocator.free_pages(frame, order);

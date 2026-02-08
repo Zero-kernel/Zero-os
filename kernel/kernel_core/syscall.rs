@@ -5832,7 +5832,11 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
 
     // MSR 寄存器常量
     const MSR_FS_BASE: u32 = 0xC000_0100;
-    const MSR_GS_BASE: u32 = 0xC000_0101;
+    // R100-1 FIX: 系统调用入口已执行 SWAPGS，此时：
+    //   IA32_GS_BASE (0xC0000101) = 内核 per-CPU 指针（不可触碰）
+    //   IA32_KERNEL_GS_BASE (0xC0000102) = 用户态 GS 基址
+    // 因此 ARCH_SET_GS / ARCH_GET_GS 必须操作 0xC0000102
+    const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
     // 获取当前进程
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
@@ -5898,7 +5902,7 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
 
             // 立即更新 MSR
             unsafe {
-                let mut msr = Msr::new(MSR_GS_BASE);
+                let mut msr = Msr::new(MSR_KERNEL_GS_BASE);
                 msr.write(addr);
             }
 
@@ -5911,11 +5915,15 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
                 return Err(SyscallError::EFAULT);
             }
 
-            // 从 PCB 获取 gs_base
-            let gs_base = {
-                let proc = process.lock();
-                proc.gs_base
-            };
+            // R100-1 FIX: 直接从 IA32_KERNEL_GS_BASE 读取用户态 GS 基址。
+            // 用户态可能通过 wrgsbase 指令修改了 GS，PCB 中的缓存值可能过期。
+            let gs_base = unsafe { Msr::new(MSR_KERNEL_GS_BASE).read() };
+
+            // 同步到 PCB 以保持一致性
+            {
+                let mut proc = process.lock();
+                proc.gs_base = gs_base;
+            }
 
             // 写回用户空间
             let result = copy_to_user(addr as *mut u8, &gs_base.to_ne_bytes());

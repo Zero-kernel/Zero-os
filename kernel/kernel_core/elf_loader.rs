@@ -318,6 +318,11 @@ fn load_segment_tracked(
         return Err(ElfLoadError::CgroupLimitExceeded);
     }
 
+    // R100-7 FIX: Record how many pages are already tracked before this segment.
+    // If mapping fails mid-way, we must uncharge bytes for pages that were
+    // pre-charged but never mapped (and thus won't be counted in rollback).
+    let tracked_before = tracked.len();
+
     // 确定页权限
     let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     if ph.flags().is_write() {
@@ -347,7 +352,7 @@ fn load_segment_tracked(
     // 注意：用户地址空间的 4MB-6MB 区域已准备好 4KB 页表
     // ELF 加载器直接创建新的 4KB 页映射
 
-    unsafe {
+    let map_result = unsafe {
         page_table::with_current_manager(VirtAddr::new(0), |mgr| -> Result<(), ElfLoadError> {
             for i in 0..page_count {
                 let va = VirtAddr::new((page_base + i * PAGE_SIZE) as u64);
@@ -374,7 +379,18 @@ fn load_segment_tracked(
                 tracked.push((page, frame));
             }
             Ok(())
-        })?;
+        })
+    };
+
+    if let Err(e) = map_result {
+        // R100-7 FIX: Uncharge cgroup bytes for pages that were pre-charged
+        // but never mapped. rollback_all_mappings will handle the tracked pages.
+        let mapped_in_segment = tracked.len().saturating_sub(tracked_before);
+        let unmapped_bytes = charge_bytes.saturating_sub((mapped_in_segment * PAGE_SIZE) as u64);
+        if unmapped_bytes > 0 {
+            cgroup::uncharge_memory(cgroup_id, unmapped_bytes);
+        }
+        return Err(e);
     }
 
     // 【修复】使用直映物理地址访问内存，避免依赖当前 CR3
@@ -436,6 +452,10 @@ fn allocate_user_stack_tracked(
         return Err(ElfLoadError::CgroupLimitExceeded);
     }
 
+    // R100-7 FIX: Record tracked count before stack mapping for accurate
+    // partial-failure uncharge (same pattern as load_segment_tracked).
+    let tracked_before = tracked.len();
+
     let flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
         | PageTableFlags::USER_ACCESSIBLE
@@ -446,7 +466,7 @@ fn allocate_user_stack_tracked(
     let mut stack_mapped: Vec<MappedEntry> = Vec::with_capacity(page_count);
     let mut frame_alloc = FrameAllocator::new();
 
-    unsafe {
+    let map_result = unsafe {
         page_table::with_current_manager(VirtAddr::new(0), |mgr| -> Result<(), ElfLoadError> {
             for i in 0..page_count {
                 let va = VirtAddr::new((stack_base + i * PAGE_SIZE) as u64);
@@ -473,11 +493,24 @@ fn allocate_user_stack_tracked(
                 tracked.push((page, frame));
             }
             Ok(())
-        })?;
+        })
+    };
+
+    if let Err(e) = map_result {
+        // R100-7 FIX: Uncharge cgroup bytes for stack pages that were pre-charged
+        // but never mapped.
+        let mapped_stack = tracked.len().saturating_sub(tracked_before);
+        let unmapped_bytes = charge_bytes.saturating_sub((mapped_stack * PAGE_SIZE) as u64);
+        if unmapped_bytes > 0 {
+            cgroup::uncharge_memory(cgroup_id, unmapped_bytes);
+        }
+        return Err(e);
     }
 
     // 【修复】使用直映物理地址清零栈区域
-    let mut remaining = USER_STACK_SIZE;
+    // R100-5 FIX: 清零所有已映射的栈页（page_count 页），而非仅 USER_STACK_SIZE 字节。
+    // 额外的 guard page 也必须清零以防信息泄漏。
+    let mut remaining = page_count * PAGE_SIZE;
     for (_, frame) in stack_mapped.iter() {
         let base = unsafe { phys_to_virt(frame.start_address()).as_mut_ptr::<u8>() };
         let len = cmp::min(PAGE_SIZE, remaining);

@@ -446,6 +446,16 @@ pub unsafe fn init_syscall_percpu(cpu_id: usize) {
 
     // User GS base starts at 0 (user can set it via arch_prctl)
     wrmsr(IA32_GS_BASE, 0);
+
+    // R100-2 FIX (double-fault regression): 立即执行 SWAPGS，使内核从启动
+    // 开始就运行在 "post-SWAPGS" 状态：
+    //   IA32_GS_BASE         = 内核 per-CPU 指针（内核态活跃使用）
+    //   IA32_KERNEL_GS_BASE  = 0（将由调度器写入用户 GS 值）
+    //
+    // 若不执行此 SWAPGS，首次 enter_usermode() 路径中的 SWAPGS 会将两个
+    // MSR 从 (GS_BASE=0, KERNEL_GS_BASE=0) 交换为 (0, 0)，导致后续
+    // SYSCALL 入口的 SWAPGS 无法恢复 per-CPU 指针，引发 DOUBLE FAULT。
+    asm!("swapgs", options(nostack, preserves_flags));
 }
 
 // ============================================================================

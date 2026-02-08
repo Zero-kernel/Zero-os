@@ -568,7 +568,14 @@ pub unsafe extern "C" fn enter_usermode(ctx: *const Context) -> ! {
         // 最后恢复 rdi
         "mov rdi, [rdi + 0x28]",
 
-        // 执行 IRETQ 进入用户态
+        // R100-2 FIX: 执行 SWAPGS 恢复用户态 GS 基址后再 IRETQ
+        // 调度器将用户 GS 写入 IA32_KERNEL_GS_BASE，SWAPGS 将其
+        // 交换到 IA32_GS_BASE 供用户态使用，同时恢复内核 per-CPU 指针
+        // CLI 确保 SWAPGS 与 IRETQ 之间不会被中断（否则中断处理器
+        // 会看到用户态 GS 导致 per-CPU 数据访问错误）
+        "cli",
+        "swapgs",
+        // 执行 IRETQ 进入用户态（IRETQ 会从栈帧恢复 RFLAGS.IF）
         "iretq",
 
         // ========================================

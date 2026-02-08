@@ -654,21 +654,80 @@ fn compute_fast_allow(prog: &[SeccompInsn]) -> FastAllowSet {
 }
 
 /// Compute filter ID from program.
+///
+/// R100-6 FIX: Uses structured field hashing instead of raw enum byte slicing
+/// to avoid undefined behavior from uninitialized padding bytes.
 fn compute_filter_id(prog: &[SeccompInsn]) -> u64 {
-    // Simple FNV-1a hash
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for insn in prog {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                insn as *const SeccompInsn as *const u8,
-                core::mem::size_of::<SeccompInsn>(),
-            )
-        };
-        for &byte in bytes {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
+    /// FNV-1a byte fold
+    #[inline]
+    fn fnv_byte(hash: &mut u64, byte: u8) {
+        *hash ^= byte as u64;
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    #[inline]
+    fn fnv_u64(hash: &mut u64, v: u64) {
+        for b in v.to_le_bytes() {
+            fnv_byte(hash, b);
         }
     }
+
+    #[inline]
+    fn fnv_i32(hash: &mut u64, v: i32) {
+        for b in v.to_le_bytes() {
+            fnv_byte(hash, b);
+        }
+    }
+
+    fn hash_action(hash: &mut u64, action: SeccompAction) {
+        match action {
+            SeccompAction::Allow => fnv_byte(hash, 0),
+            SeccompAction::Log   => fnv_byte(hash, 1),
+            SeccompAction::Errno(e) => { fnv_byte(hash, 2); fnv_i32(hash, e); }
+            SeccompAction::Trap  => fnv_byte(hash, 3),
+            SeccompAction::Kill  => fnv_byte(hash, 4),
+        }
+    }
+
+    let mut hash: u64 = 0xcbf29ce484222325;
+
+    for insn in prog {
+        match *insn {
+            SeccompInsn::LdSyscallNr => fnv_byte(&mut hash, 0),
+            SeccompInsn::LdArg(idx)  => { fnv_byte(&mut hash, 1); fnv_byte(&mut hash, idx); }
+            SeccompInsn::LdConst(v)  => { fnv_byte(&mut hash, 2); fnv_u64(&mut hash, v); }
+            SeccompInsn::And(v)      => { fnv_byte(&mut hash, 3); fnv_u64(&mut hash, v); }
+            SeccompInsn::Or(v)       => { fnv_byte(&mut hash, 4); fnv_u64(&mut hash, v); }
+            SeccompInsn::Shr(s)      => { fnv_byte(&mut hash, 5); fnv_byte(&mut hash, s); }
+            SeccompInsn::JmpEq(v, t, f) => {
+                fnv_byte(&mut hash, 6); fnv_u64(&mut hash, v);
+                fnv_byte(&mut hash, t); fnv_byte(&mut hash, f);
+            }
+            SeccompInsn::JmpNe(v, t, f) => {
+                fnv_byte(&mut hash, 7); fnv_u64(&mut hash, v);
+                fnv_byte(&mut hash, t); fnv_byte(&mut hash, f);
+            }
+            SeccompInsn::JmpLt(v, t, f) => {
+                fnv_byte(&mut hash, 8); fnv_u64(&mut hash, v);
+                fnv_byte(&mut hash, t); fnv_byte(&mut hash, f);
+            }
+            SeccompInsn::JmpLe(v, t, f) => {
+                fnv_byte(&mut hash, 9); fnv_u64(&mut hash, v);
+                fnv_byte(&mut hash, t); fnv_byte(&mut hash, f);
+            }
+            SeccompInsn::JmpGt(v, t, f) => {
+                fnv_byte(&mut hash, 10); fnv_u64(&mut hash, v);
+                fnv_byte(&mut hash, t); fnv_byte(&mut hash, f);
+            }
+            SeccompInsn::JmpGe(v, t, f) => {
+                fnv_byte(&mut hash, 11); fnv_u64(&mut hash, v);
+                fnv_byte(&mut hash, t); fnv_byte(&mut hash, f);
+            }
+            SeccompInsn::Jmp(off) => { fnv_byte(&mut hash, 12); fnv_byte(&mut hash, off); }
+            SeccompInsn::Ret(action) => { fnv_byte(&mut hash, 13); hash_action(&mut hash, action); }
+        }
+    }
+
     hash
 }
 
