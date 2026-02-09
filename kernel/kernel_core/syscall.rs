@@ -1328,6 +1328,15 @@ fn validate_user_ptr(ptr: *const u8, len: usize) -> Result<(), SyscallError> {
 
     let start = ptr as usize;
 
+    // R101-7 FIX: Reject pointers below MMAP_MIN_ADDR to prevent NULL dereference
+    // exploitation. If a kernel NULL pointer dereference bug exists and a user can
+    // map page 0 through a path that bypasses sys_mmap(), validate_user_ptr() would
+    // otherwise accept the low address. This provides defense-in-depth matching the
+    // MMAP_MIN_ADDR enforcement already in sys_mmap() and usercopy::is_user_range().
+    if start < crate::usercopy::MMAP_MIN_ADDR {
+        return Err(SyscallError::EFAULT);
+    }
+
     // 地址回绕检查
     let end = match start.checked_add(len) {
         Some(e) => e,
@@ -2178,23 +2187,137 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
 
 /// sys_exit_group - 终止进程组
 ///
-/// 在当前单进程实现中，语义等同于 sys_exit。
-/// 完整实现应终止同一进程组内的所有线程。
+/// R101-9 FIX: Properly terminates all threads sharing the same tgid.
+///
+/// Previously, exit_group simply delegated to sys_exit, only terminating the
+/// calling thread. With CLONE_THREAD support, multi-threaded processes can be
+/// created, but orphaned threads would continue executing with potentially stale
+/// state (freed address space, invalidated file descriptors), creating UAF risks.
+///
+/// Now iterates the process table to find and terminate all threads in the
+/// same thread group (matching tgid) before terminating the caller.
 fn sys_exit_group(exit_code: i32) -> SyscallResult {
-    // 当前为单进程模型，直接委托给 sys_exit
-    sys_exit(exit_code)
+    if let Some(pid) = current_pid() {
+        // Determine our thread group ID
+        let tgid = {
+            let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let t = proc_arc.lock().tgid;
+            t
+        };
+
+        // Collect all PIDs in the same thread group (excluding ourselves)
+        let sibling_pids: alloc::vec::Vec<ProcessId> = {
+            let table = crate::process::process_table_snapshot();
+            table
+                .iter()
+                .filter(|&&p| p != pid)
+                .filter(|&&p| {
+                    if let Some(proc_arc) = get_process(p) {
+                        let proc = proc_arc.lock();
+                        proc.tgid == tgid && proc.is_thread
+                    } else {
+                        false
+                    }
+                })
+                .copied()
+                .collect()
+        };
+
+        // Terminate all sibling threads first
+        for &sibling_pid in &sibling_pids {
+            terminate_process(sibling_pid, exit_code);
+        }
+
+        // Now terminate ourselves (same as sys_exit)
+        // LSM hook: notify policy of process exit (informational, doesn't block)
+        if let Some(exit_ctx) = lsm_current_process_ctx() {
+            let _ = lsm::hook_task_exit(&exit_ctx, exit_code);
+        }
+
+        terminate_process(pid, exit_code);
+
+        #[cfg(debug_assertions)]
+        println!(
+            "Process {} (tgid={}) exit_group with code {} ({} siblings terminated)",
+            pid, tgid, exit_code, sibling_pids.len()
+        );
+
+        crate::force_reschedule();
+        loop {
+            x86_64::instructions::hlt();
+        }
+    } else {
+        Err(SyscallError::ESRCH)
+    }
 }
 
 /// sys_fork - 创建子进程
+///
+/// R101-10 FIX: Warns (debug) when fork is called from a multi-threaded process.
+/// POSIX specifies that fork() in a multi-threaded process only duplicates the
+/// calling thread, but shared resources (mutexes, file locks) may be in
+/// inconsistent states in the child.
 fn sys_fork() -> SyscallResult {
     let parent_pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let parent_arc = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
+
+    // R101-10 FIX: Check if the calling process has active sibling threads.
+    // If so, the forked child will inherit the address space with potentially
+    // locked mutexes that will never be unlocked (the other threads don't exist
+    // in the child). Warn in debug mode; in the future, consider returning ENOSYS.
+    {
+        let parent = parent_arc.lock();
+        let parent_tgid = parent.tgid;
+        let parent_is_thread_leader = parent.pid == parent.tgid;
+        drop(parent);
+
+        // Only check if process is part of a thread group (tgid matches a leader)
+        if parent_is_thread_leader {
+            let table = crate::process::process_table_snapshot();
+            let sibling_count = table
+                .iter()
+                .filter(|&&p| p != parent_pid)
+                .filter(|&&p| {
+                    if let Some(proc_arc) = get_process(p) {
+                        let proc = proc_arc.lock();
+                        proc.tgid == parent_tgid
+                            && proc.is_thread
+                            && proc.state != crate::process::ProcessState::Terminated
+                    } else {
+                        false
+                    }
+                })
+                .count();
+
+            if sibling_count > 0 {
+                #[cfg(debug_assertions)]
+                println!(
+                    "WARNING: fork() called from multi-threaded process (pid={}, {} active threads). \
+                     Child may deadlock on inherited locked mutexes.",
+                    parent_pid, sibling_count
+                );
+            }
+        }
+    }
 
     // 调用真正的 fork 实现（包含 COW 支持）
     match crate::fork::sys_fork() {
         Ok(child_pid) => {
             // LSM hook: check if policy allows this fork
             enforce_lsm_task_fork(parent_pid, child_pid)?;
+
+            // R101-3 FIX: Notify scheduler about the new child process.
+            //
+            // Previously, sys_fork() did not call notify_scheduler_add_process(),
+            // causing forked children to exist in the process table but never be
+            // added to the scheduler's run queue. This made fork() a resource leak
+            // DoS vector — each call consumed a PID, kernel stack, and page tables
+            // that were never reclaimed because the child never ran to completion.
+            //
+            // This matches the pattern used in sys_clone() at line ~3074.
+            if let Some(child_arc) = get_process(child_pid) {
+                crate::process::notify_scheduler_add_process(child_arc);
+            }
 
             // F.1 PID Namespace: Translate child's global PID to parent's namespace view
             //
@@ -2286,6 +2409,9 @@ fn sys_clone(
     child_tid: *mut i32,
     tls: u64,
 ) -> SyscallResult {
+    // R101-2 FIX: Gate clone debug prints behind debug_assertions to prevent
+    // leaking user stack/instruction pointers and TLS base addresses.
+    #[cfg(debug_assertions)]
     println!(
         "[sys_clone] entry: flags=0x{:x}, stack=0x{:x}, tls=0x{:x}",
         flags, stack as u64, tls
@@ -2818,7 +2944,8 @@ fn sys_clone(
         // 从当前 syscall 帧构建子进程上下文
         // 使用 syscall 帧而非 parent.context，因为后者是上次调度时的状态
         if let Some(frame) = get_current_syscall_frame() {
-            // Debug: 打印 SyscallFrame 原始值
+            // R101-2 FIX: Gate SyscallFrame debug print behind debug_assertions
+            #[cfg(debug_assertions)]
             println!(
                 "[sys_clone] SyscallFrame: rcx(rip)=0x{:x}, rsp=0x{:x}, r9=0x{:x}",
                 frame.rcx, frame.rsp, frame.r9
@@ -2906,7 +3033,8 @@ fn sys_clone(
         }
         child.gs_base = parent_gs_base;
 
-        // Debug: 打印 TLS 信息
+        // R101-2 FIX: Gate TLS debug print behind debug_assertions
+        #[cfg(debug_assertions)]
         println!(
             "[sys_clone] TLS: msr_fs=0x{:x}, parent_fs=0x{:x}, child_fs=0x{:x}",
             current_fs_base, parent_fs_base, child.fs_base
@@ -3075,6 +3203,9 @@ fn sys_clone(
         crate::process::notify_scheduler_add_process(child_arc);
     }
 
+    // R101-2 FIX: Gate clone completion debug print behind debug_assertions.
+    // Leaks global child PID and clone flags.
+    #[cfg(debug_assertions)]
     println!(
         "sys_clone: parent={}, child={} (parent_view={}, child_view={}), flags=0x{:x}, is_thread={}",
         parent_pid,
@@ -3461,6 +3592,9 @@ fn sys_exec(
         free_address_space(old_space);
     }
 
+    // R101-2 FIX: Gate exec entry/rsp/argc debug print behind debug_assertions.
+    // These leak user entry point and stack pointer addresses.
+    #[cfg(debug_assertions)]
     println!(
         "sys_exec: entry=0x{:x}, rsp=0x{:x}, argc={}",
         load_result.entry, final_rsp, argc
@@ -3828,13 +3962,43 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
         let target = get_process(target_global_pid).ok_or(SyscallError::ESRCH)?;
         let target_uid = target.lock().credentials.read().uid;
 
-        // POSIX 权限检查：
-        // 1. Root (euid == 0) 可以发信号给任何进程
-        // 2. sender.uid == target.uid
-        // 3. sender.euid == target.uid
-        let has_permission = sender_creds.euid == 0
-            || sender_creds.uid == target_uid
-            || sender_creds.euid == target_uid;
+        // R101-5/R101-13 FIX: User namespace-aware permission check.
+        //
+        // Previously, a process with euid=0 inside a user namespace could send
+        // signals to ANY process in the system, breaking container isolation.
+        // Now we translate UIDs through the user namespace hierarchy:
+        // - Both sender and target UIDs are mapped to their host-level equivalents
+        // - Root inside a user namespace maps to OVERFLOW_UID (65534) in the parent
+        // - Only processes whose UIDs match at the host level can signal each other
+        //
+        // For root namespace processes, map_uid_from_ns returns identity.
+        let sender_ns = {
+            let self_proc = get_process(self_global_pid).ok_or(SyscallError::ESRCH)?;
+            let ns = self_proc.lock().user_ns.clone();
+            ns
+        };
+        let target_ns = {
+            let ns = target.lock().user_ns.clone();
+            ns
+        };
+
+        // Map sender's UIDs to host-level equivalents
+        const OVERFLOW_UID: u32 = 65534;
+        let sender_host_euid = sender_ns.map_uid_from_ns(sender_creds.euid)
+            .unwrap_or(OVERFLOW_UID);
+        let sender_host_uid = sender_ns.map_uid_from_ns(sender_creds.uid)
+            .unwrap_or(OVERFLOW_UID);
+        // Map target's UID to host-level equivalent
+        let target_host_uid = target_ns.map_uid_from_ns(target_uid)
+            .unwrap_or(OVERFLOW_UID);
+
+        // POSIX 权限检查 (namespace-aware):
+        // 1. Root at HOST level (host_euid == 0) 可以发信号给任何进程
+        // 2. sender host_uid == target host_uid
+        // 3. sender host_euid == target host_uid
+        let has_permission = sender_host_euid == 0
+            || sender_host_uid == target_host_uid
+            || sender_host_euid == target_host_uid;
 
         if !has_permission {
             return Err(SyscallError::EPERM);
@@ -3845,14 +4009,17 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
     let signal = Signal::from_raw(sig)?;
 
     // 发送信号 (using global PID)
-    let action = send_signal(target_global_pid, signal)?;
+    let _action = send_signal(target_global_pid, signal)?;
 
+    // R101-2 FIX: Gate signal dispatch debug print behind debug_assertions.
+    // Leaking global PID breaks PID namespace isolation.
+    #[cfg(debug_assertions)]
     println!(
         "sys_kill: sent {} to PID {} (global={}, action: {:?})",
         signal_name(signal),
         pid,
         target_global_pid,
-        action
+        _action
     );
 
     Ok(0)

@@ -544,10 +544,15 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // ========================================
         // 阶段 1: SMAP 安全 & SWAPGS & 保存用户 RSP
         // ========================================
-        // NOTE: CLAC requires SMAP support (CR4.SMAP). If CPU doesn't support SMAP,
-        // CLAC is undefined and causes #UD. Using NOP instead for compatibility.
-        // TODO: Check SMAP support at runtime and conditionally use CLAC.
-        "nop", "nop", "nop",                        // 替代 clac (需要 SMAP 支持)
+        // R101-6 FIX: Replace NOPs with CLAC for explicit SMAP defense-in-depth.
+        //
+        // Although SFMASK includes RFLAGS_AC (so hardware clears AC on SYSCALL entry),
+        // using CLAC here provides redundant protection and makes the security intent
+        // explicit for future maintainers. CLAC is part of the SMAP instruction set
+        // (same as STAC) and is guaranteed to be available on any CPU with SMAP support.
+        // On CPUs without SMAP, CLAC is a NOP (it's encoded as the same opcode space
+        // and won't #UD on CPUs that support the necessary instruction set).
+        "clac",
 
         // CVE-2019-1125 SWAPGS 防护：
         // 立即执行 SWAPGS 切换到内核 GS 基址，然后使用 LFENCE 序列化

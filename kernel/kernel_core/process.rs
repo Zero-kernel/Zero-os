@@ -688,12 +688,18 @@ impl Process {
             allowed_cpus: 0xFFFFFFFFFFFFFFFF, // SMP: Allow on all CPUs by default
             cpuset_id: 0, // Root cpuset (all CPUs)
             created_at: time::current_timestamp_ms(),
-            // R39-3 FIX: 默认以root运行，使用共享凭证结构
+            // R101-1 FIX: Default to unprivileged nobody (uid=65534) credentials.
+            //
+            // Previously all processes started with uid=0 (root), creating a flat
+            // privilege model with no defense-in-depth. Now Process::new() uses
+            // restricted defaults. Kernel-internal processes (ppid=0) are promoted
+            // to root explicitly by create_process(), and fork()/clone() inherit
+            // credentials from the parent process via independent clone.
             credentials: Arc::new(RwLock::new(Credentials {
-                uid: 0,
-                gid: 0,
-                euid: 0,
-                egid: 0,
+                uid: 65534,
+                gid: 65534,
+                euid: 65534,
+                egid: 65534,
                 supplementary_groups: Vec::new(),
             })),
             umask: 0o022,
@@ -1105,6 +1111,22 @@ pub fn create_process(
         proc.kernel_stack_top = stack_top;
     }
 
+    // R101-1 FIX: Kernel-internal processes (ppid == 0) need explicit root credentials.
+    //
+    // Process::new() now defaults to nobody (uid=65534). Kernel threads and init
+    // processes must be explicitly promoted to root. User-spawned processes will
+    // inherit credentials from the parent via fork()/clone().
+    if ppid == 0 {
+        let mut proc = process.lock();
+        *proc.credentials.write() = Credentials {
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
+            supplementary_groups: Vec::new(),
+        };
+    }
+
     // F.1 PID Namespace: Assign namespace chain for the new process
     //
     // For kernel-created processes (ppid == 0), use root namespace.
@@ -1269,6 +1291,18 @@ pub fn create_process_in_namespace(
         proc.kernel_stack_top = stack_top;
     }
 
+    // R101-1 FIX: Kernel-internal processes (ppid == 0) need explicit root credentials.
+    if ppid == 0 {
+        let mut proc = process.lock();
+        *proc.credentials.write() = Credentials {
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
+            supplementary_groups: Vec::new(),
+        };
+    }
+
     // Assign PID namespace chain using the specified target namespace
     match crate::pid_namespace::assign_pid_chain(target_ns.clone(), pid) {
         Ok(chain) => {
@@ -1429,6 +1463,25 @@ pub fn non_thread_group_vm_share_count(memory_space: usize, caller_tgid: Process
             }
         })
         .count()
+}
+
+/// R101-9 FIX: Get a snapshot of all active PIDs from the process table.
+///
+/// Returns a Vec of all PIDs that have live process entries. Used by
+/// exit_group to find sibling threads in the same thread group.
+pub fn process_table_snapshot() -> alloc::vec::Vec<ProcessId> {
+    let table = PROCESS_TABLE.lock();
+    table
+        .iter()
+        .enumerate()
+        .filter_map(|(i, slot)| {
+            if slot.is_some() {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// 设置当前进程ID

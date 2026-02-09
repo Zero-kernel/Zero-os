@@ -27,8 +27,13 @@ use crate::ipv4::Ipv4Header;
 // Constants - Security Limits
 // ============================================================================
 
-/// Fragment reassembly timeout in milliseconds (45 seconds)
-pub const FRAG_TIMEOUT_MS: u64 = 45_000;
+/// R101-12 FIX: Reduced fragment reassembly timeout from 45s to 30s.
+///
+/// The previous 45-second timeout allowed attackers to hold reassembly buffer
+/// memory for longer. Linux default is 30 seconds (net.ipv4.ipfrag_time).
+/// Reducing timeout limits the memory pressure window from crafted fragments
+/// that are never completed.
+pub const FRAG_TIMEOUT_MS: u64 = 30_000;
 
 /// Maximum reassembled packet size (IPv4 max is 65535)
 pub const MAX_PACKET_SIZE: usize = 65_535;
@@ -637,12 +642,48 @@ impl FragmentCache {
         let queue = if let Some(q) = queues.get_mut(&key) {
             q
         } else {
-            // Check limits before creating new queue
+            // R101-12 FIX: LRU eviction under memory pressure.
+            //
+            // When the global queue limit is reached, instead of simply rejecting
+            // the new fragment (which drops legitimate traffic), evict the oldest
+            // reassembly queue to make room. This ensures legitimate fragmented
+            // packets have a chance even when an attacker is flooding with crafted
+            // fragments that are never completed.
             if current_queues >= GLOBAL_MAX_QUEUES {
-                self.stats
-                    .global_limit_drops
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(FragmentDropReason::GlobalQueueLimit);
+                // Find and evict the oldest queue (by creation time)
+                let oldest_key = queues
+                    .iter()
+                    .min_by_key(|(_, q)| q.created_ms)
+                    .map(|(&k, _)| k);
+
+                if let Some(evict_key) = oldest_key {
+                    let evict_src = evict_key.src_ip();
+                    if let Some(evicted) = queues.remove(&evict_key) {
+                        let frag_count = evicted.received_frags as u32;
+                        let byte_count = evicted.received_bytes as u64;
+                        if let Some(c) = per_src.get_mut(&evict_src) {
+                            *c = c.saturating_sub(1);
+                            if *c == 0 {
+                                per_src.remove(&evict_src);
+                            }
+                        }
+                        self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
+                        if frag_count > 0 {
+                            self.stats
+                                .buffered_fragments
+                                .fetch_sub(frag_count, Ordering::Relaxed);
+                            self.stats
+                                .buffered_bytes
+                                .fetch_sub(byte_count, Ordering::Relaxed);
+                        }
+                        self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    self.stats
+                        .global_limit_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(FragmentDropReason::GlobalQueueLimit);
+                }
             }
             if current_frags >= GLOBAL_MAX_FRAGS {
                 self.stats

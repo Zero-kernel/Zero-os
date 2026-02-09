@@ -19,6 +19,7 @@ extern crate net;
 extern crate sched;
 extern crate security;
 extern crate vfs;
+extern crate livepatch; // R101-4: Boot-time ECDSA key validation
 #[macro_use]
 extern crate audit;
 extern crate trace;
@@ -305,6 +306,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 println!("      ! Continuing with reduced security");
             }
         }
+    }
+
+    // R101-4 FIX: Boot-time livepatch ECDSA key validation
+    if livepatch::has_placeholder_keys() {
+        println!("      ! WARNING: Livepatch ECDSA public keys are all-zero placeholders!");
+        println!("      ! Livepatch signature verification is non-functional.");
+        println!("      ! Generate production P-256 keys and embed them in livepatch::TRUSTED_P256_PUBKEYS_UNCOMPRESSED.");
     }
 
     // KASLR/KPTI/PCID initialization

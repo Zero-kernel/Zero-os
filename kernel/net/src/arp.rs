@@ -350,6 +350,16 @@ impl ArpCache {
     pub fn clear_dynamic(&mut self) {
         self.entries.retain(|e| e.kind == ArpEntryKind::Static);
     }
+
+    /// R101-11 FIX: Check if a static entry exists for the given IP.
+    ///
+    /// Used by gratuitous ARP processing to protect static entries (e.g., gateway)
+    /// from being updated via gratuitous ARP packets, even with matching MACs.
+    pub fn has_static_entry(&self, ip: Ipv4Addr) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.ip == ip && e.kind == ArpEntryKind::Static)
+    }
 }
 
 // ============================================================================
@@ -738,24 +748,29 @@ pub fn process_arp(
     let is_gratuitous = pkt.sender_ip == pkt.target_ip;
     let for_us = pkt.target_ip == our_ip;
 
-    // R48-2 FIX: Restrict gratuitous ARP learning to prevent cache poisoning.
+    // R101-11 FIX: Strengthened gratuitous ARP anti-spoofing.
     //
-    // Previously, we accepted ANY gratuitous ARP (sender_ip == target_ip),
-    // which allowed an attacker to inject first-use mappings for arbitrary IPs
-    // (e.g., gateway IP → attacker MAC) and hijack outbound traffic.
+    // R48-2 restricted gratuitous ARP to same-MAC refreshes. R101-11 adds an
+    // additional check: if a static entry exists for the sender IP, gratuitous
+    // ARP is NEVER used to update the cache (static entries are authoritative).
+    // This protects critical entries like the default gateway from gratuitous ARP
+    // cache poisoning attacks even if the attacker can spoof the legitimate MAC.
     //
-    // Now we only accept gratuitous ARP when:
+    // Acceptance rules for gratuitous ARP:
     // 1. It's for our own IP (legitimate self-announcement), OR
-    // 2. It's a same-MAC refresh of an existing cache entry
-    //
-    // This prevents injection of new malicious mappings while still allowing
-    // legitimate refreshes from known hosts.
+    // 2. It's a same-MAC refresh of an existing DYNAMIC cache entry
+    //    (static entries are never updated via gratuitous ARP)
     let existing_mac = cache.lookup(pkt.sender_ip, now_ms);
+
+    // Check if a static entry exists for this IP
+    let has_static_entry = cache.has_static_entry(pkt.sender_ip);
+
     let allow_gratuitous = is_gratuitous
+        && !has_static_entry  // R101-11: Never allow gratuitous ARP to affect static entries
         && (
             pkt.sender_ip == our_ip ||                        // Our own announcement
         existing_mac == Some(pkt.sender_hw)
-            // Same-MAC refresh only
+            // Same-MAC refresh only (dynamic entries)
         );
 
     // Security: Detect reflection attack attempt

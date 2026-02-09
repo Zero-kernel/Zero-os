@@ -982,14 +982,22 @@ fn slide_from_slot(slot: u64) -> u64 {
 
 /// Generate a random KASLR slide using the CSPRNG
 ///
-/// Returns 0 on failure (KASLR will be disabled).
+/// R101-8 FIX: Emits a prominent boot-time warning on RNG failure instead of
+/// silently falling back to slide=0. A deterministic kernel memory layout is
+/// a significant security regression that must be visible to operators.
 fn generate_kaslr_slide() -> u64 {
     let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
 
     match rng::random_range(max_slots + 1) {
         Ok(slot) => slide_from_slot(slot),
         Err(_) => {
-            // RNG failure - fall back to no KASLR
+            // R101-8 FIX: Warn loudly instead of silent fallback
+            println!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            println!("!! WARNING: KASLR RNG failure - KASLR IS DISABLED   !!");
+            println!("!! The kernel is booting with a DETERMINISTIC memory !!");
+            println!("!! layout. This severely weakens exploit mitigation. !!");
+            println!("!! Ensure hardware RNG (RDRAND) is available.        !!");
+            println!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
             0
         }
     }
@@ -1089,10 +1097,15 @@ pub fn init(boot_slide: Option<u64>) {
     // R39-7 FIX: Verify bootloader slide matches runtime-detected slide
     if let Some(expected) = boot_slide {
         if expected != 0 && expected != layout.kaslr_slide {
+            // R101-2 FIX: Gate address-containing messages behind debug_assertions.
+            // KASLR slide values are security-sensitive and must not leak in production.
+            #[cfg(debug_assertions)]
             println!(
                 "  ! KASLR slide mismatch: bootloader=0x{:x}, runtime=0x{:x}",
                 expected, layout.kaslr_slide
             );
+            #[cfg(not(debug_assertions))]
+            println!("  ! KASLR slide mismatch detected (details hidden in release mode)");
         }
     }
 
@@ -1107,6 +1120,9 @@ pub fn init(boot_slide: Option<u64>) {
     let partial = partial_kaslr_status();
 
     // Report status
+    // R101-2 FIX: Gate KASLR slide, heap base, and kernel section addresses behind
+    // debug_assertions. Logging these values in production completely negates KASLR
+    // by exposing the exact kernel memory layout to anyone with serial console access.
     println!(
         "  PCID: {}",
         if pcid_enabled {
@@ -1115,14 +1131,26 @@ pub fn init(boot_slide: Option<u64>) {
             "unsupported/disabled"
         }
     );
+    #[cfg(debug_assertions)]
+    {
+        println!(
+            "  KASLR: {} (slide: 0x{:x})",
+            if layout.kaslr_slide != 0 {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            layout.kaslr_slide
+        );
+    }
+    #[cfg(not(debug_assertions))]
     println!(
-        "  KASLR: {} (slide: 0x{:x})",
+        "  KASLR: {}",
         if layout.kaslr_slide != 0 {
             "enabled"
         } else {
             "disabled"
-        },
-        layout.kaslr_slide
+        }
     );
     // Report Partial KASLR status
     println!(
@@ -1131,12 +1159,14 @@ pub fn init(boot_slide: Option<u64>) {
         if partial.kernel_stacks { "yes" } else { "no" },
         if partial.userspace_aslr { "yes" } else { "no" }
     );
+    #[cfg(debug_assertions)]
     if partial.heap_base {
         println!(
             "    Heap base: 0x{:x} (randomized)",
             mm::memory::heap_base()
         );
     }
+    #[cfg(debug_assertions)]
     println!(
         "  Kernel sections: text={:#x}..{:#x} ({} bytes)",
         layout.text_start,

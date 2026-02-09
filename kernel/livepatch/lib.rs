@@ -151,6 +151,17 @@ pub fn init(ops: &'static dyn KernelOps) {
     let _ = PATCH_TABLE.call_once(init_patch_table);
 }
 
+/// R101-4 FIX: Check whether all ECDSA key slots are empty placeholders.
+///
+/// Returns `true` if all key slots contain all-zero bytes, meaning livepatch
+/// signature verification is non-functional. The kernel entry point should call
+/// this at boot and emit a warning via its own `println!` macro.
+pub fn has_placeholder_keys() -> bool {
+    TRUSTED_P256_PUBKEYS_UNCOMPRESSED
+        .iter()
+        .all(|k| k.iter().all(|&b| b == 0))
+}
+
 #[inline]
 fn ops() -> Result<&'static dyn KernelOps, Errno> {
     KERNEL_OPS.get().copied().ok_or(Errno::ENOSYS)
@@ -518,6 +529,13 @@ pub fn rollback_recent_patches(max_age_ticks: u64) -> usize {
 // Populate with real keys at build time from kernel configuration.
 // All-zero placeholders are rejected at runtime (fail-closed).
 // Multiple keys supported for key rotation scenarios.
+//
+// R101-4 FIX: Build-time assertion ensures insecure-ecdsa-stub is only used in tests.
+#[cfg(all(feature = "insecure-ecdsa-stub", not(test)))]
+compile_error!(
+    "SECURITY: `insecure-ecdsa-stub` feature must only be enabled in test builds. \
+     Remove this feature flag from production Cargo.toml to enable real ECDSA verification."
+);
 #[allow(dead_code)]
 const TRUSTED_P256_PUBKEYS_UNCOMPRESSED: &[[u8; 65]] = &[
     [0u8; 65], // Slot 0: Current production key (replace with real key)
