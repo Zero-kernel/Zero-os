@@ -442,6 +442,34 @@ pub trait LsmPolicy: Send + Sync {
     fn net_control(&self, ctx: &NetControlCtx) -> LsmResult {
         Ok(())
     }
+
+    // ========================================================================
+    // Livepatch Hooks (R102-13)
+    // ========================================================================
+
+    /// Called when a livepatch module is loaded from userspace.
+    ///
+    /// This is the most security-sensitive livepatch operation: it introduces
+    /// new executable code into the kernel. Policies should verify the caller
+    /// holds an equivalent of `CAP_SYS_MODULE`.
+    fn kpatch_load(&self, task: &ProcessCtx, patch_len: usize) -> LsmResult {
+        Ok(())
+    }
+
+    /// Called when a loaded livepatch is activated (INT3 detour installed).
+    fn kpatch_enable(&self, task: &ProcessCtx, patch_id: u64) -> LsmResult {
+        Ok(())
+    }
+
+    /// Called when a livepatch is deactivated (original instruction restored).
+    fn kpatch_disable(&self, task: &ProcessCtx, patch_id: u64) -> LsmResult {
+        Ok(())
+    }
+
+    /// Called when a disabled livepatch is unloaded and its memory freed.
+    fn kpatch_unload(&self, task: &ProcessCtx, patch_id: u64) -> LsmResult {
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -726,6 +754,23 @@ impl LsmPolicy for DenyAllPolicy {
     }
 
     fn net_shutdown(&self, _task: &ProcessCtx, _ctx: &NetCtx, _how: i32) -> LsmResult {
+        Err(LsmError::Denied)
+    }
+
+    // Livepatch hooks (R102-13)
+    fn kpatch_load(&self, _task: &ProcessCtx, _patch_len: usize) -> LsmResult {
+        Err(LsmError::Denied)
+    }
+
+    fn kpatch_enable(&self, _task: &ProcessCtx, _patch_id: u64) -> LsmResult {
+        Err(LsmError::Denied)
+    }
+
+    fn kpatch_disable(&self, _task: &ProcessCtx, _patch_id: u64) -> LsmResult {
+        Err(LsmError::Denied)
+    }
+
+    fn kpatch_unload(&self, _task: &ProcessCtx, _patch_id: u64) -> LsmResult {
         Err(LsmError::Denied)
     }
 }

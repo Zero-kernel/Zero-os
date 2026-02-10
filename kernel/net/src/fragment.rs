@@ -349,7 +349,10 @@ impl FragmentQueue {
         data: &[u8],
         now_ms: u64,
     ) -> Result<bool, FragmentDropReason> {
-        let len = data.len() as u16;
+        // R102-L1 FIX: Use checked conversion instead of silent truncation.
+        // Upstream callers enforce MTU limits, but defense-in-depth rejects
+        // oversized data that would silently wrap to a smaller u16 value.
+        let len = u16::try_from(data.len()).map_err(|_| FragmentDropReason::TooLarge)?;
 
         // Rate limiting
         if !self.rate_limiter.allow(1, now_ms) {

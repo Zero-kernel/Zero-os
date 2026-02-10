@@ -986,6 +986,26 @@ fn get_current_syscall_frame() -> Option<&'static SyscallFrame> {
     }
 }
 
+/// R102-6 FIX: Execute a closure with the current syscall frame.
+///
+/// Prevents the frame reference from escaping the active syscall window.
+/// The internal callback still returns `&'static SyscallFrame` for ABI
+/// compatibility, but this wrapper ensures callers cannot store the reference.
+///
+/// # Arguments
+///
+/// * `f` - Closure receiving `&SyscallFrame`, executed only if a frame is active.
+///
+/// # Returns
+///
+/// `Some(R)` with the closure's return value, or `None` if no frame is active.
+pub fn with_current_syscall_frame<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&SyscallFrame) -> R,
+{
+    get_current_syscall_frame().map(f)
+}
+
 /// 管道创建回调类型
 ///
 /// 由 ipc 模块注册，返回 (read_fd, write_fd) 或错误
@@ -1489,7 +1509,11 @@ fn copy_user_cstring(ptr: *const u8) -> Result<Vec<u8>, SyscallError> {
         // 2. 创建 UserCopyGuard 登记 usercopy 状态
         // 3. 页错误时安全返回 Err 而非 panic
         let mut byte = [0u8; 1];
-        crate::usercopy::copy_from_user_safe(&mut byte, unsafe { ptr.add(i) })
+        // R102-9 FIX: Use integer arithmetic instead of ptr.add() for user pointers.
+        // User pointers are not within any Rust allocation, so ptr.add() is technically
+        // UB under Rust's pointer provenance model. Integer arithmetic is provenance-safe.
+        let src_addr = (ptr as usize).wrapping_add(i) as *const u8;
+        crate::usercopy::copy_from_user_safe(&mut byte, src_addr)
             .map_err(|_| SyscallError::EFAULT)?;
 
         if byte[0] == 0 {
@@ -2943,7 +2967,8 @@ fn sys_clone(
 
         // 从当前 syscall 帧构建子进程上下文
         // 使用 syscall 帧而非 parent.context，因为后者是上次调度时的状态
-        if let Some(frame) = get_current_syscall_frame() {
+        // R102-6 FIX: Use closure-based API to prevent syscall frame reference escape.
+        let frame_applied = with_current_syscall_frame(|frame| {
             // R101-2 FIX: Gate SyscallFrame debug print behind debug_assertions
             #[cfg(debug_assertions)]
             println!(
@@ -2985,7 +3010,9 @@ fn sys_clone(
                 child.context.rsp = frame.rsp;
                 child.user_stack = parent_user_stack;
             }
-        } else {
+        });
+
+        if frame_applied.is_none() {
             // 回退：使用 parent.context（不应该发生）
             println!("sys_clone: WARNING - syscall frame not available, using stale context");
             child.context = parent_context;
@@ -3000,7 +3027,9 @@ fn sys_clone(
             }
         }
 
-        // Debug: 打印子进程上下文关键寄存器
+        // R102-10 FIX: Gate register/address dump behind debug_assertions.
+        // Leaks child RIP/RSP which defeats userspace ASLR.
+        #[cfg(debug_assertions)]
         println!(
             "[sys_clone] Child {} ctx: rax=0x{:x}, rip=0x{:x}, rsp=0x{:x}, r9=0x{:x}, rcx=0x{:x}",
             child_pid,
@@ -5377,6 +5406,9 @@ fn sys_mmap(
     // R77-2 FIX: No separate accounting call needed - charge/uncharge model is complete.
     drop(proc); // Explicitly drop the lock
 
+    // R102-10 FIX: Gate address-revealing log behind debug_assertions to prevent
+    // userspace ASLR bypass via kernel log output.
+    #[cfg(debug_assertions)]
     println!(
         "sys_mmap: pid={}, mapped {} bytes at 0x{:x}",
         pid, length_aligned, base
@@ -5486,6 +5518,8 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     drop(proc); // Explicitly drop the lock
     cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
 
+    // R102-10 FIX: Gate address-revealing log behind debug_assertions.
+    #[cfg(debug_assertions)]
     println!(
         "sys_munmap: pid={}, unmapped {} bytes at 0x{:x}",
         pid, length_aligned, addr
@@ -6016,7 +6050,9 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
                 return Err(SyscallError::EINVAL);
             }
 
-            // Debug: 打印 ARCH_SET_FS 调用
+            // R102-10 FIX: Gate TLS base address log behind debug_assertions.
+            // Leaks userspace TLS base which aids exploitation.
+            #[cfg(debug_assertions)]
             println!("[arch_prctl] PID={} ARCH_SET_FS addr=0x{:x}", pid, addr);
 
             // 更新进程 PCB 中的 fs_base
@@ -7237,7 +7273,9 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
         buf[header_size + name_bytes.len()] = 0; // NUL terminator
 
         // 复制到用户空间
-        copy_to_user(unsafe { dirp.add(written) }, &buf)?;
+        // R102-I4 FIX: Use integer arithmetic for user pointer offset (provenance-safe).
+        let dst = (dirp as usize).wrapping_add(written) as *mut u8;
+        copy_to_user(dst, &buf)?;
         written = next_written; // R42-2 FIX: Use pre-computed checked value
     }
 

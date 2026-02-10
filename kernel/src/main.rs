@@ -282,10 +282,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 }
                 if report.rng_ready {
                     println!("        - CSPRNG ready (ChaCha20 + RDRAND/RDSEED)");
-                    // 验证 RNG 工作正常
+                    // R102-L5 FIX: Validate RNG without printing raw output.
+                    // Printing raw entropy values is unnecessary and could be
+                    // sensitive if RNG is not fully initialized.
                     match security::random_u64() {
-                        Ok(val) => println!("        - RNG test: 0x{:016x}", val),
-                        Err(e) => println!("        ! RNG test failed: {:?}", e),
+                        Ok(_) => println!("        - RNG self-test: passed"),
+                        Err(e) => println!("        ! RNG self-test failed: {:?}", e),
                     }
                 } else {
                     println!("        ! CSPRNG not ready");
@@ -303,6 +305,16 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             }
             Err(e) => {
                 println!("      ! Security hardening failed: {:?}", e);
+                // R102-2 FIX: Secure profile must not boot without core mitigations.
+                // A single hardware/config anomaly should not silently disable all
+                // security hardening (W^X, NX, CSPRNG, Spectre mitigations).
+                if profile == compliance::HardeningProfile::Secure {
+                    panic!(
+                        "Security hardening failed in Secure profile: {:?} \
+                         (use Balanced profile to allow degraded boot)",
+                        e
+                    );
+                }
                 println!("      ! Continuing with reduced security");
             }
         }
@@ -356,6 +368,11 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         // V-4 fix: No longer need to update SMAP status cache.
         // clac_if_smap() now reads CR4 directly for SMP safety.
     }
+
+    // R102-5 FIX: Enforce SMAP as a hard boot requirement.
+    // The kernel unconditionally uses CLAC/STAC in syscall entry and usercopy paths.
+    // Without SMAP these instructions may #UD, crashing every syscall.
+    arch::cpu_protection::require_smap_support();
 
     // Phase 6: 初始化 SYSCALL/SYSRET 快速系统调用机制
     println!("[2.8/3] Initializing SYSCALL/SYSRET...");

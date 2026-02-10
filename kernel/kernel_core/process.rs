@@ -173,10 +173,27 @@ pub const MAX_PID: ProcessId = ((u64::MAX - KSTACK_BASE) / KSTACK_STRIDE) as Pro
 /// 返回 (栈底, 栈顶)，栈向下生长，栈顶用于 TSS.rsp0
 #[inline]
 pub fn kernel_stack_slot(pid: ProcessId) -> (VirtAddr, VirtAddr) {
-    let guard_base = VirtAddr::new(KSTACK_BASE + pid as u64 * KSTACK_STRIDE);
-    let stack_base = guard_base + (KSTACK_GUARD_PAGES as u64 * PAGE_SIZE);
-    let stack_top = stack_base + (KSTACK_PAGES as u64 * PAGE_SIZE);
-    (stack_base, stack_top)
+    // R102-8 FIX: Use checked arithmetic to prevent silent wrapping on invalid PID.
+    // While callers bound PID via MAX_PID, this helper is public and must defend
+    // against misuse that could cause overlapping kernel stacks.
+    let slot_offset = (pid as u64)
+        .checked_mul(KSTACK_STRIDE)
+        .expect("kernel_stack_slot: pid * KSTACK_STRIDE overflow");
+    let guard_base_addr = KSTACK_BASE
+        .checked_add(slot_offset)
+        .expect("kernel_stack_slot: KSTACK_BASE + slot_offset overflow");
+
+    let guard_bytes = KSTACK_GUARD_PAGES as u64 * PAGE_SIZE; // compile-time constant, safe
+    let stack_base_addr = guard_base_addr
+        .checked_add(guard_bytes)
+        .expect("kernel_stack_slot: guard_base + guard_bytes overflow");
+
+    let stack_bytes = KSTACK_PAGES as u64 * PAGE_SIZE; // compile-time constant, safe
+    let stack_top_addr = stack_base_addr
+        .checked_add(stack_bytes)
+        .expect("kernel_stack_slot: stack_base + stack_bytes overflow");
+
+    (VirtAddr::new(stack_base_addr), VirtAddr::new(stack_top_addr))
 }
 
 /// 为指定 PID 分配并映射带守护页的内核栈
@@ -1158,6 +1175,15 @@ pub fn create_process(
                 // Namespace chain assignment failed, clean up
                 println!("Error: Failed to assign PID namespace chain: {:?}", e);
                 free_kernel_stack(pid, stack_base);
+                // R102-L2 FIX: Reclaim the consumed PID to prevent PID exhaustion
+                // over time when namespace assignment repeatedly fails.
+                {
+                    let mut next_pid_guard = NEXT_PID.lock();
+                    // Only reclaim if no other PID was allocated in the meantime
+                    if *next_pid_guard == pid + 1 {
+                        *next_pid_guard = pid;
+                    }
+                }
                 return Err(ProcessCreateError::NamespaceError);
             }
         }
@@ -1313,6 +1339,13 @@ pub fn create_process_in_namespace(
         Err(e) => {
             println!("Error: Failed to assign PID namespace chain: {:?}", e);
             free_kernel_stack(pid, stack_base);
+            // R102-L2 FIX: Reclaim the consumed PID to prevent PID exhaustion.
+            {
+                let mut next_pid_guard = NEXT_PID.lock();
+                if *next_pid_guard == pid + 1 {
+                    *next_pid_guard = pid;
+                }
+            }
             return Err(ProcessCreateError::NamespaceError);
         }
     }
@@ -2139,32 +2172,41 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                 use x86_64::structures::paging::PhysFrame;
                 use x86_64::PhysAddr;
 
-                // 切换到目标进程的地址空间
-                let current_cr3 = Cr3::read();
-                let target_frame =
-                    PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
-                Cr3::write(target_frame, current_cr3.1);
+                // R102-4 FIX: Disable interrupts around CR3 switch to prevent:
+                // 1. Interrupt handlers running with the wrong page tables
+                // 2. Timer interrupts triggering rescheduling in foreign address space
+                // 3. KPTI context mismatch if interrupts load incorrect CR3
+                x86_64::instructions::interrupts::without_interrupts(|| {
+                    // 切换到目标进程的地址空间
+                    let current_cr3 = Cr3::read();
+                    let target_frame =
+                        PhysFrame::containing_address(PhysAddr::new(memory_space as u64));
+                    Cr3::write(target_frame, current_cr3.1);
 
-                // 将 0 写入 clear_child_tid 地址（带 SMAP 保护和容错处理）
-                let tid_ptr = clear_child_tid as *mut u8;
-                if (tid_ptr as usize) >= 0x1000 && (tid_ptr as usize) < 0x8000_0000_0000 {
-                    let _user = UserAccessGuard::new();
-                    let zero = 0i32.to_ne_bytes();
-                    // 忽略写入错误（用户可能已 unmap 该地址）
-                    let _ = copy_to_user_safe(tid_ptr, &zero);
-                }
+                    // 将 0 写入 clear_child_tid 地址（带 SMAP 保护和容错处理）
+                    let tid_ptr = clear_child_tid as *mut u8;
+                    if (tid_ptr as usize) >= 0x1000 && (tid_ptr as usize) < 0x8000_0000_0000 {
+                        let _user = UserAccessGuard::new();
+                        let zero = 0i32.to_ne_bytes();
+                        // 忽略写入错误（用户可能已 unmap 该地址）
+                        let _ = copy_to_user_safe(tid_ptr, &zero);
+                    }
 
-                // 恢复原来的地址空间
-                Cr3::write(current_cr3.0, current_cr3.1);
+                    // 恢复原来的地址空间
+                    Cr3::write(current_cr3.0, current_cr3.1);
+                });
             }
 
             // 唤醒等待在 clear_child_tid 地址上的 futex
             let woken = notify_futex_wake(tgid, clear_child_tid as usize, 1);
             if woken > 0 {
+                // R102-L6 FIX: Gate address-revealing log behind debug_assertions
+                #[cfg(debug_assertions)]
                 println!(
                     "  Woke {} waiters on clear_child_tid=0x{:x}",
                     woken, clear_child_tid
                 );
+                let _ = woken; // suppress unused warning in release
             }
         }
 

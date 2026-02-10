@@ -140,6 +140,42 @@ pub fn enable_protections() -> CpuProtectionStatus {
     check_cpu_features()
 }
 
+/// R102-5 FIX: Verify SMAP support and enablement at boot.
+///
+/// The kernel unconditionally uses CLAC/STAC instructions in syscall entry stubs
+/// and usercopy paths. On CPUs without SMAP support, these instructions may
+/// generate #UD (Undefined Opcode) on every syscall, causing a hard kernel crash.
+///
+/// This function MUST be called after `enable_protections()` during early boot.
+/// It will panic (halt boot) if SMAP is not available or not enabled, enforcing
+/// the fail-closed posture required by R102-5.
+///
+/// # Panics
+///
+/// - If the CPU does not support SMAP (CPUID.07H:EBX[20] not set)
+/// - If SMAP is supported but CR4.SMAP is not set (enablement failure)
+pub fn require_smap_support() {
+    let status = check_cpu_features();
+
+    if !status.smap_supported {
+        panic!(
+            "FATAL: CPU does not support SMAP (CPUID.07H:EBX[20]). \
+             The kernel requires SMAP for CLAC/STAC user-memory access guards. \
+             Boot halted."
+        );
+    }
+
+    if !status.smap_enabled {
+        panic!(
+            "FATAL: SMAP is supported but not enabled in CR4. \
+             The kernel requires SMAP enabled for CLAC/STAC user-memory access guards. \
+             Boot halted."
+        );
+    }
+
+    println!("      ✓ SMAP requirement verified (CLAC/STAC safe)");
+}
+
 /// CPUID leaf 0x7 subleaf 0 (returns eax, ebx, ecx, edx)
 ///
 /// This leaf contains extended feature flags including SMEP, SMAP, and UMIP.

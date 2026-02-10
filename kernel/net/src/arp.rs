@@ -206,6 +206,12 @@ pub struct ArpCache {
     ttl_ms: u64,
     /// Maximum number of entries
     max_entries: usize,
+    /// R102-12 FIX: Per-interface RX rate limiter.
+    /// Prevents a single malicious host on one interface from exhausting the
+    /// global token bucket and starving ARP processing on all other interfaces.
+    pub rx_rate_limiter: TokenBucket,
+    /// R102-12 FIX: Per-interface TX rate limiter.
+    pub tx_rate_limiter: TokenBucket,
 }
 
 impl ArpCache {
@@ -215,6 +221,9 @@ impl ArpCache {
             entries: VecDeque::with_capacity(max_entries.min(64)),
             ttl_ms,
             max_entries,
+            // R102-12 FIX: Per-interface rate limiters with same defaults as global.
+            rx_rate_limiter: TokenBucket::new(DEFAULT_RX_RATE_PPS, DEFAULT_RX_BURST),
+            tx_rate_limiter: TokenBucket::new(DEFAULT_TX_RATE_PPS, DEFAULT_TX_BURST),
         }
     }
 
@@ -723,8 +732,9 @@ pub fn process_arp(
 ) -> ArpResult {
     stats.inc_rx_packets();
 
-    // Rate limit RX processing
-    if !ARP_RX_RATE_LIMITER.allow(now_ms) {
+    // R102-12 FIX: Check per-interface rate limiter first, then global as backstop.
+    // This prevents a single malicious host on one interface from starving all others.
+    if !cache.rx_rate_limiter.allow(now_ms) || !ARP_RX_RATE_LIMITER.allow(now_ms) {
         stats.inc_rx_rate_limited();
         return ArpResult::Dropped(ArpError::RateLimited);
     }
@@ -842,8 +852,8 @@ pub fn process_arp(
                 return ArpResult::Handled;
             }
 
-            // Rate limit TX replies
-            if !ARP_TX_RATE_LIMITER.allow(now_ms) {
+            // R102-12 FIX: Per-interface TX rate limiter + global backstop.
+            if !cache.tx_rate_limiter.allow(now_ms) || !ARP_TX_RATE_LIMITER.allow(now_ms) {
                 stats.inc_rx_rate_limited();
                 return ArpResult::Dropped(ArpError::RateLimited);
             }

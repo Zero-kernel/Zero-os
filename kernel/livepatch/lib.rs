@@ -101,6 +101,39 @@ pub trait KernelOps: Sync {
     /// Returns true if the calling task is privileged (CAP_ADMIN or equivalent).
     fn is_privileged(&self) -> bool;
 
+    // ========================================================================
+    // R102-13 FIX: LSM hook delegates for livepatch operations.
+    //
+    // The livepatch crate does not depend on the `lsm` crate directly.
+    // Instead, the KernelOps implementor (in kernel_core or the main kernel)
+    // is responsible for calling `lsm::hook_kpatch_*` and translating
+    // `LsmError` to `Errno`. Default implementations permit all operations,
+    // maintaining backwards compatibility.
+    // ========================================================================
+
+    /// LSM check before loading a livepatch module.
+    ///
+    /// Implementors should call `lsm::hook_kpatch_load(task, patch_len)`
+    /// and return `Err(Errno::EPERM)` on denial.
+    fn check_lsm_kpatch_load(&self, _patch_len: usize) -> Result<(), Errno> {
+        Ok(())
+    }
+
+    /// LSM check before enabling a livepatch.
+    fn check_lsm_kpatch_enable(&self, _patch_id: u64) -> Result<(), Errno> {
+        Ok(())
+    }
+
+    /// LSM check before disabling a livepatch.
+    fn check_lsm_kpatch_disable(&self, _patch_id: u64) -> Result<(), Errno> {
+        Ok(())
+    }
+
+    /// LSM check before unloading a livepatch.
+    fn check_lsm_kpatch_unload(&self, _patch_id: u64) -> Result<(), Errno> {
+        Ok(())
+    }
+
     /// Copy from user memory into a kernel buffer.
     ///
     /// # Safety
@@ -1061,6 +1094,24 @@ unsafe fn atomic_write_u8(addr: usize, value: u8) {
 /// # Safety
 /// This function modifies the stack frame's instruction pointer through raw pointer
 /// manipulation. It must only be called from a breakpoint exception handler context.
+///
+/// # R102-L4: State Machine Safety Invariant
+///
+/// The handler/exec memory referenced by `slot.handler` is valid IFF the patch is in
+/// `Enabled` or `Enabling` state (`is_bp_active() == true`). The following invariants
+/// MUST be maintained by the state transition logic:
+///
+/// 1. **Enabling → Enabled**: INT3 is written to target; handler memory is live.
+///    `breakpoint_dispatch` may redirect RIP to handler.
+/// 2. **Enabled → Disabling**: INT3 is replaced with original byte; handler memory
+///    is still live (in-flight dispatches may still be executing handler code).
+/// 3. **Disabling → Disabled**: Full IPI + synchronize_rcu() ensures no CPU is
+///    executing handler code. Only then may handler memory be freed.
+/// 4. **Disabled → Unloaded**: `exec_addr` is freed via `ops.free_exec()`.
+///
+/// **Critical**: `kpatch_unload` MUST NOT free exec memory unless the patch is
+/// `Disabled` AND a full CPU synchronization barrier has completed. Otherwise,
+/// a concurrent `breakpoint_dispatch` could redirect RIP into freed memory.
 pub fn breakpoint_dispatch(stack_frame: &mut InterruptStackFrame) -> bool {
     let table = match patch_table_get() {
         Some(t) => t,
@@ -1123,9 +1174,16 @@ fn do_sys_kpatch_load(user_ptr: usize, len: usize) -> Result<u64, Errno> {
     let ops = ops()?;
     let _ = patch_table();
 
+    // R102-13 FIX: Authorization gate for livepatch operations.
+    //
+    // SECURITY: `is_privileged()` MUST check euid == 0 AND an equivalent of
+    // CAP_SYS_MODULE. Livepatch load redirects arbitrary kernel functions,
+    // making it the most powerful privilege escalation vector if mis-gated.
     if !ops.is_privileged() {
         return Err(Errno::EPERM);
     }
+    // R102-13 FIX: LSM policy check — the implementor delegates to lsm::hook_kpatch_load().
+    ops.check_lsm_kpatch_load(len)?;
 
     if user_ptr == 0 {
         return Err(Errno::EFAULT);
@@ -1173,6 +1231,8 @@ fn do_sys_kpatch_enable(patch_id: u64) -> Result<(), Errno> {
     if !ops.is_privileged() {
         return Err(Errno::EPERM);
     }
+    // R102-13 FIX: LSM policy check.
+    ops.check_lsm_kpatch_enable(patch_id)?;
     kpatch_enable(patch_id)
 }
 
@@ -1191,6 +1251,8 @@ fn do_sys_kpatch_disable(patch_id: u64) -> Result<(), Errno> {
     if !ops.is_privileged() {
         return Err(Errno::EPERM);
     }
+    // R102-13 FIX: LSM policy check.
+    ops.check_lsm_kpatch_disable(patch_id)?;
     kpatch_disable(patch_id)
 }
 
@@ -1209,6 +1271,8 @@ fn do_sys_kpatch_unload(patch_id: u64) -> Result<(), Errno> {
     if !ops.is_privileged() {
         return Err(Errno::EPERM);
     }
+    // R102-13 FIX: LSM policy check.
+    ops.check_lsm_kpatch_unload(patch_id)?;
     kpatch_unload(patch_id)
 }
 

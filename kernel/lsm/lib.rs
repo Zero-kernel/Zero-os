@@ -1674,6 +1674,90 @@ pub fn hook_net_control(ctx: &NetControlCtx) -> LsmResult {
 }
 
 // ============================================================================
+// Livepatch Hooks (R102-13)
+// ============================================================================
+
+/// Hook: livepatch load from userspace.
+///
+/// Called before a livepatch module is loaded. This is the most powerful
+/// livepatch operation (introduces arbitrary kernel code), so policies
+/// should gate it behind strong capability checks.
+#[inline]
+pub fn hook_kpatch_load(task: &ProcessCtx, patch_len: usize) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        let res = policy().kpatch_load(task, patch_len);
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "kpatch_load", err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = (task, patch_len);
+        Ok(())
+    }
+}
+
+/// Hook: livepatch enable (activate INT3 detour).
+#[inline]
+pub fn hook_kpatch_enable(task: &ProcessCtx, patch_id: u64) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        let res = policy().kpatch_enable(task, patch_id);
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "kpatch_enable", err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = (task, patch_id);
+        Ok(())
+    }
+}
+
+/// Hook: livepatch disable (rollback detour).
+#[inline]
+pub fn hook_kpatch_disable(task: &ProcessCtx, patch_id: u64) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        let res = policy().kpatch_disable(task, patch_id);
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "kpatch_disable", err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = (task, patch_id);
+        Ok(())
+    }
+}
+
+/// Hook: livepatch unload (free exec memory).
+#[inline]
+pub fn hook_kpatch_unload(task: &ProcessCtx, patch_id: u64) -> LsmResult {
+    #[cfg(feature = "lsm")]
+    {
+        let res = policy().kpatch_unload(task, patch_id);
+        if let Err(ref err) = res {
+            let subject = audit_subject_from_ctx(task.pid, task.uid, task.gid, task.cap);
+            emit_denial_audit(subject, AuditObject::None, "kpatch_unload", err);
+        }
+        res
+    }
+    #[cfg(not(feature = "lsm"))]
+    {
+        let _ = (task, patch_id);
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Initialization
 // ============================================================================
 

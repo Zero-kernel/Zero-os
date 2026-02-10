@@ -495,6 +495,107 @@ fn validate_user_range_aligned(ptr: usize, len: usize, align: usize) -> bool {
     validate_user_range(ptr, len) && is_aligned(ptr, align)
 }
 
+// ============================================================================
+// R102-I4 FIX: UserAddr — Provenance-Safe User-Space Address Wrapper
+// ============================================================================
+
+/// Provenance-safe user-space address wrapper.
+///
+/// Wraps a `usize` instead of a raw pointer to avoid Rust pointer provenance UB
+/// when performing arithmetic on user-space addresses. User addresses are not
+/// within any Rust allocation, so `ptr.add(offset)` is technically undefined
+/// behavior under Rust's provenance model. `UserAddr` uses integer arithmetic
+/// exclusively, side-stepping the issue.
+///
+/// # Design
+///
+/// `UserAddr` is intentionally minimal — it holds an untrusted address and
+/// provides safe offset arithmetic. Validation (null checks, user-space range
+/// checks, alignment) is performed by the usercopy functions that consume it,
+/// not by `UserAddr` itself. This keeps the type lightweight and composable.
+///
+/// # Example
+///
+/// ```ignore
+/// let addr = UserAddr::new(user_buf_ptr as usize);
+/// let offset_addr = addr.checked_add(42).ok_or(())?;
+/// copy_from_user_addr(&mut kernel_buf, addr)?;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UserAddr(usize);
+
+impl UserAddr {
+    /// Create a new `UserAddr` from a raw address.
+    ///
+    /// No validation is performed here; the usercopy functions that consume
+    /// this value will validate range and alignment as needed.
+    #[inline]
+    pub const fn new(addr: usize) -> Self {
+        Self(addr)
+    }
+
+    /// Return the underlying address as `usize`.
+    #[inline]
+    pub const fn as_usize(self) -> usize {
+        self.0
+    }
+
+    /// Convert to a const raw pointer (for passing to assembly helpers).
+    ///
+    /// The returned pointer has no Rust provenance; it is manufactured from
+    /// an integer. This is intentional — user addresses should never carry
+    /// kernel provenance.
+    #[inline]
+    pub const fn as_const_ptr(self) -> *const u8 {
+        self.0 as *const u8
+    }
+
+    /// Convert to a mut raw pointer (for passing to assembly helpers).
+    #[inline]
+    pub const fn as_mut_ptr(self) -> *mut u8 {
+        self.0 as *mut u8
+    }
+
+    /// Checked offset: returns `None` on integer overflow.
+    #[inline]
+    pub const fn checked_add(self, offset: usize) -> Option<Self> {
+        match self.0.checked_add(offset) {
+            Some(addr) => Some(Self(addr)),
+            None => None,
+        }
+    }
+
+    /// Wrapping offset (matches the existing `wrapping_add` pattern in usercopy).
+    #[inline]
+    pub const fn offset(self, offset: usize) -> Self {
+        Self(self.0.wrapping_add(offset))
+    }
+}
+
+impl core::fmt::LowerHex for UserAddr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+/// Copy from user space to a kernel buffer using a provenance-safe `UserAddr`.
+///
+/// This is the recommended API for new code. It delegates to `copy_from_user_safe`
+/// internally, converting the `UserAddr` to a raw pointer only at the FFI boundary.
+#[inline]
+pub fn copy_from_user_addr(dst: &mut [u8], src: UserAddr) -> Result<(), ()> {
+    copy_from_user_safe(dst, src.as_const_ptr())
+}
+
+/// Copy from a kernel buffer to user space using a provenance-safe `UserAddr`.
+///
+/// This is the recommended API for new code. It delegates to `copy_to_user_safe`
+/// internally, converting the `UserAddr` to a raw pointer only at the FFI boundary.
+#[inline]
+pub fn copy_to_user_addr(dst: UserAddr, src: &[u8]) -> Result<(), ()> {
+    copy_to_user_safe(dst.as_mut_ptr(), src)
+}
+
 /// Fault-tolerant copy from user space to kernel buffer
 ///
 /// This function handles page faults gracefully by returning EFAULT
@@ -548,9 +649,12 @@ pub fn copy_from_user_safe(dst: &mut [u8], src: *const u8) -> Result<(), ()> {
         let _smap_guard = UserAccessGuard::new();
 
         // H-26 FIX: Copy using exception-safe helpers
+        // R102-I4 FIX: Use integer arithmetic for user pointer (src) offset to
+        // avoid pointer provenance UB. dst_ptr is a kernel pointer and safe with .add().
         for i in offset..chunk_end {
             // SAFETY: user range validated; dst is a kernel slice
-            unsafe { copy_byte_from_user(dst_ptr.add(i), src.add(i)) }?;
+            let user_src = (src as usize).wrapping_add(i) as *const u8;
+            unsafe { copy_byte_from_user(dst_ptr.add(i), user_src) }?;
             USER_COPY_STATE.with(|s| s.remaining.store(len - i - 1, Ordering::SeqCst));
         }
 
@@ -607,8 +711,10 @@ pub fn copy_to_user_safe(dst: *mut u8, src: &[u8]) -> Result<(), ()> {
         let _smap_guard = UserAccessGuard::new();
 
         // H-26 FIX: Copy using exception-safe helpers
+        // R102-I4 FIX: Use integer arithmetic for user pointer (dst) offset.
         for i in offset..chunk_end {
-            unsafe { write_byte_to_user(dst.add(i), src[i]) }?;
+            let user_dst = (dst as usize).wrapping_add(i) as *mut u8;
+            unsafe { write_byte_to_user(user_dst, src[i]) }?;
             USER_COPY_STATE.with(|s| s.remaining.store(len - i - 1, Ordering::SeqCst));
         }
 

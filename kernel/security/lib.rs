@@ -310,6 +310,10 @@ pub fn init(
 ) -> Result<SecurityReport, SecurityError> {
     let mut report = SecurityReport::empty();
 
+    // R102-11 FIX: Propagate the fail-closed policy to KASLR slide generation.
+    // In strict/Secure profiles, a deterministic kernel layout is unacceptable.
+    kaslr::set_kaslr_fail_closed(config.strict_wxorx);
+
     println!("  Initializing security hardening...");
 
     // Step 1: Initialize kptr guard (early, to protect all subsequent logs)

@@ -282,6 +282,15 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         "mov ax, ss",
         "mov [rdx + 0x98], rax",
 
+        // R102-3 FIX: Clear per-CPU syscall_active and frame_ptr on switch-out.
+        // If the outgoing task was preempted inside a syscall, its syscall_active
+        // flag (set via lock cmpxchg in syscall_entry_stub) would leak to the next
+        // task scheduled on this CPU, causing spurious -EBUSY rejections.
+        // frame_ptr is similarly stale after a switch and must not be dereferenced
+        // by the incoming task.
+        "mov qword ptr gs:[{percpu_syscall_active}], 0",
+        "mov qword ptr gs:[{percpu_frame_ptr}], 0",
+
         // R69-2 Lazy FPU: Set CR0.TS to trigger #NM on first FPU/SIMD use
         // This defers FXSAVE/FXRSTOR until actually needed, saving overhead
         // when processes don't use FPU between context switches
@@ -324,6 +333,9 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         // 返回到新进程
         "ret",
         cr0_ts = const 0x8u64,  // CR0.TS (Task Switched) bit
+        // R102-3 FIX: GS-relative offsets for per-CPU syscall state cleanup
+        percpu_frame_ptr = const 16usize,       // offset of frame_ptr in SyscallPerCpu
+        percpu_syscall_active = const 24usize,  // offset of syscall_active in SyscallPerCpu
     )
 }
 

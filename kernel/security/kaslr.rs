@@ -83,7 +83,7 @@
 //! - Runtime address randomization experiments
 //! - ASLR for dynamically loaded kernel modules
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::registers::control::{Cr4, Cr4Flags};
 
@@ -97,6 +97,21 @@ static KPTI_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether PCID is enabled (set during init if CPU supports it)
 static PCID_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// R102-11: Whether KASLR must fail-closed on RNG failure (Secure profile).
+///
+/// When true, `generate_kaslr_slide()` will panic instead of falling back to
+/// a deterministic layout. Set via `set_kaslr_fail_closed()` during security
+/// initialization based on the selected hardening profile.
+static KASLR_FAIL_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Configure whether KASLR slide generation should fail closed.
+///
+/// Called by `security::init()` based on the hardening profile:
+/// `true` for Secure, `false` for Balanced/Performance.
+pub fn set_kaslr_fail_closed(fail_closed: bool) {
+    KASLR_FAIL_CLOSED.store(fail_closed, Ordering::Release);
+}
 
 // ============================================================================
 // Partial KASLR Feature Flags
@@ -531,12 +546,20 @@ impl KptiContext {
     ///
     /// Returns the user_cr3 combined with PCID if enabled.
     /// The NO_FLUSH bit (bit 63) is not set - caller should set if needed.
+    ///
+    /// # R102-14 FIX
+    ///
+    /// Defensively masks the CR3 address to ensure 4 KiB alignment before
+    /// OR-ing in PCID bits. Includes debug assertions to catch misuse early.
     #[inline]
     pub fn user_cr3_with_pcid(&self) -> u64 {
+        let cr3 = self.user_cr3 & !0xFFF;
         if self.pcid != 0 {
-            self.user_cr3 | (self.pcid as u64)
+            debug_assert_eq!(self.user_cr3 & 0xFFF, 0, "user_cr3 must be 4 KiB aligned");
+            debug_assert!(self.pcid <= 0xFFF, "PCID out of 12-bit range: {}", self.pcid);
+            cr3 | (self.pcid as u64 & 0xFFF)
         } else {
-            self.user_cr3
+            cr3
         }
     }
 
@@ -544,22 +567,32 @@ impl KptiContext {
     ///
     /// Returns the kernel_cr3 combined with PCID if enabled.
     /// The NO_FLUSH bit (bit 63) is not set - caller should set if needed.
+    ///
+    /// # R102-14 FIX
+    ///
+    /// Same defensive masking and assertions as `user_cr3_with_pcid()`.
     #[inline]
     pub fn kernel_cr3_with_pcid(&self) -> u64 {
+        let cr3 = self.kernel_cr3 & !0xFFF;
         if self.pcid != 0 {
-            self.kernel_cr3 | (self.pcid as u64)
+            debug_assert_eq!(self.kernel_cr3 & 0xFFF, 0, "kernel_cr3 must be 4 KiB aligned");
+            debug_assert!(self.pcid <= 0xFFF, "PCID out of 12-bit range: {}", self.pcid);
+            cr3 | (self.pcid as u64 & 0xFFF)
         } else {
-            self.kernel_cr3
+            cr3
         }
     }
 }
 
-/// Active KPTI context (shared for now, per-CPU in future SMP)
-static KPTI_CONTEXT: Mutex<KptiContext> = Mutex::new(KptiContext {
-    user_cr3: 0,
-    kernel_cr3: 0,
-    pcid: 0,
-});
+/// R102-1 FIX: Lock-free KPTI context storage.
+///
+/// Replaced the global `Mutex<KptiContext>` with three atomic fields to
+/// eliminate spinlock contention on the syscall/interrupt entry/exit hot path.
+/// A Mutex here would deadlock if an interrupt fires while the lock is held
+/// and the interrupt handler also needs the KPTI context.
+static KPTI_USER_CR3: AtomicU64 = AtomicU64::new(0);
+static KPTI_KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
+static KPTI_PCID: AtomicU64 = AtomicU64::new(0);
 
 /// Install a new KPTI context (enables/disables KPTI based on separation)
 ///
@@ -571,16 +604,33 @@ static KPTI_CONTEXT: Mutex<KptiContext> = Mutex::new(KptiContext {
 ///
 /// This should only be called during process switch or KPTI setup.
 /// Installing a context with different user/kernel CR3 enables KPTI.
+///
+/// # R102-1 FIX
+///
+/// Uses atomic stores with Release ordering to ensure the context is
+/// fully visible before `KPTI_ENABLED` is set.
 pub fn install_kpti_context(ctx: KptiContext) {
+    // Write fields before enabling the flag so that readers see a
+    // consistent context once KPTI_ENABLED becomes true.
+    KPTI_USER_CR3.store(ctx.user_cr3, Ordering::Release);
+    KPTI_KERNEL_CR3.store(ctx.kernel_cr3, Ordering::Release);
+    KPTI_PCID.store(ctx.pcid as u64, Ordering::Release);
     KPTI_ENABLED.store(ctx.has_kpti(), Ordering::SeqCst);
-    let mut guard = KPTI_CONTEXT.lock();
-    *guard = ctx;
 }
 
-/// Read the current KPTI context
+/// Read the current KPTI context (lock-free)
+///
+/// # R102-1 FIX
+///
+/// Reads three atomics without taking any lock, making this safe to call
+/// from syscall entry/exit and interrupt handlers.
 #[inline]
 pub fn current_kpti_context() -> KptiContext {
-    *KPTI_CONTEXT.lock()
+    KptiContext {
+        user_cr3: KPTI_USER_CR3.load(Ordering::Relaxed),
+        kernel_cr3: KPTI_KERNEL_CR3.load(Ordering::Relaxed),
+        pcid: KPTI_PCID.load(Ordering::Relaxed) as u16,
+    }
 }
 
 // ============================================================================
@@ -991,6 +1041,12 @@ fn generate_kaslr_slide() -> u64 {
     match rng::random_range(max_slots + 1) {
         Ok(slot) => slide_from_slot(slot),
         Err(_) => {
+            // R102-11 FIX: Secure profile must not tolerate deterministic layout.
+            if KASLR_FAIL_CLOSED.load(Ordering::Acquire) {
+                panic!(
+                    "KASLR RNG failure under Secure profile — refusing deterministic kernel layout"
+                );
+            }
             // R101-8 FIX: Warn loudly instead of silent fallback
             println!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
             println!("!! WARNING: KASLR RNG failure - KASLR IS DISABLED   !!");

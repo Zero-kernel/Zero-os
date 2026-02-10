@@ -173,6 +173,29 @@ static mut SYSCALL_SCRATCH_STACKS: [AlignedStack<SYSCALL_SCRATCH_SIZE>; SYSCALL_
 /// R67-11 FIX: Added `syscall_active` field to detect nested syscalls.
 /// This prevents stack corruption when an interrupt handler attempts
 /// to execute a syscall while one is already in progress.
+///
+/// # R102-L7: SWAPGS State Machine Invariant
+///
+/// The per-CPU GS base follows a strict two-state invariant that must be
+/// maintained by ALL entry/exit paths (syscall, interrupt, NMI, MCE):
+///
+/// **Kernel context** (after `init_syscall_percpu` SWAPGS or on syscall entry):
+///   - `IA32_GS_BASE` = `&SYSCALL_PERCPU[cpu_id]` (per-CPU data, active in kernel)
+///   - `IA32_KERNEL_GS_BASE` = user GS value (swapped out, for user restore)
+///
+/// **User context** (after SWAPGS in `enter_usermode` or SYSRETQ path):
+///   - `IA32_GS_BASE` = user GS value (active in userspace)
+///   - `IA32_KERNEL_GS_BASE` = `&SYSCALL_PERCPU[cpu_id]` (swapped out, for kernel restore)
+///
+/// A misplaced SWAPGS in any code path corrupts this state machine, causing:
+/// 1. Null dereference on per-CPU access (kernel crash)
+/// 2. Per-CPU data written to user-controlled memory (privilege escalation)
+/// 3. User GS pointing to kernel memory (information leak)
+///
+/// **Critical rule**: Every path from user→kernel must execute exactly one SWAPGS,
+/// and every path from kernel→user must execute exactly one SWAPGS. NMI/MCE handlers
+/// must check whether they interrupted kernel or user context before deciding whether
+/// to SWAPGS (using the IST-based entry mechanism or checking saved CS RPL).
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub struct SyscallPerCpu {
@@ -252,7 +275,10 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 }
 
 /// 系统调用入口是否已初始化
-static mut SYSCALL_INITIALIZED: bool = false;
+/// R102-L3 FIX: Use AtomicBool instead of static mut to prevent data races
+/// if multiple CPUs attempt concurrent init_syscall_msr calls.
+static SYSCALL_INITIALIZED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// 初始化 SYSCALL/SYSRET MSR
 ///
@@ -276,7 +302,7 @@ static mut SYSCALL_INITIALIZED: bool = false;
 /// bits 31:0  = 保留（32-bit 模式使用）
 /// ```
 pub unsafe fn init_syscall_msr(syscall_entry: u64) {
-    if SYSCALL_INITIALIZED {
+    if SYSCALL_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
         println!("Warning: SYSCALL MSR already initialized");
         return;
     }
@@ -317,21 +343,29 @@ pub unsafe fn init_syscall_msr(syscall_entry: u64) {
     let efer = rdmsr(IA32_EFER);
     wrmsr(IA32_EFER, efer | EFER_SCE);
 
-    SYSCALL_INITIALIZED = true;
+    SYSCALL_INITIALIZED.store(true, core::sync::atomic::Ordering::Release);
 
-    println!("SYSCALL MSR initialized:");
-    println!("  STAR:   0x{:016x}", star_value);
-    println!("  LSTAR:  0x{:016x}", syscall_entry);
-    println!("  SFMASK: 0x{:016x}", sfmask);
-    println!(
-        "  Kernel CS: 0x{:x}, SYSRET base: 0x{:x}",
-        kernel_cs, sysret_base
-    );
+    // R102-7 FIX: Gate LSTAR/STAR/SFMASK values behind debug_assertions.
+    // These contain kernel code addresses that defeat KASLR if leaked
+    // to serial console or log output in production builds.
+    #[cfg(debug_assertions)]
+    {
+        println!("SYSCALL MSR initialized:");
+        println!("  STAR:   0x{:016x}", star_value);
+        println!("  LSTAR:  0x{:016x}", syscall_entry);
+        println!("  SFMASK: 0x{:016x}", sfmask);
+        println!(
+            "  Kernel CS: 0x{:x}, SYSRET base: 0x{:x}",
+            kernel_cs, sysret_base
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    println!("SYSCALL MSR initialized");
 }
 
 /// 检查 SYSCALL/SYSRET 是否已初始化
 pub fn is_initialized() -> bool {
-    unsafe { SYSCALL_INITIALIZED }
+    SYSCALL_INITIALIZED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// 获取当前 STAR MSR 值（调试用）
@@ -383,10 +417,18 @@ pub struct SyscallFrame {
 /// 只能在 syscall 处理器内部调用（即 syscall_dispatcher 执行期间）。
 /// 在 syscall 处理结束后，返回的指针将无效。
 ///
+/// # R102-6 FIX: Lifetime Containment
+///
+/// The underlying data is only valid for the duration of the active syscall on
+/// this CPU. This function is private (`fn`, not `pub fn`) and exists solely as
+/// the registered callback for `kernel_core::register_syscall_frame_callback`.
+/// External callers MUST use `with_current_syscall_frame()` which contains the
+/// reference inside a closure, preventing escape.
+///
 /// # Returns
 ///
 /// 返回 Some(&SyscallFrame) 如果在 syscall 上下文中，否则返回 None
-pub fn get_current_syscall_frame() -> Option<&'static kernel_core::SyscallFrame> {
+fn get_current_syscall_frame_inner() -> Option<&'static kernel_core::SyscallFrame> {
     // R67-8 FIX: Use current_cpu_id() instead of hardcoded slot 0
     let cpu_id = cpu_local::current_cpu_id();
     if cpu_id >= SYSCALL_MAX_CPUS {
@@ -403,11 +445,32 @@ pub fn get_current_syscall_frame() -> Option<&'static kernel_core::SyscallFrame>
     }
 }
 
+/// R102-6 FIX: Execute a closure with the current syscall frame.
+///
+/// This is the public API for accessing the syscall frame during a syscall handler.
+/// The closure-based design prevents the frame reference from escaping beyond the
+/// active syscall window, eliminating the use-after-free hazard of the old
+/// `get_current_syscall_frame() -> Option<&'static SyscallFrame>` API.
+///
+/// # Arguments
+///
+/// * `f` - Closure that receives `&SyscallFrame` and returns a value of type `R`.
+///
+/// # Returns
+///
+/// `Some(R)` if called during an active syscall on this CPU, `None` otherwise.
+pub fn with_current_syscall_frame<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&kernel_core::SyscallFrame) -> R,
+{
+    get_current_syscall_frame_inner().map(f)
+}
+
 /// 注册 syscall 帧回调到 kernel_core
 ///
 /// 在 syscall 初始化时调用，让 kernel_core 能访问当前 syscall 帧
 pub fn register_frame_callback() {
-    kernel_core::register_syscall_frame_callback(get_current_syscall_frame);
+    kernel_core::register_syscall_frame_callback(get_current_syscall_frame_inner);
 }
 
 /// R67-8 FIX: Initialize per-CPU syscall metadata and kernel GS base.
@@ -550,8 +613,12 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // using CLAC here provides redundant protection and makes the security intent
         // explicit for future maintainers. CLAC is part of the SMAP instruction set
         // (same as STAC) and is guaranteed to be available on any CPU with SMAP support.
-        // On CPUs without SMAP, CLAC is a NOP (it's encoded as the same opcode space
-        // and won't #UD on CPUs that support the necessary instruction set).
+        //
+        // R102-5 FIX: SMAP is a hard boot requirement for Zero-OS (enforced by
+        // `require_smap_support()` during early boot). Since SMAP support is guaranteed
+        // at this point, CLAC is always a valid instruction and will never #UD.
+        // The kernel uses STAC/CLAC throughout usercopy paths (UserAccessGuard) and
+        // relies on SMAP to prevent inadvertent kernel access to user memory.
         "clac",
 
         // CVE-2019-1125 SWAPGS 防护：
