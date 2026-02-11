@@ -565,10 +565,33 @@ impl UserAddr {
         }
     }
 
+    /// R103-L1 FIX: Checked offset that returns `None` on overflow or if the
+    /// result would land outside user-space.  Callers that need overflow detection
+    /// (e.g., buffer-end computation) should use this instead of `wrapping_offset`.
+    #[inline]
+    pub fn checked_offset(self, off: usize) -> Option<Self> {
+        let addr = self.0.checked_add(off)?;
+        if addr >= USER_SPACE_TOP {
+            return None;
+        }
+        Some(Self(addr))
+    }
+
     /// Wrapping offset (matches the existing `wrapping_add` pattern in usercopy).
+    ///
+    /// R103-L1 FIX: Renamed from `offset` to `wrapping_offset` to clearly
+    /// communicate the wrapping semantics. The old name `offset` is retained
+    /// as a deprecated alias to avoid breaking existing callers.
+    #[inline]
+    pub const fn wrapping_offset(self, offset: usize) -> Self {
+        Self(self.0.wrapping_add(offset))
+    }
+
+    /// Deprecated: use `wrapping_offset` (wrapping) or `checked_offset` (safe).
+    #[deprecated(note = "R103-L1: use checked_offset() or wrapping_offset() instead")]
     #[inline]
     pub const fn offset(self, offset: usize) -> Self {
-        Self(self.0.wrapping_add(offset))
+        self.wrapping_offset(offset)
     }
 }
 

@@ -2603,7 +2603,7 @@ fn sys_clone(
         parent_brk,
         parent_name,
         parent_priority,
-        parent_context,
+        _parent_context,
         parent_user_stack,
         parent_fs_base,
         parent_gs_base,
@@ -2929,6 +2929,9 @@ fn sys_clone(
             child.state = ProcessState::Terminated;
             drop(child);
             crate::process::terminate_process(child_pid, -1);
+            // R103-L2 FIX: Gate diagnostic println behind debug_assertions.
+            // In release builds this leaks internal PID and seccomp race state.
+            #[cfg(debug_assertions)]
             println!(
                 "sys_clone: rejecting CLONE_VM during seccomp installation (pid={})",
                 parent_pid
@@ -3012,19 +3015,24 @@ fn sys_clone(
             }
         });
 
+        // R103-1 FIX (fail-closed): If the syscall frame is unavailable (cleared by
+        // a preemptive context switch racing switch_context's gs:[frame_ptr]=0 reset),
+        // we MUST NOT fall back to `parent.context`.  That snapshot may contain ring-0
+        // CS/SS, a stale kernel RSP, or state from a different scheduling epoch — any
+        // of which would crash or escalate privilege once the child is scheduled.
+        //
+        // Instead, terminate the child and return EBUSY so the caller can retry.
         if frame_applied.is_none() {
-            // 回退：使用 parent.context（不应该发生）
-            println!("sys_clone: WARNING - syscall frame not available, using stale context");
-            child.context = parent_context;
-            child.context.rax = 0;
-            if !stack.is_null() {
-                let sp = stack as u64;
-                child.context.rsp = sp;
-                child.context.rbp = sp;
-                child.user_stack = Some(VirtAddr::new(sp));
-            } else {
-                child.user_stack = parent_user_stack;
-            }
+            #[cfg(debug_assertions)]
+            println!(
+                "sys_clone: ABORT - syscall frame not available, refusing stale context (pid={})",
+                child_pid
+            );
+            child.state = ProcessState::Terminated;
+            child.memory_space = 0; // Do not free shared address space
+            drop(child);
+            crate::process::terminate_process(child_pid, -1);
+            return Err(SyscallError::EBUSY);
         }
 
         // R102-10 FIX: Gate register/address dump behind debug_assertions.

@@ -229,13 +229,38 @@ static mut SYSCALL_PERCPU: [SyscallPerCpu; SYSCALL_MAX_CPUS] =
     [SyscallPerCpu::new(); SYSCALL_MAX_CPUS];
 
 /// Offset of scratch_top in SyscallPerCpu (for GS-relative addressing)
-const PERCPU_SCRATCH_TOP_OFFSET: usize = 0;
+///
+/// R103-3 FIX: Made `pub` so `context_switch.rs` can import these offsets
+/// instead of duplicating them as hard-coded literals. A single source of
+/// truth prevents silent desync when fields are reordered.
+pub const PERCPU_SCRATCH_TOP_OFFSET: usize = 0;
 /// Offset of user_rsp_shadow in SyscallPerCpu
-const PERCPU_USER_RSP_OFFSET: usize = 8;
+pub const PERCPU_USER_RSP_OFFSET: usize = 8;
 /// Offset of frame_ptr in SyscallPerCpu
-const PERCPU_FRAME_PTR_OFFSET: usize = 16;
+pub const PERCPU_FRAME_PTR_OFFSET: usize = 16;
 /// R67-11 FIX: Offset of syscall_active flag in SyscallPerCpu
-const PERCPU_SYSCALL_ACTIVE_OFFSET: usize = 24;
+pub const PERCPU_SYSCALL_ACTIVE_OFFSET: usize = 24;
+
+// R103-3 FIX: Compile-time assertions that the offsets match the struct layout.
+// If SyscallPerCpu is reordered, these will produce a build error.
+const _: () = {
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, scratch_top) == PERCPU_SCRATCH_TOP_OFFSET,
+        "PERCPU_SCRATCH_TOP_OFFSET does not match struct layout"
+    );
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, user_rsp_shadow) == PERCPU_USER_RSP_OFFSET,
+        "PERCPU_USER_RSP_OFFSET does not match struct layout"
+    );
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, frame_ptr) == PERCPU_FRAME_PTR_OFFSET,
+        "PERCPU_FRAME_PTR_OFFSET does not match struct layout"
+    );
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, syscall_active) == PERCPU_SYSCALL_ACTIVE_OFFSET,
+        "PERCPU_SYSCALL_ACTIVE_OFFSET does not match struct layout"
+    );
+};
 
 /// R67-11 FIX: Error code for nested syscall rejection.
 /// Using -EBUSY (16) to indicate the syscall layer is busy.

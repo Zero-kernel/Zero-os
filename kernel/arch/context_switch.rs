@@ -333,9 +333,11 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         // 返回到新进程
         "ret",
         cr0_ts = const 0x8u64,  // CR0.TS (Task Switched) bit
-        // R102-3 FIX: GS-relative offsets for per-CPU syscall state cleanup
-        percpu_frame_ptr = const 16usize,       // offset of frame_ptr in SyscallPerCpu
-        percpu_syscall_active = const 24usize,  // offset of syscall_active in SyscallPerCpu
+        // R103-3 FIX: Import GS-relative offsets from syscall.rs (single source of truth)
+        // instead of duplicating magic numbers. If SyscallPerCpu is reordered, the
+        // compile-time assertions in syscall.rs will catch the mismatch at build time.
+        percpu_frame_ptr = const crate::syscall::PERCPU_FRAME_PTR_OFFSET,
+        percpu_syscall_active = const crate::syscall::PERCPU_SYSCALL_ACTIVE_OFFSET,
     )
 }
 

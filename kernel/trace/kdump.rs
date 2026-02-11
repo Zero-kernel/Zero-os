@@ -312,7 +312,8 @@ pub fn capture_crash_context(info: &PanicInfo) -> &'static CrashDump {
     let state = KDUMP_STATE.load(Ordering::Acquire);
     if state == 2 {
         // Already captured - return existing dump
-        return unsafe { &KDUMP_STORAGE };
+        // R103-L3 FIX: Use raw pointer to avoid `static mut` reference UB.
+        return unsafe { &*core::ptr::addr_of!(KDUMP_STORAGE) };
     }
 
     // Try to be the capturing CPU
@@ -321,17 +322,19 @@ pub fn capture_crash_context(info: &PanicInfo) -> &'static CrashDump {
         .is_ok()
     {
         // We are the capturing CPU
+        // R103-L3 FIX: Use raw mut pointer to avoid `static mut` reference UB.
         unsafe {
-            KDUMP_STORAGE.capture(info);
+            (*core::ptr::addr_of_mut!(KDUMP_STORAGE)).capture(info);
         }
         KDUMP_STATE.store(2, Ordering::Release);
-        unsafe { &KDUMP_STORAGE }
+        unsafe { &*core::ptr::addr_of!(KDUMP_STORAGE) }
     } else {
         // Another CPU is capturing - spin briefly until capture completes.
         for _ in 0..10_000 {
             if KDUMP_STATE.load(Ordering::Acquire) == 2 {
                 // R92-1 FIX: Only return KDUMP_STORAGE after confirmed complete.
-                return unsafe { &KDUMP_STORAGE };
+                // R103-L3 FIX: Use raw pointer to avoid `static mut` reference UB.
+                return unsafe { &*core::ptr::addr_of!(KDUMP_STORAGE) };
             }
             core::hint::spin_loop();
         }
@@ -401,7 +404,8 @@ pub fn emit_encrypted_dump(dump: &CrashDump) {
     }
 
     // Now we have exclusive access to KDUMP_BUF (emit-once guarantees single writer)
-    let out = unsafe { &mut KDUMP_BUF };
+    // R103-L3 FIX: Use raw mut pointer to avoid `static mut` reference UB.
+    let out = unsafe { &mut *core::ptr::addr_of_mut!(KDUMP_BUF) };
     let len = dump.serialize_into(out);
     if len == 0 {
         // Serialization failed - scrub and return
@@ -923,7 +927,8 @@ fn scrub_kdump_storage_if_captured() {
     if KDUMP_STATE.load(Ordering::Acquire) == 2 {
         unsafe {
             // Zero all sensitive fields in KDUMP_STORAGE
-            let storage = &mut KDUMP_STORAGE;
+            // R103-L3 FIX: Use raw mut pointer to avoid `static mut` reference UB.
+            let storage = &mut *core::ptr::addr_of_mut!(KDUMP_STORAGE);
 
             // Zero registers
             let regs_ptr = &mut storage.regs as *mut CpuRegs as *mut u8;

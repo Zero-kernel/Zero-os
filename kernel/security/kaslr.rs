@@ -590,9 +590,25 @@ impl KptiContext {
 /// eliminate spinlock contention on the syscall/interrupt entry/exit hot path.
 /// A Mutex here would deadlock if an interrupt fires while the lock is held
 /// and the interrupt handler also needs the KPTI context.
+///
+/// R103-I1 FIX: Added a seqlock (sequence counter) to guarantee consistent
+/// snapshots across the three atomics. Without the seqlock, a concurrent
+/// `install_kpti_context()` call can produce a torn read where `user_cr3`
+/// comes from one context and `kernel_cr3` from another — loading such a
+/// mixed CR3 pair into the CPU would cause an immediate page fault or,
+/// worse, silently bypass KPTI isolation.
+///
+/// Protocol:
+/// - Writer increments `KPTI_SEQ` to an odd value (write-in-progress),
+///   updates the three fields, then increments to the next even value.
+/// - Reader loads `KPTI_SEQ` (Acquire); if odd, spins. Reads the three
+///   fields (Acquire). Loads `KPTI_SEQ` again; if it changed, retries.
 static KPTI_USER_CR3: AtomicU64 = AtomicU64::new(0);
 static KPTI_KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 static KPTI_PCID: AtomicU64 = AtomicU64::new(0);
+/// Seqlock sequence counter for KPTI context consistency.
+/// Even = no write in progress; odd = write in progress.
+static KPTI_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Install a new KPTI context (enables/disables KPTI based on separation)
 ///
@@ -609,12 +625,64 @@ static KPTI_PCID: AtomicU64 = AtomicU64::new(0);
 ///
 /// Uses atomic stores with Release ordering to ensure the context is
 /// fully visible before `KPTI_ENABLED` is set.
+///
+/// # R103-I1 Safety Requirement
+///
+/// **Interrupts must be disabled** (or the caller must otherwise guarantee
+/// that no interrupt handler will call `current_kpti_context()` /
+/// `enter_kernel_mode()` / `return_to_user_mode()` on the same CPU) while
+/// this function is executing.  The seqlock write path sets `KPTI_SEQ` to
+/// an odd value; if an interrupt fires in that window and the handler reads
+/// the seqlock, it will spin forever waiting for the writer to complete —
+/// which cannot happen until the interrupt returns.  Process switch paths
+/// already run with interrupts disabled, so this is satisfied in practice.
 pub fn install_kpti_context(ctx: KptiContext) {
-    // Write fields before enabling the flag so that readers see a
-    // consistent context once KPTI_ENABLED becomes true.
+    // R103-I1 FIX: Debug-mode guard — verify interrupts are disabled to prevent
+    // deadlock with interrupt handlers that call current_kpti_context().
+    debug_assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "install_kpti_context: must be called with interrupts disabled"
+    );
+
+    // R103-I1 FIX: Seqlock write protocol.
+    //
+    // Step 1: Acquire exclusive write access by CAS-ing KPTI_SEQ from an
+    //         even value to odd (write-in-progress).  If another writer is
+    //         active (seq is odd), spin until it completes.
+    let seq = loop {
+        let s = KPTI_SEQ.load(Ordering::Relaxed);
+        if (s & 1) != 0 {
+            // Another writer is in progress; wait.
+            core::hint::spin_loop();
+            continue;
+        }
+        match KPTI_SEQ.compare_exchange_weak(
+            s,
+            s.wrapping_add(1), // odd → write in progress
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break s,
+            Err(_) => {
+                core::hint::spin_loop();
+                continue;
+            }
+        }
+    };
+
+    // Step 2: Write the three context fields.
     KPTI_USER_CR3.store(ctx.user_cr3, Ordering::Release);
     KPTI_KERNEL_CR3.store(ctx.kernel_cr3, Ordering::Release);
     KPTI_PCID.store(ctx.pcid as u64, Ordering::Release);
+
+    // Step 3: Publish the completed write by advancing KPTI_SEQ to the
+    //         next even value.  Release ordering ensures all field stores
+    //         are visible before a reader observes the new sequence number.
+    KPTI_SEQ.store(seq.wrapping_add(2), Ordering::Release);
+
+    // Update the enabled flag after the seqlock is released so that
+    // readers who see KPTI_ENABLED == true can immediately obtain a
+    // consistent snapshot via current_kpti_context().
     KPTI_ENABLED.store(ctx.has_kpti(), Ordering::SeqCst);
 }
 
@@ -624,12 +692,40 @@ pub fn install_kpti_context(ctx: KptiContext) {
 ///
 /// Reads three atomics without taking any lock, making this safe to call
 /// from syscall entry/exit and interrupt handlers.
+///
+/// # R103-I1 FIX
+///
+/// Uses a seqlock read protocol to guarantee a consistent snapshot of the
+/// three KPTI fields.  The reader spins only if a concurrent writer is
+/// active (sequence number is odd) or if the sequence number changed
+/// between the first and second read (indicating a concurrent update).
+/// In practice, `install_kpti_context()` runs only during process switch
+/// or KPTI setup, so contention is extremely rare and the loop typically
+/// completes on the first iteration.
 #[inline]
 pub fn current_kpti_context() -> KptiContext {
-    KptiContext {
-        user_cr3: KPTI_USER_CR3.load(Ordering::Relaxed),
-        kernel_cr3: KPTI_KERNEL_CR3.load(Ordering::Relaxed),
-        pcid: KPTI_PCID.load(Ordering::Relaxed) as u16,
+    loop {
+        let seq1 = KPTI_SEQ.load(Ordering::Acquire);
+        if (seq1 & 1) != 0 {
+            // Write in progress — spin.
+            core::hint::spin_loop();
+            continue;
+        }
+
+        let user_cr3 = KPTI_USER_CR3.load(Ordering::Acquire);
+        let kernel_cr3 = KPTI_KERNEL_CR3.load(Ordering::Acquire);
+        let pcid = KPTI_PCID.load(Ordering::Acquire) as u16;
+
+        let seq2 = KPTI_SEQ.load(Ordering::Acquire);
+        if seq1 == seq2 {
+            return KptiContext {
+                user_cr3,
+                kernel_cr3,
+                pcid,
+            };
+        }
+        // Sequence changed — a concurrent write occurred; retry.
+        core::hint::spin_loop();
     }
 }
 
@@ -649,7 +745,10 @@ pub fn current_kpti_context() -> KptiContext {
 /// from syscall/interrupt entry paths before accessing kernel data.
 #[inline]
 pub fn enter_kernel_mode() {
-    if !KPTI_ENABLED.load(Ordering::Relaxed) {
+    // R103-I1 FIX: Acquire ordering ensures that when KPTI_ENABLED is true,
+    // all field stores from install_kpti_context() are visible to this CPU
+    // before current_kpti_context() reads them.
+    if !KPTI_ENABLED.load(Ordering::Acquire) {
         return;
     }
 
@@ -679,7 +778,8 @@ pub fn enter_kernel_mode() {
 /// from syscall/interrupt exit paths just before returning to user mode.
 #[inline]
 pub fn return_to_user_mode() {
-    if !KPTI_ENABLED.load(Ordering::Relaxed) {
+    // R103-I1 FIX: Acquire ordering (see enter_kernel_mode comment).
+    if !KPTI_ENABLED.load(Ordering::Acquire) {
         return;
     }
 

@@ -146,6 +146,8 @@ pub enum KernelStackError {
     AllocationFailed,
     /// 页表映射失败
     MapFailed,
+    /// R103-I2 FIX: 地址计算溢出（PID 超出内核栈地址空间范围）
+    AddressOverflow,
 }
 
 /// 进程创建错误
@@ -170,30 +172,37 @@ pub const MAX_PID: ProcessId = ((u64::MAX - KSTACK_BASE) / KSTACK_STRIDE) as Pro
 
 /// 计算指定 PID 的内核栈虚拟地址范围
 ///
-/// 返回 (栈底, 栈顶)，栈向下生长，栈顶用于 TSS.rsp0
+/// 返回 Ok((栈底, 栈顶))，栈向下生长，栈顶用于 TSS.rsp0
+///
+/// # R103-I2 FIX
+///
+/// Returns `Err(KernelStackError::AddressOverflow)` instead of panicking
+/// when the PID causes address arithmetic to overflow.  Although current
+/// callers validate `pid <= MAX_PID`, this function is `pub` and future
+/// call sites might not enforce the bound.  Returning `Result` makes the
+/// contract explicit and prevents kernel panics from propagating.
 #[inline]
-pub fn kernel_stack_slot(pid: ProcessId) -> (VirtAddr, VirtAddr) {
+pub fn kernel_stack_slot(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), KernelStackError> {
     // R102-8 FIX: Use checked arithmetic to prevent silent wrapping on invalid PID.
-    // While callers bound PID via MAX_PID, this helper is public and must defend
-    // against misuse that could cause overlapping kernel stacks.
+    // R103-I2 FIX: Propagate overflow as error instead of panicking.
     let slot_offset = (pid as u64)
         .checked_mul(KSTACK_STRIDE)
-        .expect("kernel_stack_slot: pid * KSTACK_STRIDE overflow");
+        .ok_or(KernelStackError::AddressOverflow)?;
     let guard_base_addr = KSTACK_BASE
         .checked_add(slot_offset)
-        .expect("kernel_stack_slot: KSTACK_BASE + slot_offset overflow");
+        .ok_or(KernelStackError::AddressOverflow)?;
 
     let guard_bytes = KSTACK_GUARD_PAGES as u64 * PAGE_SIZE; // compile-time constant, safe
     let stack_base_addr = guard_base_addr
         .checked_add(guard_bytes)
-        .expect("kernel_stack_slot: guard_base + guard_bytes overflow");
+        .ok_or(KernelStackError::AddressOverflow)?;
 
     let stack_bytes = KSTACK_PAGES as u64 * PAGE_SIZE; // compile-time constant, safe
     let stack_top_addr = stack_base_addr
         .checked_add(stack_bytes)
-        .expect("kernel_stack_slot: stack_base + stack_bytes overflow");
+        .ok_or(KernelStackError::AddressOverflow)?;
 
-    (VirtAddr::new(stack_base_addr), VirtAddr::new(stack_top_addr))
+    Ok((VirtAddr::new(stack_base_addr), VirtAddr::new(stack_top_addr)))
 }
 
 /// 为指定 PID 分配并映射带守护页的内核栈
@@ -205,8 +214,15 @@ pub fn kernel_stack_slot(pid: ProcessId) -> (VirtAddr, VirtAddr) {
 ///
 /// 成功返回 (栈底, 栈顶)，失败返回错误
 pub fn allocate_kernel_stack(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), KernelStackError> {
-    let (stack_base, stack_top) = kernel_stack_slot(pid);
-    let guard_base = VirtAddr::new(KSTACK_BASE + pid as u64 * KSTACK_STRIDE);
+    let (stack_base, stack_top) = kernel_stack_slot(pid)?;
+    // R103-I2 FIX: Derive guard_base from stack_base using checked arithmetic
+    // instead of the previous unchecked `KSTACK_BASE + pid as u64 * KSTACK_STRIDE`.
+    let guard_bytes = KSTACK_GUARD_PAGES as u64 * PAGE_SIZE;
+    let guard_base_addr = stack_base
+        .as_u64()
+        .checked_sub(guard_bytes)
+        .ok_or(KernelStackError::AddressOverflow)?;
+    let guard_base = VirtAddr::new(guard_base_addr);
 
     let mut frame_alloc = FrameAllocator::new();
 

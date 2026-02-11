@@ -499,14 +499,16 @@ static PERMISSIVE_SLOT: PolicySlot = PolicySlot {
 #[cfg(feature = "lsm")]
 static ACTIVE_POLICY_SLOT: AtomicPtr<PolicySlot> = AtomicPtr::new(core::ptr::null_mut());
 
-/// Storage for user-provided policy slots.
+/// R103-4 FIX: Replaced `static mut USER_POLICY_SLOT` with a Mutex-guarded
+/// leaked `Box`, eliminating the `static mut` UB that Rust 2024 edition rejects.
 ///
-/// Since policies are &'static, they live forever, but we need somewhere
-/// to store the PolicySlot wrapper. We use a simple approach: the slot
-/// is allocated statically for each set_policy call. For simplicity,
-/// we only support a single non-default policy at a time.
+/// `Box::leak` produces a `&'static mut PolicySlot` with a stable heap address
+/// that we hand to `ACTIVE_POLICY_SLOT`. The `Mutex` protects the leaked pointer
+/// from concurrent `set_policy` calls (boot-time only, so no contention concern).
+/// The previous policy slot is intentionally leaked — policies are `&'static`
+/// and `set_policy` is called at most once or twice during boot.
 #[cfg(feature = "lsm")]
-static mut USER_POLICY_SLOT: Option<PolicySlot> = None;
+static USER_POLICY_SLOT: Mutex<Option<&'static PolicySlot>> = Mutex::new(None);
 
 /// Set the active security policy.
 ///
@@ -514,28 +516,28 @@ static mut USER_POLICY_SLOT: Option<PolicySlot> = None;
 ///
 /// * `policy` - Static reference to a policy implementation
 ///
-/// # Safety
+/// # Note
 ///
-/// This function is safe but should ideally be called only during boot.
+/// This function should ideally be called only during boot.
 /// If called while hooks are executing, the old policy may still be
 /// called until the next hook invocation. This is intentional to avoid
 /// requiring locks on the hot path.
 ///
-/// # Note
-///
 /// This is a no-op when the `lsm` feature is disabled.
 #[cfg(feature = "lsm")]
 pub fn set_policy(policy: &'static dyn LsmPolicy) {
-    // Store the policy in the user slot
-    // Safety: This is safe because:
-    // 1. We're storing a 'static reference
-    // 2. The atomic store below ensures proper synchronization
-    unsafe {
-        USER_POLICY_SLOT = Some(PolicySlot { policy });
-        // Get a pointer to the slot
-        let slot_ptr = USER_POLICY_SLOT.as_ref().unwrap() as *const PolicySlot as *mut PolicySlot;
-        ACTIVE_POLICY_SLOT.store(slot_ptr, Ordering::Release);
+    // R103-4 FIX: Allocate the PolicySlot on the heap and leak it for a stable
+    // 'static address. No `static mut`, no UB.
+    let slot: &'static PolicySlot = alloc::boxed::Box::leak(alloc::boxed::Box::new(PolicySlot { policy }));
+    let slot_ptr = slot as *const PolicySlot as *mut PolicySlot;
+
+    // Store reference for bookkeeping (previous slot is intentionally leaked)
+    {
+        let mut guard = USER_POLICY_SLOT.lock();
+        *guard = Some(slot);
     }
+
+    ACTIVE_POLICY_SLOT.store(slot_ptr, Ordering::Release);
 }
 
 #[cfg(not(feature = "lsm"))]

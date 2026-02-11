@@ -47,7 +47,7 @@ compile_error!("livepatch: feature `insecure-ecdsa-stub` must not be enabled in 
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 use x86_64::structures::idt::InterruptStackFrame;
 use x86_64::VirtAddr;
@@ -107,31 +107,45 @@ pub trait KernelOps: Sync {
     // The livepatch crate does not depend on the `lsm` crate directly.
     // Instead, the KernelOps implementor (in kernel_core or the main kernel)
     // is responsible for calling `lsm::hook_kpatch_*` and translating
-    // `LsmError` to `Errno`. Default implementations permit all operations,
-    // maintaining backwards compatibility.
+    // `LsmError` to `Errno`. R103-5 FIX: Default implementations now DENY
+    // all operations (fail-closed). Implementors must explicitly wire in
+    // the LSM hooks to permit livepatch operations.
     // ========================================================================
 
     /// LSM check before loading a livepatch module.
     ///
     /// Implementors should call `lsm::hook_kpatch_load(task, patch_len)`
     /// and return `Err(Errno::EPERM)` on denial.
+    ///
+    /// R103-5 FIX: Default to `Err(EPERM)` (fail-closed).
+    ///
+    /// The previous default `Ok(())` silently permitted all livepatch operations
+    /// whenever the KernelOps implementor did not override these methods.  Since
+    /// livepatch introduces arbitrary kernel code, the fail-safe default must
+    /// DENY operations until the implementor explicitly wires in the LSM hooks.
     fn check_lsm_kpatch_load(&self, _patch_len: usize) -> Result<(), Errno> {
-        Ok(())
+        Err(Errno::EPERM)
     }
 
     /// LSM check before enabling a livepatch.
+    ///
+    /// R103-5 FIX: Fail-closed default.
     fn check_lsm_kpatch_enable(&self, _patch_id: u64) -> Result<(), Errno> {
-        Ok(())
+        Err(Errno::EPERM)
     }
 
     /// LSM check before disabling a livepatch.
+    ///
+    /// R103-5 FIX: Fail-closed default.
     fn check_lsm_kpatch_disable(&self, _patch_id: u64) -> Result<(), Errno> {
-        Ok(())
+        Err(Errno::EPERM)
     }
 
     /// LSM check before unloading a livepatch.
+    ///
+    /// R103-5 FIX: Fail-closed default.
     fn check_lsm_kpatch_unload(&self, _patch_id: u64) -> Result<(), Errno> {
-        Ok(())
+        Err(Errno::EPERM)
     }
 
     /// Copy from user memory into a kernel buffer.
@@ -355,6 +369,17 @@ struct PatchSlot {
     // TSC tick (RDTSC) when the patch transitioned to Enabled; 0 = never/unknown.
     // Used for panic-time rollback of recently-enabled patches.
     enabled_tsc: AtomicU64,
+
+    // R103-2 FIX: In-flight dispatch counter.
+    //
+    // Incremented by `breakpoint_dispatch` before redirecting RIP into the handler,
+    // decremented after the handler returns (via return trampoline or wrapper).
+    // `kpatch_unload` must wait for this counter to reach 0 after `kpatch_disable`
+    // + `sync_cores()` to ensure no CPU is still executing handler code before
+    // freeing the exec memory.  Without this, a concurrent breakpoint_dispatch
+    // that loaded the handler address but has not yet executed `iretq` back to it
+    // would jump into freed memory.
+    in_flight: AtomicU32,
 }
 
 impl PatchSlot {
@@ -369,6 +394,7 @@ impl PatchSlot {
             exec_addr: AtomicUsize::new(0),
             exec_len: AtomicUsize::new(0),
             enabled_tsc: AtomicU64::new(0),
+            in_flight: AtomicU32::new(0), // R103-2 FIX
         }
     }
 }
@@ -961,12 +987,49 @@ pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
     let exec_addr = slot.exec_addr.swap(0, Ordering::AcqRel);
     let exec_len = slot.exec_len.swap(0, Ordering::AcqRel);
 
+    // R103-2 FIX: Quiescence barrier before freeing handler memory.
+    //
+    // After kpatch_disable restores the original instruction, no NEW breakpoint
+    // dispatches can start for this slot. However, a CPU that was already inside
+    // `breakpoint_dispatch` may have loaded `slot.handler` and is about to (or
+    // has already) rewritten its stack frame's RIP to point into the handler blob.
+    //
+    // Step 1: IPI + serializing barrier — ensures every CPU has retired any
+    //         in-progress breakpoint_dispatch that read the old handler address.
+    // Step 2: Spin-wait on `in_flight` counter — ensures every dispatch that
+    //         incremented the counter has completed the handler and returned.
+    ops.sync_cores();
+
+    // Bounded spin: 10 ms max (10_000 iterations × ~1µs).  If a handler takes
+    // longer than this, something is catastrophically wrong.
+    const MAX_QUIESCENCE_SPINS: u32 = 10_000;
+    let mut quiesced = false;
+    for _ in 0..MAX_QUIESCENCE_SPINS {
+        if slot.in_flight.load(Ordering::Acquire) == 0 {
+            quiesced = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    // R103-2 FIX: If handlers are still in-flight after the timeout,
+    // we MUST NOT free exec memory (UAF). Restore the slot to Disabled
+    // and let the caller retry later.
+    if !quiesced {
+        // Restore the exec addresses so the slot remains valid.
+        slot.exec_addr.store(exec_addr, Ordering::Release);
+        slot.exec_len.store(exec_len, Ordering::Release);
+        slot.state.store(PatchState::Disabled as u8, Ordering::Release);
+        return Err(Errno::EBUSY);
+    }
+
     slot.id.store(0, Ordering::Release);
     slot.target.store(0, Ordering::Release);
     slot.handler.store(0, Ordering::Release);
     slot.orig_valid.store(0, Ordering::Release);
     slot.orig_byte.store(0, Ordering::Release);
     slot.enabled_tsc.store(0, Ordering::Release);
+    slot.in_flight.store(0, Ordering::Release); // R103-2 FIX: reset counter
 
     // Finally, clear the slot.
     slot.state.store(PatchState::Empty as u8, Ordering::Release);
@@ -1140,9 +1203,19 @@ pub fn breakpoint_dispatch(stack_frame: &mut InterruptStackFrame) -> bool {
             return false;
         }
 
+        // R103-2 FIX: Track in-flight dispatches so kpatch_unload can wait
+        // for all CPUs to finish executing handler code before freeing memory.
+        slot.in_flight.fetch_add(1, Ordering::AcqRel);
+
         // Rewrite RIP to patch handler using Volatile::update().
         // The x86_64 crate's InterruptStackFrame wraps the value in Volatile
         // to prevent optimizations that could break exception handling.
+        //
+        // NOTE: The in_flight counter is decremented by the handler epilogue
+        // (return trampoline). Handlers generated by the livepatch compiler
+        // are required to call `kpatch_handler_return(slot_index)` before
+        // returning, which calls `in_flight.fetch_sub(1)`. For safety, the
+        // kpatch_unload spin-wait has a bounded timeout as a backstop.
         unsafe {
             stack_frame.as_mut().update(|frame| {
                 frame.instruction_pointer = VirtAddr::new(handler as u64);
@@ -1151,6 +1224,27 @@ pub fn breakpoint_dispatch(stack_frame: &mut InterruptStackFrame) -> bool {
         return true;
     }
     false
+}
+
+/// R103-2 FIX: Decrement the in-flight dispatch counter for a patch slot.
+///
+/// Must be called by livepatch handler epilogues (return trampolines) to signal
+/// that the handler has finished executing.  `kpatch_unload` spin-waits on this
+/// counter reaching zero before freeing the handler's exec memory.
+///
+/// # Arguments
+///
+/// * `slot_index` - Index into the patch table (0-based)
+///
+/// # Safety
+///
+/// Calling with an out-of-bounds index is a no-op (silently ignored).
+pub fn kpatch_handler_return(slot_index: usize) {
+    if let Some(table) = patch_table_get() {
+        if let Some(slot) = table.get(slot_index) {
+            slot.in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 /// A ready-to-install #BP handler for livepatch.
