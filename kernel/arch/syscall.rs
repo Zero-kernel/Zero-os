@@ -88,7 +88,26 @@ const SYSCALL_FRAME_QWORDS: usize = 16;
 /// 系统调用帧大小（字节）
 const SYSCALL_FRAME_SIZE: usize = SYSCALL_FRAME_QWORDS * 8;
 
-/// 临时栈大小（4KB，仅用于单核）
+/// Scratch stack size per logical CPU.
+///
+/// R104-7 DOC: Each CPU gets a private 4 KiB scratch stack used exclusively
+/// inside the `syscall_entry` assembly trampoline.  The stack is active only
+/// while maskable interrupts are disabled (SFMASK clears IF), so it cannot be
+/// re-entered by another syscall.  NMIs and machine-check exceptions can still
+/// fire on this stack; their handlers must be minimal.
+///
+/// **Budget breakdown (scratch stack usage before kernel-stack switch):**
+///   - Register save frame:  SYSCALL_FRAME_QWORDS × 8 = 128 bytes
+///   - `cld` + nested-syscall detection (`lock cmpxchg`): negligible stack
+///   - `call get_rsp0`:      one return-address push = 8 bytes
+///   - **Total estimated:**  ~136 bytes  ⇒  headroom ≈ 3.9 KiB
+///
+/// Note: The FXSAVE area (512 bytes) and the duplicated register frame are
+/// allocated on the **kernel stack** (TSS RSP0), not here.  See the assembly
+/// at phase 4 of `syscall_entry` for the kernel-stack layout.
+///
+/// If additional work is added to the assembly trampoline before the kernel-
+/// stack switch (e.g. shadow-stack CET verification), revisit this budget.
 const SYSCALL_SCRATCH_SIZE: usize = 4096;
 
 /// FPU/SIMD 保存区大小（FXSAVE/FXRSTOR 需要 512 字节且 16 字节对齐）

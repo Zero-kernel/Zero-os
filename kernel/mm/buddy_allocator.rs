@@ -262,12 +262,23 @@ impl BuddyAllocator {
     }
 
     /// 检查buddy块是否空闲
+    ///
+    /// R104-1 FIX: Check full block extent (`buddy_idx + pages`), not just the
+    /// start index. The bitmap is sized to `total_pages * 2`, so an incomplete
+    /// range check silently reads the extra bitmap region and may treat out-of-
+    /// range pages as "free", causing `merge_blocks()` to create oversized free
+    /// blocks that hand out frames beyond managed memory.
     fn is_buddy_free(&self, buddy_idx: usize, order: usize) -> bool {
-        if buddy_idx >= self.total_pages {
+        let pages = 1 << order;
+        // Reject if any part of the buddy block extends beyond managed pages.
+        // Use checked_add to guard against usize overflow on pathological input.
+        if buddy_idx
+            .checked_add(pages)
+            .map_or(true, |end| end > self.total_pages)
+        {
             return false;
         }
 
-        let pages = 1 << order;
         for i in 0..pages {
             if self.bitmap[buddy_idx + i] {
                 return false; // 有页面被分配

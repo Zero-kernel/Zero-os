@@ -452,23 +452,27 @@ pub trait LsmPolicy: Send + Sync {
     /// This is the most security-sensitive livepatch operation: it introduces
     /// new executable code into the kernel. Policies should verify the caller
     /// holds an equivalent of `CAP_SYS_MODULE`.
+    /// R104-6 FIX: Default-deny for livepatch operations.  Live patching
+    /// injects executable code into the kernel, so the secure default MUST be
+    /// denial.  Only a concrete policy that has verified the caller holds an
+    /// equivalent of `CAP_SYS_MODULE` should override these to `Ok(())`.
     fn kpatch_load(&self, task: &ProcessCtx, patch_len: usize) -> LsmResult {
-        Ok(())
+        Err(LsmError::Denied)
     }
 
-    /// Called when a loaded livepatch is activated (INT3 detour installed).
+    /// R104-6 FIX: Default-deny for patch activation.
     fn kpatch_enable(&self, task: &ProcessCtx, patch_id: u64) -> LsmResult {
-        Ok(())
+        Err(LsmError::Denied)
     }
 
-    /// Called when a livepatch is deactivated (original instruction restored).
+    /// R104-6 FIX: Default-deny for patch deactivation.
     fn kpatch_disable(&self, task: &ProcessCtx, patch_id: u64) -> LsmResult {
-        Ok(())
+        Err(LsmError::Denied)
     }
 
-    /// Called when a disabled livepatch is unloaded and its memory freed.
+    /// R104-6 FIX: Default-deny for patch unloading.
     fn kpatch_unload(&self, task: &ProcessCtx, patch_id: u64) -> LsmResult {
-        Ok(())
+        Err(LsmError::Denied)
     }
 }
 
@@ -489,6 +493,21 @@ impl LsmPolicy for PermissivePolicy {
 
     fn priority(&self) -> u32 {
         u32::MAX // Lowest priority
+    }
+
+    // R104-6: Trait defaults for kpatch_* now deny.  PermissivePolicy must
+    // explicitly allow them to maintain its "allow everything" contract.
+    fn kpatch_load(&self, _task: &ProcessCtx, _patch_len: usize) -> LsmResult {
+        Ok(())
+    }
+    fn kpatch_enable(&self, _task: &ProcessCtx, _patch_id: u64) -> LsmResult {
+        Ok(())
+    }
+    fn kpatch_disable(&self, _task: &ProcessCtx, _patch_id: u64) -> LsmResult {
+        Ok(())
+    }
+    fn kpatch_unload(&self, _task: &ProcessCtx, _patch_id: u64) -> LsmResult {
+        Ok(())
     }
 }
 

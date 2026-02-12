@@ -920,6 +920,8 @@ pub enum SyscallError {
     ECONNABORTED = -103,   // R51-1: 连接被中止 (accept on closed listener)
     // E.4 PI: Robust futex error
     EOWNERDEAD = -130,     // E.4 PI: Robust futex - 锁持有者已退出
+    // R104-4: Arithmetic overflow (POSIX value 75)
+    EOVERFLOW = -75,       // 值溢出 (value too large for data type)
 }
 
 impl SyscallError {
@@ -1579,8 +1581,12 @@ fn copy_user_str_array(list_ptr: *const *const u8) -> Result<Vec<Vec<u8>>, Sysca
 
 /// 初始化系统调用处理器
 pub fn init() {
-    println!("Syscall handler initialized");
-    println!("  Supported syscalls: exit, fork, getpid, read, write, yield");
+    // R104-2 FIX: Gate init diagnostics behind debug_assertions.
+    #[cfg(debug_assertions)]
+    {
+        println!("Syscall handler initialized");
+        println!("  Supported syscalls: exit, fork, getpid, read, write, yield");
+    }
 }
 
 /// Get audit subject from current process context
@@ -2132,6 +2138,8 @@ pub fn syscall_dispatcher(
         509 => sys_kpatch_load(arg0 as usize, arg1 as usize),
         510 => sys_kpatch_enable(arg0 as u64),
         511 => sys_kpatch_disable(arg0 as u64),
+        // R104-5 FIX: Wire kpatch_unload to complete the livepatch syscall family
+        512 => sys_kpatch_unload(arg0 as u64),
 
         _ => Err(SyscallError::ENOSYS),
     };
@@ -2190,6 +2198,8 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
         }
 
         terminate_process(pid, exit_code);
+        // R104-2 FIX: Gate to prevent leaking PID in release builds.
+        #[cfg(debug_assertions)]
         println!("Process {} exited with code {}", pid, exit_code);
 
         // 退出的进程不应继续运行，立即让出 CPU
@@ -2200,6 +2210,8 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
         // 如果没有其他进程，系统会回到这里（但进程已是 Zombie 状态）
         // 在这种情况下，我们必须阻止返回到用户空间
         // 进入无限循环等待中断（其他进程可能会在定时器中断中被创建）
+        // R104-2 FIX: Gate idle-loop diagnostic.
+        #[cfg(debug_assertions)]
         println!("[sys_exit] No other process to run, entering idle loop");
         loop {
             x86_64::instructions::hlt();
@@ -2463,6 +2475,8 @@ fn sys_clone(
     // 检查不支持的 flags
     // 返回 EINVAL 而不是 ENOSYS，因为这是参数验证失败而非功能未实现
     if flags & !supported_flags != 0 {
+        // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+        #[cfg(debug_assertions)]
         println!(
             "sys_clone: unsupported flags 0x{:x}",
             flags & !supported_flags
@@ -2478,6 +2492,8 @@ fn sys_clone(
         // R37-7 FIX: CLONE_THREAD requires a separate stack for the new thread.
         // Sharing the parent's stack leads to data races and corruption.
         if stack.is_null() {
+            // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+            #[cfg(debug_assertions)]
             println!(
                 "[sys_clone] CLONE_THREAD rejected: NULL stack would share parent's user stack"
             );
@@ -2506,6 +2522,8 @@ fn sys_clone(
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
         let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
         if !is_root && !has_cap_admin {
+            // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+            #[cfg(debug_assertions)]
             println!("[sys_clone] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
             return Err(SyscallError::EPERM);
         }
@@ -2894,6 +2912,8 @@ fn sys_clone(
         // Create a new child PID namespace
         let new_ns = crate::pid_namespace::PidNamespace::new_child(parent_pid_ns_for_children)
             .map_err(|e| {
+                // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+                #[cfg(debug_assertions)]
                 println!("[sys_clone] Failed to create PID namespace: {:?}", e);
                 match e {
                     crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => SyscallError::EAGAIN,
@@ -2902,6 +2922,8 @@ fn sys_clone(
                     _ => SyscallError::ENOMEM,
                 }
             })?;
+        // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+        #[cfg(debug_assertions)]
         println!(
             "[sys_clone] Created new PID namespace: id={}, level={}",
             new_ns.id().raw(),
@@ -3214,10 +3236,29 @@ fn sys_clone(
             .ok_or(SyscallError::EFAULT)?
     };
 
+    // R104-3 FIX: Move LSM check BEFORE user memory writes to prevent observable
+    // side effects when policy denies the clone. Previously, copy_to_user wrote the
+    // child TID to user memory before the LSM gate, creating a side channel. Also,
+    // copy_to_user failure (EFAULT) returned immediately without cleaning up the
+    // fully-constructed child process, leaking PID/kernel-stack/address-space.
+    //
+    // LSM hook: check if policy allows this fork/clone
+    // Must be BEFORE user memory writes and scheduler notification
+    enforce_lsm_task_fork(parent_pid, child_pid)?;
+
     // 写入 parent_tid (F.1: use parent's view of child's PID)
     if flags & CLONE_PARENT_SETTID != 0 {
         let tid_bytes = (parent_view_pid as i32).to_ne_bytes();
-        copy_to_user(parent_tid as *mut u8, &tid_bytes)?;
+        if let Err(e) = copy_to_user(parent_tid as *mut u8, &tid_bytes) {
+            // R104-3 FIX: Clean up child process on copy_to_user failure to prevent
+            // PID / kernel-stack / address-space leak.
+            if let Some(parent) = get_process(parent_pid) {
+                parent.lock().children.retain(|&p| p != child_pid);
+            }
+            terminate_process(child_pid, -1);
+            cleanup_zombie(child_pid);
+            return Err(e);
+        }
     }
 
     // 写入 child_tid（在共享地址空间中，子进程会看到此值）
@@ -3228,12 +3269,16 @@ fn sys_clone(
     // what gettid() returns to the child.
     if flags & CLONE_CHILD_SETTID != 0 {
         let tid_bytes = (child_view_pid as i32).to_ne_bytes();
-        copy_to_user(child_tid as *mut u8, &tid_bytes)?;
+        if let Err(e) = copy_to_user(child_tid as *mut u8, &tid_bytes) {
+            // R104-3 FIX: Clean up child process on copy_to_user failure.
+            if let Some(parent) = get_process(parent_pid) {
+                parent.lock().children.retain(|&p| p != child_pid);
+            }
+            terminate_process(child_pid, -1);
+            cleanup_zombie(child_pid);
+            return Err(e);
+        }
     }
-
-    // LSM hook: check if policy allows this fork/clone
-    // Must be BEFORE scheduler notification to prevent denied child from running
-    enforce_lsm_task_fork(parent_pid, child_pid)?;
 
     // 将子进程添加到调度器（通过回调，避免循环依赖）
     if let Some(child_arc) = get_process(child_pid) {
@@ -4628,7 +4673,11 @@ fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
         // 验证并写入单个缓冲区
         match sys_write(fd, entry.iov_base, entry.iov_len) {
             Ok(written) => {
-                total_written += written;
+                // R104-4 FIX: Use checked_add to prevent silent usize wrap-around
+                // when a malicious/buggy iov list accumulates > usize::MAX bytes.
+                total_written = total_written
+                    .checked_add(written)
+                    .ok_or(SyscallError::EOVERFLOW)?;
             }
             Err(e) => {
                 // 如果已写入部分数据，返回已写入的字节数
@@ -9133,6 +9182,36 @@ fn sys_kpatch_enable(patch_id: u64) -> Result<usize, SyscallError> {
 /// - Negative errno on failure
 fn sys_kpatch_disable(patch_id: u64) -> Result<usize, SyscallError> {
     let result = livepatch::sys_kpatch_disable(patch_id);
+    if result < 0 {
+        match result {
+            -1 => Err(SyscallError::EPERM),
+            -2 => Err(SyscallError::ENOENT),
+            -16 => Err(SyscallError::EBUSY),
+            -22 => Err(SyscallError::EINVAL),
+            -38 => Err(SyscallError::ENOSYS),
+            _ => Err(SyscallError::EINVAL),
+        }
+    } else {
+        Ok(0)
+    }
+}
+
+/// sys_kpatch_unload — Unload a disabled livepatch module and free its memory.
+///
+/// R104-5 FIX: This wrapper was missing from the syscall layer, leaving
+/// syscall 512 dispatching to the default ENOSYS path.
+///
+/// # Arguments
+/// * `patch_id` - The patch identifier returned by `sys_kpatch_load`.
+///
+/// # Errors
+/// - `EPERM`   — caller lacks privileges
+/// - `ENOENT`  — no patch with the given id
+/// - `EBUSY`   — patch is still enabled
+/// - `EINVAL`  — invalid patch_id or internal error
+/// - `ENOSYS`  — livepatch subsystem not available
+fn sys_kpatch_unload(patch_id: u64) -> Result<usize, SyscallError> {
+    let result = livepatch::sys_kpatch_unload(patch_id);
     if result < 0 {
         match result {
             -1 => Err(SyscallError::EPERM),

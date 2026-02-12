@@ -1112,6 +1112,8 @@ pub fn create_process(
 
     // R29-5 FIX: Check PID upper bound to prevent kernel stack address overflow
     if pid > MAX_PID {
+        // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+        #[cfg(debug_assertions)]
         println!(
             "Error: PID space exhausted (pid {} > MAX_PID {})",
             pid, MAX_PID
@@ -1123,6 +1125,8 @@ pub fn create_process(
     let (stack_base, stack_top) = match allocate_kernel_stack(pid) {
         Ok((base, top)) => (base, top),
         Err(e) => {
+            // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+            #[cfg(debug_assertions)]
             println!(
                 "Error: Failed to allocate kernel stack for PID {}: {:?}",
                 pid, e
@@ -1189,7 +1193,10 @@ pub fn create_process(
             }
             Err(e) => {
                 // Namespace chain assignment failed, clean up
+                // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+                #[cfg(debug_assertions)]
                 println!("Error: Failed to assign PID namespace chain: {:?}", e);
+                let _ = e; // suppress unused warning in release
                 free_kernel_stack(pid, stack_base);
                 // R102-L2 FIX: Reclaim the consumed PID to prevent PID exhaustion
                 // over time when namespace assignment repeatedly fails.
@@ -1262,6 +1269,8 @@ pub fn create_process(
         }
         Err(_) => {
             // Watchdog slots full - system under heavy load but not fatal
+            // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+            #[cfg(debug_assertions)]
             println!(
                 "  Warning: Failed to register watchdog for PID {} (slots full)",
                 pid
@@ -1269,6 +1278,8 @@ pub fn create_process(
         }
     }
 
+    // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+    #[cfg(debug_assertions)]
     println!(
         "Created process: PID={}, Name={}, Priority={}",
         pid, name, priority
@@ -1303,6 +1314,8 @@ pub fn create_process_in_namespace(
     let pid = *next_pid_guard;
 
     if pid > MAX_PID {
+        // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+        #[cfg(debug_assertions)]
         println!(
             "Error: PID space exhausted (pid {} > MAX_PID {})",
             pid, MAX_PID
@@ -1313,6 +1326,8 @@ pub fn create_process_in_namespace(
     let (stack_base, stack_top) = match allocate_kernel_stack(pid) {
         Ok((base, top)) => (base, top),
         Err(e) => {
+            // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+            #[cfg(debug_assertions)]
             println!(
                 "Error: Failed to allocate kernel stack for PID {}: {:?}",
                 pid, e
@@ -1353,7 +1368,10 @@ pub fn create_process_in_namespace(
             proc.pid_ns_for_children = target_ns;
         }
         Err(e) => {
+            // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+            #[cfg(debug_assertions)]
             println!("Error: Failed to assign PID namespace chain: {:?}", e);
+            let _ = e; // suppress unused warning in release
             free_kernel_stack(pid, stack_base);
             // R102-L2 FIX: Reclaim the consumed PID to prevent PID exhaustion.
             {
@@ -1415,6 +1433,8 @@ pub fn create_process_in_namespace(
             process.lock().watchdog_handle = Some(handle);
         }
         Err(_) => {
+            // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+            #[cfg(debug_assertions)]
             println!(
                 "  Warning: Failed to register watchdog for PID {} (slots full)",
                 pid
@@ -1422,6 +1442,8 @@ pub fn create_process_in_namespace(
         }
     }
 
+    // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+    #[cfg(debug_assertions)]
     println!(
         "Created process in namespace: PID={}, Name={}, Priority={}, NS={}",
         pid, name, priority, process.lock().pid_ns_for_children.id().raw()
@@ -2166,6 +2188,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         // to the PCB which is about to be deallocated. Clear ownership now.
         cpu_local::clear_fpu_owner_all_cpus(pid);
 
+        // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+        #[cfg(debug_assertions)]
         println!("Process {} terminated with exit code {}", pid, exit_code);
 
         // F.1 PID Namespace: Handle init death cascade
@@ -2325,6 +2349,8 @@ fn handle_namespace_init_death(
         if membership.ns.is_init(dying_pid) {
             // Mark namespace as shutting down
             if membership.ns.mark_shutting_down() {
+                // R104-2 FIX: Gate to prevent leaking namespace IDs + PIDs.
+                #[cfg(debug_assertions)]
                 println!(
                     "[PID NS] Init death cascade: namespace {} is shutting down (init pid={})",
                     membership.ns.id().raw(),
@@ -2335,6 +2361,8 @@ fn handle_namespace_init_death(
                 let victims = crate::pid_namespace::get_cascade_kill_pids(&membership.ns);
 
                 if !victims.is_empty() {
+                    // R104-2 FIX: Gate namespace cascade logging.
+                    #[cfg(debug_assertions)]
                     println!(
                         "[PID NS] Sending SIGKILL to {} processes in namespace {}",
                         victims.len(),
@@ -2350,6 +2378,8 @@ fn handle_namespace_init_death(
                         // Send SIGKILL (uncatchable) to each process
                         match send_signal(victim_pid, Signal::SIGKILL) {
                             Ok(_) => {
+                                // R104-2 FIX: Gate victim PID logging.
+                                #[cfg(debug_assertions)]
                                 println!(
                                     "[PID NS]   SIGKILL sent to PID {} (namespace cascade)",
                                     victim_pid
@@ -2357,10 +2387,13 @@ fn handle_namespace_init_death(
                             }
                             Err(e) => {
                                 // Process may have already exited, ignore errors
+                                // R104-2 FIX: Gate victim PID + error logging.
+                                #[cfg(debug_assertions)]
                                 println!(
                                     "[PID NS]   Failed to send SIGKILL to PID {}: {:?}",
                                     victim_pid, e
                                 );
+                                let _ = e; // suppress unused warning in release
                             }
                         }
                     }
@@ -2501,7 +2534,10 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
     // 通过 clear() 触发每个 FileDescriptor 的 Drop，自动释放管道等资源
     let fd_count = proc.fd_table.len();
     proc.fd_table.clear();
+    // R104-2 FIX: Gate all resource-cleanup diagnostics behind debug_assertions
+    // to prevent leaking fd count, page table root addresses, and PID in release.
     if fd_count > 0 {
+        #[cfg(debug_assertions)]
         println!(
             "  Closed {} file descriptors for process {}",
             fd_count, proc.pid
@@ -2515,6 +2551,7 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
         if keep_address_space {
             // 线程或被共享的地址空间不释放，只清零引用
             if !proc.is_thread {
+                #[cfg(debug_assertions)]
                 println!(
                     "  Deferred address space release for process {} (shared by other threads)",
                     proc.pid
@@ -2522,10 +2559,15 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
             }
             proc.memory_space = 0;
         } else {
+            // R104-2 FIX: Capture root before free for debug print, but gate the
+            // print behind debug_assertions to avoid leaking PT root addresses.
+            #[cfg(debug_assertions)]
+            let _saved_root = proc.memory_space;
             free_address_space(proc.memory_space);
+            #[cfg(debug_assertions)]
             println!(
                 "  Released page table hierarchy for process {} (root=0x{:x})",
-                proc.pid, proc.memory_space
+                proc.pid, _saved_root
             );
             proc.memory_space = 0;
         }
@@ -2541,6 +2583,8 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
     notify_cpuset_task_left(proc.cpuset_id);
 
     if region_count > 0 {
+        // R104-2 FIX: Gate diagnostic println behind debug_assertions.
+        #[cfg(debug_assertions)]
         println!(
             "  Cleared {} mmap regions ({} KB) for process {}",
             region_count,
@@ -2586,6 +2630,8 @@ pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
     if current_rsp >= stack_bottom && current_rsp < stack_top {
         // 当前 CPU 正在使用此栈，不能释放（会导致自踩栈崩溃）
         // 这种情况不应该发生（进程应在不同栈上清理自己的栈），但防御性编程
+        // R104-2 FIX: Gate to prevent leaking kernel RSP in release builds.
+        #[cfg(debug_assertions)]
         println!(
             "  WARNING: Skip releasing kernel stack for PID {} (in use by current CPU, RSP=0x{:x})",
             pid, current_rsp
@@ -2613,6 +2659,8 @@ pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
             });
         }
 
+        // R104-2 FIX: Gate to prevent leaking kernel stack address in release builds.
+        #[cfg(debug_assertions)]
         println!(
             "  Released kernel stack for PID {} at 0x{:x}",
             pid, stack_base_u64
