@@ -20,3 +20,4 @@ x86_64 = "0.15"
 bitflags = "2.4"
 drivers = { path = "../drivers" }
 mm = { path = "../mm" }
+klog = { path = "../klog" }

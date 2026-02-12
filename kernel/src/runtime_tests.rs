@@ -1580,9 +1580,9 @@ pub fn run_all_runtime_tests() -> TestReport {
     let mut failed = 0usize;
     let mut warnings = 0usize;
 
-    println!();
-    println!("=== Runtime Functional Tests ===");
-    println!();
+    klog_always!();
+    klog_always!("=== Runtime Functional Tests ===");
+    klog_always!();
 
     for test in tests {
         print!("  [TEST] {}... ", test.name());
@@ -1591,15 +1591,15 @@ pub fn run_all_runtime_tests() -> TestReport {
 
         match &result {
             TestResult::Pass => {
-                println!("PASS");
+                klog_always!("PASS");
                 passed += 1;
             }
             TestResult::Warning(msg) => {
-                println!("WARN: {}", msg);
+                klog_always!("WARN: {}", msg);
                 warnings += 1;
             }
             TestResult::Fail(msg) => {
-                println!("FAIL: {}", msg);
+                klog_always!("FAIL: {}", msg);
                 failed += 1;
             }
         }
@@ -1610,12 +1610,12 @@ pub fn run_all_runtime_tests() -> TestReport {
         });
     }
 
-    println!();
-    println!(
+    klog_always!();
+    klog_always!(
         "=== Test Summary: {} passed, {} warnings, {} failed ===",
         passed, warnings, failed
     );
-    println!();
+    klog_always!();
 
     TestReport {
         passed,

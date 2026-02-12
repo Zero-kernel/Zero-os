@@ -13,6 +13,7 @@ cpu_local = { path = "../cpu_local" }
 drivers = { path = "../drivers" }
 security = { path = "../security" }
 compliance = { path = "../compliance" }
+klog = { path = "../klog" }
 
 [features]
 default = []

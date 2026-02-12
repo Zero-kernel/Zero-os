@@ -199,7 +199,7 @@ impl VirtioNetDevice {
         // Only support modern transport (legacy requires different queue setup)
         let version = transport.version();
         if version != VIRTIO_VERSION_MODERN {
-            drivers::println!("[net] Legacy virtio-net not supported, need modern transport");
+            kprintln!("[net] Legacy virtio-net not supported, need modern transport");
             return Err(NetError::NotSupported);
         }
 
@@ -267,7 +267,7 @@ impl VirtioNetDevice {
         let mut rx_chain_next = Vec::with_capacity(rx_size);
         rx_chain_next.resize_with(rx_size, || None);
 
-        drivers::println!(
+        kprintln!(
             "[net] {} ({}) MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             name,
             transport.kind(),
@@ -432,7 +432,7 @@ impl VirtioNetDevice {
         if head_raw >= qsize {
             self.stats.rx_errors += 1;
             // Log the invalid descriptor for debugging
-            drivers::println!(
+            kprintln!(
                 "[net] WARNING: device returned invalid used.id {} >= {}",
                 head_raw,
                 qsize
@@ -499,7 +499,7 @@ impl VirtioNetDevice {
             // Device reported more bytes than we posted - log and count as error
             // This makes device misbehavior visible while still delivering data
             self.stats.rx_errors += 1;
-            drivers::println!(
+            kprintln!(
                 "[net] WARNING: device reported len {} > posted capacity {}, clamping",
                 raw_payload_len,
                 capacity
@@ -709,7 +709,7 @@ impl NetDevice for VirtioNetDevice {
             let head_raw = used.id;
             if head_raw >= qsize {
                 self.stats.tx_errors += 1;
-                drivers::println!(
+                kprintln!(
                     "[net] WARNING: TX device returned invalid used.id {} >= {}",
                     head_raw,
                     qsize

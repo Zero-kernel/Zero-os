@@ -72,8 +72,9 @@
 
 extern crate alloc;
 
-#[macro_use]
 extern crate drivers;
+#[macro_use]
+extern crate klog;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -573,8 +574,8 @@ pub fn init() {
     // Register built-in tracepoints
     let _ = register_tracepoint(&watchdog::TRACE_WATCHDOG_HANG);
 
-    println!("[trace] Observability subsystem initialized");
-    println!(
+    klog_always!("[trace] Observability subsystem initialized");
+    klog_always!(
         "      Max tracepoints: {}, counters: {}, watchdog slots: {}",
         MAX_TRACEPOINTS,
         counters::TRACE_COUNTER_COUNT,

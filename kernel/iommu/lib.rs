@@ -55,8 +55,9 @@
 
 extern crate alloc;
 
-#[macro_use]
 extern crate drivers;
+#[macro_use]
+extern crate klog;
 
 // R94-13 FIX: Prevent accidentally shipping identity-domain pass-through.
 // VT-d pass-through allows devices to DMA into arbitrary physical memory.
@@ -267,27 +268,27 @@ pub fn init() -> IommuResult<u32> {
         return Err(IommuError::NotInitialized);
     }
 
-    println!("[IOMMU] Initializing IOMMU subsystem...");
+    klog_always!("[IOMMU] Initializing IOMMU subsystem...");
 
     // Parse ACPI DMAR table
     let dmar = match dmar::parse_dmar_table() {
         Ok(d) => d,
         Err(DmarError::NotFound) => {
-            println!("[IOMMU] No DMAR table found - IOMMU not available");
+            klog_always!("[IOMMU] No DMAR table found - IOMMU not available");
             // R90-1 NOTE: No IOMMU hardware present - allow legacy bypass.
             // Only mark INIT_FAILED when hardware exists but init fails,
             // not when hardware is absent (backward compatibility).
             return Err(IommuError::NoDmarTable);
         }
         Err(e) => {
-            println!("[IOMMU] DMAR table parse error: {:?}", e);
+            klog!(Error, "[IOMMU] DMAR table parse error: {:?}", e);
             // R90-1 FIX: DMAR exists but parse failed - fail-closed
             IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
             return Err(IommuError::InvalidDmar);
         }
     };
 
-    println!(
+    klog_always!(
         "[IOMMU] DMAR table found: {} DRHD units, {} RMRR regions",
         dmar.drhd_count(),
         dmar.rmrr_count()
@@ -296,7 +297,7 @@ pub fn init() -> IommuResult<u32> {
     // Check if interrupt remapping is required by platform
     let ir_required = dmar.interrupt_remap_required();
     if ir_required {
-        println!("[IOMMU]   Interrupt remapping required by platform");
+        klog_always!("[IOMMU]   Interrupt remapping required by platform");
     }
 
     // Initialize each DRHD (DMA Remapping Hardware Unit)
@@ -305,7 +306,7 @@ pub fn init() -> IommuResult<u32> {
 
     for drhd in dmar.drhd_iter() {
         if count as usize >= MAX_IOMMU_UNITS {
-            println!("[IOMMU] Warning: Too many IOMMU units, ignoring remaining");
+            klog!(Warn, "[IOMMU] Warning: Too many IOMMU units, ignoring remaining");
             break;
         }
 
@@ -317,14 +318,14 @@ pub fn init() -> IommuResult<u32> {
                 match unit.setup_interrupt_remapping(ir_required) {
                     Ok(enabled) => {
                         if enabled {
-                            println!(
+                            klog_always!(
                                 "[IOMMU]   Unit {}: base={:#x}, segment={}, IR=enabled",
                                 count,
                                 drhd.register_base(),
                                 drhd.segment()
                             );
                         } else {
-                            println!(
+                            klog_always!(
                                 "[IOMMU]   Unit {}: base={:#x}, segment={}, IR=disabled",
                                 count,
                                 drhd.register_base(),
@@ -335,7 +336,7 @@ pub fn init() -> IommuResult<u32> {
                     Err(e) => {
                         if ir_required {
                             // Fail-closed: If IR is required but setup fails, abort
-                            println!(
+                            klog!(Error,
                                 "[IOMMU]   Unit {}: Interrupt remapping required but failed: {:?}",
                                 count, e
                             );
@@ -343,7 +344,7 @@ pub fn init() -> IommuResult<u32> {
                             IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
                             return Err(IommuError::HardwareInitFailed);
                         } else {
-                            println!(
+                            klog_always!(
                                 "[IOMMU]   Unit {}: base={:#x}, segment={}, IR=unsupported",
                                 count,
                                 drhd.register_base(),
@@ -357,7 +358,7 @@ pub fn init() -> IommuResult<u32> {
                 count += 1;
             }
             Err(e) => {
-                println!(
+                klog!(Error,
                     "[IOMMU]   Failed to initialize unit at {:#x}: {:?}",
                     drhd.register_base(),
                     e
@@ -367,7 +368,7 @@ pub fn init() -> IommuResult<u32> {
     }
 
     if count == 0 {
-        println!("[IOMMU] No IOMMU units initialized");
+        klog!(Error, "[IOMMU] No IOMMU units initialized");
         // R90-1 FIX: Mark init as failed to prevent bypass
         IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
         return Err(IommuError::HardwareInitFailed);
@@ -389,7 +390,7 @@ pub fn init() -> IommuResult<u32> {
         } else if (sagaw & (1 << 0)) != 0 {
             39u8
         } else {
-            println!("[IOMMU] No common AGAW supported across all units");
+            klog!(Error, "[IOMMU] No common AGAW supported across all units");
             IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
             return Err(IommuError::HardwareInitFailed);
         }
@@ -416,7 +417,7 @@ pub fn init() -> IommuResult<u32> {
     // but attach_device() requires a valid SLPT root (fail-closed if missing).
     kernel_domain.ensure_page_table_root()?;
 
-    println!(
+    klog_always!(
         "[IOMMU] Kernel domain 0: page-table (AGAW={}-bit, on-demand mappings)",
         kernel_domain_agaw
     );
@@ -426,7 +427,7 @@ pub fn init() -> IommuResult<u32> {
     // Handle RMRR (Reserved Memory Region Reporting)
     // These are memory regions that devices may DMA to before OS takes control
     for rmrr in dmar.rmrr_iter() {
-        println!(
+        klog_always!(
             "[IOMMU]   RMRR: {:#x}-{:#x} (segment {})",
             rmrr.base(),
             rmrr.limit(),
@@ -443,10 +444,10 @@ pub fn init() -> IommuResult<u32> {
         let mut success = 0u32;
         for (i, unit) in units.iter().enumerate() {
             if let Err(e) = unit.enable_translation() {
-                println!("[IOMMU] WARNING: Failed to enable translation on unit {}: {:?}", i, e);
+                klog!(Warn, "[IOMMU] WARNING: Failed to enable translation on unit {}: {:?}", i, e);
                 // Continue with other units - partial enablement is better than none
             } else {
-                println!("[IOMMU]   Unit {} translation enabled", i);
+                klog_always!("[IOMMU]   Unit {} translation enabled", i);
                 success += 1;
             }
         }
@@ -456,7 +457,7 @@ pub fn init() -> IommuResult<u32> {
     // R94-13 FIX: Only register hooks if at least one unit has translation enabled.
     // If all units failed, don't register hooks to avoid map failures and memory leaks.
     if translation_success_count == 0 && count > 0 {
-        println!("[IOMMU] ERROR: No units could enable translation, IOMMU not operational");
+        klog!(Error, "[IOMMU] ERROR: No units could enable translation, IOMMU not operational");
         IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
         return Err(IommuError::HardwareInitFailed);
     }
@@ -473,7 +474,7 @@ pub fn init() -> IommuResult<u32> {
         unmap_range: dma_unmap_range_hook,
     });
 
-    println!("[IOMMU] Initialized {} IOMMU units", count);
+    kprintln!("[IOMMU] Initialized {} IOMMU units", count);
 
     Ok(count)
 }
@@ -610,7 +611,7 @@ pub fn attach_device_to_domain(device: PciDeviceId, domain_id: DomainId) -> Iomm
     // Attach device to domain via the IOMMU unit
     unit.attach_device(&device, domain)?;
 
-    println!(
+    kprintln!(
         "[IOMMU] Attached device {:02x}:{:02x}.{} to domain {}",
         device.bus, device.device, device.function, domain_id
     );
@@ -695,7 +696,7 @@ pub fn detach_device_from_domain(device: PciDeviceId, domain_id: DomainId) -> Io
     // Detach device from domain via the IOMMU unit
     unit.detach_device(&device, domain_id)?;
 
-    println!(
+    kprintln!(
         "[IOMMU] Detached device {:02x}:{:02x}.{} from domain {}",
         device.bus, device.device, device.function, domain_id
     );
@@ -827,7 +828,7 @@ pub fn create_domain(domain_type: DomainType) -> IommuResult<DomainId> {
 
     domains.push(Arc::new(domain));
 
-    println!("[IOMMU] Created domain {} ({:?})", id, domain_type);
+    kprintln!("[IOMMU] Created domain {} ({:?})", id, domain_type);
     Ok(id)
 }
 
@@ -949,7 +950,7 @@ pub fn create_vm_domain(vm_id: u64) -> IommuResult<DomainId> {
     // Record VM association (hold domain write lock first, then VM lock)
     VM_DOMAINS.lock().insert(id, vm_id);
 
-    println!(
+    kprintln!(
         "[IOMMU] Created VM domain {} for VM {} (page-table)",
         id, vm_id
     );
@@ -1037,7 +1038,7 @@ pub fn assign_device_to_vm(
 
     let handle = IrteHandle::new(irte_index, device.source_id(), 0);
 
-    println!(
+    kprintln!(
         "[IOMMU] Assigned device {:02x}:{:02x}.{} to VM domain {} (IRTE {})",
         device.bus, device.device, device.function, vm_domain_id, irte_index
     );
@@ -1115,7 +1116,7 @@ pub fn unassign_device_from_vm(
         }
         Err(_) => {
             // IR table unavailable - log warning but device is already detached
-            println!(
+            kprintln!(
                 "[IOMMU] WARNING: IR cleanup failed for device {:02x}:{:02x}.{} (IRTE {} orphaned)",
                 device.bus, device.device, device.function, irte_index
             );
@@ -1123,7 +1124,7 @@ pub fn unassign_device_from_vm(
         }
     };
 
-    println!(
+    kprintln!(
         "[IOMMU] Unassigned device {:02x}:{:02x}.{} from VM domain {} (IRTE {} {})",
         device.bus, device.device, device.function, vm_domain_id, irte_index,
         if ir_cleanup_ok { "freed" } else { "orphaned" }
@@ -1134,20 +1135,20 @@ pub fn unassign_device_from_vm(
 
 /// Print IOMMU status for debugging.
 pub fn print_status() {
-    println!("=== IOMMU Status ===");
-    println!("  Enabled: {}", is_enabled());
-    println!("  Units: {}", unit_count());
+    kprintln!("=== IOMMU Status ===");
+    kprintln!("  Enabled: {}", is_enabled());
+    kprintln!("  Units: {}", unit_count());
 
     if is_enabled() {
         let units = IOMMU_UNITS.read();
         for (i, unit) in units.iter().enumerate() {
-            println!("  Unit {}: segment={}", i, unit.segment());
+            kprintln!("  Unit {}: segment={}", i, unit.segment());
         }
 
         let domains = DOMAINS.read();
-        println!("  Domains: {}", domains.len());
+        kprintln!("  Domains: {}", domains.len());
         for domain in domains.iter() {
-            println!(
+            kprintln!(
                 "    Domain {}: {:?}, {} mappings",
                 domain.id(),
                 domain.domain_type(),
@@ -1299,11 +1300,11 @@ fn isolate_device(record: &FaultRecord, segment: u16, unit: &Arc<VtdUnit>) {
     // R86-1 FIX: Validate segment - legacy PCI I/O only supports segment 0
     // Multi-segment systems require ECAM (memory-mapped config space)
     if segment != 0 {
-        println!(
+        kprintln!(
             "[IOMMU] WARNING: Cannot isolate device {:02x}:{:02x}.{} on segment {} - legacy PCI I/O only supports segment 0",
             bus, device, function, segment
         );
-        println!(
+        kprintln!(
             "[IOMMU] SECURITY: Faulting device on segment {} remains active (source ID {:04x})",
             segment, record.source_id
         );
@@ -1317,7 +1318,7 @@ fn isolate_device(record: &FaultRecord, segment: u16, unit: &Arc<VtdUnit>) {
     let vendor_device = pci_cfg_read32(bus, device, function, 0x00);
     let vendor = (vendor_device & 0xFFFF) as u16;
     if vendor == PCI_VENDOR_INVALID {
-        println!(
+        kprintln!(
             "[IOMMU] Isolation skipped: no PCI device at {:02x}:{:02x}.{} (source ID {:04x})",
             bus, device, function, record.source_id
         );
@@ -1338,7 +1339,7 @@ fn isolate_device(record: &FaultRecord, segment: u16, unit: &Arc<VtdUnit>) {
     drop(_pci_lock);
 
     if verify & PCI_COMMAND_BUS_MASTER == 0 {
-        println!(
+        kprintln!(
             "[IOMMU] Isolated faulting device {:02x}:{:02x}.{} (source ID {:04x}): bus master disabled",
             bus, device, function, record.source_id
         );
@@ -1354,7 +1355,7 @@ fn isolate_device(record: &FaultRecord, segment: u16, unit: &Arc<VtdUnit>) {
         }
     } else {
         // Isolation failed - log warning for audit
-        println!(
+        kprintln!(
             "[IOMMU] WARNING: Failed to disable bus mastering for {:02x}:{:02x}.{} (source ID {:04x}); command {:#06x} -> {:#06x} (verified {:#06x})",
             bus, device, function, record.source_id, command, new_command, verify
         );
@@ -1424,7 +1425,7 @@ pub fn handle_dma_faults() -> usize {
         // R85-4: Quiesce interrupt storms when overflow detected and isolation enabled
         if overflow && config.isolate_devices {
             unit.set_fault_interrupt_enabled(false);
-            println!(
+            kprintln!(
                 "[IOMMU] Unit {} fault interrupts disabled due to overflow (isolation mode)",
                 unit_index
             );
@@ -1443,7 +1444,7 @@ pub fn handle_dma_faults() -> usize {
             if record.fault_reason.is_security_relevant() && !config.console_logging {
                 // R85-5: Redact low bits to avoid leaking full physical addresses
                 let redacted = record.fault_address & !0xFFF;
-                println!(
+                kprintln!(
                     "[IOMMU] SECURITY: Unit {} fault from {:04x} addr~={:#x} reason={:?}",
                     unit_index,
                     record.source_id,

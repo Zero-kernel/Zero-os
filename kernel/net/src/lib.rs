@@ -31,6 +31,8 @@
 
 extern crate alloc;
 extern crate security;
+#[macro_use]
+extern crate klog;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -292,14 +294,14 @@ unsafe fn map_pci_mmio(phys_base: u64, size: usize) -> Result<i64, NetError> {
     let offset = NET_MMIO_OFFSET.fetch_add(aligned_size as u64, Ordering::SeqCst);
 
     if offset + aligned_size as u64 > NET_MMIO_VIRT_SIZE {
-        drivers::println!("      [NET MMIO] Virtual space exhausted");
+        klog_always!("      [NET MMIO] Virtual space exhausted");
         return Err(NetError::IoError);
     }
 
     let virt_addr = NET_MMIO_VIRT_BASE + offset;
     let virt_offset = virt_addr as i64 - phys_base as i64;
 
-    drivers::println!(
+    klog_always!(
         "      [NET MMIO] Mapping phys {:#x} -> virt {:#x} (size {:#x})",
         phys_base,
         virt_addr,
@@ -316,11 +318,11 @@ unsafe fn map_pci_mmio(phys_base: u64, size: usize) -> Result<i64, NetError> {
         &mut frame_alloc,
     ) {
         Ok(()) => {
-            drivers::println!("      [NET MMIO] Mapping successful");
+            klog_always!("      [NET MMIO] Mapping successful");
             Ok(virt_offset)
         }
         Err(e) => {
-            drivers::println!("      [NET MMIO] Mapping failed: {:?}", e);
+            klog_always!("      [NET MMIO] Mapping failed: {:?}", e);
             Err(NetError::IoError)
         }
     }
@@ -379,8 +381,8 @@ unsafe fn map_virtio_pci_regions(
 ///
 /// Returns the number of devices successfully initialized.
 pub fn init() -> usize {
-    drivers::println!("  Network subsystem initialized");
-    drivers::println!("      Probing for network devices...");
+    klog_always!("  Network subsystem initialized");
+    klog_always!("      Probing for network devices...");
 
     let mut registered = 0;
 
@@ -388,7 +390,7 @@ pub fn init() -> usize {
     let pci_devices = pci::probe_virtio_net();
 
     if pci_devices.is_empty() {
-        drivers::println!("      No virtio-net devices found");
+        klog_always!("      No virtio-net devices found");
     } else {
         for (idx, pci_dev) in pci_devices.iter().enumerate() {
             let name = alloc::format!("eth{}", idx);
@@ -401,7 +403,7 @@ pub fn init() -> usize {
                 Err(e) => {
                     // R82-4 FIX: Disable bus mastering on MMIO mapping failure
                     pci::disable_bus_master(&pci_dev.slot);
-                    drivers::println!(
+                    klog!(Error,
                         "      ! MMIO mapping failed for {:02x}:{:02x}.{}: {:?} (bus master disabled)",
                         pci_dev.slot.bus,
                         pci_dev.slot.device,
@@ -419,7 +421,7 @@ pub fn init() -> usize {
 
                     match register_device(device) {
                         Ok(_) => {
-                            drivers::println!(
+                            klog_always!(
                                 "      ✓ {} @ {:02x}:{:02x}.{} MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
                                 name,
                                 pci_dev.slot.bus,
@@ -433,7 +435,7 @@ pub fn init() -> usize {
                         Err(e) => {
                             // R82-4 FIX: Disable bus mastering on registration failure
                             pci::disable_bus_master(&pci_dev.slot);
-                            drivers::println!(
+                            klog!(Error,
                                 "      ! Failed to register {}: {:?} (bus master disabled)",
                                 name, e
                             );
@@ -443,7 +445,7 @@ pub fn init() -> usize {
                 Err(e) => {
                     // R82-4 FIX: Disable bus mastering on driver probe failure
                     pci::disable_bus_master(&pci_dev.slot);
-                    drivers::println!(
+                    klog!(Error,
                         "      ! virtio-net probe @ {:02x}:{:02x}.{} failed: {:?} (bus master disabled)",
                         pci_dev.slot.bus,
                         pci_dev.slot.device,
@@ -456,7 +458,7 @@ pub fn init() -> usize {
     }
 
     if registered > 0 {
-        drivers::println!("      ✓ {} network device(s) registered", registered);
+        klog_always!("      ✓ {} network device(s) registered", registered);
     }
 
     registered

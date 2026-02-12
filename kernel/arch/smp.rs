@@ -23,7 +23,7 @@
 //! ```rust,ignore
 //! // After BSP init, bring up APs
 //! let num_cpus = arch::smp::start_aps();
-//! println!("Brought up {} CPUs", num_cpus);
+//! kprintln!("Brought up {} CPUs", num_cpus);
 //! ```
 
 #![allow(dead_code)]
@@ -584,7 +584,7 @@ fn make_trampoline_executable() {
         let pd_entry = &mut pd[0];
 
         if pd_entry.is_unused() {
-            drivers::println!("[SMP] WARNING: missing identity mapping for trampoline region");
+            klog_always!("[SMP] WARNING: missing identity mapping for trampoline region");
             return;
         }
 
@@ -592,7 +592,7 @@ fn make_trampoline_executable() {
         let pd_addr = pd_entry.addr();
         let is_huge = pd_flags.contains(PageTableFlags::HUGE_PAGE);
 
-        drivers::println!(
+        klog_always!(
             "[SMP] PD[0] addr=0x{:x} flags={:?} (huge={})",
             pd_addr.as_u64(),
             pd_flags,
@@ -606,9 +606,9 @@ fn make_trampoline_executable() {
                 new_flags.remove(PageTableFlags::NO_EXECUTE);
                 pd_entry.set_addr(pd_addr, new_flags);
                 tlb::flush_all();
-                drivers::println!("[SMP] Trampoline (2MB huge) made executable");
+                klog_always!("[SMP] Trampoline (2MB huge) made executable");
             } else {
-                drivers::println!("[SMP] Trampoline (2MB huge) already executable");
+                klog_always!("[SMP] Trampoline (2MB huge) already executable");
             }
         } else {
             // L-5 FIX: PD[0] is a PT pointer, need to handle 4KB pages
@@ -617,7 +617,7 @@ fn make_trampoline_executable() {
                 let mut new_flags = pd_flags;
                 new_flags.remove(PageTableFlags::NO_EXECUTE);
                 pd_entry.set_addr(pd_addr, new_flags);
-                drivers::println!("[SMP] PD[0] NX cleared");
+                klog_always!("[SMP] PD[0] NX cleared");
             }
 
             // Now clear NX on the specific trampoline PTE (0x8000 / 0x1000 = index 8)
@@ -631,14 +631,14 @@ fn make_trampoline_executable() {
                     let mut new_flags = pt_flags;
                     new_flags.remove(PageTableFlags::NO_EXECUTE);
                     pt_entry.set_addr(pt_entry.addr(), new_flags);
-                    drivers::println!("[SMP] Trampoline PTE[{}] NX cleared", trampoline_pt_idx);
+                    klog_always!("[SMP] Trampoline PTE[{}] NX cleared", trampoline_pt_idx);
                 } else {
-                    drivers::println!("[SMP] Trampoline PTE[{}] already executable", trampoline_pt_idx);
+                    klog_always!("[SMP] Trampoline PTE[{}] already executable", trampoline_pt_idx);
                 }
             }
 
             tlb::flush_all();
-            drivers::println!("[SMP] Trampoline (4KB page) made executable");
+            klog_always!("[SMP] Trampoline (4KB page) made executable");
         }
     }
 }
@@ -710,7 +710,7 @@ fn make_trampoline_nonexecutable() {
 pub fn set_rsdp_address(rsdp_phys: u64) {
     RSDP_PHYS_ADDR.store(rsdp_phys, Ordering::Release);
     if rsdp_phys != 0 {
-        drivers::println!("[SMP] RSDP address set to 0x{:x}", rsdp_phys);
+        klog_always!("[SMP] RSDP address set to 0x{:x}", rsdp_phys);
     }
 }
 
@@ -745,13 +745,13 @@ pub fn start_aps() -> usize {
         .collect();
 
     if ap_lapic_ids.is_empty() {
-        drivers::println!("[SMP] Single-core system detected");
+        klog_always!("[SMP] Single-core system detected");
         SMP_INIT_DONE.store(true, Ordering::Release);
         TOTAL_CPUS.store(1, Ordering::Release);
         return 1;
     }
 
-    drivers::println!("[SMP] Found {} AP(s), starting...", ap_lapic_ids.len());
+    klog_always!("[SMP] Found {} AP(s), starting...", ap_lapic_ids.len());
 
     // Ensure the identity-mapped trampoline region is executable
     // (Security hardening sets NX on identity-mapped memory)
@@ -769,7 +769,7 @@ pub fn start_aps() -> usize {
     let cr4 = read_cr4();
     let efer = read_efer();
 
-    drivers::println!(
+    klog_always!(
         "[SMP] BSP CR3=0x{:x} CR4=0x{:x} EFER=0x{:x}",
         cr3_phys,
         cr4,
@@ -805,7 +805,7 @@ pub fn start_aps() -> usize {
         }
 
         // Send INIT-SIPI-SIPI sequence
-        drivers::println!("[SMP] Waking CPU {} (LAPIC ID {})", cpu_index, lapic_id);
+        klog_always!("[SMP] Waking CPU {} (LAPIC ID {})", cpu_index, lapic_id);
 
         unsafe {
             // INIT IPI
@@ -832,7 +832,7 @@ pub fn start_aps() -> usize {
                 // mode before reaching the claim code. We cannot safely continue
                 // to the next AP as this AP might still be running and could
                 // read corrupted data later.
-                drivers::println!(
+                klog_always!(
                     "[SMP] CRITICAL: CPU {} did not claim trampoline data - halting SMP init",
                     cpu_index
                 );
@@ -851,13 +851,13 @@ pub fn start_aps() -> usize {
             core::hint::spin_loop();
             timeout -= 1;
             if timeout == 0 {
-                drivers::println!("[SMP] WARNING: CPU {} failed to complete init!", cpu_index);
+                klog_always!("[SMP] WARNING: CPU {} failed to complete init!", cpu_index);
                 break;
             }
         }
 
         if timeout > 0 {
-            drivers::println!("[SMP] CPU {} online", cpu_index);
+            klog_always!("[SMP] CPU {} online", cpu_index);
         }
     }
 
@@ -869,7 +869,7 @@ pub fn start_aps() -> usize {
     // This is important for W^X policy compliance
     make_trampoline_nonexecutable();
 
-    drivers::println!("[SMP] {} CPU(s) online", total);
+    klog_always!("[SMP] {} CPU(s) online", total);
     total
 }
 
@@ -934,7 +934,7 @@ pub extern "C" fn ap_rust_entry(
     let lapic_expected = lapic_id as u32;
     let lapic_actual = unsafe { apic::lapic_id() };
     if lapic_actual != lapic_expected {
-        drivers::println!(
+        klog_always!(
             "[SMP] SECURITY: LAPIC ID mismatch (expected {}, found {}) - halting AP",
             lapic_expected,
             lapic_actual
@@ -1105,7 +1105,7 @@ fn alloc_ap_stack() -> u64 {
         }
 
         if attempt > 0 {
-            println!("[SMP] AP stack allocation attempt {} got high frame 0x{:x}, retrying...",
+            klog_always!("[SMP] AP stack allocation attempt {} got high frame 0x{:x}, retrying...",
                      attempt + 1, phys);
         }
     }
@@ -1130,7 +1130,7 @@ fn enumerate_cpus() -> Vec<u32> {
     }
 
     // Fallback: BSP only
-    drivers::println!("[SMP] MADT not found, single-core fallback");
+    klog_always!("[SMP] MADT not found, single-core fallback");
     vec![unsafe { apic::lapic_id() }]
 }
 
@@ -1262,7 +1262,7 @@ pub(crate) unsafe fn find_rsdp() -> Option<(u64, u64)> {
         if let Some(result) = validate_rsdp_at(rsdp_phys) {
             return Some(result);
         }
-        drivers::println!(
+        klog_always!(
             "[SMP] Bootloader RSDP at 0x{:x} invalid, trying BIOS scan",
             rsdp_phys
         );

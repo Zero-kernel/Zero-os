@@ -11,7 +11,7 @@
 //! ```rust,ignore
 //! let status = cpu_protection::enable_protections();
 //! if !status.smep_enabled || !status.smap_enabled {
-//!     println!("WARNING: CPU lacks full protection");
+//!     kprintln!("WARNING: CPU lacks full protection");
 //! }
 //! ```
 //!
@@ -47,16 +47,16 @@ impl CpuProtectionStatus {
 
     /// Print status summary
     pub fn print(&self) {
-        println!("CPU Protection Status:");
-        println!(
+        kprintln!("CPU Protection Status:");
+        kprintln!(
             "  SMEP: supported={}, enabled={}",
             self.smep_supported, self.smep_enabled
         );
-        println!(
+        kprintln!(
             "  SMAP: supported={}, enabled={}",
             self.smap_supported, self.smap_enabled
         );
-        println!(
+        kprintln!(
             "  UMIP: supported={}, enabled={}",
             self.umip_supported, self.umip_enabled
         );
@@ -173,7 +173,7 @@ pub fn require_smap_support() {
         );
     }
 
-    println!("      ✓ SMAP requirement verified (CLAC/STAC safe)");
+    kprintln!("      ✓ SMAP requirement verified (CLAC/STAC safe)");
 }
 
 /// CPUID leaf 0x7 subleaf 0 (returns eax, ebx, ecx, edx)

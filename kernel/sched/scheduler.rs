@@ -224,11 +224,11 @@ pub struct SchedulerStats {
 
 impl SchedulerStats {
     pub fn print(&self) {
-        println!("=== Scheduler Statistics ===");
-        println!("Scheduled:  {}", self.scheduled);
-        println!("Enqueued:   {}", self.enqueued);
-        println!("Woken:      {}", self.woken);
-        println!("Ticks:      {}", self.ticks);
+        klog_always!("=== Scheduler Statistics ===");
+        klog_always!("Scheduled:  {}", self.scheduled);
+        klog_always!("Enqueued:   {}", self.enqueued);
+        klog_always!("Woken:      {}", self.woken);
+        klog_always!("Ticks:      {}", self.ticks);
     }
 }
 
@@ -239,7 +239,7 @@ lazy_static::lazy_static! {
 
 /// 初始化调度器
 pub fn init() {
-    println!("Priority scheduler initialized");
+    klog_always!("Priority scheduler initialized");
 
     // 创建init进程（PID 0，最高优先级）
     // Init 进程必须成功创建，失败则 panic
@@ -247,7 +247,7 @@ pub fn init() {
         .expect("FATAL: Failed to create init process - kernel stack allocation failed");
     SCHEDULER.lock().add_process(init_pid);
 
-    println!("Init process created with PID {}", init_pid);
+    klog_always!("Init process created with PID {}", init_pid);
 }
 
 /// 执行调度
@@ -298,7 +298,7 @@ pub fn run() -> ! {
             // 现在只是简单地打印信息
             if let Some(process) = get_process(pid) {
                 let proc = process.lock();
-                println!(
+                kprintln!(
                     "Running process: PID={}, Name={}, Priority={}, TimeSlice={}ms",
                     pid, proc.name, proc.dynamic_priority, proc.time_slice
                 );
@@ -308,7 +308,7 @@ pub fn run() -> ! {
             x86_64::instructions::hlt();
         } else {
             // 没有进程可运行，进入空闲状态
-            println!("No process to run, entering idle state");
+            kprintln!("No process to run, entering idle state");
             x86_64::instructions::hlt();
         }
     }

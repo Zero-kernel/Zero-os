@@ -67,7 +67,7 @@ const TICK_NS: u64 = 1_000_000;
 macro_rules! sched_debug {
     ($($arg:tt)*) => {
         if SCHED_DEBUG {
-            println!($($arg)*);
+            kprintln!($($arg)*);
         }
     };
 }
@@ -178,11 +178,11 @@ impl SchedulerStats {
     }
 
     pub fn print(&self) {
-        println!("=== Scheduler Statistics ===");
-        println!("Context switches: {}", self.total_switches);
-        println!("Total ticks:      {}", self.total_ticks);
-        println!("Processes created: {}", self.processes_created);
-        println!("Processes terminated: {}", self.processes_terminated);
+        klog_always!("=== Scheduler Statistics ===");
+        klog_always!("Context switches: {}", self.total_switches);
+        klog_always!("Total ticks:      {}", self.total_ticks);
+        klog_always!("Processes created: {}", self.processes_created);
+        klog_always!("Processes terminated: {}", self.processes_terminated);
     }
 }
 
@@ -1393,7 +1393,7 @@ impl Scheduler {
             }
 
             // Debug output for Ring 3 transition (minimal)
-            // Uncomment for debugging: println!("[SCHED] -> PID {} (Ring {})", next_pid, if next_is_user { 3 } else { 0 });
+            // Uncomment for debugging: kprintln!("[SCHED] -> PID {} (Ring {})", next_pid, if next_is_user { 3 } else { 0 });
 
             // G.1: Track context switches in per-CPU observability counters
             increment_counter(TraceCounter::ContextSwitches, 1);
@@ -1434,7 +1434,7 @@ impl Scheduler {
 
                     // 恢复用户进程的 FS/GS base (TLS 支持)
                     // 必须在 enter_usermode 之前的最后一步写入 MSR
-                    // 因为 println! 等内核代码可能会覆盖 FS_BASE MSR
+                    // 因为 kprintln! 等内核代码可能会覆盖 FS_BASE MSR
                     {
                         use x86_64::registers::model_specific::Msr;
                         const MSR_FS_BASE: u32 = 0xC000_0100;
@@ -1481,9 +1481,9 @@ pub fn init() {
     // 注册信号恢复回调，让 SIGCONT 能正确恢复暂停的进程
     kernel_core::register_resume_callback(Scheduler::resume_stopped);
 
-    println!("Enhanced scheduler initialized");
-    println!("  Ready queue: per-CPU with work stealing (R69-1)");
-    println!("  Scheduling algorithm: Priority-based with time slice");
-    println!("  SMP kick: IPI wake on new work (R70-2)");
-    println!("  Context switch: Enabled with CR3 switching + Ring 3 IRETQ support");
+    klog_always!("Enhanced scheduler initialized");
+    klog_always!("  Ready queue: per-CPU with work stealing (R69-1)");
+    klog_always!("  Scheduling algorithm: Priority-based with time slice");
+    klog_always!("  SMP kick: IPI wake on new work (R70-2)");
+    klog_always!("  Context switch: Enabled with CR3 switching + Ring 3 IRETQ support");
 }

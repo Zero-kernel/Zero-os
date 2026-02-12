@@ -685,7 +685,7 @@ pub fn log_match(verdict: &FirewallVerdict, packet: &FirewallPacket, now_ms: u64
         return;
     }
 
-    drivers::println!(
+    kprintln!(
         "[fw] rule={:?} action={:?} proto={:?} {:?}:{:?} -> {:?}:{:?} ct_state={:?}",
         verdict.rule_id,
         verdict.action,

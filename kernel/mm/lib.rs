@@ -5,6 +5,8 @@ extern crate alloc;
 // 导入 drivers crate 的宏
 #[macro_use]
 extern crate drivers;
+#[macro_use]
+extern crate klog;
 
 pub mod buddy_allocator;
 pub mod dma;
@@ -34,5 +36,5 @@ pub use tlb_shootdown::{
 };
 
 pub fn init() {
-    println!("Memory management module initialized");
+    klog_always!("Memory management module initialized");
 }

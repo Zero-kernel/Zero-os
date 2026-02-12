@@ -7,6 +7,8 @@ use alloc::boxed::Box;
 // 导入 drivers crate 的宏
 #[macro_use]
 extern crate drivers;
+#[macro_use]
+extern crate klog;
 
 pub use kernel_core::process;
 use kernel_core::{FileOps, NamespaceId, SyscallError};
@@ -74,7 +76,7 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
         (rfd, wfd)
     };
 
-    println!(
+    kprintln!(
         "sys_pipe: created pipe (read_fd={}, write_fd={})",
         read_fd, write_fd
     );
@@ -386,8 +388,8 @@ pub fn init() {
     kernel_core::register_futex_callback(futex_callback);
 
     ipc::init();
-    println!("  Synchronization primitives loaded (WaitQueue, KMutex, Semaphore, CondVar)");
-    println!("  Pipe support loaded (anonymous pipes with blocking I/O)");
-    println!("  Futex support loaded (user-space fast mutex with timeout)");
-    println!("  Syscall callbacks registered (pipe, read, write, close, futex)");
+    klog_always!("  Synchronization primitives loaded (WaitQueue, KMutex, Semaphore, CondVar)");
+    klog_always!("  Pipe support loaded (anonymous pipes with blocking I/O)");
+    klog_always!("  Futex support loaded (user-space fast mutex with timeout)");
+    klog_always!("  Syscall callbacks registered (pipe, read, write, close, futex)");
 }

@@ -347,7 +347,7 @@ static SYSCALL_INITIALIZED: core::sync::atomic::AtomicBool =
 /// ```
 pub unsafe fn init_syscall_msr(syscall_entry: u64) {
     if SYSCALL_INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
-        println!("Warning: SYSCALL MSR already initialized");
+        klog!(Warn, "Warning: SYSCALL MSR already initialized");
         return;
     }
 
@@ -394,17 +394,17 @@ pub unsafe fn init_syscall_msr(syscall_entry: u64) {
     // to serial console or log output in production builds.
     #[cfg(debug_assertions)]
     {
-        println!("SYSCALL MSR initialized:");
-        println!("  STAR:   0x{:016x}", star_value);
-        println!("  LSTAR:  0x{:016x}", syscall_entry);
-        println!("  SFMASK: 0x{:016x}", sfmask);
-        println!(
+        kprintln!("SYSCALL MSR initialized:");
+        kprintln!("  STAR:   0x{:016x}", star_value);
+        kprintln!("  LSTAR:  0x{:016x}", syscall_entry);
+        kprintln!("  SFMASK: 0x{:016x}", sfmask);
+        kprintln!(
             "  Kernel CS: 0x{:x}, SYSRET base: 0x{:x}",
             kernel_cs, sysret_base
         );
     }
     #[cfg(not(debug_assertions))]
-    println!("SYSCALL MSR initialized");
+    klog_always!("SYSCALL MSR initialized");
 }
 
 /// 检查 SYSCALL/SYSRET 是否已初始化
@@ -964,7 +964,7 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
 /// * `user_rsp` - The invalid user RSP that triggered the fallback
 #[no_mangle]
 extern "C" fn syscall_bad_return(user_rip: u64, user_rsp: u64) -> ! {
-    println!(
+    kprintln!(
         "syscall: SECURITY - rejecting invalid return RIP=0x{:x} RSP=0x{:x}",
         user_rip, user_rsp
     );

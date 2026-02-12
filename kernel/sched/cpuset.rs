@@ -183,7 +183,7 @@ pub fn init() {
     kernel_core::register_cpuset_task_joined(cpuset_task_joined_callback);
     kernel_core::register_cpuset_task_left(cpuset_task_left_callback);
 
-    drivers::println!("[CPUSET] Initialized with root mask 0x{:016x}", online_mask);
+    klog_always!("[CPUSET] Initialized with root mask 0x{:016x}", online_mask);
 }
 
 /// Get the current online CPU mask.

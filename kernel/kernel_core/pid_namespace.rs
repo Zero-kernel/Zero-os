@@ -606,7 +606,7 @@ pub fn get_cascade_kill_pids(ns: &Arc<PidNamespace>) -> Vec<ProcessId> {
 
 /// Print namespace hierarchy for debugging.
 pub fn print_namespace_info(ns: &Arc<PidNamespace>) {
-    println!(
+    kprintln!(
         "[PID NS] id={}, level={}, members={}, init={:?}, shutting_down={}",
         ns.id().raw(),
         ns.level(),
@@ -625,7 +625,7 @@ pub fn print_pid_chain(chain: &[PidNamespaceMembership]) {
         }
         print!("ns{}:pid{}", m.ns.id().raw(), m.pid);
     }
-    println!();
+    kprintln!();
 }
 
 // ============================================================================

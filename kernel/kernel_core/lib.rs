@@ -7,6 +7,10 @@ extern crate alloc;
 #[macro_use]
 extern crate drivers;
 
+// 导入 klog crate，提供 kprintln!, klog!, klog_always! 宏
+#[macro_use]
+extern crate klog;
+
 // 导出 vga_buffer 模块中的其他公共函数
 pub use drivers::vga_buffer;
 
@@ -258,5 +262,5 @@ pub fn init() {
     // F.2: Initialize cgroup v2 subsystem
     cgroup::init();
 
-    println!("Kernel core module initialized");
+    klog_always!("Kernel core module initialized");
 }

@@ -43,6 +43,8 @@ extern crate alloc;
 
 #[macro_use]
 extern crate drivers;
+#[macro_use]
+extern crate klog;
 
 pub mod cgroupfs;
 pub mod devfs;
@@ -80,5 +82,5 @@ pub use mount_namespace::{
 /// - Standard device files (null, zero, console)
 pub fn vfs_init() {
     manager::init();
-    println!("VFS subsystem initialized");
+    klog_always!("VFS subsystem initialized");
 }

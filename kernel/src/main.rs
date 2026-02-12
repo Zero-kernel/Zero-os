@@ -24,6 +24,8 @@ extern crate livepatch; // R101-4: Boot-time ECDSA key validation
 extern crate audit;
 extern crate trace;
 extern crate compliance;
+#[macro_use]
+extern crate klog;
 
 // A.3 Audit capability gate imports
 use cap::CapRights;
@@ -86,7 +88,7 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
 
     // Skip if device is read-only
     if device.is_read_only() {
-        println!("        [SKIP] Device is read-only");
+        klog_always!("        [SKIP] Device is read-only");
         return true;
     }
 
@@ -95,7 +97,7 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
 
     // Need at least 2 sectors for test (use last 2 sectors)
     if capacity < 4 {
-        println!("        [SKIP] Device too small for write test");
+        klog_always!("        [SKIP] Device too small for write test");
         return true;
     }
 
@@ -116,18 +118,18 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
     };
 
     // Write test pattern
-    println!("        Writing test pattern to sector {}...", test_sector);
+    klog_always!("        Writing test pattern to sector {}...", test_sector);
     match device.write_sync(test_sector, &test_pattern) {
         Ok(n) if n == sector_size => {}
         Ok(n) => {
-            println!(
+            klog_always!(
                 "        [FAIL] Write returned {} bytes, expected {}",
                 n, sector_size
             );
             return false;
         }
         Err(e) => {
-            println!("        [FAIL] Write failed: {:?}", e);
+            klog_always!("        [FAIL] Write failed: {:?}", e);
             return false;
         }
     }
@@ -137,26 +139,26 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
     match device.read_sync(test_sector, &mut read_buf) {
         Ok(n) if n == sector_size => {}
         Ok(n) => {
-            println!(
+            klog_always!(
                 "        [FAIL] Read returned {} bytes, expected {}",
                 n, sector_size
             );
             return false;
         }
         Err(e) => {
-            println!("        [FAIL] Read failed: {:?}", e);
+            klog_always!("        [FAIL] Read failed: {:?}", e);
             return false;
         }
     }
 
     // Verify
     if read_buf[..512] == test_pattern {
-        println!("        [PASS] Write/read verification successful");
+        klog_always!("        [PASS] Write/read verification successful");
         true
     } else {
-        println!("        [FAIL] Data mismatch!");
-        println!("        Expected first 8: {:02x?}", &test_pattern[..8]);
-        println!("        Got first 8:      {:02x?}", &read_buf[..8]);
+        klog_always!("        [FAIL] Data mismatch!");
+        klog_always!("        Expected first 8: {:02x?}", &test_pattern[..8]);
+        klog_always!("        Got first 8:      {:02x?}", &read_buf[..8]);
         false
     }
 }
@@ -206,25 +208,25 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // 初始化VGA驱动（后备，framebuffer 初始化后 VGA 输出会被跳过）
     drivers::vga_buffer::init();
 
-    println!("==============================");
-    println!("  Zero-OS Microkernel v0.1");
-    println!("==============================");
-    println!();
+    klog_always!("==============================");
+    klog_always!("  Zero-OS Microkernel v0.1");
+    klog_always!("==============================");
+    klog_always!();
 
     // 阶段1：初始化中断处理
-    println!("[1/3] Initializing interrupts...");
+    klog_always!("[1/3] Initializing interrupts...");
     arch::interrupts::init();
-    println!("      ✓ IDT loaded with 20+ handlers");
+    klog_always!("      ✓ IDT loaded with 20+ handlers");
 
     // 阶段2：初始化内存管理
-    println!("[2/3] Initializing memory management...");
+    klog_always!("[2/3] Initializing memory management...");
     if let Some(info) = boot_info {
         mm::memory::init_with_bootinfo(info);
-        println!("      ✓ Heap and Buddy allocator ready (using BootInfo)");
+        klog_always!("      ✓ Heap and Buddy allocator ready (using BootInfo)");
     } else {
-        println!("      ! BootInfo missing, using fallback initialization");
+        klog_always!("      ! BootInfo missing, using fallback initialization");
         mm::memory::init();
-        println!("      ✓ Heap and Buddy allocator ready (fallback mode)");
+        klog_always!("      ✓ Heap and Buddy allocator ready (fallback mode)");
     }
 
     // 初始化页表管理器
@@ -232,25 +234,25 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     unsafe {
         mm::page_table::init(x86_64::VirtAddr::new(0));
     }
-    println!("      ✓ Page table manager initialized");
+    klog_always!("      ✓ Page table manager initialized");
 
     // 安装内核栈守护页（必须在 mm 初始化后、启用中断前）
-    println!("[2.5/3] Installing kernel stack guard pages...");
+    klog_always!("[2.5/3] Installing kernel stack guard pages...");
     unsafe {
         match stack_guard::install() {
             Ok(()) => {
-                println!("      ✓ Guard pages installed for kernel stacks");
+                klog_always!("      ✓ Guard pages installed for kernel stacks");
             }
             Err(e) => {
-                println!("      ! Failed to install guard pages: {:?}", e);
-                println!("      ! Continuing with static stacks (less safe)");
+                klog_always!("      ! Failed to install guard pages: {:?}", e);
+                klog_always!("      ! Continuing with static stacks (less safe)");
             }
         }
     }
 
     // 安全加固（Phase 0: W^X, NX, Identity Map Cleanup, CSPRNG, kptr guard, Spectre）
     // G.3 Compliance: Use HardeningProfile to configure security settings
-    println!("[2.6/3] Applying security hardening...");
+    klog_always!("[2.6/3] Applying security hardening...");
     {
         let mut frame_allocator = mm::memory::FrameAllocator::new();
 
@@ -260,11 +262,19 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         let profile = compliance::HardeningProfile::Balanced;
         compliance::set_profile(profile);
 
+        // H.2.2: Wire klog filter from hardening profile
+        let klog_profile = match profile {
+            compliance::HardeningProfile::Secure => klog::KlogProfile::Secure,
+            compliance::HardeningProfile::Balanced => klog::KlogProfile::Balanced,
+            compliance::HardeningProfile::Performance => klog::KlogProfile::Performance,
+        };
+        klog::set_profile(klog_profile);
+
         // Generate SecurityConfig from the selected profile
         let phys_offset = mm::page_table::get_physical_memory_offset();
         let sec_config = profile.security_config(phys_offset);
 
-        println!(
+        klog_always!(
             "      Profile: {} (audit_capacity: {})",
             profile.name(),
             profile.audit_capacity()
@@ -272,39 +282,39 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
         match security::init(sec_config, &mut frame_allocator) {
             Ok(report) => {
-                println!("      ✓ Security hardening applied");
-                println!("        - Identity map: {:?}", report.identity_cleanup);
+                klog_always!("      ✓ Security hardening applied");
+                klog_always!("        - Identity map: {:?}", report.identity_cleanup);
                 if let Some(nx) = &report.nx_summary {
-                    println!(
+                    klog_always!(
                         "        - NX enforced: {} pages protected",
                         nx.data_nx_pages
                     );
                 }
                 if report.rng_ready {
-                    println!("        - CSPRNG ready (ChaCha20 + RDRAND/RDSEED)");
+                    klog_always!("        - CSPRNG ready (ChaCha20 + RDRAND/RDSEED)");
                     // R102-L5 FIX: Validate RNG without printing raw output.
                     // Printing raw entropy values is unnecessary and could be
                     // sensitive if RNG is not fully initialized.
                     match security::random_u64() {
-                        Ok(_) => println!("        - RNG self-test: passed"),
-                        Err(e) => println!("        ! RNG self-test failed: {:?}", e),
+                        Ok(_) => klog_always!("        - RNG self-test: passed"),
+                        Err(e) => klog_always!("        ! RNG self-test failed: {:?}", e),
                     }
                 } else {
-                    println!("        ! CSPRNG not ready");
+                    klog_always!("        ! CSPRNG not ready");
                 }
                 if report.kptr_guard_active {
-                    println!("        - kptr guard: active");
+                    klog_always!("        - kptr guard: active");
                 }
                 if let Some(spectre) = &report.spectre_status {
-                    println!("        - Spectre mitigations: {}", spectre.summary());
+                    klog_always!("        - Spectre mitigations: {}", spectre.summary());
                 }
 
                 // G.3: Lock profile after security initialization
                 compliance::lock_profile();
-                println!("        - Profile locked (immutable until reboot)");
+                klog_always!("        - Profile locked (immutable until reboot)");
             }
             Err(e) => {
-                println!("      ! Security hardening failed: {:?}", e);
+                klog_always!("      ! Security hardening failed: {:?}", e);
                 // R102-2 FIX: Secure profile must not boot without core mitigations.
                 // A single hardware/config anomaly should not silently disable all
                 // security hardening (W^X, NX, CSPRNG, Spectre mitigations).
@@ -315,54 +325,54 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                         e
                     );
                 }
-                println!("      ! Continuing with reduced security");
+                klog_always!("      ! Continuing with reduced security");
             }
         }
     }
 
     // R101-4 FIX: Boot-time livepatch ECDSA key validation
     if livepatch::has_placeholder_keys() {
-        println!("      ! WARNING: Livepatch ECDSA public keys are all-zero placeholders!");
-        println!("      ! Livepatch signature verification is non-functional.");
-        println!("      ! Generate production P-256 keys and embed them in livepatch::TRUSTED_P256_PUBKEYS_UNCOMPRESSED.");
+        klog_always!("      ! WARNING: Livepatch ECDSA public keys are all-zero placeholders!");
+        klog_always!("      ! Livepatch signature verification is non-functional.");
+        klog_always!("      ! Generate production P-256 keys and embed them in livepatch::TRUSTED_P256_PUBKEYS_UNCOMPRESSED.");
     }
 
     // KASLR/KPTI/PCID initialization
     // R39-7 FIX: Pass KASLR slide from bootloader to kernel
-    println!("[2.65/3] Initializing KASLR/KPTI/PCID...");
+    klog_always!("[2.65/3] Initializing KASLR/KPTI/PCID...");
     security::init_kaslr(boot_info.map(|info| info.kaslr_slide));
     // Cache INVPCID capability for TLB shootdowns (uses CPUID + PCID state)
     mm::tlb_shootdown::init_invpcid_support();
 
     // CPU 硬件保护特性启用 (SMEP/SMAP/UMIP)
-    println!("[2.7/3] Enabling CPU protection features...");
+    klog_always!("[2.7/3] Enabling CPU protection features...");
     {
         let cpu_status = arch::cpu_protection::enable_protections();
         if cpu_status.smep_enabled {
-            println!("        - SMEP: enabled (blocks kernel executing user pages)");
+            klog_always!("        - SMEP: enabled (blocks kernel executing user pages)");
         } else if cpu_status.smep_supported {
-            println!("        ! SMEP: supported but failed to enable");
+            klog_always!("        ! SMEP: supported but failed to enable");
         } else {
-            println!("        - SMEP: not supported by CPU");
+            klog_always!("        - SMEP: not supported by CPU");
         }
         if cpu_status.smap_enabled {
-            println!("        - SMAP: enabled (blocks kernel accessing user pages)");
+            klog_always!("        - SMAP: enabled (blocks kernel accessing user pages)");
         } else if cpu_status.smap_supported {
-            println!("        ! SMAP: supported but failed to enable");
+            klog_always!("        ! SMAP: supported but failed to enable");
         } else {
-            println!("        - SMAP: not supported by CPU");
+            klog_always!("        - SMAP: not supported by CPU");
         }
         if cpu_status.umip_enabled {
-            println!("        - UMIP: enabled (blocks user SGDT/SIDT/SLDT)");
+            klog_always!("        - UMIP: enabled (blocks user SGDT/SIDT/SLDT)");
         } else if cpu_status.umip_supported {
-            println!("        ! UMIP: supported but failed to enable");
+            klog_always!("        ! UMIP: supported but failed to enable");
         } else {
-            println!("        - UMIP: not supported by CPU");
+            klog_always!("        - UMIP: not supported by CPU");
         }
         if cpu_status.is_fully_protected() {
-            println!("      ✓ All CPU protections active");
+            klog_always!("      ✓ All CPU protections active");
         } else {
-            println!("      ! Partial CPU protection (some features unavailable)");
+            klog_always!("      ! Partial CPU protection (some features unavailable)");
         }
 
         // V-4 fix: No longer need to update SMAP status cache.
@@ -375,7 +385,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     arch::cpu_protection::require_smap_support();
 
     // Phase 6: 初始化 SYSCALL/SYSRET 快速系统调用机制
-    println!("[2.8/3] Initializing SYSCALL/SYSRET...");
+    klog_always!("[2.8/3] Initializing SYSCALL/SYSRET...");
     {
         // GDT 必须在此之前初始化（由 arch::interrupts::init() 完成）
         // 获取系统调用入口点地址并配置 MSR
@@ -386,13 +396,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         // 注册 syscall 帧回调，让 kernel_core 能访问当前 syscall 帧
         // 这对于 clone/fork 正确设置子进程上下文至关重要
         arch::register_frame_callback();
-        println!("      ✓ SYSCALL MSR configured");
-        println!("      ✓ Syscall frame callback registered");
-        println!("      ✓ Ring 3 transition support ready");
+        klog_always!("      ✓ SYSCALL MSR configured");
+        klog_always!("      ✓ Syscall frame callback registered");
+        klog_always!("      ✓ Ring 3 transition support ready");
     }
 
     // 阶段3：测试基础功能
-    println!("[3/3] Running basic tests...");
+    klog_always!("[3/3] Running basic tests...");
 
     // 测试内存分配
     use alloc::vec::Vec;
@@ -400,33 +410,33 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     for i in 0..10 {
         test_vec.push(i);
     }
-    println!("      ✓ Heap allocation test passed");
+    klog_always!("      ✓ Heap allocation test passed");
 
     // 显示内存统计
     let mem_stats = mm::memory::FrameAllocator::new().stats();
-    println!("      ✓ Memory stats available");
+    klog_always!("      ✓ Memory stats available");
 
-    println!();
-    println!("=== System Information ===");
+    klog_always!();
+    klog_always!("=== System Information ===");
     mem_stats.print();
 
-    println!();
-    println!("=== Verifying Core Subsystems ===");
-    println!();
+    klog_always!();
+    klog_always!("=== Verifying Core Subsystems ===");
+    klog_always!();
 
     // 验证各个模块已编译
-    println!("[4/8] Verifying architecture support...");
-    println!("      ✓ arch crate loaded");
-    println!("      ✓ Context switch module available");
+    klog_always!("[4/8] Verifying architecture support...");
+    klog_always!("      ✓ arch crate loaded");
+    klog_always!("      ✓ Context switch module available");
 
-    println!("[5/8] Initializing kernel core...");
+    klog_always!("[5/8] Initializing kernel core...");
     kernel_core::init(); // 初始化进程管理和 BOOT_CR3 缓存（必须在调度器前）
-    println!("      ✓ Process management ready");
-    println!("      ✓ System calls framework ready");
-    println!("      ✓ Fork/COW implementation compiled");
+    klog_always!("      ✓ Process management ready");
+    klog_always!("      ✓ System calls framework ready");
+    klog_always!("      ✓ Fork/COW implementation compiled");
 
     // Phase E: APIC and SMP Initialization
-    println!("[5.5/8] Initializing APIC and SMP...");
+    klog_always!("[5.5/8] Initializing APIC and SMP...");
     {
         // Pass ACPI RSDP address from bootloader to SMP module (required for UEFI systems)
         if let Some(info) = boot_info {
@@ -438,20 +448,20 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             arch::apic::init();
         }
         let bsp_lapic_id = arch::apic::bsp_lapic_id();
-        println!("      ✓ BSP LAPIC initialized (ID: {})", bsp_lapic_id);
+        klog_always!("      ✓ BSP LAPIC initialized (ID: {})", bsp_lapic_id);
 
         // E.1: Initialize HPET (High Precision Event Timer) if available
         // HPET provides a high-resolution counter for precise timing and
         // can be used as an alternative reference for LAPIC calibration.
         match arch::hpet::init() {
             Ok(info) => {
-                println!(
+                klog_always!(
                     "      ✓ HPET initialized (freq={} Hz, timers={}, 64-bit={})",
                     info.frequency_hz, info.comparator_count, info.counter_64bit
                 );
             }
             Err(e) => {
-                println!("      ! HPET unavailable: {:?} (using PIT for calibration)", e);
+                klog_always!("      ! HPET unavailable: {:?} (using PIT for calibration)", e);
             }
         }
 
@@ -460,13 +470,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         unsafe {
             match arch::apic::calibrate_lapic_timer() {
                 Ok(init_count) => {
-                    println!(
+                    klog_always!(
                         "      ✓ LAPIC timer calibrated (init_count: {})",
                         init_count
                     );
                 }
                 Err(e) => {
-                    println!(
+                    klog_always!(
                         "      ! LAPIC timer calibration failed: {}, using default",
                         e
                     );
@@ -483,92 +493,92 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             kernel_stack_top, // IRQ stack (same as kernel stack for now)
             kernel_stack_top, // Syscall stack (same for now)
         );
-        println!("      ✓ BSP per-CPU data initialized");
+        klog_always!("      ✓ BSP per-CPU data initialized");
 
         // R67-8 FIX: Initialize per-CPU syscall metadata and GS base for BSP
         unsafe {
             arch::syscall::init_syscall_percpu(0);
         }
-        println!("      ✓ BSP syscall per-CPU state initialized");
+        klog_always!("      ✓ BSP syscall per-CPU state initialized");
 
         // Attempt to bring up Application Processors (APs)
         // This will enumerate CPUs via ACPI MADT and send INIT-SIPI-SIPI
         let num_cpus = arch::start_aps();
         if num_cpus > 1 {
-            println!("      ✓ SMP enabled: {} CPU(s) online", num_cpus);
+            klog_always!("      ✓ SMP enabled: {} CPU(s) online", num_cpus);
         } else {
-            println!("      ✓ Single-core mode (no APs found or SMP disabled)");
+            klog_always!("      ✓ Single-core mode (no APs found or SMP disabled)");
         }
     }
 
-    println!("[6/8] Initializing scheduler...");
+    klog_always!("[6/8] Initializing scheduler...");
     sched::enhanced_scheduler::init(); // 注册定时器和重调度回调
-    println!("      ✓ Enhanced scheduler initialized");
+    klog_always!("      ✓ Enhanced scheduler initialized");
 
     // E.5: Initialize cpuset subsystem after CPU enumeration
     sched::cpuset::init();
-    println!("      ✓ Cpuset CPU isolation initialized");
+    klog_always!("      ✓ Cpuset CPU isolation initialized");
 
-    println!("[7/8] Initializing IPC...");
+    klog_always!("[7/8] Initializing IPC...");
     ipc::init(); // 初始化IPC子系统并注册清理回调
-    println!("      ✓ Capability-based endpoints enabled");
-    println!("      ✓ Process cleanup callback registered");
+    klog_always!("      ✓ Capability-based endpoints enabled");
+    klog_always!("      ✓ Process cleanup callback registered");
 
-    println!("[7.5/8] Initializing VFS...");
+    klog_always!("[7.5/8] Initializing VFS...");
     vfs::init(); // 初始化虚拟文件系统
-    println!("      ✓ devfs mounted at /dev");
-    println!("      ✓ Device files: null, zero, console");
+    klog_always!("      ✓ devfs mounted at /dev");
+    klog_always!("      ✓ Device files: null, zero, console");
 
     // Initialize page cache before block layer mounts filesystems
-    println!("[7.52/8] Initializing Page Cache...");
+    klog_always!("[7.52/8] Initializing Page Cache...");
     mm::init_page_cache();
-    println!("      ✓ Global page cache initialized");
+    klog_always!("      ✓ Global page cache initialized");
 
     // Phase D: Network Layer
-    println!("[7.54/8] Initializing Network Layer...");
+    klog_always!("[7.54/8] Initializing Network Layer...");
     let net_devices = net::init();
     if net_devices == 0 {
-        println!("      ! No network devices detected");
+        klog_always!("      ! No network devices detected");
     }
 
     // Phase C: Block Layer and Storage Foundation
-    println!("[7.55/8] Initializing Block Layer...");
+    klog_always!("[7.55/8] Initializing Block Layer...");
     block::init();
     // Probe for virtio-blk devices and register with VFS
     if let Some((device, name)) = block::probe_devices() {
         let device_for_registration = device.clone();
         match vfs::register_block_device(name, device_for_registration) {
             Ok(()) => {
-                println!("      ✓ Registered /dev/{} in devfs", name);
+                klog_always!("      ✓ Registered /dev/{} in devfs", name);
 
                 // Phase C: Test block write path (uses last sectors, outside filesystem)
-                println!("      [TEST] Block device write/read verification:");
+                klog_always!("      [TEST] Block device write/read verification:");
                 if test_block_write(&device) {
-                    println!("      ✓ Block write path verified");
+                    klog_always!("      ✓ Block write path verified");
                 } else {
-                    println!("      ! Block write test failed");
+                    klog_always!("      ! Block write test failed");
                 }
 
                 // Phase C: Try to mount as ext2 filesystem
                 match vfs::Ext2Fs::mount(device) {
                     Ok(fs) => match vfs::mount("/mnt", fs) {
-                        Ok(()) => println!("      ✓ Mounted /dev/{} on /mnt as ext2", name),
-                        Err(e) => println!(
+                        Ok(()) => klog_always!("      ✓ Mounted /dev/{} on /mnt as ext2", name),
+                        Err(e) => klog_always!(
                             "      ! Registered /dev/{} but failed to mount on /mnt: {:?}",
                             name, e
                         ),
                     },
-                    Err(e) => println!(
+                    Err(e) => klog_always!(
                         "      ! Registered /dev/{} but failed to initialize ext2: {:?}",
                         name, e
                     ),
                 }
             }
-            Err(e) => println!("      ! Failed to register /dev/{}: {:?}", name, e),
+            Err(e) => klog_always!("      ! Failed to register /dev/{}: {:?}", name, e),
         }
     }
 
-    println!("[7.6/8] Initializing audit subsystem...");
+    klog_always!("[7.6/8] Initializing audit subsystem...");
     match audit::init(64) {
         // Reduced from 256 to save heap memory
         Ok(()) => {
@@ -582,11 +592,11 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 0,
                 0, // timestamp 0 = boot
             );
-            println!(
+            klog_always!(
                 "      ✓ Audit subsystem ready (capacity: {} events)",
                 audit::DEFAULT_CAPACITY
             );
-            println!("      ✓ Hash-chained tamper evidence enabled");
+            klog_always!("      ✓ Hash-chained tamper evidence enabled");
 
             // A.3: Register audit snapshot authorizer (capability gate)
             // Policy: Allow root (euid == 0) OR holders of CAP_AUDIT_READ
@@ -616,7 +626,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 // Deny all others
                 Err(audit::AuditError::AccessDenied)
             });
-            println!("      ✓ Audit capability gate registered (CAP_AUDIT_READ)");
+            klog_always!("      ✓ Audit capability gate registered (CAP_AUDIT_READ)");
 
             // R66-10 FIX: Register HMAC key authorizer (capability gate for audit config)
             // Policy: Allow root (euid == 0) OR holders of CAP_AUDIT_WRITE
@@ -647,7 +657,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 // Deny all others
                 Err(audit::AuditError::AccessDenied)
             });
-            println!("      ✓ Audit HMAC key gate registered (CAP_AUDIT_WRITE)");
+            klog_always!("      ✓ Audit HMAC key gate registered (CAP_AUDIT_WRITE)");
 
             // R72-HMAC: Generate and install audit HMAC key for integrity protection
             // Uses CSPRNG to generate a 32-byte cryptographically secure key.
@@ -657,16 +667,16 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 match security::rng::fill_random(&mut audit_hmac_key) {
                     Ok(()) => match audit::set_hmac_key(&audit_hmac_key) {
                         Ok(()) => {
-                            println!("      ✓ Audit HMAC key installed (32 bytes, CSPRNG)");
-                            println!("        - All audit events now HMAC-SHA256 protected");
+                            klog_always!("      ✓ Audit HMAC key installed (32 bytes, CSPRNG)");
+                            klog_always!("        - All audit events now HMAC-SHA256 protected");
                         }
                         Err(e) => {
-                            println!("      ! Failed to set audit HMAC key: {:?}", e);
+                            klog_always!("      ! Failed to set audit HMAC key: {:?}", e);
                         }
                     },
                     Err(e) => {
-                        println!("      ! Failed to generate audit HMAC key: {:?}", e);
-                        println!("        - Audit events using plain SHA-256 chain only");
+                        klog_always!("      ! Failed to generate audit HMAC key: {:?}", e);
+                        klog_always!("        - Audit events using plain SHA-256 chain only");
                     }
                 }
                 // R72-HMAC: Zero key material from stack to limit exposure window
@@ -678,12 +688,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             }
         }
         Err(e) => {
-            println!("      ! Audit initialization failed: {:?}", e);
+            klog_always!("      ! Audit initialization failed: {:?}", e);
         }
     }
 
     // Phase G.1: Observability subsystem (tracepoints, counters, watchdog)
-    println!("[7.7/8] Initializing observability subsystem...");
+    klog_always!("[7.7/8] Initializing observability subsystem...");
     trace::init();
     // G.1: Force-initialize per-CPU counter storage and mark counters as ready.
     // This ensures the CpuLocal<PerCpuCounters> lazy init happens during boot
@@ -713,11 +723,11 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         }
         false
     });
-    println!("      ✓ Trace capability gate registered (CAP_TRACE_READ)");
+    klog_always!("      ✓ Trace capability gate registered (CAP_TRACE_READ)");
 
-    println!("[8/8] Verifying memory management...");
-    println!("      ✓ Page table manager compiled");
-    println!("      ✓ mmap/munmap available");
+    klog_always!("[8/8] Verifying memory management...");
+    klog_always!("      ✓ Page table manager compiled");
+    klog_always!("      ✓ mmap/munmap available");
 
     // 运行集成测试
     integration_test::run_all_tests();
@@ -725,45 +735,45 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // 运行运行时功能测试
     let test_report = runtime_tests::run_all_runtime_tests();
     if test_report.failed > 0 {
-        println!("WARNING: {} runtime tests failed!", test_report.failed);
+        klog_always!("WARNING: {} runtime tests failed!", test_report.failed);
     }
 
     // 运行 Ring 3 用户态测试
-    println!("[9/9] Running Ring 3 user mode test...");
+    klog_always!("[9/9] Running Ring 3 user mode test...");
     if usermode_test::run_usermode_test() {
-        println!("      ✓ Ring 3 test process created successfully");
+        klog_always!("      ✓ Ring 3 test process created successfully");
     } else {
-        println!("      ! Ring 3 test setup failed");
+        klog_always!("      ! Ring 3 test setup failed");
     }
 
-    println!("=== System Ready ===");
-    println!();
-    println!("🎉 Zero-OS Phase 1 Complete!");
-    println!("All subsystems verified and integrated successfully!");
-    println!();
-    println!("📊 Component Summary:");
-    println!("   • VGA Driver & Output");
-    println!("   • Interrupt Handling (20+ handlers)");
-    println!("   • Memory Management (Heap + Buddy allocator)");
-    println!("   • Page Table Manager");
-    println!("   • Kernel Stack Guard Pages");
-    println!("   • Security Hardening (W^X, NX, CSPRNG)");
-    println!("   • CPU Protection (SMEP/SMAP/UMIP)");
-    println!("   • SYSCALL/SYSRET (Ring 3 transition)");
-    println!("   • Process Control Block");
-    println!("   • Enhanced Scheduler (Multi-level feedback queue)");
-    println!("   • Context Switch (176-byte context + IRETQ)");
-    println!("   • System Calls (50+ defined)");
-    println!("   • Fork with COW");
-    println!("   • Memory Mapping (mmap/munmap)");
-    println!("   • Capability-based IPC");
-    println!("   • Virtual File System (VFS)");
-    println!("   • Device Files (/dev/null, /dev/zero, /dev/console)");
-    println!("   • Security Audit (hash-chained events)");
-    println!("   • Ring 3 User Mode (Phase 6 complete)");
-    println!();
-    println!("进入空闲循环...");
-    println!();
+    klog_always!("=== System Ready ===");
+    klog_always!();
+    klog_always!("🎉 Zero-OS Phase 1 Complete!");
+    klog_always!("All subsystems verified and integrated successfully!");
+    klog_always!();
+    klog_always!("📊 Component Summary:");
+    klog_always!("   • VGA Driver & Output");
+    klog_always!("   • Interrupt Handling (20+ handlers)");
+    klog_always!("   • Memory Management (Heap + Buddy allocator)");
+    klog_always!("   • Page Table Manager");
+    klog_always!("   • Kernel Stack Guard Pages");
+    klog_always!("   • Security Hardening (W^X, NX, CSPRNG)");
+    klog_always!("   • CPU Protection (SMEP/SMAP/UMIP)");
+    klog_always!("   • SYSCALL/SYSRET (Ring 3 transition)");
+    klog_always!("   • Process Control Block");
+    klog_always!("   • Enhanced Scheduler (Multi-level feedback queue)");
+    klog_always!("   • Context Switch (176-byte context + IRETQ)");
+    klog_always!("   • System Calls (50+ defined)");
+    klog_always!("   • Fork with COW");
+    klog_always!("   • Memory Mapping (mmap/munmap)");
+    klog_always!("   • Capability-based IPC");
+    klog_always!("   • Virtual File System (VFS)");
+    klog_always!("   • Device Files (/dev/null, /dev/zero, /dev/console)");
+    klog_always!("   • Security Audit (hash-chained events)");
+    klog_always!("   • Ring 3 User Mode (Phase 6 complete)");
+    klog_always!();
+    klog_always!("进入空闲循环...");
+    klog_always!();
 
     // 启用中断（IDT 已初始化完成）
     // 注意：在启用中断前，确保所有中断处理程序已正确设置

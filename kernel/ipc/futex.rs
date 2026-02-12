@@ -792,8 +792,7 @@ fn apply_pi_and_propagate(
         depth += 1;
         if depth > MAX_PI_CHAIN_DEPTH {
             // Log warning but don't panic - gracefully stop propagation
-            #[cfg(debug_assertions)]
-            drivers::println!(
+            kprintln!(
                 "[FUTEX] PI chain depth exceeded {} at key {:?}, truncating",
                 MAX_PI_CHAIN_DEPTH,
                 cur_key

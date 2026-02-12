@@ -194,12 +194,12 @@ pub fn init() {
     }
 
     let selectors = selectors();
-    println!("GDT initialized with per-CPU TSS support (R70-3)");
-    println!("  Kernel CS: {:?}", selectors.kernel_code);
-    println!("  Kernel DS: {:?}", selectors.kernel_data);
-    println!("  User CS:   {:?}", selectors.user_code);
-    println!("  User DS:   {:?}", selectors.user_data);
-    println!("  TSS:       {:?}", selectors.tss);
+    klog_always!("GDT initialized with per-CPU TSS support (R70-3)");
+    klog_always!("  Kernel CS: {:?}", selectors.kernel_code);
+    klog_always!("  Kernel DS: {:?}", selectors.kernel_data);
+    klog_always!("  User CS:   {:?}", selectors.user_code);
+    klog_always!("  User DS:   {:?}", selectors.user_data);
+    klog_always!("  TSS:       {:?}", selectors.tss);
 }
 
 /// 获取段选择子

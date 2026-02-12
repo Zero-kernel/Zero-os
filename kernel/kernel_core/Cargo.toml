@@ -24,3 +24,4 @@ net = { path = "../net" }
 trace = { path = "../trace" }
 compliance = { path = "../compliance" }
 livepatch = { path = "../livepatch" }
+klog = { path = "../klog" }

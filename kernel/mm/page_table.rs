@@ -389,7 +389,7 @@ pub unsafe fn init(physical_memory_offset: VirtAddr) {
     let manager = PageTableManager::new(get_phys_offset());
     *PAGE_TABLE_MANAGER.lock() = Some(manager);
 
-    println!(
+    klog_always!(
         "Page table manager initialized (PHYS_OFFSET: 0x{:x})",
         PHYSICAL_MEMORY_OFFSET
     );

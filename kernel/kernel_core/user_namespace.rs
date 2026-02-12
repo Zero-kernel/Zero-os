@@ -786,7 +786,7 @@ pub fn root_user_namespace() -> Arc<UserNamespace> {
 
 /// Print namespace information for debugging.
 pub fn print_user_namespace_info(ns: &Arc<UserNamespace>) {
-    println!(
+    kprintln!(
         "[USER NS] id={}, level={}, refcount={}, uid_map_set={}, gid_map_set={}",
         ns.id().raw(),
         ns.level(),

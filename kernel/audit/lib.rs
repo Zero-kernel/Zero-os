@@ -55,8 +55,9 @@
 
 extern crate alloc;
 
-#[macro_use]
 extern crate drivers;
+#[macro_use]
+extern crate klog;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1547,7 +1548,7 @@ pub fn init(capacity: usize) -> Result<(), AuditError> {
         Ok(())
     })?;
 
-    println!(
+    klog_always!(
         "  Audit subsystem initialized (capacity: {} events)",
         capacity
     );
@@ -1609,7 +1610,7 @@ pub fn set_hmac_key(key: &[u8]) -> Result<(), AuditError> {
         let mut ring = AUDIT_RING.lock();
         if let Some(ref mut r) = *ring {
             r.set_key(key)?;
-            println!(
+            klog_always!(
                 "  Audit HMAC key set ({} bytes) - integrity protection active",
                 key.len()
             );
@@ -1656,7 +1657,7 @@ pub fn enable() {
 /// ignored to prevent attackers from covering their tracks.
 pub fn disable() {
     // R35-AUDIT-1: Audit is mandatory - log the attempt but don't disable
-    println!("  audit: disable() called but ignored (audit is mandatory)");
+    kprintln!("  audit: disable() called but ignored (audit is mandatory)");
 }
 
 /// Check if audit is enabled
@@ -1932,7 +1933,7 @@ pub fn snapshot() -> Result<AuditSnapshot, AuditError> {
 
     // R72-PERSIST: Invoke persistence hook (best-effort, don't lose events on failure)
     if let Err(err) = run_persistence_hook(&snapshot.events) {
-        println!(
+        kprintln!(
             "  audit: persistence hook failed: {:?} (events returned to caller)",
             err
         );
@@ -2175,9 +2176,9 @@ pub fn verify_chain(events: &[AuditEvent]) -> bool {
 /// let key = b"my-audit-signing-key";
 /// let events = export_audit_log();
 /// if verify_chain_hmac(&events, key) {
-///     println!("Audit log integrity verified");
+///     kprintln!("Audit log integrity verified");
 /// } else {
-///     println!("WARNING: Audit log may have been tampered with!");
+///     kprintln!("WARNING: Audit log may have been tampered with!");
 /// }
 /// ```
 pub fn verify_chain_hmac(events: &[AuditEvent], key: &[u8]) -> bool {

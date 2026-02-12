@@ -263,9 +263,9 @@ impl TraceCounterSnapshot {
 ///
 /// ```rust,ignore
 /// if let Ok(snapshot) = trace::snapshot_counters() {
-///     println!("Total syscalls: {}", snapshot.get(TraceCounter::SyscallEntry));
+///     kprintln!("Total syscalls: {}", snapshot.get(TraceCounter::SyscallEntry));
 ///     for (name, value) in snapshot.iter() {
-///         println!("  {}: {}", name, value);
+///         kprintln!("  {}: {}", name, value);
 ///     }
 /// }
 /// ```

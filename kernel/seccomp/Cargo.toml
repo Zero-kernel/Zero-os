@@ -14,6 +14,7 @@ bitflags = "2.4"
 # Cross-crate dependencies
 drivers = { path = "../drivers" }
 audit = { path = "../audit" }
+klog = { path = "../klog" }
 
 [features]
 default = []

@@ -30,8 +30,9 @@
 
 extern crate alloc;
 
-#[macro_use]
 extern crate drivers;
+#[macro_use]
+extern crate klog;
 
 pub mod kaslr;
 pub mod kptr;
@@ -207,27 +208,27 @@ impl SecurityReport {
 
     /// Print the security report to console
     pub fn print(&self) {
-        println!("=== Security Hardening Report ===");
-        println!("Identity Map: {:?}", self.identity_cleanup);
+        klog_always!("=== Security Hardening Report ===");
+        klog_always!("Identity Map: {:?}", self.identity_cleanup);
 
         if let Some(ref nx) = self.nx_summary {
-            println!("NX Enforcement:");
-            println!("  Text (R-X): {} pages", nx.text_rx_pages);
-            println!("  RoData (R--): {} pages", nx.ro_pages);
-            println!("  Data (RW-): {} pages", nx.data_nx_pages);
+            klog_always!("NX Enforcement:");
+            klog_always!("  Text (R-X): {} pages", nx.text_rx_pages);
+            klog_always!("  RoData (R--): {} pages", nx.ro_pages);
+            klog_always!("  Data (RW-): {} pages", nx.data_nx_pages);
         }
 
         if let Some(ref wx) = self.wxorx_summary {
-            println!("W^X Validation:");
-            println!("  Scanned: {} entries", wx.scanned_entries);
-            println!("  Violations: {}", wx.violations);
+            klog_always!("W^X Validation:");
+            klog_always!("  Scanned: {} entries", wx.scanned_entries);
+            klog_always!("  Violations: {}", wx.violations);
         }
 
-        println!(
+        klog_always!(
             "CSPRNG: {}",
             if self.rng_ready { "Ready" } else { "Not Ready" }
         );
-        println!(
+        klog_always!(
             "kptr Guard: {}",
             if self.kptr_guard_active {
                 "Active"
@@ -237,8 +238,8 @@ impl SecurityReport {
         );
 
         if let Some(ref spectre) = self.spectre_status {
-            println!("Spectre/Meltdown Mitigations:");
-            println!(
+            klog_always!("Spectre/Meltdown Mitigations:");
+            klog_always!(
                 "  IBRS: {} (supported: {})",
                 if spectre.ibrs_enabled {
                     "enabled"
@@ -247,7 +248,7 @@ impl SecurityReport {
                 },
                 spectre.ibrs_supported
             );
-            println!(
+            klog_always!(
                 "  STIBP: {} (supported: {})",
                 if spectre.stibp_enabled {
                     "enabled"
@@ -256,20 +257,20 @@ impl SecurityReport {
                 },
                 spectre.stibp_supported
             );
-            println!("  IBPB: supported: {}", spectre.ibpb_supported);
-            println!("  Status: {}", spectre.summary());
+            klog_always!("  IBPB: supported: {}", spectre.ibpb_supported);
+            klog_always!("  Status: {}", spectre.summary());
         }
 
         if let Some(ref tests) = self.test_report {
-            println!("Security Self-Tests:");
-            println!(
+            klog_always!("Security Self-Tests:");
+            klog_always!(
                 "  Passed: {}, Failed: {}, Warnings: {}",
                 tests.passed, tests.failed, tests.warnings
             );
         }
 
-        println!("Total Violations: {}", self.total_violations);
-        println!(
+        klog_always!("Total Violations: {}", self.total_violations);
+        klog_always!(
             "Overall Status: {}",
             if self.is_secure() {
                 "SECURE"
@@ -314,21 +315,21 @@ pub fn init(
     // In strict/Secure profiles, a deterministic kernel layout is unacceptable.
     kaslr::set_kaslr_fail_closed(config.strict_wxorx);
 
-    println!("  Initializing security hardening...");
+    klog_always!("  Initializing security hardening...");
 
     // Step 1: Initialize kptr guard (early, to protect all subsequent logs)
     if config.enable_kptr_guard {
-        println!("    [1/7] Enabling kptr guard...");
+        klog_always!("    [1/7] Enabling kptr guard...");
         kptr::init();
         kptr::enable();
         report.kptr_guard_active = true;
     } else {
-        println!("    [1/7] kptr guard: SKIPPED (disabled)");
+        klog_always!("    [1/7] kptr guard: SKIPPED (disabled)");
         kptr::disable();
     }
 
     // Step 2: Clean up identity mapping
-    println!(
+    klog_always!(
         "    [2/7] Cleaning identity map ({:?})...",
         config.cleanup_strategy
     );
@@ -338,17 +339,17 @@ pub fn init(
 
     // Step 3: Enforce NX on kernel data sections
     if config.enforce_nx {
-        println!("    [3/7] Enforcing NX bit on data pages...");
+        klog_always!("    [3/7] Enforcing NX bit on data pages...");
         let nx_summary =
             memory_hardening::enforce_nx_for_kernel(config.phys_offset, frame_allocator)?;
         report.nx_summary = Some(nx_summary);
     } else {
-        println!("    [3/7] NX enforcement: SKIPPED (disabled)");
+        klog_always!("    [3/7] NX enforcement: SKIPPED (disabled)");
     }
 
     // Step 4: Validate W^X policy
     if config.validate_wxorx {
-        println!("    [4/7] Validating W^X policy...");
+        klog_always!("    [4/7] Validating W^X policy...");
         match wxorx::validate_active(config.phys_offset) {
             Ok(summary) => {
                 // X-3 FIX: Ok now means zero violations by contract
@@ -358,7 +359,7 @@ pub fn init(
                 // X-3 FIX: PolicyViolation now contains the full summary
                 report.wxorx_summary = Some(summary);
                 report.total_violations += summary.violations;
-                println!(
+                klog_always!(
                     "      WARNING: {} W^X violation(s) detected",
                     summary.violations
                 );
@@ -367,7 +368,7 @@ pub fn init(
                 }
             }
             Err(WxorxError::Violation(v)) => {
-                println!("      WARNING: W^X violation at {:?}", v.virt_base);
+                klog_always!("      WARNING: W^X violation at {:?}", v.virt_base);
                 report.total_violations += 1;
                 report.wxorx_summary = Some(ValidationSummary {
                     scanned_entries: 0,
@@ -379,19 +380,19 @@ pub fn init(
                 }
             }
             Err(e) => {
-                println!("      WARNING: W^X validation error: {:?}", e);
+                klog_always!("      WARNING: W^X validation error: {:?}", e);
                 if config.strict_wxorx {
                     return Err(SecurityError::Wxorx(e));
                 }
             }
         }
     } else {
-        println!("    [4/7] W^X validation: SKIPPED (disabled)");
+        klog_always!("    [4/7] W^X validation: SKIPPED (disabled)");
     }
 
     // Step 5: Initialize hardware RNG and CSPRNG
     if config.initialize_rng {
-        println!("    [5/7] Initializing hardware RNG and CSPRNG...");
+        klog_always!("    [5/7] Initializing hardware RNG and CSPRNG...");
         match rng::init_global() {
             Ok(()) => {
                 report.rng_ready = true;
@@ -399,41 +400,41 @@ pub fn init(
                 // Verify RNG is working with a test read
                 match random_u64() {
                     Ok(_) => {
-                        println!("      CSPRNG verified operational");
+                        klog_always!("      CSPRNG verified operational");
                         // Reseed kptr guard with strong entropy
                         if config.enable_kptr_guard {
                             kptr::reseed_from_entropy();
                         }
                     }
                     Err(e) => {
-                        println!("      WARNING: CSPRNG verification failed: {:?}", e);
+                        klog_always!("      WARNING: CSPRNG verification failed: {:?}", e);
                         report.rng_ready = false;
                     }
                 }
             }
             Err(e) => {
-                println!("      WARNING: RNG initialization failed: {:?}", e);
+                klog_always!("      WARNING: RNG initialization failed: {:?}", e);
                 report.rng_ready = false;
             }
         }
     } else {
-        println!("    [5/7] RNG initialization: SKIPPED (disabled)");
+        klog_always!("    [5/7] RNG initialization: SKIPPED (disabled)");
     }
 
     // Step 6: Enable Spectre/Meltdown mitigations
     if config.enable_spectre_mitigations {
-        println!("    [6/7] Enabling Spectre/Meltdown mitigations...");
+        klog_always!("    [6/7] Enabling Spectre/Meltdown mitigations...");
         match spectre::init() {
             Ok(status) => {
-                println!("      Mitigations: {}", status.summary());
+                klog_always!("      Mitigations: {}", status.summary());
                 if status.retpoline_required && !status.retpoline_compiler && !status.ibrs_enabled {
-                    println!("      WARNING: Retpoline required but not available");
+                    klog_always!("      WARNING: Retpoline required but not available");
                     report.total_violations += 1;
                 }
                 report.spectre_status = Some(status);
             }
             Err(e) => {
-                println!("      WARNING: Spectre mitigations failed: {:?}", e);
+                klog_always!("      WARNING: Spectre mitigations failed: {:?}", e);
                 // Don't increment violations for unsupported CPUs
                 if !matches!(e, SpectreError::Unsupported(_)) {
                     report.total_violations += 1;
@@ -441,30 +442,30 @@ pub fn init(
             }
         }
     } else {
-        println!("    [6/7] Spectre mitigations: SKIPPED (disabled)");
+        klog_always!("    [6/7] Spectre mitigations: SKIPPED (disabled)");
     }
 
     // Step 7: Run security self-tests (optional)
     if config.run_security_tests {
-        println!("    [7/7] Running security self-tests...");
+        klog_always!("    [7/7] Running security self-tests...");
         let ctx = TestContext {
             phys_offset: config.phys_offset,
         };
         let test_report = tests::run_security_tests(&ctx);
 
         if test_report.failed > 0 {
-            println!(
+            klog_always!(
                 "      WARNING: {} security tests failed",
                 test_report.failed
             );
             report.total_violations += test_report.failed;
         } else {
-            println!("      All {} tests passed", test_report.passed);
+            klog_always!("      All {} tests passed", test_report.passed);
         }
 
         report.test_report = Some(test_report);
     } else {
-        println!("    [7/7] Security self-tests: SKIPPED (disabled)");
+        klog_always!("    [7/7] Security self-tests: SKIPPED (disabled)");
     }
 
     Ok(report)

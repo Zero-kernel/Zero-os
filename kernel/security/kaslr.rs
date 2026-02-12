@@ -1148,12 +1148,13 @@ fn generate_kaslr_slide() -> u64 {
                 );
             }
             // R101-8 FIX: Warn loudly instead of silent fallback
-            println!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-            println!("!! WARNING: KASLR RNG failure - KASLR IS DISABLED   !!");
-            println!("!! The kernel is booting with a DETERMINISTIC memory !!");
-            println!("!! layout. This severely weakens exploit mitigation. !!");
-            println!("!! Ensure hardware RNG (RDRAND) is available.        !!");
-            println!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            // Must be visible to operators even in release builds.
+            klog_always!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            klog_always!("!! WARNING: KASLR RNG failure - KASLR IS DISABLED   !!");
+            klog_always!("!! The kernel is booting with a DETERMINISTIC memory !!");
+            klog_always!("!! layout. This severely weakens exploit mitigation. !!");
+            klog_always!("!! Ensure hardware RNG (RDRAND) is available.        !!");
+            klog_always!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
             0
         }
     }
@@ -1256,12 +1257,12 @@ pub fn init(boot_slide: Option<u64>) {
             // R101-2 FIX: Gate address-containing messages behind debug_assertions.
             // KASLR slide values are security-sensitive and must not leak in production.
             #[cfg(debug_assertions)]
-            println!(
+            kprintln!(
                 "  ! KASLR slide mismatch: bootloader=0x{:x}, runtime=0x{:x}",
                 expected, layout.kaslr_slide
             );
             #[cfg(not(debug_assertions))]
-            println!("  ! KASLR slide mismatch detected (details hidden in release mode)");
+            klog_always!("  ! KASLR slide mismatch detected (details hidden in release mode)");
         }
     }
 
@@ -1279,7 +1280,7 @@ pub fn init(boot_slide: Option<u64>) {
     // R101-2 FIX: Gate KASLR slide, heap base, and kernel section addresses behind
     // debug_assertions. Logging these values in production completely negates KASLR
     // by exposing the exact kernel memory layout to anyone with serial console access.
-    println!(
+    klog_always!(
         "  PCID: {}",
         if pcid_enabled {
             "enabled"
@@ -1289,7 +1290,7 @@ pub fn init(boot_slide: Option<u64>) {
     );
     #[cfg(debug_assertions)]
     {
-        println!(
+        kprintln!(
             "  KASLR: {} (slide: 0x{:x})",
             if layout.kaslr_slide != 0 {
                 "enabled"
@@ -1300,7 +1301,7 @@ pub fn init(boot_slide: Option<u64>) {
         );
     }
     #[cfg(not(debug_assertions))]
-    println!(
+    klog_always!(
         "  KASLR: {}",
         if layout.kaslr_slide != 0 {
             "enabled"
@@ -1309,7 +1310,7 @@ pub fn init(boot_slide: Option<u64>) {
         }
     );
     // Report Partial KASLR status
-    println!(
+    klog_always!(
         "  Partial KASLR: heap={}, kstack={}, user={}",
         if partial.heap_base { "yes" } else { "no" },
         if partial.kernel_stacks { "yes" } else { "no" },
@@ -1317,19 +1318,19 @@ pub fn init(boot_slide: Option<u64>) {
     );
     #[cfg(debug_assertions)]
     if partial.heap_base {
-        println!(
+        kprintln!(
             "    Heap base: 0x{:x} (randomized)",
             mm::memory::heap_base()
         );
     }
     #[cfg(debug_assertions)]
-    println!(
+    kprintln!(
         "  Kernel sections: text={:#x}..{:#x} ({} bytes)",
         layout.text_start,
         layout.text_start + layout.text_size,
         layout.text_size
     );
-    println!(
+    klog_always!(
         "  KPTI: {} (stubs installed)",
         if is_kpti_enabled() {
             "enabled"

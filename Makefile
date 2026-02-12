@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -340,6 +340,34 @@ run-smp-debug: build disk-ext2.img
 		-nographic \
 		-d int,cpu_reset \
 		-D qemu-smp.log
+
+# H.2.2 CI gate: Reject ungated println! in kernel code.
+# Allowed locations: kernel/drivers/ (macro definition), kernel/klog/ (implementation).
+# All other crates must use kprintln!, klog!, or klog_always!.
+# Comments and doc strings containing println! are excluded.
+lint-release:
+	@echo "=== Lint: checking for ungated println! ==="
+	@HITS=$$(grep -rn '\bprintln!' kernel/ \
+		--include='*.rs' \
+		--exclude-dir=drivers \
+		--exclude-dir=klog \
+		| grep -v '^\s*//' \
+		| grep -v '//.*println!' \
+		| grep -v '///.*println!' \
+		| grep -v '//!.*println!' \
+		| grep -v '#\[cfg(feature' \
+		| grep -v 'macro_rules!' \
+		| grep '^\S*\.rs:[0-9]*:\s*println!' \
+	) ; \
+	if [ -n "$$HITS" ]; then \
+		echo "ERROR: Ungated println! found in kernel code:"; \
+		echo "$$HITS"; \
+		echo ""; \
+		echo "Use kprintln!, klog!(Level, ...), or klog_always! instead."; \
+		exit 1; \
+	else \
+		echo "OK: No ungated println! found outside drivers/klog."; \
+	fi
 
 clean:
 	cargo clean

@@ -46,8 +46,9 @@
 
 extern crate alloc;
 
-#[macro_use]
 extern crate drivers;
+#[macro_use]
+extern crate klog;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -104,7 +105,7 @@ pub fn register_current_hooks(evaluator: SeccompEvaluator, enabled_check: Seccom
     *CURRENT_ENABLED_CHECK.write() = Some(enabled_check);
     // R65-14 FIX: Mark seccomp as initialized - fail-closed after this point
     SECCOMP_INITIALIZED.store(true, Ordering::SeqCst);
-    println!("  Seccomp hooks registered for current-process evaluation (fail-closed mode active)");
+    klog_always!("  Seccomp hooks registered for current-process evaluation (fail-closed mode active)");
 }
 
 // ============================================================================
@@ -412,7 +413,7 @@ pub fn notify_violation(
 
 /// Initialize the seccomp subsystem.
 pub fn init() {
-    println!("  Seccomp/Pledge subsystem initialized");
+    klog_always!("  Seccomp/Pledge subsystem initialized");
 }
 
 // ============================================================================

@@ -16,6 +16,7 @@ x86_64 = "0.15"
 # Note: kernel_core removed to avoid cyclic dependency
 # ProcessId and FileOps are defined locally in types.rs
 drivers = { path = "../drivers" }
+klog = { path = "../klog" }
 
 [features]
 default = []

@@ -51,7 +51,6 @@
 
 extern crate alloc;
 
-#[macro_use]
 extern crate drivers;
 
 use cap::{CapId, CapRights};

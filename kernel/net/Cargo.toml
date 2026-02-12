@@ -17,3 +17,4 @@ cap = { path = "../cap" }
 lsm = { path = "../lsm" }
 security = { path = "../security" }
 iommu = { path = "../iommu" }
+klog = { path = "../klog" }

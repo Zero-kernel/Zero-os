@@ -5,6 +5,8 @@ extern crate alloc;
 // 导入 drivers crate 的宏
 #[macro_use]
 extern crate drivers;
+#[macro_use]
+extern crate klog;
 
 extern crate kernel_core;
 extern crate lazy_static;
@@ -27,7 +29,7 @@ pub use lock_ordering::{LockClassKey, LockdepMutex, LockLevel};
 pub use cpuset::{CpusetError, CpusetId, CpusetNode};
 
 pub fn init() {
-    println!("Scheduler module initialized");
+    klog_always!("Scheduler module initialized");
     enhanced_scheduler::init();
     // Note: cpuset::init() should be called after CPU enumeration in main.rs
 }

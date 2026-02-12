@@ -458,7 +458,7 @@ impl BufPool {
 
         if allocated < pool_size {
             // Log warning about partial allocation
-            drivers::println!(
+            kprintln!(
                 "[net] BufPool: only allocated {}/{} buffers",
                 allocated,
                 pool_size

@@ -342,12 +342,12 @@ impl Vfs {
 
         // Create /dev directory entry
         if let Err(e) = ramfs.create(&root_inode, "dev", dir_mode) {
-            println!("Warning: failed to create /dev mountpoint: {:?}", e);
+            klog!(Warn, "Warning: failed to create /dev mountpoint: {:?}", e);
         }
 
         // Create /proc directory entry
         if let Err(e) = ramfs.create(&root_inode, "proc", dir_mode) {
-            println!("Warning: failed to create /proc mountpoint: {:?}", e);
+            klog!(Warn, "Warning: failed to create /proc mountpoint: {:?}", e);
         }
 
         // Create and mount devfs at /dev
@@ -364,7 +364,7 @@ impl Vfs {
         // Create /sys and /sys/fs/cgroup directory hierarchy for cgroupfs
         // First create /sys directory
         if let Err(e) = ramfs.create(&root_inode, "sys", dir_mode) {
-            println!("Warning: failed to create /sys mountpoint: {:?}", e);
+            klog!(Warn, "Warning: failed to create /sys mountpoint: {:?}", e);
         }
 
         // Create /sys/fs via sysfs (we mount a ramfs at /sys for now)
@@ -375,13 +375,13 @@ impl Vfs {
         // Create /sys/fs directory
         let sys_root = sysfs.root_inode();
         if let Err(e) = sysfs.create(&sys_root, "fs", dir_mode) {
-            println!("Warning: failed to create /sys/fs directory: {:?}", e);
+            klog!(Warn, "Warning: failed to create /sys/fs directory: {:?}", e);
         }
 
         // Get /sys/fs and create cgroup directory
         if let Ok(fs_inode) = sysfs.lookup(&sys_root, "fs") {
             if let Err(e) = sysfs.create(&fs_inode, "cgroup", dir_mode) {
-                println!("Warning: failed to create /sys/fs/cgroup directory: {:?}", e);
+                klog!(Warn, "Warning: failed to create /sys/fs/cgroup directory: {:?}", e);
             }
         }
 
@@ -390,7 +390,7 @@ impl Vfs {
         self.mount_in_namespace(&root_ns, "/sys/fs/cgroup", cgroupfs)
             .expect("Failed to mount cgroupfs");
 
-        println!("VFS initialized: ramfs at /, devfs at /dev, procfs at /proc, cgroupfs at /sys/fs/cgroup");
+        klog_always!("VFS initialized: ramfs at /, devfs at /dev, procfs at /proc, cgroupfs at /sys/fs/cgroup");
     }
 
     /// Mount a filesystem at the given path (in current process's namespace)
@@ -1461,7 +1461,7 @@ pub fn register_syscall_callbacks() {
     // post-clone parent mounts from leaking into child namespaces.
     kernel_core::register_mount_ns_materialize_callback(mount_ns_materialize_callback);
 
-    println!("VFS syscall callbacks registered (openat2 enabled, R74-2 materialize enabled)");
+    klog_always!("VFS syscall callbacks registered (openat2 enabled, R74-2 materialize enabled)");
 }
 
 /// R74-2 FIX: Mount namespace materialization callback.

@@ -453,7 +453,7 @@ pub fn log_fault_to_console(record: &FaultRecord, unit_index: usize) {
     let (bdf, _len) = record.bdf_string();
     let bdf_str = core::str::from_utf8(&bdf[..7]).unwrap_or("??:??.?");
 
-    println!(
+    kprintln!(
         "[IOMMU] Unit {}: DMA fault from {} addr={:#x} reason={:?} type={:?}{}{}",
         unit_index,
         bdf_str,

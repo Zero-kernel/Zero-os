@@ -16,3 +16,4 @@ lsm = { path = "../lsm", features = ["lsm"] }
 block = { path = "../block" }
 mm = { path = "../mm" }
 cap = { path = "../cap" }
+klog = { path = "../klog" }

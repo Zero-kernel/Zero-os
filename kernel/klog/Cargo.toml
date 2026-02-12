@@ -1,0 +1,15 @@
+[package]
+name = "klog"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-OS kernel logging: profile-aware, security-conscious, no_std"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+# Only depend on `drivers` for the underlying _print() output sink.
+# Profile filtering is injected at runtime via `set_profile()` — no compile-time
+# dependency on `compliance` or `security`, keeping this crate lightweight so
+# every kernel subcrate can depend on it without pulling in the world.
+drivers = { path = "../drivers" }

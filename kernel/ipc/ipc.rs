@@ -247,7 +247,7 @@ lazy_static::lazy_static! {
 
 /// 初始化IPC系统
 pub fn init() {
-    println!("IPC system initialized (capability-based endpoints)");
+    klog_always!("IPC system initialized (capability-based endpoints)");
 }
 
 /// 注册新端点

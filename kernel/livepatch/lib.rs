@@ -202,7 +202,7 @@ pub fn init(ops: &'static dyn KernelOps) {
 ///
 /// Returns `true` if all key slots contain all-zero bytes, meaning livepatch
 /// signature verification is non-functional. The kernel entry point should call
-/// this at boot and emit a warning via its own `println!` macro.
+/// this at boot and emit a warning via its own `kprintln!` macro.
 pub fn has_placeholder_keys() -> bool {
     TRUSTED_P256_PUBKEYS_UNCOMPRESSED
         .iter()

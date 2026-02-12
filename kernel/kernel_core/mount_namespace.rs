@@ -256,7 +256,7 @@ pub fn clone_namespace(parent: Arc<MountNamespace>) -> Result<Arc<MountNamespace
 
 /// Print namespace information for debugging.
 pub fn print_namespace_info(ns: &Arc<MountNamespace>) {
-    println!(
+    kprintln!(
         "[MNT NS] id={}, level={}, refcount={}",
         ns.id().raw(),
         ns.level(),

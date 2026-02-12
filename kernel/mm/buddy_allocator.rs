@@ -384,10 +384,10 @@ pub fn init_buddy_allocator(base_addr: PhysAddr, size: usize) {
     let allocator = BuddyAllocator::new(base_addr, size);
     *BUDDY_ALLOCATOR.lock() = Some(allocator);
 
-    println!("Buddy allocator initialized:");
-    println!("  Base address: 0x{:x}", base_addr);
-    println!("  Size: {} MB", size / (1024 * 1024));
-    println!("  Total pages: {}", size / PAGE_SIZE);
+    klog_always!("Buddy allocator initialized:");
+    klog_always!("  Base address: 0x{:x}", base_addr);
+    klog_always!("  Size: {} MB", size / (1024 * 1024));
+    klog_always!("  Total pages: {}", size / PAGE_SIZE);
 }
 
 /// 分配物理页面
@@ -468,7 +468,7 @@ pub fn get_allocator_stats() -> Option<AllocatorStats> {
 
 /// 运行Buddy分配器自测
 pub fn run_self_test() {
-    println!("Running Buddy allocator self-test...");
+    kprintln!("Running Buddy allocator self-test...");
 
     let base = PhysAddr::new(0x10000000); // 256MB处
     let size = 16 * 1024 * 1024; // 16MB测试区域
@@ -482,7 +482,7 @@ pub fn run_self_test() {
         frame1.start_address() == base,
         "Test 1 failed: Wrong address"
     );
-    println!("  Test 1 passed: Basic allocation");
+    kprintln!("  Test 1 passed: Basic allocation");
 
     // 测试2: 分配和释放
     let initial_free = allocator.free_pages;
@@ -498,7 +498,7 @@ pub fn run_self_test() {
         allocator.free_pages == initial_free,
         "Test 2 failed: Free count not restored"
     );
-    println!("  Test 2 passed: Allocation and free");
+    kprintln!("  Test 2 passed: Allocation and free");
 
     // 测试3: Buddy合并
     let frame3 = allocator.alloc_pages(0).unwrap();
@@ -507,9 +507,9 @@ pub fn run_self_test() {
     allocator.free_pages(frame4, 0);
     let frame5 = allocator.alloc_pages(1); // 应该能分配大小为2的块
     assert!(frame5.is_some(), "Test 3 failed: Buddy merge failed");
-    println!("  Test 3 passed: Buddy merge");
+    kprintln!("  Test 3 passed: Buddy merge");
 
-    println!("All Buddy allocator tests passed!");
+    kprintln!("All Buddy allocator tests passed!");
 }
 
 /// 简单的断言宏（用于no_std环境）

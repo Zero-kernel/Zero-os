@@ -1012,7 +1012,7 @@ impl VtdUnit {
             Err(IommuError::PermissionDenied) => {
                 // Non-zero segment - can't use legacy I/O, but still proceed with context teardown
                 // The device may continue DMA until hardware naturally stops, but context is removed
-                println!(
+                kprintln!(
                     "[IOMMU] WARNING: Cannot disable bus mastering for {:02x}:{:02x}.{} (segment {}), proceeding with context teardown",
                     device.bus, device.device, device.function, device.segment
                 );
@@ -1434,7 +1434,7 @@ impl VtdUnit {
 
         if overflow {
             // Log that faults may have been lost due to overflow
-            println!(
+            kprintln!(
                 "[IOMMU] Fault overflow detected on unit (segment={})",
                 self.segment
             );
@@ -1459,7 +1459,7 @@ impl VtdUnit {
         if self.num_fault_regs() > fault::MAX_FAULT_RECORDS
             && records.len() == fault::MAX_FAULT_RECORDS
         {
-            println!(
+            kprintln!(
                 "[IOMMU] Unit {} fault processing truncated at {} records (hardware has {})",
                 self.segment,
                 fault::MAX_FAULT_RECORDS,

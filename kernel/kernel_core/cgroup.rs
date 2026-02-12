@@ -1111,7 +1111,7 @@ static CGROUP_COUNT: AtomicU32 = AtomicU32::new(1); // Root counts as 1
 pub fn init() {
     // Force lazy initialization
     let _ = ROOT_CGROUP.id();
-    println!("[cgroup] Cgroup v2 subsystem initialized (root id=0)");
+    klog_always!("[cgroup] Cgroup v2 subsystem initialized (root id=0)");
 }
 
 /// Looks up a cgroup by its ID.

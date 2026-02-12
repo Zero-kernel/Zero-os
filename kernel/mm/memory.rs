@@ -159,7 +159,7 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         if let Some((base, rand)) = select_heap_base_from_bootinfo(boot_info) {
             (base, rand, true)
         } else {
-            println!("  Warning: BootInfo memory map unavailable for heap validation, using default window");
+            klog!(Warn, "  Warning: BootInfo memory map unavailable for heap validation, using default window");
             let (base, rand) = select_heap_base();
             (base, rand, false)
         };
@@ -174,7 +174,7 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         (false, true) => " (static, validated)",
         (false, false) => " (static)",
     };
-    println!(
+    klog_always!(
         "Heap allocator initialized: {} KB at 0x{:x}{}",
         HEAP_SIZE / 1024,
         heap_base,
@@ -183,11 +183,11 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
 
     // 从 BootInfo 解析内存映射
     let (pmm_base, pmm_size) = select_region_from_bootinfo(boot_info).unwrap_or_else(|| {
-        println!("  Warning: BootInfo memory map unavailable, using fallback region");
+        klog!(Warn, "  Warning: BootInfo memory map unavailable, using fallback region");
         (FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE)
     });
 
-    println!(
+    klog_always!(
         "  Physical memory region: 0x{:x} - 0x{:x} ({} MB)",
         pmm_base,
         pmm_base + pmm_size as u64,
@@ -201,7 +201,7 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
     #[cfg(debug_assertions)]
     buddy_allocator::run_self_test();
 
-    println!("Memory manager fully initialized (using BootInfo)");
+    klog_always!("Memory manager fully initialized (using BootInfo)");
 }
 
 /// 后备初始化函数（无 BootInfo 时使用）
@@ -209,19 +209,20 @@ pub fn init() {
     // 初始化堆分配器（包含 Partial KASLR 堆随机化，但无法验证内存映射）
     let (heap_base, randomized) = select_heap_base();
     let heap_base = init_heap_allocator_at(heap_base, randomized);
-    println!(
+    let status = if heap_randomized() {
+        " (randomized, unvalidated)"
+    } else {
+        " (static)"
+    };
+    klog_always!(
         "Heap allocator initialized: {} KB at 0x{:x}{}",
         HEAP_SIZE / 1024,
         heap_base,
-        if heap_randomized() {
-            " (randomized, unvalidated)"
-        } else {
-            " (static)"
-        }
+        status
     );
 
     // 使用硬编码区域
-    println!("  Warning: No BootInfo, using hardcoded memory region");
+    klog!(Warn, "  Warning: No BootInfo, using hardcoded memory region");
     buddy_allocator::init_buddy_allocator(
         PhysAddr::new(FALLBACK_PHYS_MEM_START),
         FALLBACK_PHYS_MEM_SIZE,
@@ -231,7 +232,7 @@ pub fn init() {
     #[cfg(debug_assertions)]
     buddy_allocator::run_self_test();
 
-    println!("Memory manager fully initialized (fallback mode)");
+    klog_always!("Memory manager fully initialized (fallback mode)");
 }
 
 // ============================================================================
@@ -464,7 +465,7 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
     let mut best: Option<(u64, u64)> = None;
     let mut total_conventional: u64 = 0;
 
-    println!("  Scanning UEFI memory map ({} descriptors)...", desc_count);
+    klog_always!("  Scanning UEFI memory map ({} descriptors)...", desc_count);
 
     for i in 0..desc_count {
         let addr = map_info.buffer + (i * map_info.descriptor_size) as u64;
@@ -507,7 +508,7 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
         }
     }
 
-    println!(
+    klog_always!(
         "  Total usable memory: {} MB",
         total_conventional / (1024 * 1024)
     );
@@ -601,26 +602,26 @@ pub struct MemoryStats {
 impl MemoryStats {
     /// 打印内存统计信息
     pub fn print(&self) {
-        println!("=== Memory Statistics ===");
-        println!("Physical Memory:");
-        println!(
+        klog_always!("=== Memory Statistics ===");
+        klog_always!("Physical Memory:");
+        klog_always!(
             "  Total: {} pages ({} MB)",
             self.total_physical_pages,
             self.total_physical_pages * 4 / 1024
         );
-        println!(
+        klog_always!(
             "  Free:  {} pages ({} MB)",
             self.free_physical_pages,
             self.free_physical_pages * 4 / 1024
         );
-        println!(
+        klog_always!(
             "  Used:  {} pages ({} MB)",
             self.used_physical_pages,
             self.used_physical_pages * 4 / 1024
         );
-        println!("  Fragmentation: {}%", self.fragmentation_percent);
-        println!("Kernel Heap:");
-        println!(
+        klog_always!("  Fragmentation: {}%", self.fragmentation_percent);
+        klog_always!("Kernel Heap:");
+        klog_always!(
             "  Used:  {} KB / {} KB",
             self.heap_used_bytes / 1024,
             self.heap_total_bytes / 1024

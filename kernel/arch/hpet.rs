@@ -14,8 +14,8 @@
 //! ```rust,ignore
 //! // Initialize HPET early in boot
 //! match arch::hpet::init() {
-//!     Ok(info) => println!("HPET: {} Hz", info.frequency_hz),
-//!     Err(e) => println!("HPET unavailable: {:?}", e),
+//!     Ok(info) => kprintln!("HPET: {} Hz", info.frequency_hz),
+//!     Err(e) => kprintln!("HPET unavailable: {:?}", e),
 //! }
 //!
 //! // Read the main counter for precise timing
@@ -426,7 +426,7 @@ unsafe fn init_internal() -> Result<HpetInfo, HpetInitError> {
         counter_64bit,
     };
 
-    println!(
+    klog_always!(
         "[HPET] Initialized: phys=0x{:x}, virt=0x{:x}, freq={} Hz, timers={}, 64-bit={}",
         base_phys, base_virt, frequency_hz, comparator_count, counter_64bit
     );

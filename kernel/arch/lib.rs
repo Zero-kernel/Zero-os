@@ -5,6 +5,8 @@ extern crate alloc;
 // 导入 drivers crate 的宏
 #[macro_use]
 extern crate drivers;
+#[macro_use]
+extern crate klog;
 
 pub mod apic;
 pub mod context_switch;
@@ -57,5 +59,5 @@ pub fn init() {
     gdt::init();
     context_switch::init_fpu();
     syscall::register_frame_callback(); // 注册 syscall 帧回调
-    println!("Arch module initialized (FPU/SIMD enabled)");
+    klog_always!("Arch module initialized (FPU/SIMD enabled)");
 }

@@ -159,7 +159,7 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
     // 栈区域：[USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_TOP)
     let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
     if brk_start >= stack_base {
-        println!(
+        klog_always!(
             "ELF loader: brk_start 0x{:x} overlaps with stack at 0x{:x}",
             brk_start, stack_base
         );
@@ -167,7 +167,7 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
         return Err(ElfLoadError::OverlapWithStack);
     }
 
-    println!(
+    klog_always!(
         "ELF loaded: entry=0x{:x}, brk_start=0x{:x}",
         elf.header.pt2.entry_point(),
         brk_start
@@ -177,7 +177,7 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
     // 防止恶意 ELF 设置内核地址或非法地址导致 #GP 或代码执行到错误位置
     let entry = elf.header.pt2.entry_point();
     if entry < USER_BASE as u64 || entry >= USER_STACK_TOP {
-        println!(
+        klog_always!(
             "ELF loader: invalid entry point 0x{:x} (valid range: 0x{:x}-0x{:x})",
             entry, USER_BASE, USER_STACK_TOP
         );
@@ -187,7 +187,7 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
     // 验证 canonical（虽然上面的范围检查已经隐含了这一点，但显式检查更安全）
     let sign_extended = ((entry as i64) >> 47) as u64;
     if sign_extended != 0 && sign_extended != 0x1FFFF {
-        println!("ELF loader: non-canonical entry point 0x{:x}", entry);
+        klog_always!("ELF loader: non-canonical entry point 0x{:x}", entry);
         rollback_all_mappings(&mut all_mappings, cgroup_id);
         return Err(ElfLoadError::SegmentOutOfRange);
     }
@@ -311,7 +311,7 @@ fn load_segment_tracked(
     // by loading large binaries that exceed memory.max.
     let charge_bytes = (page_count * PAGE_SIZE) as u64;
     if cgroup::try_charge_memory(cgroup_id, charge_bytes).is_err() {
-        println!(
+        klog_always!(
             "ELF loader: cgroup memory limit exceeded for segment (need {} bytes)",
             charge_bytes
         );
@@ -337,11 +337,11 @@ fn load_segment_tracked(
     let mut segment_mapped: Vec<MappedEntry> = Vec::with_capacity(page_count);
     let mut frame_alloc = FrameAllocator::new();
 
-    println!(
+    klog_always!(
         "  load_segment: vaddr=0x{:x}, memsz={}, filesz={}, pages={}",
         vaddr, memsz, filesz, page_count
     );
-    println!(
+    klog_always!(
         "    flags: R={} W={} X={} => PTFlags: 0x{:x}",
         true,
         ph.flags().is_write(),
@@ -363,7 +363,7 @@ fn load_segment_tracked(
                     .ok_or(ElfLoadError::OutOfMemory)?;
 
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
-                    println!(
+                    klog_always!(
                         "ELF loader: map_page FAILED for va=0x{:x}: {:?}",
                         va.as_u64(),
                         e
@@ -445,7 +445,7 @@ fn allocate_user_stack_tracked(
     // This enforces cgroup memory limits for stack allocation.
     let charge_bytes = (page_count * PAGE_SIZE) as u64;
     if cgroup::try_charge_memory(cgroup_id, charge_bytes).is_err() {
-        println!(
+        klog_always!(
             "ELF loader: cgroup memory limit exceeded for stack (need {} bytes)",
             charge_bytes
         );
@@ -477,7 +477,7 @@ fn allocate_user_stack_tracked(
                     .ok_or(ElfLoadError::OutOfMemory)?;
 
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
-                    println!(
+                    klog_always!(
                         "ELF loader: map_page FAILED for stack va=0x{:x}: {:?}",
                         va.as_u64(),
                         e
@@ -545,7 +545,7 @@ fn rollback_all_mappings(tracked: &mut Vec<MappedEntry>, cgroup_id: cgroup::Cgro
     }
 
     let page_count = tracked.len();
-    println!("ELF loader: rolling back {} mapped pages", page_count);
+    klog_always!("ELF loader: rolling back {} mapped pages", page_count);
 
     // R93-6 FIX: Uncharge memory for all pages being rolled back.
     // This ensures cgroup memory accounting remains accurate on failure.
@@ -563,7 +563,7 @@ fn rollback_all_mappings(tracked: &mut Vec<MappedEntry>, cgroup_id: cgroup::Cgro
                         frame_alloc.deallocate_frame(unmapped_frame);
                     }
                     Err(e) => {
-                        println!(
+                        klog_always!(
                             "ELF rollback: unmap_page failed for va=0x{:x}: {:?}",
                             page.start_address().as_u64(),
                             e
@@ -580,13 +580,13 @@ fn rollback_all_mappings(tracked: &mut Vec<MappedEntry>, cgroup_id: cgroup::Cgro
 pub fn print_elf_info(image: &[u8]) {
     if let Ok(elf) = ElfFile::new(image) {
         let hdr = &elf.header;
-        println!("=== ELF Info ===");
-        println!("Entry point: 0x{:x}", hdr.pt2.entry_point());
-        println!("Program headers: {}", hdr.pt2.ph_count());
+        klog_always!("=== ELF Info ===");
+        klog_always!("Entry point: 0x{:x}", hdr.pt2.entry_point());
+        klog_always!("Program headers: {}", hdr.pt2.ph_count());
 
         for (i, ph) in elf.program_iter().enumerate() {
             if ph.get_type() == Ok(PhType::Load) {
-                println!(
+                klog_always!(
                     "  Segment {}: vaddr=0x{:x}, memsz=0x{:x}, filesz=0x{:x}",
                     i,
                     ph.virtual_addr(),

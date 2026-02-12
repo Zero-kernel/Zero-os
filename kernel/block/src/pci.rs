@@ -116,7 +116,7 @@ fn read_bar(bus: u8, dev: u8, func: u8, bar: u8) -> Option<u64> {
     let low = pci_config_read32(bus, dev, func, off);
 
     // DEBUG: Print raw BAR value
-    // println!("      [BAR] bar{} raw low={:#x}", bar, low);
+    // kprintln!("      [BAR] bar{} raw low={:#x}", bar, low);
 
     // Check if this is an I/O BAR (bit 0 = 1)
     if low & 1 != 0 {
@@ -281,14 +281,14 @@ pub fn probe_virtio_blk() -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)>
                     Err(iommu::IommuError::NotAvailable) => {
                         // IOMMU not present - proceed without DMA isolation (legacy mode)
                         // This is an explicit acknowledgment of the security tradeoff.
-                        println!(
+                        klog_always!(
                             "    ! WARNING: No IOMMU - {:02x}:{:02x}.{} has unprotected DMA access",
                             bus, dev, func
                         );
                     }
                     Err(err) => {
                         // Other IOMMU errors - fail closed (skip device)
-                        println!(
+                        klog_always!(
                             "    ! IOMMU attach failed for {:02x}:{:02x}.{}: {:?}",
                             bus, dev, func, err
                         );
@@ -313,7 +313,7 @@ pub fn probe_virtio_blk() -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)>
                     } else {
                         "transitional"
                     };
-                    println!(
+                    klog_always!(
                         "    Found virtio-blk ({}) at PCI {:02x}:{:02x}.{}, type={}, common_cfg={:#x}",
                         dev_type, bus, dev, func, subsystem_id, caps.common_cfg
                     );
@@ -329,7 +329,7 @@ pub fn probe_virtio_blk() -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)>
                     } else {
                         "transitional"
                     };
-                    println!(
+                    klog_always!(
                         "    virtio-blk ({}) at PCI {:02x}:{:02x}.{} lacks modern capabilities (bus master disabled)",
                         dev_type, bus, dev, func
                     );

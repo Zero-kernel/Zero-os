@@ -1581,12 +1581,8 @@ fn copy_user_str_array(list_ptr: *const *const u8) -> Result<Vec<Vec<u8>>, Sysca
 
 /// 初始化系统调用处理器
 pub fn init() {
-    // R104-2 FIX: Gate init diagnostics behind debug_assertions.
-    #[cfg(debug_assertions)]
-    {
-        println!("Syscall handler initialized");
-        println!("  Supported syscalls: exit, fork, getpid, read, write, yield");
-    }
+    klog_always!("Syscall handler initialized");
+    klog_always!("  Supported syscalls: exit, fork, getpid, read, write, yield");
 }
 
 /// Get audit subject from current process context
@@ -2199,8 +2195,7 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
 
         terminate_process(pid, exit_code);
         // R104-2 FIX: Gate to prevent leaking PID in release builds.
-        #[cfg(debug_assertions)]
-        println!("Process {} exited with code {}", pid, exit_code);
+        klog_always!("Process {} exited with code {}", pid, exit_code);
 
         // 退出的进程不应继续运行，立即让出 CPU
         // 这也会触发等待中的父进程被调度
@@ -2211,8 +2206,7 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
         // 在这种情况下，我们必须阻止返回到用户空间
         // 进入无限循环等待中断（其他进程可能会在定时器中断中被创建）
         // R104-2 FIX: Gate idle-loop diagnostic.
-        #[cfg(debug_assertions)]
-        println!("[sys_exit] No other process to run, entering idle loop");
+        klog_always!("[sys_exit] No other process to run, entering idle loop");
         loop {
             x86_64::instructions::hlt();
         }
@@ -2272,8 +2266,7 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
 
         terminate_process(pid, exit_code);
 
-        #[cfg(debug_assertions)]
-        println!(
+        kprintln!(
             "Process {} (tgid={}) exit_group with code {} ({} siblings terminated)",
             pid, tgid, exit_code, sibling_pids.len()
         );
@@ -2326,8 +2319,7 @@ fn sys_fork() -> SyscallResult {
                 .count();
 
             if sibling_count > 0 {
-                #[cfg(debug_assertions)]
-                println!(
+                kprintln!(
                     "WARNING: fork() called from multi-threaded process (pid={}, {} active threads). \
                      Child may deadlock on inherited locked mutexes.",
                     parent_pid, sibling_count
@@ -2447,8 +2439,7 @@ fn sys_clone(
 ) -> SyscallResult {
     // R101-2 FIX: Gate clone debug prints behind debug_assertions to prevent
     // leaking user stack/instruction pointers and TLS base addresses.
-    #[cfg(debug_assertions)]
-    println!(
+    kprintln!(
         "[sys_clone] entry: flags=0x{:x}, stack=0x{:x}, tls=0x{:x}",
         flags, stack as u64, tls
     );
@@ -2476,8 +2467,7 @@ fn sys_clone(
     // 返回 EINVAL 而不是 ENOSYS，因为这是参数验证失败而非功能未实现
     if flags & !supported_flags != 0 {
         // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-        #[cfg(debug_assertions)]
-        println!(
+        kprintln!(
             "sys_clone: unsupported flags 0x{:x}",
             flags & !supported_flags
         );
@@ -2492,9 +2482,7 @@ fn sys_clone(
         // R37-7 FIX: CLONE_THREAD requires a separate stack for the new thread.
         // Sharing the parent's stack leads to data races and corruption.
         if stack.is_null() {
-            // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-            #[cfg(debug_assertions)]
-            println!(
+            kprintln!(
                 "[sys_clone] CLONE_THREAD rejected: NULL stack would share parent's user stack"
             );
             return Err(SyscallError::EINVAL);
@@ -2504,14 +2492,14 @@ fn sys_clone(
     // F.1: CLONE_NEWPID cannot be combined with CLONE_THREAD
     // Creating a thread in a new PID namespace makes no sense - threads share PID space
     if flags & CLONE_NEWPID != 0 && flags & CLONE_THREAD != 0 {
-        println!("[sys_clone] CLONE_NEWPID cannot be combined with CLONE_THREAD");
+        kprintln!("[sys_clone] CLONE_NEWPID cannot be combined with CLONE_THREAD");
         return Err(SyscallError::EINVAL);
     }
 
     // F.1: CLONE_NEWNS cannot be combined with CLONE_THREAD
     // Mount namespace is per-process; threads must share the same mount namespace
     if flags & CLONE_NEWNS != 0 && flags & CLONE_THREAD != 0 {
-        println!("[sys_clone] CLONE_NEWNS cannot be combined with CLONE_THREAD");
+        kprintln!("[sys_clone] CLONE_NEWNS cannot be combined with CLONE_THREAD");
         return Err(SyscallError::EINVAL);
     }
 
@@ -2522,9 +2510,7 @@ fn sys_clone(
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
         let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
         if !is_root && !has_cap_admin {
-            // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-            #[cfg(debug_assertions)]
-            println!("[sys_clone] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
+            kprintln!("[sys_clone] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
             return Err(SyscallError::EPERM);
         }
     }
@@ -2532,7 +2518,7 @@ fn sys_clone(
     // F.1: CLONE_NEWIPC cannot be combined with CLONE_THREAD
     // IPC namespace is per-process; threads must share the same IPC namespace
     if flags & CLONE_NEWIPC != 0 && flags & CLONE_THREAD != 0 {
-        println!("[sys_clone] CLONE_NEWIPC cannot be combined with CLONE_THREAD");
+        kprintln!("[sys_clone] CLONE_NEWIPC cannot be combined with CLONE_THREAD");
         return Err(SyscallError::EINVAL);
     }
 
@@ -2543,7 +2529,7 @@ fn sys_clone(
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
         let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
         if !is_root && !has_cap_admin {
-            println!("[sys_clone] CLONE_NEWIPC denied: requires CAP_SYS_ADMIN or root");
+            kprintln!("[sys_clone] CLONE_NEWIPC denied: requires CAP_SYS_ADMIN or root");
             return Err(SyscallError::EPERM);
         }
     }
@@ -2551,7 +2537,7 @@ fn sys_clone(
     // F.1: CLONE_NEWNET cannot be combined with CLONE_THREAD
     // Network namespace is per-process; threads must share the same network namespace
     if flags & CLONE_NEWNET != 0 && flags & CLONE_THREAD != 0 {
-        println!("[sys_clone] CLONE_NEWNET cannot be combined with CLONE_THREAD");
+        kprintln!("[sys_clone] CLONE_NEWNET cannot be combined with CLONE_THREAD");
         return Err(SyscallError::EINVAL);
     }
 
@@ -2562,7 +2548,7 @@ fn sys_clone(
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
         let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
         if !is_root && !has_cap_admin {
-            println!("[sys_clone] CLONE_NEWNET denied: requires CAP_NET_ADMIN or root");
+            kprintln!("[sys_clone] CLONE_NEWNET denied: requires CAP_NET_ADMIN or root");
             return Err(SyscallError::EPERM);
         }
     }
@@ -2570,7 +2556,7 @@ fn sys_clone(
     // F.1: CLONE_NEWUSER cannot be combined with CLONE_THREAD
     // User namespace is per-process; threads must share the same user namespace
     if flags & CLONE_NEWUSER != 0 && flags & CLONE_THREAD != 0 {
-        println!("[sys_clone] CLONE_NEWUSER cannot be combined with CLONE_THREAD");
+        kprintln!("[sys_clone] CLONE_NEWUSER cannot be combined with CLONE_THREAD");
         return Err(SyscallError::EINVAL);
     }
 
@@ -2732,7 +2718,7 @@ fn sys_clone(
                 materialize_namespace(&parent_mount_ns);
                 materialize_namespace(&ns);
 
-                println!(
+                klog!(Info,
                     "[sys_clone] Created new mount namespace: id={}, level={} (eagerly materialized)",
                     ns.id().raw(),
                     ns.level()
@@ -2757,11 +2743,11 @@ fn sys_clone(
                 Some(ns)
             }
             Err(crate::mount_namespace::MountNsError::MaxDepthExceeded) => {
-                println!("[sys_clone] Failed to create mount namespace: max depth exceeded");
+                klog!(Error, "[sys_clone] Failed to create mount namespace: max depth exceeded");
                 return Err(SyscallError::EAGAIN);
             }
             Err(e) => {
-                println!("[sys_clone] Failed to create mount namespace: {:?}", e);
+                klog!(Error, "[sys_clone] Failed to create mount namespace: {:?}", e);
                 return Err(SyscallError::ENOMEM);
             }
         }
@@ -2773,7 +2759,7 @@ fn sys_clone(
     let new_ipc_ns = if flags & CLONE_NEWIPC != 0 {
         match crate::ipc_namespace::clone_ipc_namespace(parent_ipc_ns_for_children.clone()) {
             Ok(ns) => {
-                println!(
+                klog!(Info,
                     "[sys_clone] Created new IPC namespace: id={}, level={}",
                     ns.id().raw(),
                     ns.level()
@@ -2798,16 +2784,16 @@ fn sys_clone(
                 Some(ns)
             }
             Err(crate::ipc_namespace::IpcNsError::MaxDepthExceeded) => {
-                println!("[sys_clone] Failed to create IPC namespace: max depth exceeded");
+                klog!(Error, "[sys_clone] Failed to create IPC namespace: max depth exceeded");
                 return Err(SyscallError::EAGAIN);
             }
             // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
             Err(crate::ipc_namespace::IpcNsError::MaxNamespaces) => {
-                println!("[sys_clone] Failed to create IPC namespace: max namespaces exceeded");
+                klog!(Error, "[sys_clone] Failed to create IPC namespace: max namespaces exceeded");
                 return Err(SyscallError::EAGAIN);
             }
             Err(e) => {
-                println!("[sys_clone] Failed to create IPC namespace: {:?}", e);
+                klog!(Error, "[sys_clone] Failed to create IPC namespace: {:?}", e);
                 return Err(SyscallError::ENOMEM);
             }
         }
@@ -2819,7 +2805,7 @@ fn sys_clone(
     let new_net_ns = if flags & CLONE_NEWNET != 0 {
         match crate::net_namespace::clone_net_namespace(parent_net_ns_for_children.clone()) {
             Ok(ns) => {
-                println!(
+                klog!(Info,
                     "[sys_clone] Created new network namespace: id={}, level={}, has_loopback={}",
                     ns.id().raw(),
                     ns.level(),
@@ -2845,16 +2831,16 @@ fn sys_clone(
                 Some(ns)
             }
             Err(crate::net_namespace::NetNsError::MaxDepthExceeded) => {
-                println!("[sys_clone] Failed to create network namespace: max depth exceeded");
+                klog!(Error, "[sys_clone] Failed to create network namespace: max depth exceeded");
                 return Err(SyscallError::EAGAIN);
             }
             // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
             Err(crate::net_namespace::NetNsError::MaxNamespaces) => {
-                println!("[sys_clone] Failed to create network namespace: max namespaces exceeded");
+                klog!(Error, "[sys_clone] Failed to create network namespace: max namespaces exceeded");
                 return Err(SyscallError::EAGAIN);
             }
             Err(e) => {
-                println!("[sys_clone] Failed to create network namespace: {:?}", e);
+                klog!(Error, "[sys_clone] Failed to create network namespace: {:?}", e);
                 return Err(SyscallError::ENOMEM);
             }
         }
@@ -2866,7 +2852,7 @@ fn sys_clone(
     let new_user_ns = if flags & CLONE_NEWUSER != 0 {
         match crate::user_namespace::clone_user_namespace(parent_user_ns_for_children.clone()) {
             Ok(ns) => {
-                println!(
+                klog!(Info,
                     "[sys_clone] Created new user namespace: id={}, level={}",
                     ns.id().raw(),
                     ns.level()
@@ -2891,15 +2877,15 @@ fn sys_clone(
                 Some(ns)
             }
             Err(crate::user_namespace::UserNsError::MaxDepthExceeded) => {
-                println!("[sys_clone] Failed to create user namespace: max depth exceeded");
+                klog!(Error, "[sys_clone] Failed to create user namespace: max depth exceeded");
                 return Err(SyscallError::EAGAIN);
             }
             Err(crate::user_namespace::UserNsError::MaxNamespaces) => {
-                println!("[sys_clone] Failed to create user namespace: max namespaces exceeded");
+                klog!(Error, "[sys_clone] Failed to create user namespace: max namespaces exceeded");
                 return Err(SyscallError::EAGAIN);
             }
             Err(e) => {
-                println!("[sys_clone] Failed to create user namespace: {:?}", e);
+                klog!(Error, "[sys_clone] Failed to create user namespace: {:?}", e);
                 return Err(SyscallError::ENOMEM);
             }
         }
@@ -2913,8 +2899,7 @@ fn sys_clone(
         let new_ns = crate::pid_namespace::PidNamespace::new_child(parent_pid_ns_for_children)
             .map_err(|e| {
                 // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-                #[cfg(debug_assertions)]
-                println!("[sys_clone] Failed to create PID namespace: {:?}", e);
+                kprintln!("[sys_clone] Failed to create PID namespace: {:?}", e);
                 match e {
                     crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => SyscallError::EAGAIN,
                     // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
@@ -2923,8 +2908,7 @@ fn sys_clone(
                 }
             })?;
         // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-        #[cfg(debug_assertions)]
-        println!(
+        kprintln!(
             "[sys_clone] Created new PID namespace: id={}, level={}",
             new_ns.id().raw(),
             new_ns.level()
@@ -2953,8 +2937,7 @@ fn sys_clone(
             crate::process::terminate_process(child_pid, -1);
             // R103-L2 FIX: Gate diagnostic println behind debug_assertions.
             // In release builds this leaks internal PID and seccomp race state.
-            #[cfg(debug_assertions)]
-            println!(
+            kprintln!(
                 "sys_clone: rejecting CLONE_VM during seccomp installation (pid={})",
                 parent_pid
             );
@@ -2995,8 +2978,7 @@ fn sys_clone(
         // R102-6 FIX: Use closure-based API to prevent syscall frame reference escape.
         let frame_applied = with_current_syscall_frame(|frame| {
             // R101-2 FIX: Gate SyscallFrame debug print behind debug_assertions
-            #[cfg(debug_assertions)]
-            println!(
+            kprintln!(
                 "[sys_clone] SyscallFrame: rcx(rip)=0x{:x}, rsp=0x{:x}, r9=0x{:x}",
                 frame.rcx, frame.rsp, frame.r9
             );
@@ -3045,8 +3027,7 @@ fn sys_clone(
         //
         // Instead, terminate the child and return EBUSY so the caller can retry.
         if frame_applied.is_none() {
-            #[cfg(debug_assertions)]
-            println!(
+            kprintln!(
                 "sys_clone: ABORT - syscall frame not available, refusing stale context (pid={})",
                 child_pid
             );
@@ -3059,8 +3040,7 @@ fn sys_clone(
 
         // R102-10 FIX: Gate register/address dump behind debug_assertions.
         // Leaks child RIP/RSP which defeats userspace ASLR.
-        #[cfg(debug_assertions)]
-        println!(
+        kprintln!(
             "[sys_clone] Child {} ctx: rax=0x{:x}, rip=0x{:x}, rsp=0x{:x}, r9=0x{:x}, rcx=0x{:x}",
             child_pid,
             child.context.rax,
@@ -3093,8 +3073,7 @@ fn sys_clone(
         child.gs_base = parent_gs_base;
 
         // R101-2 FIX: Gate TLS debug print behind debug_assertions
-        #[cfg(debug_assertions)]
-        println!(
+        kprintln!(
             "[sys_clone] TLS: msr_fs=0x{:x}, parent_fs=0x{:x}, child_fs=0x{:x}",
             current_fs_base, parent_fs_base, child.fs_base
         );
@@ -3287,8 +3266,7 @@ fn sys_clone(
 
     // R101-2 FIX: Gate clone completion debug print behind debug_assertions.
     // Leaks global child PID and clone flags.
-    #[cfg(debug_assertions)]
-    println!(
+    kprintln!(
         "sys_clone: parent={}, child={} (parent_view={}, child_view={}), flags=0x{:x}, is_thread={}",
         parent_pid,
         child_pid,
@@ -3343,7 +3321,7 @@ fn sys_exec(
         proc.tgid
     };
     if thread_group_size(tgid) > 1 {
-        println!(
+        kprintln!(
             "sys_exec: refusing exec in multithreaded process (tgid={}, threads={})",
             tgid,
             thread_group_size(tgid)
@@ -3356,7 +3334,7 @@ fn sys_exec(
         return Err(SyscallError::EINVAL);
     }
     if image_len > MAX_EXEC_IMAGE_SIZE {
-        println!(
+        kprintln!(
             "sys_exec: ELF size {} exceeds limit {}",
             image_len, MAX_EXEC_IMAGE_SIZE
         );
@@ -3440,7 +3418,7 @@ fn sys_exec(
     // 加载 ELF 映像
     // S-7 fix: Let the guard handle rollback on error
     let load_result = load_elf(&elf_data).map_err(|e| {
-        println!("sys_exec: ELF load failed: {:?}", e);
+        klog!(Error, "sys_exec: ELF load failed: {:?}", e);
         SyscallError::ENOEXEC
     })?;
 
@@ -3676,8 +3654,7 @@ fn sys_exec(
 
     // R101-2 FIX: Gate exec entry/rsp/argc debug print behind debug_assertions.
     // These leak user entry point and stack pointer addresses.
-    #[cfg(debug_assertions)]
-    println!(
+    kprintln!(
         "sys_exec: entry=0x{:x}, rsp=0x{:x}, argc={}",
         load_result.entry, final_rsp, argc
     );
@@ -3787,7 +3764,7 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
             // 清理僵尸进程资源
             cleanup_zombie(child_pid);
 
-            println!(
+            kprintln!(
                 "sys_wait: reaped child {} (ns_pid={}) with exit code {}",
                 child_pid, parent_view_pid, exit_code
             );
@@ -4095,8 +4072,7 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
 
     // R101-2 FIX: Gate signal dispatch debug print behind debug_assertions.
     // Leaking global PID breaks PID namespace isolation.
-    #[cfg(debug_assertions)]
-    println!(
+    kprintln!(
         "sys_kill: sent {} to PID {} (global={}, action: {:?})",
         signal_name(signal),
         pid,
@@ -4132,7 +4108,7 @@ fn sys_unshare(flags: u64) -> SyscallResult {
     let unsupported = flags & !supported;
 
     if unsupported != 0 {
-        println!(
+        kprintln!(
             "[sys_unshare] Unsupported flags: 0x{:x} (supported: CLONE_NEWPID | CLONE_NEWNS)",
             unsupported
         );
@@ -4157,7 +4133,7 @@ fn sys_unshare(flags: u64) -> SyscallResult {
         let new_ns =
             crate::pid_namespace::PidNamespace::new_child(current_ns_for_children).map_err(
                 |e| {
-                    println!("[sys_unshare] Failed to create PID namespace: {:?}", e);
+                    klog!(Error, "[sys_unshare] Failed to create PID namespace: {:?}", e);
                     match e {
                         crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => {
                             SyscallError::EAGAIN
@@ -4177,7 +4153,7 @@ fn sys_unshare(flags: u64) -> SyscallResult {
             proc.pid_ns_for_children = new_ns.clone();
         }
 
-        println!(
+        klog!(Info,
             "[sys_unshare] Process {} unshared PID namespace, children will use ns_id={}, level={}",
             pid,
             new_ns.id().raw(),
@@ -4197,7 +4173,7 @@ fn sys_unshare(flags: u64) -> SyscallResult {
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
         let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
         if !is_root && !has_cap_admin {
-            println!("[sys_unshare] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
+            kprintln!("[sys_unshare] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
             return Err(SyscallError::EPERM);
         }
 
@@ -4215,7 +4191,7 @@ fn sys_unshare(flags: u64) -> SyscallResult {
         };
         let thread_count = crate::thread_group_size(tgid);
         if thread_count > 1 {
-            println!(
+            kprintln!(
                 "[sys_unshare] CLONE_NEWNS denied: thread group has {} threads (must be 1)",
                 thread_count
             );
@@ -4228,7 +4204,7 @@ fn sys_unshare(flags: u64) -> SyscallResult {
         };
 
         let new_ns = crate::mount_namespace::clone_namespace(current_ns.clone()).map_err(|e| {
-            println!("[sys_unshare] Failed to create mount namespace: {:?}", e);
+            klog!(Error, "[sys_unshare] Failed to create mount namespace: {:?}", e);
             match e {
                 crate::mount_namespace::MountNsError::MaxDepthExceeded => SyscallError::EAGAIN,
                 _ => SyscallError::ENOMEM,
@@ -4249,7 +4225,7 @@ fn sys_unshare(flags: u64) -> SyscallResult {
             proc.mount_ns_for_children = new_ns.clone();
         }
 
-        println!(
+        klog!(Info,
             "[sys_unshare] Process {} unshared mount namespace, now using ns_id={}, level={} (eagerly materialized)",
             pid,
             new_ns.id().raw(),
@@ -4298,7 +4274,7 @@ fn sys_unshare(flags: u64) -> SyscallResult {
 fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
     // Validate namespace type
     if nstype != 0 && (nstype as u64) != CLONE_NEWNS {
-        println!("[sys_setns] Invalid nstype: {}", nstype);
+        kprintln!("[sys_setns] Invalid nstype: {}", nstype);
         return Err(SyscallError::EINVAL);
     }
 
@@ -4309,7 +4285,7 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
     // Previously used unwrap_or(true) which would grant root access on None
     let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
     if !is_root && !has_cap_admin {
-        println!("[sys_setns] Permission denied: requires CAP_SYS_ADMIN or root");
+        kprintln!("[sys_setns] Permission denied: requires CAP_SYS_ADMIN or root");
         return Err(SyscallError::EPERM);
     }
 
@@ -4329,7 +4305,7 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
     };
     let thread_count = crate::thread_group_size(tgid);
     if thread_count > 1 {
-        println!(
+        kprintln!(
             "[sys_setns] CLONE_NEWNS denied: thread group has {} threads (must be 1)",
             thread_count
         );
@@ -4346,12 +4322,12 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
         {
             ns_fd.namespace()
         } else {
-            println!("[sys_setns] fd {} is not a mount namespace fd", fd);
+            kprintln!("[sys_setns] fd {} is not a mount namespace fd", fd);
             return Err(SyscallError::EINVAL);
         }
     };
 
-    println!(
+    klog!(Info,
         "[sys_setns] Process {} switching to mount namespace id={}, level={}",
         pid,
         target_ns.id().raw(),
@@ -4481,8 +4457,7 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
     // 使用 prepare-check-finish 模式避免丢失唤醒竞态
     if fd == 0 {
         // Debug: print heap stats before allocation
-        #[cfg(debug_assertions)]
-        println!("[sys_read] fd=0 count={}", count);
+        kprintln!("[sys_read] fd=0 count={}", count);
 
         let mut tmp = vec![0u8; count];
         loop {
@@ -5465,8 +5440,7 @@ fn sys_mmap(
 
     // R102-10 FIX: Gate address-revealing log behind debug_assertions to prevent
     // userspace ASLR bypass via kernel log output.
-    #[cfg(debug_assertions)]
-    println!(
+    kprintln!(
         "sys_mmap: pid={}, mapped {} bytes at 0x{:x}",
         pid, length_aligned, base
     );
@@ -5576,8 +5550,7 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
 
     // R102-10 FIX: Gate address-revealing log behind debug_assertions.
-    #[cfg(debug_assertions)]
-    println!(
+    kprintln!(
         "sys_munmap: pid={}, unmapped {} bytes at 0x{:x}",
         pid, length_aligned, addr
     );
@@ -5787,14 +5760,14 @@ fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFil
     // Validate flags - reject TSYNC since we don't implement thread synchronization
     // Silently accepting TSYNC would leave sibling threads unsandboxed (security gap)
     if flags & seccomp::SeccompFlags::TSYNC.bits() != 0 {
-        println!("[sys_seccomp] TSYNC not implemented, rejecting");
+        kprintln!("[sys_seccomp] TSYNC not implemented, rejecting");
         return Err(SyscallError::EINVAL);
     }
 
     // R28-8 Fix: Reject NEW_THREADS flag since we don't implement per-new-thread filtering
     // Accepting this flag would make callers believe new threads are sandboxed when they're not.
     if flags & seccomp::SeccompFlags::NEW_THREADS.bits() != 0 {
-        println!("[sys_seccomp] NEW_THREADS not implemented, rejecting");
+        kprintln!("[sys_seccomp] NEW_THREADS not implemented, rejecting");
         return Err(SyscallError::EINVAL);
     }
 
@@ -5906,7 +5879,7 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             // R26-3 FIX: Mark installation complete
             proc.seccomp_installing = false;
 
-            println!("[sys_seccomp] PID={} installed STRICT mode", pid);
+            klog!(Info, "[sys_seccomp] PID={} installed STRICT mode", pid);
             Ok(0)
         }
         SECCOMP_SET_MODE_FILTER => {
@@ -5933,7 +5906,7 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
 
             // Reject if multi-threaded without TSYNC (partial sandboxing)
             if thread_count > 1 && !tsync_requested {
-                println!(
+                klog!(Warn,
                     "[sys_seccomp] PID={} REJECTED: threads={} without TSYNC",
                     pid, thread_count
                 );
@@ -5943,7 +5916,7 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             // R37-1 FIX: If pure CLONE_VM siblings exist, reject regardless of TSYNC.
             // TSYNC only synchronizes CLONE_THREAD siblings (same tgid), not CLONE_VM processes.
             if pure_vm_siblings > 0 {
-                println!(
+                klog!(Warn,
                     "[sys_seccomp] PID={} REJECTED: {} CLONE_VM siblings (different tgid) present; \
                     seccomp cannot secure shared address space",
                     pid, pure_vm_siblings
@@ -5967,7 +5940,7 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             // R26-3 FIX: Mark installation complete
             proc.seccomp_installing = false;
 
-            println!(
+            klog!(Info,
                 "[sys_seccomp] PID={} installed FILTER mode (total filters: {})",
                 pid,
                 proc.seccomp_state.filters.len()
@@ -6002,7 +5975,7 @@ fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> Sysca
             let mut proc = proc_arc.lock();
             proc.seccomp_state.no_new_privs = true;
 
-            println!("[sys_prctl] PID={} set NO_NEW_PRIVS", pid);
+            klog!(Info, "[sys_prctl] PID={} set NO_NEW_PRIVS", pid);
             Ok(0)
         }
         PR_GET_NO_NEW_PRIVS => {
@@ -6109,8 +6082,7 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
 
             // R102-10 FIX: Gate TLS base address log behind debug_assertions.
             // Leaks userspace TLS base which aids exploitation.
-            #[cfg(debug_assertions)]
-            println!("[arch_prctl] PID={} ARCH_SET_FS addr=0x{:x}", pid, addr);
+            kprintln!("[arch_prctl] PID={} ARCH_SET_FS addr=0x{:x}", pid, addr);
 
             // 更新进程 PCB 中的 fs_base
             {
@@ -6328,7 +6300,7 @@ macro_rules! sched_affinity_debug {
     ($($arg:tt)*) => {
         #[cfg(feature = "sched_debug")]
         {
-            drivers::println!($($arg)*);
+            kprintln!($($arg)*);
         }
     };
 }
@@ -9249,12 +9221,12 @@ impl SyscallStats {
     }
 
     pub fn print(&self) {
-        println!("=== Syscall Statistics ===");
-        println!("Total calls:  {}", self.total_calls);
-        println!("Exit calls:   {}", self.exit_calls);
-        println!("Fork calls:   {}", self.fork_calls);
-        println!("Read calls:   {}", self.read_calls);
-        println!("Write calls:  {}", self.write_calls);
-        println!("Failed calls: {}", self.failed_calls);
+        klog_always!("=== Syscall Statistics ===");
+        klog_always!("Total calls:  {}", self.total_calls);
+        klog_always!("Exit calls:   {}", self.exit_calls);
+        klog_always!("Fork calls:   {}", self.fork_calls);
+        klog_always!("Read calls:   {}", self.read_calls);
+        klog_always!("Write calls:  {}", self.write_calls);
+        klog_always!("Failed calls: {}", self.failed_calls);
     }
 }

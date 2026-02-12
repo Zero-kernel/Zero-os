@@ -24,3 +24,4 @@ x86_64 = "0.15"
 p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
 # ECDSA verification only (no signing / no RFC6979). Uses ecdsa::hazmat::verify_prehashed.
 ecdsa = { version = "0.16", default-features = false, features = ["hazmat", "arithmetic"] }
+klog = { path = "../klog" }

@@ -13,7 +13,7 @@
 //!
 //! 硬件中断处理器必须保存/恢复 FPU/SSE 状态，因为：
 //! 1. x86-interrupt 调用约定不保存 FPU 寄存器
-//! 2. 中断处理器内的代码（如 println!, memcpy）可能使用 SSE 指令
+//! 2. 中断处理器内的代码（如 kprintln!, memcpy）可能使用 SSE 指令
 //! 3. 不保存会破坏被中断进程的 FPU 状态
 //!
 //! R66-7 fix: FPU save area is now per-CPU to support SMP. Each CPU has its
@@ -300,17 +300,17 @@ pub struct InterruptStatsSnapshot {
 
 impl InterruptStatsSnapshot {
     pub fn print(&self) {
-        println!("=== Interrupt Statistics ===");
-        println!("Exceptions:");
-        println!("  Breakpoint:       {}", self.breakpoint);
-        println!("  Page Fault:       {}", self.page_fault);
-        println!("  Double Fault:     {}", self.double_fault);
-        println!("  GP Fault:         {}", self.general_protection_fault);
-        println!("  Invalid Opcode:   {}", self.invalid_opcode);
-        println!("  Divide Error:     {}", self.divide_error);
-        println!("Hardware Interrupts:");
-        println!("  Timer:            {}", self.timer);
-        println!("  Keyboard:         {}", self.keyboard);
+        klog_always!("=== Interrupt Statistics ===");
+        klog_always!("Exceptions:");
+        klog_always!("  Breakpoint:       {}", self.breakpoint);
+        klog_always!("  Page Fault:       {}", self.page_fault);
+        klog_always!("  Double Fault:     {}", self.double_fault);
+        klog_always!("  GP Fault:         {}", self.general_protection_fault);
+        klog_always!("  Invalid Opcode:   {}", self.invalid_opcode);
+        klog_always!("  Divide Error:     {}", self.divide_error);
+        klog_always!("Hardware Interrupts:");
+        klog_always!("  Timer:            {}", self.timer);
+        klog_always!("  Keyboard:         {}", self.keyboard);
     }
 }
 
@@ -464,10 +464,10 @@ pub fn init() {
         serial_init_interrupt();
     }
 
-    println!("Interrupt Descriptor Table (IDT) loaded");
-    println!("  Exception handlers: 20 (double fault uses IST)");
-    println!("  Hardware interrupt handlers: 3 (Timer, Keyboard, Serial)");
-    println!("  FPU/SIMD support enabled (FXSAVE/FXRSTOR ready)");
+    klog_always!("Interrupt Descriptor Table (IDT) loaded");
+    klog_always!("  Exception handlers: 20 (double fault uses IST)");
+    klog_always!("  Hardware interrupt handlers: 3 (Timer, Keyboard, Serial)");
+    klog_always!("  FPU/SIMD support enabled (FXSAVE/FXRSTOR ready)");
 }
 
 /// Load IDT on an Application Processor.
@@ -558,7 +558,7 @@ pub fn get_stats() -> InterruptStatsSnapshot {
 extern "x86-interrupt" fn divide_error_handler(_stack_frame: InterruptStackFrame) {
     clac_if_smap();
     INTERRUPT_STATS.divide_error.fetch_add(1, Ordering::Relaxed);
-    // 注意：中断处理程序中不使用 println! 以避免死锁
+    // 注意：中断处理程序中不使用 kprintln! 以避免死锁
     panic!("Divide by zero or division overflow");
 }
 
@@ -1328,7 +1328,7 @@ pub unsafe fn pic_init() {
     core::arch::asm!("out dx, al", in("dx") PIC1_DATA, in("al") new_mask1, options(nostack, nomem));
     core::arch::asm!("out dx, al", in("dx") PIC2_DATA, in("al") new_mask2, options(nostack, nomem));
 
-    println!(
+    klog_always!(
         "PIC initialized: IRQ0-7 -> vectors {}-{}, IRQ8-15 -> vectors {}-{}",
         PIC1_OFFSET,
         PIC1_OFFSET + 7,

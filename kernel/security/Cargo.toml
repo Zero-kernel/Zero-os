@@ -13,3 +13,4 @@ lazy_static = { version = "1.4", features = ["spin_no_std"] }
 x86_64 = "0.15"
 mm = { path = "../mm" }
 drivers = { path = "../drivers" }
+klog = { path = "../klog" }

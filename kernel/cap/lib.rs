@@ -80,8 +80,9 @@
 
 extern crate alloc;
 
-#[macro_use]
 extern crate drivers;
+#[macro_use]
+extern crate klog;
 
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -519,7 +520,7 @@ impl CapTableInner {
 ///
 /// Must be called during kernel boot after heap initialization.
 pub fn init() {
-    println!("  Capability subsystem initialized");
+    klog_always!("  Capability subsystem initialized");
 }
 
 // ============================================================================

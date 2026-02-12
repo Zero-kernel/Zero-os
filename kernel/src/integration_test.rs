@@ -4,57 +4,57 @@
 
 /// 测试页表管理器
 pub fn test_page_table() {
-    println!("  [TEST] Page Table Manager...");
-    println!("    ✓ Page table manager module compiled");
-    println!("    ✓ Virtual memory mapping support ready");
+    klog_always!("  [TEST] Page Table Manager...");
+    klog_always!("    ✓ Page table manager module compiled");
+    klog_always!("    ✓ Virtual memory mapping support ready");
 }
 
 /// 测试进程控制块
 pub fn test_process_control_block() {
-    println!("  [TEST] Process Control Block...");
-    println!("    ✓ Process structure defined");
-    println!("    ✓ Priority system implemented");
-    println!("    ✓ State management ready");
+    klog_always!("  [TEST] Process Control Block...");
+    klog_always!("    ✓ Process structure defined");
+    klog_always!("    ✓ Priority system implemented");
+    klog_always!("    ✓ State management ready");
 }
 
 /// 测试增强型调度器
 pub fn test_scheduler() {
-    println!("  [TEST] Enhanced Scheduler...");
-    println!("    ✓ Scheduler module compiled");
-    println!("    ✓ Multi-level feedback queue ready");
-    println!("    ✓ Clock tick integration prepared");
+    klog_always!("  [TEST] Enhanced Scheduler...");
+    klog_always!("    ✓ Scheduler module compiled");
+    klog_always!("    ✓ Multi-level feedback queue ready");
+    klog_always!("    ✓ Clock tick integration prepared");
 }
 
 /// 测试Fork系统调用框架
 pub fn test_fork_framework() {
-    println!("  [TEST] Fork System Call Framework...");
-    println!("    ✓ Fork implementation compiled");
-    println!("    ✓ COW (Copy-on-Write) framework ready");
-    println!("    ✓ Physical page ref counting available");
+    klog_always!("  [TEST] Fork System Call Framework...");
+    klog_always!("    ✓ Fork implementation compiled");
+    klog_always!("    ✓ COW (Copy-on-Write) framework ready");
+    klog_always!("    ✓ Physical page ref counting available");
 }
 
 /// 测试系统调用
 pub fn test_syscalls() {
-    println!("  [TEST] System Calls...");
-    println!("    ✓ System call framework defined");
-    println!("    ✓ 50+ system calls enumerated");
-    println!("    ✓ Handler infrastructure ready");
+    klog_always!("  [TEST] System Calls...");
+    klog_always!("    ✓ System call framework defined");
+    klog_always!("    ✓ 50+ system calls enumerated");
+    klog_always!("    ✓ Handler infrastructure ready");
 }
 
 /// 测试上下文切换
 pub fn test_context_switch() {
-    println!("  [TEST] Context Switch...");
-    println!("    ✓ Context structure (176 bytes) defined");
-    println!("    ✓ Assembly switch routine compiled");
-    println!("    ✓ Register save/restore ready");
+    klog_always!("  [TEST] Context Switch...");
+    klog_always!("    ✓ Context structure (176 bytes) defined");
+    klog_always!("    ✓ Assembly switch routine compiled");
+    klog_always!("    ✓ Register save/restore ready");
 }
 
 /// 测试内存映射
 pub fn test_memory_mapping() {
-    println!("  [TEST] Memory Mapping...");
-    println!("    ✓ mmap system call implemented");
-    println!("    ✓ munmap system call implemented");
-    println!("    ✓ Memory protection flags supported");
+    klog_always!("  [TEST] Memory Mapping...");
+    klog_always!("    ✓ mmap system call implemented");
+    klog_always!("    ✓ munmap system call implemented");
+    klog_always!("    ✓ Memory protection flags supported");
 }
 
 /// Test ext2 filesystem write support
@@ -62,29 +62,29 @@ pub fn test_memory_mapping() {
 /// This test verifies the ext2 write infrastructure is compiled and functional.
 /// Full write testing requires a writable test file in the disk image.
 pub fn test_ext2_write() {
-    println!("  [TEST] Ext2 Write Support...");
+    klog_always!("  [TEST] Ext2 Write Support...");
 
     // Verify /mnt is mounted by checking stat
     match vfs::stat("/mnt") {
         Ok(stat) => {
-            println!("    ✓ /mnt mounted (ino={})", stat.ino);
-            println!("    ✓ Ext2 write_at() implemented");
-            println!("    ✓ Block allocation with bitmap management");
-            println!("    ✓ Inode persistence to disk");
+            klog_always!("    ✓ /mnt mounted (ino={})", stat.ino);
+            klog_always!("    ✓ Ext2 write_at() implemented");
+            klog_always!("    ✓ Block allocation with bitmap management");
+            klog_always!("    ✓ Inode persistence to disk");
         }
         Err(e) => {
-            println!("    - /mnt not mounted: {:?}", e);
+            klog_always!("    - /mnt not mounted: {:?}", e);
         }
     }
 
-    println!("    ✓ Ext2 write infrastructure compiled");
+    klog_always!("    ✓ Ext2 write infrastructure compiled");
 }
 
 /// 运行所有集成测试
 pub fn run_all_tests() {
-    println!();
-    println!("=== Component Integration Tests ===");
-    println!();
+    klog_always!();
+    klog_always!("=== Component Integration Tests ===");
+    klog_always!();
 
     test_page_table();
     test_process_control_block();
@@ -95,7 +95,7 @@ pub fn run_all_tests() {
     test_memory_mapping();
     test_ext2_write();
 
-    println!();
-    println!("=== All Component Tests Passed! ===");
-    println!();
+    klog_always!();
+    klog_always!("=== All Component Tests Passed! ===");
+    klog_always!();
 }

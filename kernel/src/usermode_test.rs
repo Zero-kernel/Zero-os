@@ -25,7 +25,7 @@ use x86_64::structures::paging::{PageTable, PageTableFlags};
 
 /// Debug: Dump page table entries for a virtual address
 fn dump_page_table_for_addr(addr: u64) {
-    println!("\n[DEBUG] Page table dump for 0x{:x}:", addr);
+    klog_always!("\n[DEBUG] Page table dump for 0x{:x}:", addr);
 
     // Calculate indices
     let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
@@ -33,7 +33,7 @@ fn dump_page_table_for_addr(addr: u64) {
     let pd_idx = ((addr >> 21) & 0x1FF) as usize;
     let pt_idx = ((addr >> 12) & 0x1FF) as usize;
 
-    println!(
+    klog_always!(
         "  Indices: PML4[{}] PDPT[{}] PD[{}] PT[{}]",
         pml4_idx, pdpt_idx, pd_idx, pt_idx
     );
@@ -41,7 +41,7 @@ fn dump_page_table_for_addr(addr: u64) {
     // Get current CR3
     let (cr3_frame, _) = Cr3::read();
     let pml4_phys = cr3_frame.start_address().as_u64();
-    println!("  CR3: 0x{:x}", pml4_phys);
+    klog_always!("  CR3: 0x{:x}", pml4_phys);
 
     // Access page tables via physical memory offset
     let phys_offset = mm::page_table::get_physical_memory_offset().as_u64();
@@ -51,7 +51,7 @@ fn dump_page_table_for_addr(addr: u64) {
         let pml4_virt = (phys_offset + pml4_phys) as *const PageTable;
         let pml4 = &*pml4_virt;
         let pml4_entry = &pml4[pml4_idx];
-        println!(
+        klog_always!(
             "  PML4[{}]: flags=0x{:x}, addr=0x{:x}, USER={}",
             pml4_idx,
             pml4_entry.flags().bits(),
@@ -60,7 +60,7 @@ fn dump_page_table_for_addr(addr: u64) {
         );
 
         if !pml4_entry.flags().contains(PageTableFlags::PRESENT) {
-            println!("  -> PML4 entry not present!");
+            klog_always!("  -> PML4 entry not present!");
             return;
         }
 
@@ -69,7 +69,7 @@ fn dump_page_table_for_addr(addr: u64) {
         let pdpt_virt = (phys_offset + pdpt_phys) as *const PageTable;
         let pdpt = &*pdpt_virt;
         let pdpt_entry = &pdpt[pdpt_idx];
-        println!(
+        klog_always!(
             "  PDPT[{}]: flags=0x{:x}, addr=0x{:x}, USER={}",
             pdpt_idx,
             pdpt_entry.flags().bits(),
@@ -78,12 +78,12 @@ fn dump_page_table_for_addr(addr: u64) {
         );
 
         if !pdpt_entry.flags().contains(PageTableFlags::PRESENT) {
-            println!("  -> PDPT entry not present!");
+            klog_always!("  -> PDPT entry not present!");
             return;
         }
 
         if pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            println!("  -> PDPT entry is 1GB huge page");
+            klog_always!("  -> PDPT entry is 1GB huge page");
             return;
         }
 
@@ -92,7 +92,7 @@ fn dump_page_table_for_addr(addr: u64) {
         let pd_virt = (phys_offset + pd_phys) as *const PageTable;
         let pd = &*pd_virt;
         let pd_entry = &pd[pd_idx];
-        println!(
+        klog_always!(
             "  PD[{}]: flags=0x{:x}, addr=0x{:x}, USER={}, HUGE={}",
             pd_idx,
             pd_entry.flags().bits(),
@@ -102,12 +102,12 @@ fn dump_page_table_for_addr(addr: u64) {
         );
 
         if !pd_entry.flags().contains(PageTableFlags::PRESENT) {
-            println!("  -> PD entry not present!");
+            klog_always!("  -> PD entry not present!");
             return;
         }
 
         if pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            println!("  -> PD entry is 2MB huge page");
+            klog_always!("  -> PD entry is 2MB huge page");
             return;
         }
 
@@ -116,7 +116,7 @@ fn dump_page_table_for_addr(addr: u64) {
         let pt_virt = (phys_offset + pt_phys) as *const PageTable;
         let pt = &*pt_virt;
         let pt_entry = &pt[pt_idx];
-        println!(
+        klog_always!(
             "  PT[{}]: flags=0x{:x}, addr=0x{:x}, USER={}, NX={}",
             pt_idx,
             pt_entry.flags().bits(),
@@ -126,13 +126,13 @@ fn dump_page_table_for_addr(addr: u64) {
         );
 
         if !pt_entry.flags().contains(PageTableFlags::PRESENT) {
-            println!("  -> PT entry not present!");
+            klog_always!("  -> PT entry not present!");
             return;
         }
 
-        println!("  -> Final physical page: 0x{:x}", pt_entry.addr().as_u64());
+        klog_always!("  -> Final physical page: 0x{:x}", pt_entry.addr().as_u64());
     }
-    println!();
+    klog_always!();
 }
 
 /// Wrapper to ensure ELF data is properly aligned for parsing
@@ -232,41 +232,41 @@ const PROCESS_NAME: &str = "hello";
 ///
 /// Returns true if the test setup succeeded (actual execution is asynchronous).
 pub fn run_usermode_test() -> bool {
-    println!("\n=== Ring 3 Execution Test ===\n");
-    println!("Embedded ELF size: {} bytes", user_elf().len());
+    klog_always!("\n=== Ring 3 Execution Test ===\n");
+    klog_always!("Embedded ELF size: {} bytes", user_elf().len());
 
     // Save current CR3 so we can restore it after loading the ELF
     let (saved_cr3_frame, _) = Cr3::read();
     let saved_cr3 = saved_cr3_frame.start_address().as_u64() as usize;
 
     // Step 1: Create a new process
-    println!("[1/4] Creating user process...");
+    klog_always!("[1/4] Creating user process...");
     // create_process(name: String, ppid: ProcessId, priority: Priority) -> Result<ProcessId, ProcessCreateError>
     // ppid = 0 means init process is parent, priority = 50 (default)
     let pid = match create_process(PROCESS_NAME.to_string(), 0, 50) {
         Ok(pid) => pid,
         Err(e) => {
-            println!("      ✗ Failed to create process: {:?}", e);
+            klog_always!("      ✗ Failed to create process: {:?}", e);
             return false;
         }
     };
-    println!("      ✓ Process created with PID {}", pid);
+    klog_always!("      ✓ Process created with PID {}", pid);
 
     // Step 2: Create fresh address space
-    println!("[2/4] Creating address space...");
+    klog_always!("[2/4] Creating address space...");
     let (_pml4_frame, memory_space) = match create_fresh_address_space() {
         Ok(result) => {
-            println!("      ✓ Address space created");
+            klog_always!("      ✓ Address space created");
             result
         }
         Err(e) => {
-            println!("      ✗ Failed to create address space: {:?}", e);
+            klog_always!("      ✗ Failed to create address space: {:?}", e);
             return false;
         }
     };
 
     // Step 3: Switch to new address space and load ELF
-    println!("[3/4] Loading ELF binary...");
+    klog_always!("[3/4] Loading ELF binary...");
 
     // Get reference to aligned ELF data
     let elf_data = user_elf();
@@ -276,8 +276,8 @@ pub fn run_usermode_test() -> bool {
 
     let load_result = match load_elf(elf_data) {
         Ok(result) => {
-            println!("      ✓ ELF loaded at entry 0x{:x}", result.entry);
-            println!("      ✓ User stack top at 0x{:x}", result.user_stack_top);
+            klog_always!("      ✓ ELF loaded at entry 0x{:x}", result.entry);
+            klog_always!("      ✓ User stack top at 0x{:x}", result.user_stack_top);
 
             // Debug: Dump page table entries for the entry point and stack
             dump_page_table_for_addr(result.entry);
@@ -287,7 +287,7 @@ pub fn run_usermode_test() -> bool {
             result
         }
         Err(e) => {
-            println!("      ✗ Failed to load ELF: {:?}", e);
+            klog_always!("      ✗ Failed to load ELF: {:?}", e);
             // Restore original CR3
             kernel_core::process::activate_memory_space(saved_cr3);
             return false;
@@ -295,7 +295,7 @@ pub fn run_usermode_test() -> bool {
     };
 
     // Step 4: Update process PCB with loaded state
-    println!("[4/4] Configuring process context...");
+    klog_always!("[4/4] Configuring process context...");
     if let Some(process) = get_process(pid) {
         let mut proc = process.lock();
 
@@ -340,13 +340,13 @@ pub fn run_usermode_test() -> bool {
         // Mark as ready to run
         proc.state = ProcessState::Ready;
 
-        println!("      ✓ Process context configured");
-        println!("        Entry: 0x{:x}", load_result.entry);
-        println!("        RSP:   0x{:x}", load_result.user_stack_top);
-        println!("        CS:    0x{:x} (Ring 3)", proc.context.cs);
-        println!("        SS:    0x{:x} (Ring 3)", proc.context.ss);
+        klog_always!("      ✓ Process context configured");
+        klog_always!("        Entry: 0x{:x}", load_result.entry);
+        klog_always!("        RSP:   0x{:x}", load_result.user_stack_top);
+        klog_always!("        CS:    0x{:x} (Ring 3)", proc.context.cs);
+        klog_always!("        SS:    0x{:x} (Ring 3)", proc.context.ss);
     } else {
-        println!("      ✗ Failed to get process");
+        klog_always!("      ✗ Failed to get process");
         kernel_core::process::activate_memory_space(saved_cr3);
         return false;
     }
@@ -354,15 +354,15 @@ pub fn run_usermode_test() -> bool {
     // Add process to scheduler's ready queue
     if let Some(process) = get_process(pid) {
         sched::enhanced_scheduler::Scheduler::add_process(process);
-        println!("      ✓ Process added to scheduler ready queue");
+        klog_always!("      ✓ Process added to scheduler ready queue");
     }
 
     // Restore kernel address space (scheduler will switch when running the process)
     kernel_core::process::activate_memory_space(saved_cr3);
 
-    println!("\n✓ Ring 3 test process ready!");
-    println!("  The process will execute when scheduled.");
-    println!("  Expected output: \"Hello from Ring 3!\" followed by PID\n");
+    klog_always!("\n✓ Ring 3 test process ready!");
+    klog_always!("  The process will execute when scheduled.");
+    klog_always!("  Expected output: \"Hello from Ring 3!\" followed by PID\n");
 
     true
 }
@@ -375,8 +375,8 @@ pub fn run_usermode_test() -> bool {
 /// Use this only for debugging the Ring 3 transition itself.
 #[allow(dead_code)]
 pub unsafe fn test_direct_ring3_jump() -> ! {
-    println!("\n=== Direct Ring 3 Jump Test ===\n");
-    println!("WARNING: This test will not return!\n");
+    klog_always!("\n=== Direct Ring 3 Jump Test ===\n");
+    klog_always!("WARNING: This test will not return!\n");
 
     // Create address space
     let (_pml4_frame, memory_space) =
@@ -388,9 +388,9 @@ pub unsafe fn test_direct_ring3_jump() -> ! {
     // Load ELF
     let load_result = load_elf(user_elf()).expect("Failed to load ELF");
 
-    println!("Jumping to Ring 3...");
-    println!("  Entry: 0x{:x}", load_result.entry);
-    println!("  Stack: 0x{:x}", load_result.user_stack_top);
+    klog_always!("Jumping to Ring 3...");
+    klog_always!("  Entry: 0x{:x}", load_result.entry);
+    klog_always!("  Stack: 0x{:x}", load_result.user_stack_top);
 
     // Set TSS RSP0 for syscall return
     arch::set_kernel_stack(arch::default_kernel_stack_top());

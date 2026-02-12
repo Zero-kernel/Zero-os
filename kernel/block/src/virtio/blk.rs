@@ -244,7 +244,7 @@ impl VirtQueue {
     fn free_desc(&self, idx: u16) {
         // Bounds check
         if idx >= self.size {
-            println!(
+            kprintln!(
                 "[virtio-blk] R66-6: free_desc called with OOB index {}",
                 idx
             );
@@ -257,7 +257,7 @@ impl VirtQueue {
             if let Some(slot) = alloc.get_mut(idx as usize) {
                 if !*slot {
                     // Already free - double-free attempt detected
-                    println!(
+                    kprintln!(
                         "[virtio-blk] R66-6 SECURITY: double-free detected for descriptor {}",
                         idx
                     );
@@ -328,7 +328,7 @@ impl VirtQueue {
             // A malicious device could set used_idx to arbitrary values
             if pending > self.size {
                 // Possible attack: device reported too many completions or rolled back
-                println!(
+                kprintln!(
                     "[virtio-blk] R66-5 SECURITY: invalid used.idx jump detected! \
                      used_idx={}, last={}, pending={}, size={}",
                     used_idx, last, pending, self.size
@@ -347,7 +347,7 @@ impl VirtQueue {
 
             // R66-5 FIX: Validate that the returned descriptor ID is within bounds
             if elem.id >= self.size as u32 {
-                println!(
+                kprintln!(
                     "[virtio-blk] R66-5 SECURITY: invalid used.id={} exceeds queue size={}",
                     elem.id, self.size
                 );
@@ -705,7 +705,7 @@ impl VirtioBlkDevice {
         }) {
             Some(entry) => entry,
             None => {
-                println!(
+                kprintln!(
                     "[virtio-blk] completion for unknown descriptor head={} ignored",
                     used.id
                 );
@@ -717,7 +717,7 @@ impl VirtioBlkDevice {
         let meta = match buffer.pending.take() {
             Some(m) => m,
             None => {
-                println!(
+                kprintln!(
                     "[virtio-blk] completion for descriptor head={} without metadata",
                     used.id
                 );
@@ -804,7 +804,7 @@ impl VirtioBlkDevice {
             let _ =
                 TIMEOUT_LEAKED_REQUESTS
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
-            println!(
+            kprintln!(
                 "[virtio-blk] late completion for abandoned request head={} status={}",
                 head, status
             );
@@ -1022,7 +1022,7 @@ impl VirtioBlkDevice {
                     }
                     Some(RequestCompletion::Flush(_)) => {
                         // Unexpected flush completion during I/O wait
-                        println!(
+                        kprintln!(
                             "[virtio-blk] unexpected flush completion while waiting for I/O head={}",
                             desc0
                         );
@@ -1055,7 +1055,7 @@ impl VirtioBlkDevice {
                         meta.abandoned = true;
                     }
                 }
-                println!(
+                kprintln!(
                     "[virtio-blk] timeout waiting for request head={} sector={} bytes={}, \
                      buffers pinned (reset required, total leaked={})",
                     desc0,
@@ -1347,7 +1347,7 @@ impl BlockDevice for VirtioBlkDevice {
                     }
                     Some(RequestCompletion::Io(_)) => {
                         // Unexpected I/O completion during flush wait
-                        println!(
+                        kprintln!(
                             "[virtio-blk] unexpected I/O completion while waiting for flush head={}",
                             desc0
                         );
@@ -1380,7 +1380,7 @@ impl BlockDevice for VirtioBlkDevice {
                         meta.abandoned = true;
                     }
                 }
-                println!(
+                kprintln!(
                     "[virtio-blk] flush timeout head={}, buffers pinned (reset required, total leaked={})",
                     desc0, leaked
                 );

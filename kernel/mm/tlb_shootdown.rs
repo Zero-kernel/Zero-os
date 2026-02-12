@@ -159,7 +159,7 @@ pub fn init_invpcid_support() {
     let supported = invpcid_supported();
     INVPCID_SUPPORTED.store(supported, Ordering::Release);
     if supported {
-        drivers::println!("[TLB] INVPCID instruction available - using efficient flushes");
+        kprintln!("[TLB] INVPCID instruction available - using efficient flushes");
     }
 }
 
@@ -607,7 +607,7 @@ fn enqueue_mailbox(
             // Queue is full, need to wait
             spins += 1;
             if spins % 100_000 == 0 {
-                drivers::println!(
+                kprintln!(
                     "[TLB] CPU shootdown queue full, waiting (head={}, tail={}, spins={})",
                     head,
                     tail,
@@ -757,7 +757,7 @@ fn wait_for_acks_with_retry(
             }
         } else {
             // Final timeout - this is a critical error
-            drivers::println!(
+            kprintln!(
                 "[CRITICAL] TLB shootdown gen {} failed after {} retries. CPUs not responding: {:?}",
                 generation,
                 ACK_TIMEOUT_RETRIES,
@@ -793,7 +793,7 @@ fn warn_timeout(targets: &[usize], generation: u64) {
         .copied()
         .collect();
 
-    drivers::println!(
+    kprintln!(
         "[WARN] TLB shootdown gen {} timed out waiting for ACK from CPUs {:?}",
         generation,
         missing

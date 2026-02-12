@@ -104,7 +104,7 @@ pub fn on_allocation_failure(nr_pages_needed: usize) {
         return;
     }
 
-    println!(
+    klog_always!(
         "OOM: cache reclaim insufficient (reclaimed {} pages, needed {})",
         reclaimed, nr_pages_needed
     );
@@ -134,18 +134,18 @@ fn kill_best_candidate(nr_pages_needed: usize) {
     let snapshot = match snapshot_cb {
         Some(f) => f(),
         None => {
-            println!("OOM: no snapshot provider registered");
+            klog_always!("OOM: no snapshot provider registered");
             return;
         }
     };
 
     if snapshot.is_empty() {
-        println!("OOM: no eligible processes to kill");
+        klog_always!("OOM: no eligible processes to kill");
         return;
     }
 
     if let Some(victim) = select_victim(&snapshot) {
-        println!(
+        klog_always!(
             "OOM: killing pid={} tgid={} rss={} pages nice={} adj={}",
             victim.pid, victim.tgid, victim.rss_pages, victim.nice, victim.oom_score_adj
         );
@@ -159,7 +159,7 @@ fn kill_best_candidate(nr_pages_needed: usize) {
 
         emit_audit(&victim, nr_pages_needed, ts_cb);
     } else {
-        println!("OOM: no eligible processes to kill (protected or kernel threads)");
+        klog_always!("OOM: no eligible processes to kill (protected or kernel threads)");
     }
 }
 
@@ -224,7 +224,7 @@ fn emit_audit(victim: &OomProcessInfo, needed: usize, ts_cb: Option<TimestampFn>
         encode_nice(victim.nice),
     ];
 
-    println!(
+    klog_always!(
         "OOM AUDIT: timestamp={} pid={} needed={} rss={} adj={} nice={}",
         timestamp, victim.pid, needed, victim.rss_pages, victim.oom_score_adj, victim.nice
     );

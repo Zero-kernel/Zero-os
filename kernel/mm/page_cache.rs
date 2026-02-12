@@ -776,7 +776,7 @@ lazy_static! {
 pub fn init() {
     // Force lazy static initialization
     let stats = PAGE_CACHE.stats();
-    drivers::println!(
+    klog_always!(
         "Page cache initialized: max_pages={}, current={}",
         stats.max_pages,
         stats.nr_pages
@@ -1032,7 +1032,7 @@ impl MemoryPressureHandler for PageCachePressureHandler {
             // Not enough clean pages, need to writeback dirty pages first
             // In a real implementation, this would trigger async writeback
             // For now, we just report how many we could free
-            drivers::println!(
+            klog_always!(
                 "Page cache: memory pressure, freed {} pages (needed {})",
                 freed,
                 nr_pages_needed

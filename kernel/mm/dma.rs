@@ -302,7 +302,7 @@ impl Drop for DmaBuffer {
                 // IOMMU unmap failed - scrub and leak pages to prevent reuse
                 // under an unknown DMA state. This is fail-safe behavior.
                 scrub_range(self.phys, alloc_bytes);
-                println!(
+                kprintln!(
                     "[DMA] WARNING: IOMMU unmap failed for iova={:#x} size={}, leaking pages",
                     self.iova, self.size
                 );
@@ -431,7 +431,7 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
             match e {
                 DmaError::IommuMapRejected => {
                     // Safe error: no mapping was installed, we can free the pages
-                    println!(
+                    kprintln!(
                         "[DMA] INFO: IOMMU map rejected for phys={:#x} size={}, freeing pages",
                         phys, size
                     );
@@ -440,7 +440,7 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
                 DmaError::IommuMapFailed | _ => {
                     // Unsafe error: mapping state uncertain, must leak pages
                     // to prevent device from accessing reused memory
-                    println!(
+                    kprintln!(
                         "[DMA] WARNING: IOMMU map failed for phys={:#x} size={}, leaking pages",
                         phys, size
                     );

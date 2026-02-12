@@ -390,7 +390,7 @@ pub unsafe fn calibrate_lapic_timer() -> Result<u32, &'static str> {
     );
 
     if !lapic_initialized() {
-        drivers::println!("[APIC] calibrate_lapic_timer: LAPIC not initialized");
+        klog!(Warn, "[APIC] calibrate_lapic_timer: LAPIC not initialized");
         return Err("lapic not initialized");
     }
 
@@ -451,7 +451,7 @@ unsafe fn calibrate_with_hpet() -> Option<u32> {
         polls = polls.wrapping_add(1);
         if polls >= MAX_HPET_POLLS {
             lapic_write(lapic::TIMER_INIT, 0);
-            drivers::println!("[APIC] calibrate_with_hpet: HPET wait timeout");
+            klog!(Warn, "[APIC] calibrate_with_hpet: HPET wait timeout");
             return None;
         }
         spin_loop();
@@ -462,7 +462,7 @@ unsafe fn calibrate_with_hpet() -> Option<u32> {
     lapic_write(lapic::TIMER_INIT, 0);
 
     if elapsed == 0 {
-        drivers::println!("[APIC] calibrate_with_hpet: LAPIC timer did not decrement");
+        klog!(Warn, "[APIC] calibrate_with_hpet: LAPIC timer did not decrement");
         return None;
     }
 
@@ -471,12 +471,12 @@ unsafe fn calibrate_with_hpet() -> Option<u32> {
     let calibrated = per_ms.min(u32::MAX as u64) as u32;
 
     if calibrated == 0 {
-        drivers::println!("[APIC] calibrate_with_hpet: computed init count is zero");
+        klog!(Warn, "[APIC] calibrate_with_hpet: computed init count is zero");
         return None;
     }
 
     LAPIC_TIMER_INIT_COUNT.store(calibrated, Ordering::Relaxed);
-    drivers::println!(
+    klog_always!(
         "[APIC] LAPIC timer calibrated via HPET: {} ticks in {} ms -> init_count={} (div=16, ~1kHz)",
         elapsed,
         window_ms,
@@ -506,7 +506,7 @@ unsafe fn calibrate_with_pit() -> Result<u32, &'static str> {
     // Calculate PIT reload value for the calibration window
     let pit_reload = ((PIT_FREQUENCY_HZ as u64 * LAPIC_CALIBRATION_WINDOW_MS as u64) + 500) / 1000;
     if pit_reload == 0 || pit_reload > u16::MAX as u64 {
-        drivers::println!(
+        klog!(Warn,
             "[APIC] calibrate_lapic_timer: invalid PIT reload value {}",
             pit_reload
         );
@@ -538,7 +538,7 @@ unsafe fn calibrate_with_pit() -> Result<u32, &'static str> {
         if polls >= MAX_PIT_POLLS {
             pit_gate.write(saved_gate);
             lapic_write(lapic::TIMER_INIT, 0);
-            drivers::println!("[APIC] calibrate_lapic_timer: PIT wait timeout");
+            klog!(Warn, "[APIC] calibrate_lapic_timer: PIT wait timeout");
             return Err("pit timeout");
         }
         spin_loop();
@@ -550,7 +550,7 @@ unsafe fn calibrate_with_pit() -> Result<u32, &'static str> {
     pit_gate.write(saved_gate);
 
     if elapsed == 0 {
-        drivers::println!("[APIC] calibrate_lapic_timer: LAPIC timer did not decrement");
+        klog!(Warn, "[APIC] calibrate_lapic_timer: LAPIC timer did not decrement");
         return Err("lapic timer not running");
     }
 
@@ -560,12 +560,12 @@ unsafe fn calibrate_with_pit() -> Result<u32, &'static str> {
     let calibrated = per_ms.min(u32::MAX as u64) as u32;
 
     if calibrated == 0 {
-        drivers::println!("[APIC] calibrate_lapic_timer: computed init count is zero");
+        klog!(Warn, "[APIC] calibrate_lapic_timer: computed init count is zero");
         return Err("calibration result zero");
     }
 
     LAPIC_TIMER_INIT_COUNT.store(calibrated, Ordering::Relaxed);
-    drivers::println!(
+    klog_always!(
         "[APIC] LAPIC timer calibrated: {} ticks in {} ms -> init_count={} (div=16, ~1kHz)",
         elapsed,
         LAPIC_CALIBRATION_WINDOW_MS,
@@ -1097,14 +1097,14 @@ pub fn print_status() {
 
     if lapic_init {
         let bsp_id = bsp_lapic_id();
-        drivers::println!("  LAPIC: enabled (BSP ID: {})", bsp_id);
+        klog_always!("  LAPIC: enabled (BSP ID: {})", bsp_id);
     } else {
-        drivers::println!("  LAPIC: not initialized");
+        klog_always!("  LAPIC: not initialized");
     }
 
     if ioapic_init {
-        drivers::println!("  I/O APIC: enabled");
+        klog_always!("  I/O APIC: enabled");
     } else {
-        drivers::println!("  I/O APIC: not initialized (using 8259 PIC)");
+        klog_always!("  I/O APIC: not initialized (using 8259 PIC)");
     }
 }

@@ -368,7 +368,7 @@ pub fn clone_net_namespace(parent: Arc<NetNamespace>) -> Result<Arc<NetNamespace
 
 /// Print namespace information for debugging.
 pub fn print_net_namespace_info(ns: &Arc<NetNamespace>) {
-    println!(
+    kprintln!(
         "[NET NS] id={}, level={}, refcount={}, devices={}",
         ns.id().raw(),
         ns.level(),

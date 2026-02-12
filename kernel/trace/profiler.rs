@@ -32,7 +32,7 @@
 //! // Retrieve samples (drains buffers)
 //! let snapshot = trace::snapshot_profiler()?;
 //! for sample in &snapshot.samples {
-//!     println!("CPU{}: pid={} rip=0x{:x}", sample.cpu, sample.pid, sample.rip);
+//!     kprintln!("CPU{}: pid={} rip=0x{:x}", sample.cpu, sample.pid, sample.rip);
 //! }
 //!
 //! // Stop profiling

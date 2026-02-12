@@ -314,7 +314,7 @@ fn fork_inner(
         child.context.rax = 0; // 子进程返回值 0
         child.state = ProcessState::Ready;
 
-        println!(
+        kprintln!(
             "Fork: parent={}, child={}, COW enabled",
             parent.pid, child.pid
         );
@@ -367,7 +367,7 @@ fn cleanup_partial_child(child_pid: ProcessId) {
         free_address_space(addr_space);
     }
 
-    println!("Fork failed: cleaned up partial child PID {}", child_pid);
+    kprintln!("Fork failed: cleaned up partial child PID {}", child_pid);
 }
 
 /// 实现写时复制(Copy-On-Write)的页表复制
@@ -444,7 +444,7 @@ pub unsafe fn copy_page_table_cow(
         // 当前单核模式下，只做本地 flush
         mm::flush_current_as_all();
 
-        println!(
+        kprintln!(
             "COW page table copy: parent=0x{:x}, child=0x{:x}, leaves={}, tables={}",
             parent_page_table,
             child_page_table,
@@ -574,7 +574,7 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
             frame_alloc.deallocate_frame(old_frame);
         }
 
-        println!(
+        kprintln!(
             "COW page fault: pid={}, addr=0x{:x} resolved",
             pid, fault_addr
         );
@@ -1109,7 +1109,7 @@ unsafe fn deep_copy_identity_for_user(
 
     // 如果 PDPT[0] 是 1GB 大页，我们不支持拆分（太复杂）
     if current_pdpt_0.flags().contains(PageTableFlags::HUGE_PAGE) {
-        println!("WARNING: 1GB huge page at PDPT[0], cannot split for user space");
+        kprintln!("WARNING: 1GB huge page at PDPT[0], cannot split for user space");
         return Err(ForkError::PageTableCopyFailed);
     }
 

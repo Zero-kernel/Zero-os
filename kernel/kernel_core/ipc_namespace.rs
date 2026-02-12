@@ -314,7 +314,7 @@ pub fn clone_ipc_namespace(parent: Arc<IpcNamespace>) -> Result<Arc<IpcNamespace
 
 /// Print namespace information for debugging.
 pub fn print_ipc_namespace_info(ns: &Arc<IpcNamespace>) {
-    println!(
+    kprintln!(
         "[IPC NS] id={}, level={}, refcount={}",
         ns.id().raw(),
         ns.level(),
