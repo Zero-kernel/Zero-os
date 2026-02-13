@@ -675,9 +675,16 @@ impl Ext2Fs {
             return Err(FsError::ReadOnly);
         }
 
+        // R105-4 FIX: Use checked arithmetic to prevent overflow/divide-by-zero.
         let descs_per_block = (self.block_size as usize) / size_of::<Ext2GroupDesc>();
-        let bgdt_block = if self.block_size == 1024 { 2 } else { 1 };
-        let block = bgdt_block + (group / descs_per_block) as u32;
+        if descs_per_block == 0 {
+            return Err(FsError::Invalid);
+        }
+        let bgdt_block: u32 = if self.block_size == 1024 { 2 } else { 1 };
+        let group_block = u32::try_from(group / descs_per_block)
+            .map_err(|_| FsError::Invalid)?;
+        let block = bgdt_block.checked_add(group_block)
+            .ok_or(FsError::Invalid)?;
         let offset = (group % descs_per_block) * size_of::<Ext2GroupDesc>();
 
         // Read-modify-write the block containing the descriptor

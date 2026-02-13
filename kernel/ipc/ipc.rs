@@ -66,6 +66,8 @@ pub enum IpcError {
     MessageTooLarge,
     /// 端点数量超限
     TooManyEndpoints,
+    /// R105-5 FIX: 全局端点 ID 空间耗尽
+    EndpointIdExhausted,
 }
 
 /// IPC端点
@@ -160,7 +162,12 @@ impl EndpointRegistry {
             return Err(IpcError::TooManyEndpoints);
         }
 
-        let endpoint_id = NEXT_ENDPOINT_ID.fetch_add(1, Ordering::SeqCst);
+        // R105-5 FIX: Use fetch_update with checked_add to prevent wrapping to 0
+        // on u64 overflow.  In practice u64 exhaustion is unreachable, but
+        // correctness should not depend on probabilistic arguments.
+        let endpoint_id = NEXT_ENDPOINT_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+            .map_err(|_| IpcError::EndpointIdExhausted)?;
         let endpoint = Endpoint::new(owner, allowed_senders);
 
         process_endpoints.insert(endpoint_id, endpoint);

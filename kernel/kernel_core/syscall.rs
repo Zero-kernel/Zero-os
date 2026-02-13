@@ -4711,30 +4711,14 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    // LSM hook: check file create permission if O_CREAT is set
+    // R105-1 FIX: Removed duplicate LSM hook_file_create / hook_file_open from
+    // the syscall layer.  The VFS layer (manager.rs open_file / create_file)
+    // already invokes both hooks with the authoritative inode metadata.
+    // Keeping the hooks here caused:
+    //   1. Double hook invocation per open, with inconsistent object identity
+    //      (path_hash here vs real inode in VFS).
+    //   2. Risk of policy desync if one layer is bypassed.
     let open_flags = flags as u32;
-    let path_hash = audit::hash_path(&path_str);
-
-    if let Some(proc_ctx) = lsm_current_process_ctx() {
-        // Check create permission first (if O_CREAT)
-        if open_flags & lsm::OpenFlags::O_CREAT != 0 {
-            // Get parent directory inode and name hash
-            let (parent_hash, name_hash) = match path_str.rfind('/') {
-                Some(0) => (audit::hash_path("/"), audit::hash_path(&path_str[1..])),
-                Some(idx) => (
-                    audit::hash_path(&path_str[..idx]),
-                    audit::hash_path(&path_str[idx + 1..]),
-                ),
-                None => (audit::hash_path("."), path_hash),
-            };
-
-            if let Err(err) =
-                lsm::hook_file_create(&proc_ctx, parent_hash, name_hash, mode & 0o7777)
-            {
-                return Err(lsm_error_to_syscall(err));
-            }
-        }
-    }
 
     // 获取 VFS 回调
     let open_fn = {
@@ -4742,20 +4726,8 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
         *callback.as_ref().ok_or(SyscallError::ENOSYS)?
     };
 
-    // 调用 VFS 打开文件
+    // 调用 VFS 打开文件 — VFS enforces LSM hooks with real inode context
     let file_ops = open_fn(&path_str, flags as u32, mode)?;
-
-    // LSM hook: check file open permission
-    // This is after VFS open to have file metadata, but before fd allocation
-    // If denied, file_ops will be dropped (closed) automatically
-    if let Some(proc_ctx) = lsm_current_process_ctx() {
-        let file_ctx = lsm::FileCtx::new(path_hash, mode, path_hash);
-        if let Err(err) =
-            lsm::hook_file_open(&proc_ctx, path_hash, lsm::OpenFlags(open_flags), &file_ctx)
-        {
-            return Err(lsm_error_to_syscall(err));
-        }
-    }
 
     // R39-4 FIX: O_CLOEXEC 常量定义
     const O_CLOEXEC: u32 = 0x80000;
@@ -7032,27 +7004,9 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     let mode = how_local.mode as u32;
     // Note: `resolve` already defined above for R65-22 validation
 
-    // LSM hook: check file create permission if O_CREAT is set
-    let path_hash = audit::hash_path(&resolved_path);
-
-    if let Some(proc_ctx) = lsm_current_process_ctx() {
-        if open_flags & lsm::OpenFlags::O_CREAT != 0 {
-            let (parent_hash, name_hash) = match resolved_path.rfind('/') {
-                Some(0) => (audit::hash_path("/"), audit::hash_path(&resolved_path[1..])),
-                Some(idx) => (
-                    audit::hash_path(&resolved_path[..idx]),
-                    audit::hash_path(&resolved_path[idx + 1..]),
-                ),
-                None => (audit::hash_path("."), path_hash),
-            };
-
-            if let Err(err) =
-                lsm::hook_file_create(&proc_ctx, parent_hash, name_hash, mode & 0o7777)
-            {
-                return Err(lsm_error_to_syscall(err));
-            }
-        }
-    }
+    // R105-1 FIX: Removed duplicate LSM hooks — VFS layer enforces
+    // hook_file_create and hook_file_open with real inode context.
+    // See sys_open_internal R105-1 comment for rationale.
 
     // Get VFS callback with resolve support
     let open_fn = {
@@ -7060,18 +7014,8 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
         *callback.as_ref().ok_or(SyscallError::ENOSYS)?
     };
 
-    // Call VFS with resolve flags
+    // Call VFS with resolve flags — VFS enforces LSM hooks
     let file_ops = open_fn(&resolved_path, open_flags, mode, resolve)?;
-
-    // LSM hook: check file open permission
-    if let Some(proc_ctx) = lsm_current_process_ctx() {
-        let file_ctx = lsm::FileCtx::new(path_hash, mode, path_hash);
-        if let Err(err) =
-            lsm::hook_file_open(&proc_ctx, path_hash, lsm::OpenFlags(open_flags), &file_ctx)
-        {
-            return Err(lsm_error_to_syscall(err));
-        }
-    }
 
     // O_CLOEXEC flag
     const O_CLOEXEC: u32 = 0x80000;

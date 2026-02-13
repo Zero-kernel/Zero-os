@@ -167,7 +167,10 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
         return Err(ElfLoadError::OverlapWithStack);
     }
 
-    klog_always!(
+    // R105-2 FIX: Diagnostic address log moved to debug-gated kprintln!.
+    // These are user-space VAs (not kernel), but still should not appear in
+    // production logs to avoid aiding ROP/JOP gadget searches.
+    kprintln!(
         "ELF loaded: entry=0x{:x}, brk_start=0x{:x}",
         elf.header.pt2.entry_point(),
         brk_start
@@ -337,11 +340,12 @@ fn load_segment_tracked(
     let mut segment_mapped: Vec<MappedEntry> = Vec::with_capacity(page_count);
     let mut frame_alloc = FrameAllocator::new();
 
-    klog_always!(
+    // R105-2 FIX: Segment layout diagnostics moved to debug-gated kprintln!.
+    kprintln!(
         "  load_segment: vaddr=0x{:x}, memsz={}, filesz={}, pages={}",
         vaddr, memsz, filesz, page_count
     );
-    klog_always!(
+    kprintln!(
         "    flags: R={} W={} X={} => PTFlags: 0x{:x}",
         true,
         ph.flags().is_write(),

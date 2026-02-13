@@ -380,6 +380,11 @@ pub struct VirtioBlkDevice {
     name: String,
     /// Transport layer (MMIO or PCI).
     transport: VirtioTransport,
+    /// R105-3 FIX: Owned DMA buffer for virtqueue memory.
+    /// Keeps the IOMMU mapping alive for the device's lifetime without mem::forget.
+    /// Field is intentionally never read — held purely for RAII lifetime management.
+    #[allow(dead_code)]
+    virtqueue_dma: DmaBuffer,
     /// Virtqueue for requests.
     queue: VirtQueue,
     /// Device capacity in sectors.
@@ -593,7 +598,9 @@ impl VirtioBlkDevice {
         // Allocate queue memory (simplified: use high physical memory)
         // In a real implementation, this would use a proper DMA allocator
         let queue_mem_size = VirtQueue::calc_size(queue_size);
-        let queue_phys = Self::alloc_dma_memory(queue_mem_size)?;
+        // R105-3 FIX: Keep DmaBuffer ownership instead of extracting phys + forget.
+        let virtqueue_dma = Self::alloc_dma_memory(queue_mem_size)?;
+        let queue_phys = virtqueue_dma.phys();
 
         // Get notify offset for PCI transport
         let notify_off = transport.queue_notify_off(0);
@@ -629,6 +636,7 @@ impl VirtioBlkDevice {
         Ok(Arc::new(Self {
             name: String::from(name),
             transport,
+            virtqueue_dma,
             queue,
             capacity,
             sector_size,
@@ -641,40 +649,11 @@ impl VirtioBlkDevice {
 
     /// Allocate DMA-able memory using the unified DMA allocator with IOMMU mapping.
     ///
-    /// Returns the physical address of the allocated memory.
-    /// The memory is zeroed before returning.
-    ///
-    /// # Security (R94-13 Enhancement)
-    ///
-    /// Unlike direct buddy allocator usage, this uses mm::dma::alloc_dma_buffer()
-    /// which creates on-demand IOMMU mappings. The DmaBuffer is intentionally
-    /// leaked (via core::mem::forget) since virtqueue memory is never freed.
-    fn alloc_dma_memory(size: usize) -> Result<u64, BlockError> {
-        match alloc_dma_buffer(size) {
-            Ok(buf) => {
-                let phys_addr = buf.phys();
-                // Intentionally leak the DmaBuffer since virtqueue memory is never freed.
-                // This keeps the IOMMU mapping alive for the device's lifetime.
-                core::mem::forget(buf);
-                Ok(phys_addr)
-            }
-            Err(_) => Err(BlockError::NoMem),
-        }
-    }
-
-    /// Free DMA-able memory previously allocated with `alloc_dma_memory`.
-    ///
-    /// # Note
-    ///
-    /// This function is kept for backward compatibility but is effectively a no-op
-    /// for virtqueue memory (which is leaked via forget). For request buffers,
-    /// DmaBuffer is now stored in RequestMeta and freed automatically on drop.
-    #[allow(dead_code)]
-    fn free_dma_memory(_phys_addr: u64, _size: usize) {
-        // No-op: DmaBuffer handles cleanup automatically when dropped.
-        // This function is kept for code compatibility but virtqueue memory
-        // is intentionally leaked (never freed), and request buffers use
-        // DmaBuffer directly in RequestMeta.
+    /// R105-3 FIX: Returns the `DmaBuffer` directly so ownership can be retained
+    /// by the caller, avoiding `core::mem::forget` and ensuring the IOMMU mapping
+    /// is automatically cleaned up when the device is dropped.
+    fn alloc_dma_memory(size: usize) -> Result<DmaBuffer, BlockError> {
+        alloc_dma_buffer(size).map_err(|_| BlockError::NoMem)
     }
 
     /// Notify the device of new available descriptors.
