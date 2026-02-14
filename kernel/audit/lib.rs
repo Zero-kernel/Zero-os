@@ -1131,6 +1131,103 @@ impl AuditRing {
         events
     }
 
+    /// Read up to `max_events` events with `id >= cursor` without draining.
+    ///
+    /// `cursor` is an event ID. If `cursor` refers to an event that has already
+    /// been evicted from the ring buffer, reading starts from the oldest
+    /// available event. Returns `next_cursor = last_returned_id + 1`.
+    fn read_from_cursor(&self, cursor: u64, max_events: usize) -> AuditExportBatch {
+        let tail_hash = self.tail_hash();
+
+        if self.len == 0 || self.buf.is_empty() || max_events == 0 {
+            return AuditExportBatch {
+                events: Vec::new(),
+                next_cursor: cursor,
+                has_more: false,
+                tail_hash,
+            };
+        }
+
+        // Clamp cursor to the valid range [oldest_id, next_id].
+        // - If cursor < oldest_id: the requested events were evicted; start
+        //   from the oldest available event.
+        // - If cursor >= next_id: the caller has a stale/future cursor
+        //   (e.g., from a reboot); clamp to next_id so the caller polls
+        //   for new events instead of missing them.
+        let oldest_id = self.buf[self.head]
+            .as_ref()
+            .map(|e| e.id)
+            .unwrap_or(cursor);
+        let start_cursor = if cursor < oldest_id {
+            oldest_id
+        } else if cursor >= self.next_id {
+            // Future cursor: nothing available yet; return next_id so the
+            // caller can poll again when new events arrive.
+            return AuditExportBatch {
+                events: Vec::new(),
+                next_cursor: self.next_id,
+                has_more: false,
+                tail_hash,
+            };
+        } else {
+            cursor
+        };
+
+        // Linear scan to find the first buffered event with id >= start_cursor.
+        let mut start_offset: Option<usize> = None;
+        for i in 0..self.len {
+            let idx = (self.head + i) % self.buf.len();
+            if let Some(ref event) = self.buf[idx] {
+                if event.id >= start_cursor {
+                    start_offset = Some(i);
+                    break;
+                }
+            }
+        }
+
+        let Some(start_offset) = start_offset else {
+            // Cursor is beyond the newest available event.
+            return AuditExportBatch {
+                events: Vec::new(),
+                next_cursor: start_cursor,
+                has_more: false,
+                tail_hash,
+            };
+        };
+
+        let available = self.len - start_offset;
+        let to_take = core::cmp::min(max_events, available);
+        let mut events = Vec::with_capacity(to_take);
+        let mut last_id = start_cursor;
+
+        for i in 0..available {
+            if events.len() >= to_take {
+                break;
+            }
+            let idx = (self.head + start_offset + i) % self.buf.len();
+            if let Some(ref event) = self.buf[idx] {
+                if event.id < start_cursor {
+                    continue;
+                }
+                last_id = event.id;
+                events.push(event.clone());
+            }
+        }
+
+        let next_cursor = if events.is_empty() {
+            start_cursor
+        } else {
+            last_id.wrapping_add(1)
+        };
+
+        AuditExportBatch {
+            events,
+            next_cursor,
+            has_more: available > to_take,
+            tail_hash,
+        }
+    }
+
     /// Get the current tail hash (for integrity verification)
     fn tail_hash(&self) -> [u8; 32] {
         self.prev_hash
@@ -1176,6 +1273,232 @@ pub struct AuditStats {
     /// Current tail hash (SHA-256)
     pub tail_hash: [u8; 32],
 }
+
+// ============================================================================
+// Cursor-Based Export (Non-Draining) — G.fin.2
+// ============================================================================
+
+/// Batch of audit events exported from a cursor without draining the ring buffer.
+pub struct AuditExportBatch {
+    /// Exported events in ascending `id` order.
+    pub events: Vec<AuditEvent>,
+    /// Cursor to resume from on the next call (`last_returned_id + 1`).
+    pub next_cursor: u64,
+    /// `true` if there are additional events available after this batch.
+    pub has_more: bool,
+    /// Current tail hash of the audit chain (SHA-256).
+    pub tail_hash: [u8; 32],
+}
+
+/// Magic value for [`AuditExportHeader`] ("ZAUD" in little-endian).
+pub const AUDIT_EXPORT_MAGIC: u32 = u32::from_le_bytes(*b"ZAUD");
+
+/// Export format version.
+pub const AUDIT_EXPORT_VERSION: u16 = 1;
+
+/// Fixed-size export header written before `AuditExportRecord[]`.
+///
+/// All integer fields are stored in little-endian byte order on the wire.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditExportHeader {
+    /// Magic: `AUDIT_EXPORT_MAGIC` ("ZAUD").
+    pub magic: u32,
+    /// Format version: `AUDIT_EXPORT_VERSION`.
+    pub version: u16,
+    /// Number of `AuditExportRecord` entries following this header.
+    pub record_count: u16,
+    /// Next cursor for the caller to resume from (`last_returned_id + 1`).
+    pub cursor: u64,
+    /// Current chain tail hash (SHA-256).
+    pub tail_hash: [u8; 32],
+}
+
+impl AuditExportHeader {
+    /// Serialized size in bytes.
+    pub const SIZE: usize = 48;
+
+    /// Construct a new header.
+    #[inline]
+    pub const fn new(record_count: u16, next_cursor: u64, tail_hash: [u8; 32]) -> Self {
+        Self {
+            magic: AUDIT_EXPORT_MAGIC,
+            version: AUDIT_EXPORT_VERSION,
+            record_count,
+            cursor: next_cursor,
+            tail_hash,
+        }
+    }
+
+    /// Serialize to a little-endian byte representation.
+    #[inline]
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        out[0..4].copy_from_slice(&self.magic.to_le_bytes());
+        out[4..6].copy_from_slice(&self.version.to_le_bytes());
+        out[6..8].copy_from_slice(&self.record_count.to_le_bytes());
+        out[8..16].copy_from_slice(&self.cursor.to_le_bytes());
+        out[16..48].copy_from_slice(&self.tail_hash);
+        out
+    }
+}
+
+// Compile-time size assertion.
+const _: [(); AuditExportHeader::SIZE] = [(); core::mem::size_of::<AuditExportHeader>()];
+
+/// Fixed-size export record (128 bytes) for a single audit event.
+///
+/// Designed for a stable userspace ABI and efficient bulk transfer. Truncated
+/// hash fields (8 bytes of the full 32-byte SHA-256) provide enough entropy
+/// for chain integrity spot-checks; the full hashes are available via the
+/// kernel's in-memory ring buffer for authoritative verification.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditExportRecord {
+    /// Monotonically increasing event ID.
+    pub id: u64,
+    /// Timestamp (timer ticks since boot).
+    pub timestamp: u64,
+    /// Event category (`AuditKind` repr).
+    pub kind: u8,
+    /// Operation outcome (`AuditOutcome` repr).
+    pub outcome: u8,
+    _pad0: [u8; 2],
+    /// Subject PID.
+    pub pid: u32,
+    /// Subject UID.
+    pub uid: u32,
+    /// Subject GID.
+    pub gid: u32,
+    /// Capability ID used (0 if none).
+    pub cap_id: u64,
+    /// Object type discriminant (0=None, 1=Path, 2=Endpoint, 3=Process, etc.).
+    pub object_disc: u8,
+    _pad1: [u8; 3],
+    /// Error number (0 if success).
+    pub errno: i32,
+    /// Operation-specific arguments (up to 6).
+    pub args: [u64; 6],
+    /// Truncated `prev_hash` (first 8 bytes of SHA-256).
+    pub prev_hash_trunc: [u8; 8],
+    /// Truncated `hash` (first 8 bytes of SHA-256).
+    pub hash_trunc: [u8; 8],
+    /// Number of events dropped before this one.
+    pub dropped: u64,
+    /// Reserved for future use.
+    pub reserved: [u8; 8],
+}
+
+impl AuditExportRecord {
+    /// Serialized size in bytes.
+    pub const SIZE: usize = 128;
+
+    /// Map an `AuditObject` to its discriminant byte.
+    #[inline]
+    fn object_disc(obj: &AuditObject) -> u8 {
+        match obj {
+            AuditObject::None => 0,
+            AuditObject::Path { .. } => 1,
+            AuditObject::Endpoint { .. } => 2,
+            AuditObject::Process { .. } => 3,
+            AuditObject::Socket { .. } => 4,
+            AuditObject::Memory { .. } => 5,
+            AuditObject::Capability { .. } => 6,
+            AuditObject::Namespace { .. } => 7,
+        }
+    }
+
+    /// Convert an `AuditEvent` into the fixed-size export representation.
+    ///
+    /// When `redact_syscall_args` is `true`, syscall arguments `args[1..]` are
+    /// zeroed to avoid leaking user pointers across processes; `args[0]`
+    /// (the syscall number) is preserved.
+    #[inline]
+    pub fn from_event(event: &AuditEvent, redact_syscall_args: bool) -> Self {
+        let mut args = [0u64; 6];
+        let count = core::cmp::min(event.arg_count as usize, args.len());
+        let should_redact = redact_syscall_args && matches!(event.kind, AuditKind::Syscall);
+        for i in 0..count {
+            args[i] = if should_redact && i != 0 {
+                0
+            } else {
+                event.args[i]
+            };
+        }
+
+        let mut prev_hash_trunc = [0u8; 8];
+        prev_hash_trunc.copy_from_slice(&event.prev_hash[..8]);
+        let mut hash_trunc = [0u8; 8];
+        hash_trunc.copy_from_slice(&event.hash[..8]);
+
+        Self {
+            id: event.id,
+            timestamp: event.timestamp,
+            kind: event.kind as u8,
+            outcome: event.outcome as u8,
+            _pad0: [0; 2],
+            pid: event.subject.pid,
+            uid: event.subject.uid,
+            gid: event.subject.gid,
+            cap_id: event.subject.cap_id.unwrap_or(0),
+            object_disc: Self::object_disc(&event.object),
+            _pad1: [0; 3],
+            errno: event.errno,
+            args,
+            prev_hash_trunc,
+            hash_trunc,
+            dropped: event.dropped,
+            reserved: [0; 8],
+        }
+    }
+
+    /// Serialize into the on-wire little-endian byte representation.
+    #[inline]
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        let mut o = 0usize;
+
+        out[o..o + 8].copy_from_slice(&self.id.to_le_bytes());
+        o += 8;
+        out[o..o + 8].copy_from_slice(&self.timestamp.to_le_bytes());
+        o += 8;
+        out[o] = self.kind;
+        o += 1;
+        out[o] = self.outcome;
+        o += 1;
+        out[o..o + 2].copy_from_slice(&self._pad0);
+        o += 2;
+        out[o..o + 4].copy_from_slice(&self.pid.to_le_bytes());
+        o += 4;
+        out[o..o + 4].copy_from_slice(&self.uid.to_le_bytes());
+        o += 4;
+        out[o..o + 4].copy_from_slice(&self.gid.to_le_bytes());
+        o += 4;
+        out[o..o + 8].copy_from_slice(&self.cap_id.to_le_bytes());
+        o += 8;
+        out[o] = self.object_disc;
+        o += 1;
+        out[o..o + 3].copy_from_slice(&self._pad1);
+        o += 3;
+        out[o..o + 4].copy_from_slice(&self.errno.to_le_bytes());
+        o += 4;
+        for arg in &self.args {
+            out[o..o + 8].copy_from_slice(&arg.to_le_bytes());
+            o += 8;
+        }
+        out[o..o + 8].copy_from_slice(&self.prev_hash_trunc);
+        o += 8;
+        out[o..o + 8].copy_from_slice(&self.hash_trunc);
+        o += 8;
+        out[o..o + 8].copy_from_slice(&self.dropped.to_le_bytes());
+        o += 8;
+        out[o..o + 8].copy_from_slice(&self.reserved);
+        out
+    }
+}
+
+// Compile-time size assertion.
+const _: [(); AuditExportRecord::SIZE] = [(); core::mem::size_of::<AuditExportRecord>()];
 
 // ============================================================================
 // Snapshot Authorization (Capability Gate)
@@ -1892,6 +2215,41 @@ pub fn emit_security_allow(
         0,
         timestamp,
     )
+}
+
+/// Export a batch of audit events from a cursor without draining the ring buffer.
+///
+/// This is the preferred API for remote delivery / userspace audit daemon
+/// forwarding. Callers provide a monotonically increasing `cursor` (event ID)
+/// and receive up to `max_events` events with `id >= cursor`. Events remain
+/// in the ring buffer and can be re-exported or eventually evicted naturally.
+///
+/// If `cursor` refers to an event that has already been evicted, export starts
+/// from the oldest available event. The returned `AuditExportBatch::next_cursor`
+/// should be passed to the next call to resume.
+///
+/// # Capability Gate
+///
+/// Identical to `snapshot()`: requires `SNAPSHOT_AUTHORIZER` / `CAP_AUDIT_READ`.
+pub fn export(cursor: u64, max_events: usize) -> Result<AuditExportBatch, AuditError> {
+    if !AUDIT_INITIALIZED.load(Ordering::Relaxed) {
+        return Err(AuditError::Uninitialized);
+    }
+
+    // Capability gate: verify caller has CAP_AUDIT_READ.
+    ensure_snapshot_authorized()?;
+
+    // Invoke flush hook so pending events from other subsystems are visible.
+    run_flush_hook();
+
+    interrupts::without_interrupts(|| {
+        let ring = AUDIT_RING.lock();
+        if let Some(ref r) = *ring {
+            Ok(r.read_from_cursor(cursor, max_events))
+        } else {
+            Err(AuditError::Uninitialized)
+        }
+    })
 }
 
 /// Take a snapshot of the audit log (drains all buffered events)

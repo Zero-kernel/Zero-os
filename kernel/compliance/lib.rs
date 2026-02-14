@@ -25,6 +25,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use security::SecurityConfig;
+use spin::Once;
 
 // ============================================================================
 // Hardening Profiles
@@ -144,6 +145,170 @@ impl Default for HardeningProfile {
 }
 
 // ============================================================================
+// G.fin.1 Policy Surface (boot-time locked)
+// ============================================================================
+
+/// Origin of the selected [`HardeningProfile`].
+///
+/// Used for audit/attestation to distinguish defaults from explicit operator
+/// intent (boot cmdline) or runtime changes (privileged control plane / tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ProfileSource {
+    /// Built-in kernel default (no explicit selection).
+    Default = 0,
+    /// Selected via boot command line / bootloader configuration.
+    BootCmdline = 1,
+    /// Selected at runtime (tests / privileged control plane).
+    Runtime = 2,
+}
+
+/// Read-only, boot-time policy surface derived from a [`HardeningProfile`].
+///
+/// Initialised exactly once during early boot via [`init_policy_surface`] and
+/// intended to be the **single source of truth** consulted by all subsystems
+/// for security policy decisions. The struct is `Copy` and all fields are
+/// immutable after initialisation.
+///
+/// # Field Semantics
+///
+/// | Field | Secure | Balanced | Performance |
+/// |-------|--------|----------|-------------|
+/// | `panic_redact_details` | true | false | false |
+/// | `kaslr_fail_closed` | true | false | false |
+/// | `kpti_fail_closed` | true | false | false |
+/// | `audit_ring_capacity` | 256 | 128 | 64 |
+/// | `debug_interfaces_enabled` | false | true | true |
+/// | `spectre_mitigations` | true | true | false |
+/// | `kptr_guard` | true | true | false |
+/// | `strict_wxorx` | true | false | false |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicySurface {
+    /// Active hardening profile.
+    pub profile: HardeningProfile,
+    /// How the profile was selected (audit trail).
+    pub source: ProfileSource,
+    /// If `true`, the panic handler must redact details (file paths, pointers).
+    pub panic_redact_details: bool,
+    /// If `true`, KASLR initialisation failures are fatal.
+    pub kaslr_fail_closed: bool,
+    /// If `true`, KPTI initialisation failures are fatal.
+    pub kpti_fail_closed: bool,
+    /// Audit ring buffer capacity to use during `audit::init()`.
+    pub audit_ring_capacity: usize,
+    /// If `true`, debug interfaces (serial debug, test hooks) may be exposed.
+    pub debug_interfaces_enabled: bool,
+    /// If `true`, Spectre-class mitigations (IBRS, STIBP, retpolines) are active.
+    pub spectre_mitigations: bool,
+    /// If `true`, kernel pointer guarding/obfuscation is active.
+    pub kptr_guard: bool,
+    /// If `true`, W^X violations are fatal (panic instead of warn).
+    pub strict_wxorx: bool,
+}
+
+impl PolicySurface {
+    /// Build a policy surface from a hardening profile and its source.
+    pub const fn from_profile(profile: HardeningProfile, source: ProfileSource) -> Self {
+        let is_secure = matches!(profile, HardeningProfile::Secure);
+        Self {
+            profile,
+            source,
+            panic_redact_details: is_secure,
+            kaslr_fail_closed: is_secure,
+            kpti_fail_closed: is_secure,
+            audit_ring_capacity: profile.audit_capacity(),
+            debug_interfaces_enabled: !is_secure,
+            spectre_mitigations: profile.spectre_mitigations_enabled(),
+            kptr_guard: profile.kptr_guard_enabled(),
+            strict_wxorx: is_secure,
+        }
+    }
+}
+
+/// Boot-time locked policy surface (initialised exactly once).
+static POLICY_SURFACE: Once<PolicySurface> = Once::new();
+
+/// Initialise the global [`PolicySurface`] from a hardening profile.
+///
+/// This must be called **exactly once** during early boot, before any subsystem
+/// queries [`policy()`]. It:
+/// 1. Sets the global `ACTIVE_PROFILE` atomically.
+/// 2. Builds and stores the immutable `PolicySurface`.
+/// 3. Emits a profile validation audit event (tolerated if audit is not yet
+///    initialised — the event is silently dropped).
+///
+/// # Panics
+///
+/// Panics if called a second time with a **different** profile (configuration
+/// conflict indicates a boot-time programming error).
+pub fn init_policy_surface(
+    profile: HardeningProfile,
+    source: ProfileSource,
+) -> &'static PolicySurface {
+    // If already initialised, only allow idempotent calls with the same profile
+    // and source. Mismatched source would silently degrade attestation accuracy.
+    if let Some(existing) = POLICY_SURFACE.get() {
+        if existing.profile != profile || existing.source != source {
+            panic!(
+                "PolicySurface already initialised ({}/{:?}), cannot re-init with ({}/{:?})",
+                existing.profile.name(),
+                existing.source,
+                profile.name(),
+                source,
+            );
+        }
+        return existing;
+    }
+
+    // Set the underlying atomic profile. After PolicySurface exists, set_profile()
+    // is rejected to prevent policy/profile divergence.
+    let set_ok = set_profile(profile);
+    let active = current_profile();
+    if !set_ok && active != profile {
+        panic!(
+            "Hardening profile is locked to {}, cannot set requested {}",
+            active.name(),
+            profile.name(),
+        );
+    }
+
+    let surface = PolicySurface::from_profile(profile, source);
+    let surface_ref = POLICY_SURFACE.call_once(|| surface);
+
+    // Validate internal consistency: stored surface must agree with atomic profile.
+    let validated = surface_ref.profile == profile && current_profile() == profile;
+    emit_profile_validation_audit_event(surface_ref, validated);
+
+    if !validated {
+        panic!("Hardening profile validation failed (fail-closed)");
+    }
+
+    surface_ref
+}
+
+/// Get the boot-time locked policy surface.
+///
+/// This is the primary accessor for all subsystems that need policy decisions.
+///
+/// # Panics
+///
+/// Panics if called before [`init_policy_surface`].
+#[inline]
+pub fn policy() -> &'static PolicySurface {
+    POLICY_SURFACE
+        .get()
+        .expect("PolicySurface accessed before init_policy_surface()")
+}
+
+/// Check whether the policy surface has been initialised.
+///
+/// Useful in early boot paths that may run before `init_policy_surface()`.
+#[inline]
+pub fn is_policy_initialized() -> bool {
+    POLICY_SURFACE.get().is_some()
+}
+
+// ============================================================================
 // Global Profile State
 // ============================================================================
 
@@ -155,10 +320,15 @@ static PROFILE_LOCKED: AtomicBool = AtomicBool::new(false);
 
 /// Set the active hardening profile.
 ///
-/// This can only be called once during early boot before `lock_profile()`.
-/// Returns `false` if the profile is already locked.
+/// This can only be called during early boot before `lock_profile()` and
+/// before [`init_policy_surface`] stores the policy surface. Returns `false`
+/// if the profile is locked or a `PolicySurface` already exists.
 pub fn set_profile(profile: HardeningProfile) -> bool {
     if PROFILE_LOCKED.load(Ordering::Acquire) {
+        return false;
+    }
+    // Once the policy surface exists, reject changes to prevent divergence.
+    if POLICY_SURFACE.get().is_some() {
         return false;
     }
     ACTIVE_PROFILE.store(profile as u8, Ordering::Release);
@@ -190,8 +360,12 @@ pub fn current_profile() -> HardeningProfile {
 }
 
 /// Check if the profile has been locked.
+///
+/// Returns `true` if either `lock_profile()` was called explicitly **or**
+/// a [`PolicySurface`] has been initialised (which implicitly prevents further
+/// profile changes via `set_profile()`).
 pub fn is_profile_locked() -> bool {
-    PROFILE_LOCKED.load(Ordering::Acquire)
+    PROFILE_LOCKED.load(Ordering::Acquire) || POLICY_SURFACE.get().is_some()
 }
 
 // ============================================================================
@@ -596,6 +770,77 @@ mod fips_kat {
 // ============================================================================
 // Audit Integration
 // ============================================================================
+
+/// Emit hardening profile / policy surface validation audit event.
+///
+/// Emitted once during early boot after [`init_policy_surface`]. If the audit
+/// subsystem is not yet initialised the event is silently dropped (the
+/// `audit::emit` call returns `Err(Uninitialized)`).
+fn emit_profile_validation_audit_event(surface: &PolicySurface, validated: bool) {
+    // args layout (Internal kind):
+    //   [0] event discriminator (2 = policy surface validation)
+    //   [1] profile (HardeningProfile repr)
+    //   [2] audit ring capacity
+    //   [3] flags bitset (see constants below)
+    //   [4] profile source (ProfileSource repr)
+    //   [5] validated flag (1 = pass, 0 = fail)
+    const EVENT_ID: u64 = 2;
+    const FLAG_PANIC_REDACT: u64 = 1 << 0;
+    const FLAG_KASLR_FAIL_CLOSED: u64 = 1 << 1;
+    const FLAG_KPTI_FAIL_CLOSED: u64 = 1 << 2;
+    const FLAG_DEBUG_INTERFACES: u64 = 1 << 3;
+    const FLAG_SPECTRE: u64 = 1 << 4;
+    const FLAG_KPTR_GUARD: u64 = 1 << 5;
+    const FLAG_STRICT_WXORX: u64 = 1 << 6;
+
+    let mut flags = 0u64;
+    if surface.panic_redact_details {
+        flags |= FLAG_PANIC_REDACT;
+    }
+    if surface.kaslr_fail_closed {
+        flags |= FLAG_KASLR_FAIL_CLOSED;
+    }
+    if surface.kpti_fail_closed {
+        flags |= FLAG_KPTI_FAIL_CLOSED;
+    }
+    if surface.debug_interfaces_enabled {
+        flags |= FLAG_DEBUG_INTERFACES;
+    }
+    if surface.spectre_mitigations {
+        flags |= FLAG_SPECTRE;
+    }
+    if surface.kptr_guard {
+        flags |= FLAG_KPTR_GUARD;
+    }
+    if surface.strict_wxorx {
+        flags |= FLAG_STRICT_WXORX;
+    }
+
+    let outcome = if validated {
+        audit::AuditOutcome::Info
+    } else {
+        audit::AuditOutcome::Error
+    };
+
+    let event_args: [u64; 6] = [
+        EVENT_ID,
+        surface.profile as u64,
+        surface.audit_ring_capacity as u64,
+        flags,
+        surface.source as u64,
+        if validated { 1 } else { 0 },
+    ];
+
+    let _ = audit::emit(
+        audit::AuditKind::Internal,
+        outcome,
+        audit::AuditSubject::kernel(),
+        audit::AuditObject::None,
+        &event_args,
+        0,
+        0, // Timestamp 0 = early boot
+    );
+}
 
 /// Emit FIPS-related audit event.
 fn emit_fips_audit_event(success: bool, _message: &str) {

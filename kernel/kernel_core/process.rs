@@ -12,7 +12,7 @@ use alloc::{
 };
 use cap::CapTable;
 use core::any::Any;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use lsm::ProcessCtx as LsmProcessCtx; // R25-7 FIX: Import LSM for task_exit hook
 use mm::memory::FrameAllocator;
 use mm::page_table;
@@ -169,6 +169,13 @@ pub enum ProcessCreateError {
 /// After this many PIDs, new stacks would overflow into other kernel memory.
 /// Calculation: (u64::MAX - KSTACK_BASE) / KSTACK_STRIDE ≈ 209,715
 pub const MAX_PID: ProcessId = ((u64::MAX - KSTACK_BASE) / KSTACK_STRIDE) as ProcessId;
+
+/// R106-11 (P0-4): User-visible PID upper bound (Linux default: 32768).
+///
+/// Bounded separately from `MAX_PID` (kernel stack address space limit) so PID
+/// recycling keeps the process table bounded and prevents PID exhaustion under
+/// fork/exit churn. Valid PIDs are in [1, PID_MAX].
+pub const PID_MAX: ProcessId = 32_768;
 
 /// 计算指定 PID 的内核栈虚拟地址范围
 ///
@@ -397,6 +404,13 @@ impl Default for Context {
 pub struct Process {
     /// 进程ID（唯一标识，也是 Linux 语义中的 tid）
     pub pid: ProcessId,
+
+    /// R106-1 FIX: 进程代际（monotonic generation counter）。
+    ///
+    /// 每个进程实例获得一个全局唯一、单调递增的 generation 值。
+    /// 当 PID 被回收并分配给新进程时，新进程的 generation 不同于旧进程，
+    /// 从而防止 IPC allowed_senders 等基于 PID 的授权被新进程继承。
+    pub generation: u64,
 
     /// 线程ID（等于 pid，保持 Linux 兼容性）
     pub tid: ProcessId,
@@ -688,6 +702,7 @@ impl Process {
     pub fn new(pid: ProcessId, ppid: ProcessId, name: String, priority: Priority) -> Self {
         Process {
             pid,
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::SeqCst),
             tid: pid,  // tid == pid (Linux 语义)
             tgid: pid, // 主线程时 tgid == pid
             ppid,
@@ -1073,12 +1088,21 @@ lazy_static::lazy_static! {
 /// to acquire the same non-reentrant spinlock on the same CPU.
 ///
 /// Encoding: 0 = no current process, N > 0 = ProcessId N.
-/// PID 0 is never assigned (NEXT_PID starts at 1), so 0 is a safe sentinel.
+/// PID 0 is never assigned, so 0 is a safe sentinel.
 static CURRENT_PID: cpu_local::CpuLocal<AtomicUsize> =
     cpu_local::CpuLocal::new(|| AtomicUsize::new(0));
 
-/// 下一个可用的PID
-static NEXT_PID: Mutex<ProcessId> = Mutex::new(1);
+/// R106-11 (P0-4): Next PID allocation hint for circular scan.
+///
+/// PID 0 is never allocated; valid PIDs are in [1, PID_MAX].
+/// On each allocation, the scan starts from this hint and wraps around.
+static NEXT_PID_HINT: Mutex<ProcessId> = Mutex::new(1);
+
+/// R106-1 FIX: 下一个可用的进程 generation（单调递增，永不复用）。
+///
+/// 每个新进程实例（包括 PID 复用场景）获得唯一的 generation 值，
+/// 用于 IPC 授权等需要区分进程身份的场景。u64 空间在实际中不可耗尽。
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// 初始化进程子系统
 ///
@@ -1087,6 +1111,48 @@ pub fn init() {
     // 强制 BOOT_CR3 lazy_static 初始化，确保捕获当前（引导）CR3
     let _ = *BOOT_CR3;
     klog_always!("  Process subsystem initialized (boot CR3 cached)");
+}
+
+/// R106-11 (P0-4): Allocate a free global PID with recycling.
+///
+/// Uses a circular scan starting from `hint`. On wrap-around, scans from PID 1
+/// up to the previous hint. PID 0 is never allocated.
+///
+/// # Lock ordering
+///
+/// The caller must hold `NEXT_PID_HINT` and pass the already-locked
+/// `PROCESS_TABLE` to avoid double-locking.
+fn allocate_global_pid(
+    hint: &mut ProcessId,
+    table: &Vec<Option<Arc<Mutex<Process>>>>,
+) -> Result<ProcessId, ProcessCreateError> {
+    let pid_max = PID_MAX.min(MAX_PID);
+
+    let start = match *hint {
+        0 => 1,
+        n if n > pid_max => 1,
+        n => n,
+    };
+
+    // Forward scan: [start, pid_max]
+    for pid in start..=pid_max {
+        let is_free = table.get(pid).map(|slot| slot.is_none()).unwrap_or(true);
+        if is_free {
+            *hint = if pid == pid_max { 1 } else { pid + 1 };
+            return Ok(pid);
+        }
+    }
+
+    // Wrap-around scan: [1, start)
+    for pid in 1..start {
+        let is_free = table.get(pid).map(|slot| slot.is_none()).unwrap_or(true);
+        if is_free {
+            *hint = if pid == pid_max { 1 } else { pid + 1 };
+            return Ok(pid);
+        }
+    }
+
+    Err(ProcessCreateError::PidExhausted)
 }
 
 /// 创建新进程
@@ -1106,36 +1172,56 @@ pub fn create_process(
     ppid: ProcessId,
     priority: Priority,
 ) -> Result<ProcessId, ProcessCreateError> {
-    // 先尝试分配内核栈，失败则直接返回错误（不分配 PID）
-    let mut next_pid_guard = NEXT_PID.lock();
-    let pid = *next_pid_guard;
+    // R106-11 (P0-4): Allocate PID via recycling scan.
+    // Lock ordering: NEXT_PID_HINT → PROCESS_TABLE (consistent with all paths).
+    //
+    // Kernel stack deallocation is deferred via call_rcu(), so a recycled PID's
+    // stack slot may still be mapped. If allocate_kernel_stack returns AlreadyMapped,
+    // advance the hint past that PID and retry with the next candidate.
+    let mut hint_guard = NEXT_PID_HINT.lock();
 
-    // R29-5 FIX: Check PID upper bound to prevent kernel stack address overflow
-    if pid > MAX_PID {
-        // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-        kprintln!(
-            "Error: PID space exhausted (pid {} > MAX_PID {})",
-            pid, MAX_PID
-        );
-        return Err(ProcessCreateError::PidExhausted);
-    }
+    // Maximum retries bounded by practical RCU backlog; in a healthy system only
+    // a handful of PIDs can be in the grace-period window simultaneously.
+    const MAX_STACK_RETRIES: usize = 32;
+    let mut stack_retries = 0;
+    let (pid, stack_base, stack_top) = loop {
+        let pid = {
+            let table = PROCESS_TABLE.lock();
+            allocate_global_pid(&mut hint_guard, &table)?
+        };
 
-    // 为进程分配内核栈 - SECURITY FIX Z-7: 失败时必须返回错误
-    let (stack_base, stack_top) = match allocate_kernel_stack(pid) {
-        Ok((base, top)) => (base, top),
-        Err(e) => {
-            // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-            kprintln!(
-                "Error: Failed to allocate kernel stack for PID {}: {:?}",
-                pid, e
-            );
-            return Err(ProcessCreateError::KernelStackAllocFailed(e));
+        match allocate_kernel_stack(pid) {
+            Ok((base, top)) => break (pid, base, top),
+            Err(KernelStackError::AlreadyMapped) => {
+                // Stack slot still mapped from RCU-deferred free; skip this PID.
+                stack_retries += 1;
+                if stack_retries >= MAX_STACK_RETRIES {
+                    kprintln!(
+                        "Error: {} consecutive PIDs have stale kernel stacks (RCU backlog)",
+                        stack_retries
+                    );
+                    return Err(ProcessCreateError::KernelStackAllocFailed(
+                        KernelStackError::AlreadyMapped,
+                    ));
+                }
+                // Advance hint past the stale PID so the next scan starts beyond it.
+                // The slot is None in PROCESS_TABLE, so the allocator will normally
+                // return it again on wrap-around. However, with forward-scanning and
+                // a large PID space (32768), the RCU grace period will almost certainly
+                // complete before the allocator wraps back to this PID.
+                let pid_max = PID_MAX.min(MAX_PID);
+                *hint_guard = if pid >= pid_max { 1 } else { pid + 1 };
+                continue;
+            }
+            Err(e) => {
+                kprintln!(
+                    "Error: Failed to allocate kernel stack for PID {}: {:?}",
+                    pid, e
+                );
+                return Err(ProcessCreateError::KernelStackAllocFailed(e));
+            }
         }
     };
-
-    // 栈分配成功后才递增 PID 计数器，避免 PID 泄漏
-    *next_pid_guard += 1;
-    drop(next_pid_guard);
 
     let process = Arc::new(Mutex::new(Process::new(pid, ppid, name.clone(), priority)));
 
@@ -1195,15 +1281,8 @@ pub fn create_process(
                 kprintln!("Error: Failed to assign PID namespace chain: {:?}", e);
                 let _ = e; // suppress unused warning in release
                 free_kernel_stack(pid, stack_base);
-                // R102-L2 FIX: Reclaim the consumed PID to prevent PID exhaustion
-                // over time when namespace assignment repeatedly fails.
-                {
-                    let mut next_pid_guard = NEXT_PID.lock();
-                    // Only reclaim if no other PID was allocated in the meantime
-                    if *next_pid_guard == pid + 1 {
-                        *next_pid_guard = pid;
-                    }
-                }
+                // R106-11: PID reclaim is automatic — the slot is still None,
+                // so the next allocate_global_pid() scan will find it.
                 return Err(ProcessCreateError::NamespaceError);
             }
         }
@@ -1227,23 +1306,31 @@ pub fn create_process(
         proc.mount_ns_for_children = target_mnt_ns;
     }
 
-    let mut table = PROCESS_TABLE.lock();
+    // R106-11 (P0-4): Insert into PROCESS_TABLE, then release hint_guard.
+    // The hint_guard was held throughout to prevent concurrent allocators from
+    // reusing this PID slot before insertion.
+    {
+        let mut table = PROCESS_TABLE.lock();
 
-    // 确保进程表有足够的空间存储新进程
-    // PID 直接作为索引使用，因此表长度需要 >= pid + 1
-    while table.len() <= pid {
-        table.push(None);
-    }
+        // 确保进程表有足够的空间存储新进程
+        // PID 直接作为索引使用，因此表长度需要 >= pid + 1
+        while table.len() <= pid {
+            table.push(None);
+        }
 
-    // 将新进程存储在其 PID 对应的索引位置
-    table[pid] = Some(process.clone());
+        // 将新进程存储在其 PID 对应的索引位置
+        table[pid] = Some(process.clone());
 
-    // 如果有父进程，将此进程添加到父进程的子进程列表
-    if ppid > 0 {
-        if let Some(Some(parent)) = table.get(ppid) {
-            parent.lock().children.push(pid);
+        // 如果有父进程，将此进程添加到父进程的子进程列表
+        if ppid > 0 {
+            if let Some(Some(parent)) = table.get(ppid) {
+                parent.lock().children.push(pid);
+            }
         }
     }
+
+    // Safe to release now — the PID slot is occupied in PROCESS_TABLE
+    drop(hint_guard);
 
     // E.5 Cpuset: count kernel-created tasks (ppid == 0) so root cpuset reflects live tasks.
     // Fork path handles task counting separately via fork.rs which also copies cpuset_id.
@@ -1305,32 +1392,43 @@ pub fn create_process_in_namespace(
     target_ns: Arc<crate::pid_namespace::PidNamespace>,
 ) -> Result<ProcessId, ProcessCreateError> {
     // Allocate PID and kernel stack (same as create_process)
-    let mut next_pid_guard = NEXT_PID.lock();
-    let pid = *next_pid_guard;
+    // R106-11 (P0-4): Allocate PID via recycling scan with AlreadyMapped retry.
+    let mut hint_guard = NEXT_PID_HINT.lock();
 
-    if pid > MAX_PID {
-        // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-        kprintln!(
-            "Error: PID space exhausted (pid {} > MAX_PID {})",
-            pid, MAX_PID
-        );
-        return Err(ProcessCreateError::PidExhausted);
-    }
+    const MAX_STACK_RETRIES: usize = 32;
+    let mut stack_retries = 0;
+    let (pid, stack_base, stack_top) = loop {
+        let pid = {
+            let table = PROCESS_TABLE.lock();
+            allocate_global_pid(&mut hint_guard, &table)?
+        };
 
-    let (stack_base, stack_top) = match allocate_kernel_stack(pid) {
-        Ok((base, top)) => (base, top),
-        Err(e) => {
-            // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-            kprintln!(
-                "Error: Failed to allocate kernel stack for PID {}: {:?}",
-                pid, e
-            );
-            return Err(ProcessCreateError::KernelStackAllocFailed(e));
+        match allocate_kernel_stack(pid) {
+            Ok((base, top)) => break (pid, base, top),
+            Err(KernelStackError::AlreadyMapped) => {
+                stack_retries += 1;
+                if stack_retries >= MAX_STACK_RETRIES {
+                    kprintln!(
+                        "Error: {} consecutive PIDs have stale kernel stacks (RCU backlog)",
+                        stack_retries
+                    );
+                    return Err(ProcessCreateError::KernelStackAllocFailed(
+                        KernelStackError::AlreadyMapped,
+                    ));
+                }
+                let pid_max = PID_MAX.min(MAX_PID);
+                *hint_guard = if pid >= pid_max { 1 } else { pid + 1 };
+                continue;
+            }
+            Err(e) => {
+                kprintln!(
+                    "Error: Failed to allocate kernel stack for PID {}: {:?}",
+                    pid, e
+                );
+                return Err(ProcessCreateError::KernelStackAllocFailed(e));
+            }
         }
     };
-
-    *next_pid_guard += 1;
-    drop(next_pid_guard);
 
     let process = Arc::new(Mutex::new(Process::new(pid, ppid, name.clone(), priority)));
 
@@ -1365,13 +1463,8 @@ pub fn create_process_in_namespace(
             kprintln!("Error: Failed to assign PID namespace chain: {:?}", e);
             let _ = e; // suppress unused warning in release
             free_kernel_stack(pid, stack_base);
-            // R102-L2 FIX: Reclaim the consumed PID to prevent PID exhaustion.
-            {
-                let mut next_pid_guard = NEXT_PID.lock();
-                if *next_pid_guard == pid + 1 {
-                    *next_pid_guard = pid;
-                }
-            }
+            // R106-11: PID reclaim is automatic — the slot is still None,
+            // so the next allocate_global_pid() scan will find it.
             return Err(ProcessCreateError::NamespaceError);
         }
     }
@@ -1394,19 +1487,25 @@ pub fn create_process_in_namespace(
         proc.mount_ns_for_children = target_mnt_ns;
     }
 
-    let mut table = PROCESS_TABLE.lock();
+    // R106-11 (P0-4): Insert into PROCESS_TABLE, then release hint_guard.
+    {
+        let mut table = PROCESS_TABLE.lock();
 
-    while table.len() <= pid {
-        table.push(None);
-    }
+        while table.len() <= pid {
+            table.push(None);
+        }
 
-    table[pid] = Some(process.clone());
+        table[pid] = Some(process.clone());
 
-    if ppid > 0 {
-        if let Some(Some(parent)) = table.get(ppid) {
-            parent.lock().children.push(pid);
+        if ppid > 0 {
+            if let Some(Some(parent)) = table.get(ppid) {
+                parent.lock().children.push(pid);
+            }
         }
     }
+
+    // Safe to release now — the PID slot is occupied in PROCESS_TABLE
+    drop(hint_guard);
 
     if ppid == 0 {
         let cpuset_id = process.lock().cpuset_id;
@@ -1451,6 +1550,17 @@ pub fn create_process_in_namespace(
 pub fn current_pid() -> Option<ProcessId> {
     let raw = CURRENT_PID.with(|pid| pid.load(Ordering::Relaxed));
     if raw == 0 { None } else { Some(raw) }
+}
+
+/// R106-1 FIX: 获取当前进程的 generation 值。
+///
+/// 与 `current_pid()` 配合使用，提供 (pid, generation) 二元组
+/// 作为不可伪造的进程身份标识，防止 PID 复用后的授权继承。
+pub fn current_generation() -> Option<u64> {
+    let pid = current_pid()?;
+    let process = get_process(pid)?;
+    let proc = process.lock();
+    Some(proc.generation)
 }
 
 /// R25-6 FIX: Get the size of a thread group (number of tasks sharing the same tgid).

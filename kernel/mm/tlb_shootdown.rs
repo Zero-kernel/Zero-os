@@ -57,12 +57,16 @@ pub struct TlbShootdownStats {
     pub range_flushes: u64,
     /// Number of pages flushed in range operations
     pub pages_flushed: u64,
+    /// R106-5: Number of times mailbox saturation forced a full-flush fallback
+    pub coalesced_fallbacks: u64,
 }
 
 // Atomic statistics for SMP-safe updates
 static STATS_FULL_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static STATS_RANGE_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static STATS_PAGES_FLUSHED: AtomicU64 = AtomicU64::new(0);
+/// R106-5: Counter for mailbox saturation fallbacks
+static STATS_COALESCED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// SMP support flag - now true since IPI-based shootdown is implemented
 static SMP_SHOOTDOWN_IMPLEMENTED: bool = true;
@@ -560,17 +564,22 @@ fn collect_target_cpus(target_cr3: u64) -> Vec<usize> {
 /// this enqueues the request into a bounded ring buffer. The queue allows multiple
 /// requests to be batched, reducing serialization and IPI overhead.
 ///
-/// # Backpressure
+/// # R106-5 FIX: Graceful Fallback on Saturation
 ///
-/// If the queue is full (4 outstanding requests), we spin-wait for space.
-/// This should be rare in practice since IPIs are fast.
+/// Previously panicked when the queue was full after MAILBOX_WAIT_SPINS.
+/// Now returns `false` to signal the caller to fall back to a full TLB flush,
+/// which is safe (though less efficient). Panicking on runtime queue pressure
+/// was a user-triggerable DoS vector via rapid mmap/munmap churn.
+///
+/// Returns `true` if the request was successfully enqueued, `false` if the
+/// queue is saturated and the caller should use a full-flush fallback.
 fn enqueue_mailbox(
     mailbox: &TlbShootdownMailbox,
     cr3: u64,
     start: u64,
     len: u64,
     generation: u64,
-) {
+) -> bool {
     const MAILBOX_WAIT_SPINS: usize = 500_000;
     let mut spins = 0usize;
 
@@ -598,9 +607,12 @@ fn enqueue_mailbox(
                 // Publish entry by storing generation with Release
                 entry.generation.store(generation, Ordering::Release);
 
-                // Also update request_gen for compatibility with ACK waiting
-                mailbox.request_gen.store(generation, Ordering::Release);
-                return;
+                // Also update request_gen for compatibility with ACK waiting.
+                // Use fetch_max to keep it monotonic under concurrent posters.
+                mailbox
+                    .request_gen
+                    .fetch_max(generation, Ordering::Release);
+                return true;
             }
             // CAS failed, retry
         } else {
@@ -615,11 +627,16 @@ fn enqueue_mailbox(
                 );
             }
             if spins >= MAILBOX_WAIT_SPINS {
-                panic!(
-                    "CRITICAL: TLB shootdown queue saturated (head={}, tail={}) \
-                     after {} spins. Cannot proceed without risking stale TLB.",
-                    head, tail, MAILBOX_WAIT_SPINS
+                // R106-5 FIX: Graceful fallback instead of panic.
+                // Under runtime pressure (rapid mmap/munmap), signal the caller
+                // to perform a full TLB flush rather than crashing the kernel.
+                klog_always!(
+                    "[TLB][R106-5] shootdown mailbox saturated (head={}, tail={}) after {} spins; falling back to full flush",
+                    head,
+                    tail,
+                    MAILBOX_WAIT_SPINS
                 );
+                return false;
             }
         }
 
@@ -645,7 +662,14 @@ fn enqueue_mailbox(
 /// 1. Target CPUs are collected from per-address-space tracking (only active CPUs)
 /// 2. Every active CPU must have been initialized with a mailbox
 /// 3. A missing mailbox for an active CPU indicates a critical initialization bug
-fn post_requests(targets: &[usize], cr3: u64, start: u64, len: u64, generation: u64) {
+///
+/// # R106-5 FIX: Returns list of CPUs whose mailboxes were saturated
+///
+/// CPUs returned in this list need a full-flush fallback via the IPI handler.
+/// For these CPUs, request_gen is advanced without a queue entry so the IPI
+/// handler performs an implicit full flush when it sees request_gen > ack_gen.
+fn post_requests(targets: &[usize], cr3: u64, start: u64, len: u64, generation: u64) -> Vec<usize> {
+    let mut fallback_cpus = Vec::new();
     for &cpu in targets {
         // R94-8 FIX: A target CPU MUST have an initialized mailbox. If it doesn't,
         // this is a critical per-CPU initialization failure that would silently skip
@@ -657,8 +681,17 @@ fn post_requests(targets: &[usize], cr3: u64, start: u64, len: u64, generation: 
                 cpu
             )
         });
-        enqueue_mailbox(mailbox, cr3, start, len, generation);
+        if !enqueue_mailbox(mailbox, cr3, start, len, generation) {
+            // R106-5 FIX: Queue saturated for this CPU. Advance request_gen so
+            // the IPI handler performs a full flush when it sees the generation gap.
+            mailbox
+                .request_gen
+                .fetch_max(generation, Ordering::Release);
+            STATS_COALESCED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            fallback_cpus.push(cpu);
+        }
     }
+    fallback_cpus
 }
 
 /// Send TLB shootdown IPIs to all target CPUs
@@ -802,14 +835,27 @@ fn warn_timeout(targets: &[usize], generation: u64) {
 
 /// Dispatch a TLB shootdown to remote CPUs
 ///
-/// Returns (targets, generation) if there are remote CPUs to notify,
+/// Returns dispatch metadata if there are remote CPUs to notify,
 /// None if this is the only CPU.
 ///
 /// # R68 Architecture Improvement
 ///
 /// Now uses per-address-space tracking to target only CPUs that might have
 /// TLB entries for the current CR3, reducing unnecessary IPI traffic.
-fn dispatch_shootdown(start: u64, len: u64) -> Option<(Vec<usize>, u64)> {
+///
+/// # R106-5 FIX: Propagates mailbox saturation info
+///
+/// The returned `ShootdownDispatch` includes a list of CPUs whose mailboxes
+/// were saturated. Callers should perform a full local flush when this list
+/// is non-empty to ensure correctness.
+struct ShootdownDispatch {
+    targets: Vec<usize>,
+    generation: u64,
+    /// R106-5: CPUs that couldn't be enqueued (mailbox full); need full-flush fallback
+    fallback_cpus: Vec<usize>,
+}
+
+fn dispatch_shootdown(start: u64, len: u64) -> Option<ShootdownDispatch> {
     let cr3 = current_cr3_value();
 
     // R68 optimization: Use per-address-space tracking to target only relevant CPUs
@@ -827,13 +873,18 @@ fn dispatch_shootdown(start: u64, len: u64) -> Option<(Vec<usize>, u64)> {
 
     let generation = NEXT_SHOOTDOWN_GEN.fetch_add(1, Ordering::SeqCst);
 
-    // Post requests to all target mailboxes
-    post_requests(&targets, cr3, start, len, generation);
+    // Post requests to all target mailboxes. Under mailbox saturation this may
+    // return a list of CPUs that need a full-flush fallback (R106-5).
+    let fallback_cpus = post_requests(&targets, cr3, start, len, generation);
 
     // Send IPIs to wake up targets
     send_ipis(&targets, sender);
 
-    Some((targets, generation))
+    Some(ShootdownDispatch {
+        targets,
+        generation,
+        fallback_cpus,
+    })
 }
 
 /// Range operation type for flush optimization
@@ -903,13 +954,7 @@ pub fn flush_current_as_all() {
     flush_all_local();
 
     // Wait for remote ACKs with retry support
-    if let Some((targets, generation)) = shoot {
-        // R71-4 FIX: Only self-ACK if this was actually our request.
-        // The initiating CPU is filtered from targets by collect_target_cpus(),
-        // so normally we don't need to ACK our own mailbox. But if another CPU
-        // sent us a shootdown request with a lower generation, unconditionally
-        // writing our generation could accidentally ACK that foreign request.
-        // Only ACK if the request_gen matches our generation.
+    if let Some(ShootdownDispatch { targets, generation, .. }) = shoot {
         let mailbox = current_cpu().tlb_mailbox();
         if mailbox.request_gen.load(Ordering::Acquire) == generation {
             mailbox.ack_gen.store(generation, Ordering::Release);
@@ -974,11 +1019,21 @@ pub fn flush_current_as_range(start: VirtAddr, len: usize) {
             // Dispatch to remote CPUs
             let shoot = dispatch_shootdown(aligned_start, aligned_len);
 
-            // Flush local TLB
-            flush_range_local(aligned_start, aligned_len);
+            // R106-5: Check if any target CPU's mailbox was saturated
+            let needs_full_flush_fallback = shoot
+                .as_ref()
+                .map(|s| !s.fallback_cpus.is_empty())
+                .unwrap_or(false);
+
+            // Flush local TLB — use full flush if any mailbox was saturated
+            if needs_full_flush_fallback {
+                flush_all_local();
+            } else {
+                flush_range_local(aligned_start, aligned_len);
+            }
 
             // Wait for remote ACKs with retry support
-            if let Some((targets, generation)) = shoot {
+            if let Some(ShootdownDispatch { targets, generation, .. }) = shoot {
                 // R71-4 FIX: Same self-ACK protection as flush_current_as_all.
                 // Only ACK if the request_gen matches to avoid accidentally
                 // acknowledging a foreign request.
@@ -1002,8 +1057,13 @@ pub fn flush_current_as_range(start: VirtAddr, len: usize) {
                 }
             }
 
-            STATS_RANGE_FLUSHES.fetch_add(1, Ordering::Relaxed);
-            STATS_PAGES_FLUSHED.fetch_add(pages, Ordering::Relaxed);
+            // R106-5: Track stats based on whether fallback was used
+            if needs_full_flush_fallback {
+                STATS_FULL_FLUSHES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                STATS_RANGE_FLUSHES.fetch_add(1, Ordering::Relaxed);
+                STATS_PAGES_FLUSHED.fetch_add(pages, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1028,6 +1088,7 @@ pub fn get_stats() -> TlbShootdownStats {
         full_flushes: STATS_FULL_FLUSHES.load(Ordering::Relaxed),
         range_flushes: STATS_RANGE_FLUSHES.load(Ordering::Relaxed),
         pages_flushed: STATS_PAGES_FLUSHED.load(Ordering::Relaxed),
+        coalesced_fallbacks: STATS_COALESCED_FALLBACKS.load(Ordering::Relaxed),
     }
 }
 
@@ -1059,7 +1120,7 @@ pub fn handle_shootdown_ipi() {
 
         // Check if queue is empty
         if head >= tail {
-            return; // No more entries to process
+            break; // Queue drained — fall through to the request_gen gap check
         }
 
         let slot = (head as usize) % TLB_SHOOTDOWN_QUEUE_LEN;
@@ -1114,5 +1175,15 @@ pub fn handle_shootdown_ipi() {
         // Clear entry and advance head
         entry.generation.store(0, Ordering::Release);
         mailbox.head.store(head + 1, Ordering::Release);
+    }
+
+    // R106-5 FIX: Implicit full-flush fallback for saturated mailbox.
+    // When a requester couldn't enqueue (queue full), it advanced request_gen
+    // without a queue entry. Detect this case and perform a full flush.
+    let requested = mailbox.request_gen.load(Ordering::Acquire);
+    let acked = mailbox.ack_gen.load(Ordering::Acquire);
+    if requested > acked {
+        flush_all_local();
+        mailbox.ack_gen.store(requested, Ordering::Release);
     }
 }

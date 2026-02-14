@@ -705,10 +705,12 @@ impl TcpSocketState {
 // TCP Listen State (R51-1: Passive Open)
 // ============================================================================
 
-/// TCP connection lookup key type (local_ip, local_port, remote_ip, remote_port)
+/// R106-10 FIX: TCP connection lookup key type (net_ns_id, local_ip, local_port, remote_ip, remote_port)
 ///
 /// Used for both active and passive TCP connection tracking.
-type TcpLookupKey = (u32, u16, u32, u16);
+/// The namespace ID ensures that connections in different network namespaces
+/// cannot collide on the same 4-tuple.
+type TcpLookupKey = (NamespaceId, u32, u16, u32, u16);
 
 /// Half-open connection (SYN received, SYN-ACK sent, awaiting final ACK).
 struct PendingSyn {
@@ -769,13 +771,9 @@ impl TcpListenState {
         // This prevents the TOCTOU race where multiple threads could all pass
         // a non-atomic check before any increment, exceeding the global limit.
         //
-        // If this returns false, caller should fall back to SYN cookies for
-        // stateless flood protection (not yet implemented - currently drops).
+        // If this returns false, caller falls back to SYN cookies for
+        // stateless flood protection (R106-2 FIX: implemented in SYN handler).
         if !try_inc_half_open() {
-            // TODO: Implement SYN cookie fallback here instead of dropping.
-            // SYN cookies allow stateless protection against SYN floods by
-            // encoding state in the ISN, eliminating the need for per-connection
-            // memory during the half-open phase.
             return false;
         }
 
@@ -1931,7 +1929,7 @@ impl SocketTable {
         let local_ip = sock.local_ip().map(Ipv4Addr).unwrap_or(src_ip);
 
         // Build the connection key for uniqueness check
-        let conn_key = tcp_map_key_from_parts(local_ip, local_port, dst_ip, dst_port);
+        let conn_key = tcp_map_key_from_parts(sock.net_ns_id, local_ip, local_port, dst_ip, dst_port);
 
         // Check for duplicate connection (but don't register yet - defer until after LSM)
         {
@@ -2831,7 +2829,7 @@ impl SocketTable {
                     meta.remote_ip,
                     meta.remote_port,
                 ) {
-                    let key = tcp_map_key_from_parts(Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
+                    let key = tcp_map_key_from_parts(sock.net_ns_id, Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
                     if self.tcp_conns.lock().remove(&key).is_some() {
                         // R74-5 FIX: Decrement active connection counter when removing connection
                         dec_active_conn();
@@ -2970,9 +2968,10 @@ impl SocketTable {
             if tcp_bindings.contains_key(&(net_ns_id, candidate)) {
                 continue;
             }
-            // Also check if any connection uses this as local port
-            // Note: tcp_conns is not namespace-partitioned as connections are unique by 4-tuple
-            let in_use = tcp_conns.keys().any(|(_, port, _, _)| *port == candidate);
+            // R106-10 FIX: Check if any connection uses this port within this namespace
+            let in_use = tcp_conns
+                .keys()
+                .any(|(ns_id, _, port, _, _)| *ns_id == net_ns_id && *port == candidate);
             if !in_use {
                 return Ok(candidate);
             }
@@ -2985,7 +2984,9 @@ impl SocketTable {
             if tcp_bindings.contains_key(&(net_ns_id, candidate)) {
                 continue;
             }
-            let in_use = tcp_conns.keys().any(|(_, port, _, _)| *port == candidate);
+            let in_use = tcp_conns
+                .keys()
+                .any(|(ns_id, _, port, _, _)| *ns_id == net_ns_id && *port == candidate);
             if !in_use {
                 return Ok(candidate);
             }
@@ -3027,21 +3028,23 @@ impl SocketTable {
     // TCP RX Path (Phase 2)
     // ========================================================================
 
-    /// Look up a TCP connection by 4-tuple, removing stale entries.
+    /// R106-10 FIX: Look up a TCP connection by namespace + 4-tuple, removing stale entries.
     ///
     /// # Arguments
+    /// * `net_ns_id` - Network namespace for scoped lookup
     /// * `local_ip` - Our IP (destination in incoming packet)
     /// * `local_port` - Our port (destination port in incoming packet)
     /// * `remote_ip` - Peer IP (source in incoming packet)
     /// * `remote_port` - Peer port (source port in incoming packet)
     pub fn lookup_tcp_conn(
         &self,
+        net_ns_id: NamespaceId,
         local_ip: Ipv4Addr,
         local_port: u16,
         remote_ip: Ipv4Addr,
         remote_port: u16,
     ) -> Option<Arc<SocketState>> {
-        let key = tcp_map_key_from_parts(local_ip, local_port, remote_ip, remote_port);
+        let key = tcp_map_key_from_parts(net_ns_id, local_ip, local_port, remote_ip, remote_port);
         let mut conns = self.tcp_conns.lock();
         match conns.get(&key).and_then(|w| w.upgrade()) {
             Some(sock) => Some(sock),
@@ -3086,7 +3089,7 @@ impl SocketTable {
         if header.flags & TCP_FLAG_RST != 0 {
             // If we have a connection, validate RST before accepting
             if let Some(sock) =
-                self.lookup_tcp_conn(dst_ip, header.dst_port, src_ip, header.src_port)
+                self.lookup_tcp_conn(net_ns_id, dst_ip, header.dst_port, src_ip, header.src_port)
             {
                 let mut guard = sock.tcp.lock();
                 if let Some(tcp_state) = guard.as_mut() {
@@ -3155,8 +3158,8 @@ impl SocketTable {
             return None;
         }
 
-        // Look up existing connection by 4-tuple
-        let sock = match self.lookup_tcp_conn(dst_ip, header.dst_port, src_ip, header.src_port) {
+        // Look up existing connection by namespace + 4-tuple
+        let sock = match self.lookup_tcp_conn(net_ns_id, dst_ip, header.dst_port, src_ip, header.src_port) {
             Some(s) => s,
             None => {
                 // R51-1: Passive open handling for inbound SYN
@@ -3170,6 +3173,7 @@ impl SocketTable {
                         let mut listen_guard = listener.listen.lock();
                         if let Some(listen_state) = listen_guard.as_mut() {
                             let syn_key = tcp_map_key_from_parts(
+                                listener.net_ns_id,
                                 dst_ip,
                                 header.dst_port,
                                 src_ip,
@@ -3187,13 +3191,19 @@ impl SocketTable {
                             // Select MSS for SYN cookie (used in both paths)
                             let (mss_index, cookie_mss) = syn_cookie_select_mss(options.mss);
 
-                            // Enforce global connection limit before allocating resources
+                            // R106-2 FIX: Determine if we should fall back to SYN cookies.
+                            // When the global connection limit is reached, use stateless
+                            // SYN-ACK instead of silently dropping.  This ensures legitimate
+                            // clients can still complete handshakes once connection slots
+                            // free up, while attackers gain no DoS advantage.
+                            let mut force_syn_cookie = false;
                             {
                                 let mut conns = self.tcp_conns.lock();
                                 conns.retain(|_, weak| weak.strong_count() > 0);
                                 if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
-                                    // Connection limit reached - silently drop SYN
-                                    return None;
+                                    // R106-2 FIX: Global active connection limit reached —
+                                    // fall back to SYN cookies instead of dropping the SYN.
+                                    force_syn_cookie = true;
                                 }
                                 // Check if 4-tuple already exists (race condition guard)
                                 if conns.get(&syn_key).and_then(|w| w.upgrade()).is_some() {
@@ -3201,9 +3211,14 @@ impl SocketTable {
                                 }
                             }
 
-                            // SYN Cookie Path: If SYN queue is full, use stateless SYN-ACK
-                            // This prevents SYN flood attacks from exhausting resources
-                            if listen_state.syn_queue.len() >= listen_state.syn_backlog {
+                            // R106-2 FIX: SYN Cookie Path — use stateless SYN-ACK when:
+                            // 1. Per-listener SYN backlog is full (original condition), OR
+                            // 2. Global active connection limit is reached (new condition)
+                            // SYN cookies require zero per-connection state, providing
+                            // graceful degradation instead of silent SYN drops.
+                            if force_syn_cookie
+                                || listen_state.syn_queue.len() >= listen_state.syn_backlog
+                            {
                                 // Generate SYN cookie ISN (encodes 4-tuple, time, MSS)
                                 let cookie_iss = generate_syn_cookie_isn(
                                     now_ms,
@@ -3365,17 +3380,42 @@ impl SocketTable {
                             };
 
                             // SYN cookie path handles the backlog-full case above,
-                            // so queue_syn should always succeed here
+                            // but queue_syn can still fail due to global half-open limit.
                             if listen_state.queue_syn(pending) {
                                 return Some(syn_ack);
                             }
 
-                            // Cleanup (shouldn't happen given the check above)
+                            // R106-2 FIX: queue_syn failed (global half-open limit).
+                            // Clean up allocated state and fall back to SYN cookies
+                            // instead of silently dropping the SYN.
                             self.tcp_conns.lock().remove(&syn_key);
                             self.sockets.write().remove(&child_id);
                             // R77-4 FIX: Rollback quota on failure path
                             self.dec_ns_count(listener.net_ns_id);
-                            return None;
+
+                            // Fall back to stateless SYN cookie SYN-ACK
+                            let cookie_iss = generate_syn_cookie_isn(
+                                now_ms,
+                                dst_ip,
+                                header.dst_port,
+                                src_ip,
+                                header.src_port,
+                                mss_index,
+                            );
+                            let syn_ack_options = [TcpOptionKind::Mss(cookie_mss)];
+                            let cookie_syn_ack = build_tcp_segment_with_options(
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
+                                cookie_iss,
+                                header.seq_num.wrapping_add(1),
+                                TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                TCP_DEFAULT_WINDOW,
+                                &syn_ack_options,
+                                &[],
+                            );
+                            return Some(cookie_syn_ack);
                         }
                     }
                 }
@@ -3418,6 +3458,7 @@ impl SocketTable {
 
                             // Valid SYN cookie - create connection
                             let syn_key = tcp_map_key_from_parts(
+                                listener.net_ns_id,
                                 dst_ip,
                                 header.dst_port,
                                 src_ip,
@@ -4757,7 +4798,7 @@ impl SocketTable {
                 let is_syn = header.flags & TCP_FLAG_SYN != 0;
                 let is_ack = header.flags & TCP_FLAG_ACK != 0;
                 let syn_key =
-                    tcp_map_key_from_parts(dst_ip, header.dst_port, src_ip, header.src_port);
+                    tcp_map_key_from_parts(net_ns_id, dst_ip, header.dst_port, src_ip, header.src_port);
 
                 // Handle retransmitted SYN: resend cached SYN-ACK
                 if is_syn && !is_ack {
@@ -5370,17 +5411,17 @@ impl SocketTable {
                                 let rst_seg =
                                     if let Some(mut tcb_guard) = pending.sock.tcp.try_lock() {
                                         if let Some(tcb) = tcb_guard.as_mut() {
-                                            // Extract IP addresses from the key
-                                            let local_ip = Ipv4Addr(key.0.to_be_bytes());
-                                            let remote_ip = Ipv4Addr(key.2.to_be_bytes());
+                                            // R106-10 FIX: key.0 is now NamespaceId; IPs/ports shifted by 1
+                                            let local_ip = Ipv4Addr(key.1.to_be_bytes());
+                                            let remote_ip = Ipv4Addr(key.3.to_be_bytes());
                                             let seq = tcb.control.snd_nxt;
                                             let ack = tcb.control.rcv_nxt;
 
                                             Some(build_tcp_segment(
                                                 local_ip,
                                                 remote_ip,
-                                                key.1, // local_port
-                                                key.3, // remote_port
+                                                key.2, // local_port
+                                                key.4, // remote_port
                                                 seq,
                                                 ack,
                                                 TCP_FLAG_RST | TCP_FLAG_ACK,
@@ -5397,7 +5438,7 @@ impl SocketTable {
                                 // Queue for cleanup outside locks
                                 syn_timeouts.push((
                                     pending.sock.clone(),
-                                    Ipv4Addr(key.2.to_be_bytes()),
+                                    Ipv4Addr(key.3.to_be_bytes()),
                                     rst_seg,
                                 ));
                             }
@@ -5740,16 +5781,17 @@ impl SocketTable {
                             let rst_seg = {
                                 let mut tcb_guard = pending.sock.tcp.lock();
                                 if let Some(tcb) = tcb_guard.as_mut() {
-                                    let local_ip = Ipv4Addr(key.0.to_be_bytes());
-                                    let remote_ip = Ipv4Addr(key.2.to_be_bytes());
+                                    // R106-10 FIX: key.0 is now NamespaceId; IPs/ports shifted by 1
+                                    let local_ip = Ipv4Addr(key.1.to_be_bytes());
+                                    let remote_ip = Ipv4Addr(key.3.to_be_bytes());
                                     let seq = tcb.control.snd_nxt;
                                     let ack = tcb.control.rcv_nxt;
 
                                     Some(build_tcp_segment(
                                         local_ip,
                                         remote_ip,
-                                        key.1,
-                                        key.3,
+                                        key.2,
+                                        key.4,
                                         seq,
                                         ack,
                                         TCP_FLAG_RST | TCP_FLAG_ACK,
@@ -5763,7 +5805,7 @@ impl SocketTable {
 
                             syn_timeouts.push((
                                 pending.sock.clone(),
-                                Ipv4Addr(key.2.to_be_bytes()),
+                                Ipv4Addr(key.3.to_be_bytes()),
                                 rst_seg,
                             ));
                         }
@@ -5837,14 +5879,14 @@ impl SocketTable {
             }
         }
 
-        // Remove 4-tuple from connection map
+        // Remove namespace + 4-tuple from connection map
         if let (Some(lip), Some(lport), Some(rip), Some(rport)) = (
             meta.local_ip,
             meta.local_port,
             meta.remote_ip,
             meta.remote_port,
         ) {
-            let key = tcp_map_key_from_parts(Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
+            let key = tcp_map_key_from_parts(sock.net_ns_id, Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
             if self.tcp_conns.lock().remove(&key).is_some() {
                 // R74-5 Enhancement: Decrement active connection counter when removing.
                 //
@@ -6001,15 +6043,17 @@ fn ipv4_to_u64(bytes: [u8; 4]) -> u64 {
     u32::from_be_bytes(bytes) as u64
 }
 
-/// Build TCP lookup key from connection parts.
+/// R106-10 FIX: Build TCP lookup key from namespace + connection parts.
 #[inline]
 fn tcp_map_key_from_parts(
+    net_ns_id: NamespaceId,
     local_ip: Ipv4Addr,
     local_port: u16,
     remote_ip: Ipv4Addr,
     remote_port: u16,
 ) -> TcpLookupKey {
     (
+        net_ns_id,
         u32::from_be_bytes(local_ip.0),
         local_port,
         u32::from_be_bytes(remote_ip.0),
@@ -6017,11 +6061,12 @@ fn tcp_map_key_from_parts(
     )
 }
 
-/// Build TCP lookup key from TcpConnKey.
+/// R106-10 FIX: Build TCP lookup key from namespace + TcpConnKey.
 #[inline]
 #[allow(dead_code)]
-fn tcp_map_key_from_conn_key(key: &TcpConnKey) -> TcpLookupKey {
+fn tcp_map_key_from_conn_key(net_ns_id: NamespaceId, key: &TcpConnKey) -> TcpLookupKey {
     (
+        net_ns_id,
         u32::from_be_bytes(key.local_ip.0),
         key.local_port,
         u32::from_be_bytes(key.remote_ip.0),

@@ -9,7 +9,7 @@
 //! - R75-2 FIX: 按 IPC 命名空间分区端点表
 
 use alloc::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::Arc,
     vec::Vec,
 };
@@ -56,6 +56,8 @@ pub struct ReceivedMessage {
 pub enum IpcError {
     /// 没有当前进程上下文
     NoCurrentProcess,
+    /// R106-1 FIX: 目标进程不存在（无法查询 generation）
+    ProcessNotFound,
     /// 端点不存在
     EndpointNotFound,
     /// 访问被拒绝（无发送权限或非端点所有者）
@@ -74,41 +76,62 @@ pub enum IpcError {
 ///
 /// 每个端点属于一个进程（owner），只有owner可以接收消息。
 /// 发送权限通过allowed_senders白名单控制。
+///
+/// R106-1 FIX: 授权现在使用 (ProcessId, generation) 二元组而非裸 PID，
+/// 防止 PID 复用后新进程继承旧进程的 IPC 发送权限。
 #[derive(Debug)]
 struct Endpoint {
     /// 端点所有者进程ID
     owner: ProcessId,
-    /// 允许发送消息的进程ID集合
-    allowed_senders: BTreeSet<ProcessId>,
+    /// R106-1 FIX: 端点所有者的 generation
+    owner_generation: u64,
+    /// R106-1 FIX: 允许发送消息的进程 (pid -> generation)
+    allowed_senders: BTreeMap<ProcessId, u64>,
     /// 消息队列
     queue: VecDeque<Message>,
 }
 
 impl Endpoint {
     /// 创建新端点
-    fn new(owner: ProcessId, allowed_senders: &[ProcessId]) -> Self {
-        let mut allowed = BTreeSet::new();
+    ///
+    /// R106-1 FIX: 接受预解析的 (pid, generation) 对，避免在持有 ENDPOINTS 锁时
+    /// 访问 PROCESS_TABLE（防止锁序反转死锁）。
+    fn new(
+        owner: ProcessId,
+        owner_generation: u64,
+        resolved_senders: &[(ProcessId, u64)],
+    ) -> Self {
+        let mut allowed = BTreeMap::new();
         // 所有者总是可以发送（给自己）
-        allowed.insert(owner);
-        for pid in allowed_senders {
-            allowed.insert(*pid);
+        allowed.insert(owner, owner_generation);
+        for &(pid, gen) in resolved_senders {
+            if pid == owner {
+                continue; // 已添加
+            }
+            allowed.insert(pid, gen);
         }
 
         Endpoint {
             owner,
+            owner_generation,
             allowed_senders: allowed,
             queue: VecDeque::new(),
         }
     }
 
     /// 检查进程是否有发送权限
-    fn can_send(&self, sender: ProcessId) -> bool {
-        self.allowed_senders.contains(&sender)
+    ///
+    /// R106-1 FIX: 同时验证 PID 和 generation，防止 PID 复用后的越权发送。
+    fn can_send(&self, sender: ProcessId, sender_generation: u64) -> bool {
+        self.allowed_senders.get(&sender).copied() == Some(sender_generation)
     }
 
     /// 授权另一个进程发送
-    fn grant_access(&mut self, pid: ProcessId) {
-        self.allowed_senders.insert(pid);
+    ///
+    /// R106-1 FIX: 接受预查询的 generation 值，避免在持有 ENDPOINTS 锁时
+    /// 访问 PROCESS_TABLE（防止锁序反转死锁）。
+    fn grant_access(&mut self, pid: ProcessId, generation: u64) {
+        self.allowed_senders.insert(pid, generation);
     }
 
     /// 撤销另一个进程的发送权限
@@ -145,11 +168,15 @@ impl EndpointRegistry {
     /// 注册新端点
     ///
     /// R75-2 FIX: 端点注册在调用者的 IPC 命名空间内
+    ///
+    /// R106-1 FIX: 接受预解析的 (pid, generation) 对，所有 PROCESS_TABLE 查询
+    /// 必须在获取 ENDPOINTS 锁之前完成（防止锁序反转死锁）。
     fn register_endpoint(
         &mut self,
         ns_id: NamespaceId,
         owner: ProcessId,
-        allowed_senders: &[ProcessId],
+        owner_generation: u64,
+        resolved_senders: &[(ProcessId, u64)],
     ) -> Result<EndpointId, IpcError> {
         // 检查端点数量限制
         let process_endpoints = self
@@ -168,7 +195,7 @@ impl EndpointRegistry {
         let endpoint_id = NEXT_ENDPOINT_ID
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
             .map_err(|_| IpcError::EndpointIdExhausted)?;
-        let endpoint = Endpoint::new(owner, allowed_senders);
+        let endpoint = Endpoint::new(owner, owner_generation, resolved_senders);
 
         process_endpoints.insert(endpoint_id, endpoint);
         self.owner_index.insert(endpoint_id, (ns_id, owner));
@@ -277,10 +304,24 @@ pub fn init() {
 /// * `TooManyEndpoints` - 端点数量超过限制
 pub fn register_endpoint(allowed_senders: &[ProcessId]) -> Result<EndpointId, IpcError> {
     let owner = process::current_pid().ok_or(IpcError::NoCurrentProcess)?;
+    let owner_generation = process::current_generation().ok_or(IpcError::ProcessNotFound)?;
     let ns_id = current_ipc_ns_id().ok_or(IpcError::NoCurrentProcess)?;
+
+    // R106-1 FIX: 在获取 ENDPOINTS 锁之前解析所有 sender 的 generation，
+    // 避免在持有 ENDPOINTS 锁时访问 PROCESS_TABLE（防止锁序反转死锁）。
+    let mut resolved_senders = Vec::with_capacity(allowed_senders.len());
+    for &pid in allowed_senders {
+        if pid == owner {
+            continue; // 所有者已在 Endpoint::new() 中自动添加
+        }
+        let proc_arc = process::get_process(pid).ok_or(IpcError::ProcessNotFound)?;
+        let gen = proc_arc.lock().generation;
+        resolved_senders.push((pid, gen));
+    }
+
     ENDPOINTS
         .lock()
-        .register_endpoint(ns_id, owner, allowed_senders)
+        .register_endpoint(ns_id, owner, owner_generation, &resolved_senders)
 }
 
 /// 发送消息到端点
@@ -308,6 +349,7 @@ pub fn register_endpoint(allowed_senders: &[ProcessId]) -> Result<EndpointId, Ip
 pub fn send_message(endpoint_id: EndpointId, data: Vec<u8>) -> Result<(), IpcError> {
     // 自动获取发送者身份（不可伪造）
     let sender = process::current_pid().ok_or(IpcError::NoCurrentProcess)?;
+    let sender_generation = process::current_generation().ok_or(IpcError::ProcessNotFound)?;
     let ns_id = current_ipc_ns_id().ok_or(IpcError::NoCurrentProcess)?;
 
     // 检查消息大小
@@ -320,8 +362,8 @@ pub fn send_message(endpoint_id: EndpointId, data: Vec<u8>) -> Result<(), IpcErr
         .endpoint_mut(ns_id, endpoint_id)
         .ok_or(IpcError::EndpointNotFound)?;
 
-    // 检查发送权限
-    if !endpoint.can_send(sender) {
+    // R106-1 FIX: 检查发送权限（PID + generation 双重验证）
+    if !endpoint.can_send(sender, sender_generation) {
         return Err(IpcError::AccessDenied);
     }
 
@@ -354,6 +396,7 @@ pub fn send_message(endpoint_id: EndpointId, data: Vec<u8>) -> Result<(), IpcErr
 /// * `AccessDenied` - 当前进程不是端点所有者
 pub fn receive_message(endpoint_id: EndpointId) -> Result<Option<ReceivedMessage>, IpcError> {
     let receiver = process::current_pid().ok_or(IpcError::NoCurrentProcess)?;
+    let receiver_generation = process::current_generation().ok_or(IpcError::ProcessNotFound)?;
     let ns_id = current_ipc_ns_id().ok_or(IpcError::NoCurrentProcess)?;
 
     let mut registry = ENDPOINTS.lock();
@@ -361,8 +404,8 @@ pub fn receive_message(endpoint_id: EndpointId) -> Result<Option<ReceivedMessage
         .endpoint_mut(ns_id, endpoint_id)
         .ok_or(IpcError::EndpointNotFound)?;
 
-    // 只有所有者可以接收
-    if endpoint.owner != receiver {
+    // R106-1 FIX: 只有所有者可以接收（PID + generation 双重验证）
+    if endpoint.owner != receiver || endpoint.owner_generation != receiver_generation {
         return Err(IpcError::AccessDenied);
     }
 
@@ -389,18 +432,26 @@ pub fn receive_message(endpoint_id: EndpointId) -> Result<Option<ReceivedMessage
 /// * `pid` - 要授权的进程ID
 pub fn grant_access(endpoint_id: EndpointId, pid: ProcessId) -> Result<(), IpcError> {
     let owner = process::current_pid().ok_or(IpcError::NoCurrentProcess)?;
+    let owner_generation = process::current_generation().ok_or(IpcError::ProcessNotFound)?;
     let ns_id = current_ipc_ns_id().ok_or(IpcError::NoCurrentProcess)?;
+
+    // R106-1 FIX: 在获取 ENDPOINTS 锁之前查询目标进程的 generation，
+    // 避免锁序反转死锁（ENDPOINTS → PROCESS_TABLE vs PROCESS_TABLE → ENDPOINTS）。
+    let target_proc = process::get_process(pid).ok_or(IpcError::ProcessNotFound)?;
+    let target_generation = target_proc.lock().generation;
+    drop(target_proc); // 显式释放，确保不跨 ENDPOINTS 锁持有
 
     let mut registry = ENDPOINTS.lock();
     let endpoint = registry
         .endpoint_mut(ns_id, endpoint_id)
         .ok_or(IpcError::EndpointNotFound)?;
 
-    if endpoint.owner != owner {
+    // R106-1 FIX: 所有者验证包含 generation
+    if endpoint.owner != owner || endpoint.owner_generation != owner_generation {
         return Err(IpcError::AccessDenied);
     }
 
-    endpoint.grant_access(pid);
+    endpoint.grant_access(pid, target_generation);
     Ok(())
 }
 
@@ -416,6 +467,7 @@ pub fn grant_access(endpoint_id: EndpointId, pid: ProcessId) -> Result<(), IpcEr
 /// * `pid` - 要撤销权限的进程ID
 pub fn revoke_access(endpoint_id: EndpointId, pid: ProcessId) -> Result<(), IpcError> {
     let owner = process::current_pid().ok_or(IpcError::NoCurrentProcess)?;
+    let owner_generation = process::current_generation().ok_or(IpcError::ProcessNotFound)?;
     let ns_id = current_ipc_ns_id().ok_or(IpcError::NoCurrentProcess)?;
 
     let mut registry = ENDPOINTS.lock();
@@ -423,7 +475,8 @@ pub fn revoke_access(endpoint_id: EndpointId, pid: ProcessId) -> Result<(), IpcE
         .endpoint_mut(ns_id, endpoint_id)
         .ok_or(IpcError::EndpointNotFound)?;
 
-    if endpoint.owner != owner {
+    // R106-1 FIX: 所有者验证包含 generation
+    if endpoint.owner != owner || endpoint.owner_generation != owner_generation {
         return Err(IpcError::AccessDenied);
     }
 
@@ -447,6 +500,7 @@ pub fn revoke_access(endpoint_id: EndpointId, pid: ProcessId) -> Result<(), IpcE
 /// 新的等待队列导致再次阻塞。
 pub fn destroy_endpoint(endpoint_id: EndpointId) -> Result<(), IpcError> {
     let owner = process::current_pid().ok_or(IpcError::NoCurrentProcess)?;
+    let owner_generation = process::current_generation().ok_or(IpcError::ProcessNotFound)?;
     let ns_id = current_ipc_ns_id().ok_or(IpcError::NoCurrentProcess)?;
 
     let registry = ENDPOINTS.lock();
@@ -454,7 +508,8 @@ pub fn destroy_endpoint(endpoint_id: EndpointId) -> Result<(), IpcError> {
         .endpoint(ns_id, endpoint_id)
         .ok_or(IpcError::EndpointNotFound)?;
 
-    if endpoint.owner != owner {
+    // R106-1 FIX: 所有者验证包含 generation
+    if endpoint.owner != owner || endpoint.owner_generation != owner_generation {
         return Err(IpcError::AccessDenied);
     }
 
@@ -512,6 +567,7 @@ pub fn cleanup_process_endpoints(ns_id: NamespaceId, pid: ProcessId) {
 /// R75-2 FIX: 只能查询同一 IPC 命名空间内的端点
 pub fn get_queue_length(endpoint_id: EndpointId) -> Result<usize, IpcError> {
     let receiver = process::current_pid().ok_or(IpcError::NoCurrentProcess)?;
+    let receiver_generation = process::current_generation().ok_or(IpcError::ProcessNotFound)?;
     let ns_id = current_ipc_ns_id().ok_or(IpcError::NoCurrentProcess)?;
 
     let registry = ENDPOINTS.lock();
@@ -519,8 +575,8 @@ pub fn get_queue_length(endpoint_id: EndpointId) -> Result<usize, IpcError> {
         .endpoint(ns_id, endpoint_id)
         .ok_or(IpcError::EndpointNotFound)?;
 
-    // 只有所有者可以查看队列状态
-    if endpoint.owner != receiver {
+    // R106-1 FIX: 只有所有者可以查看队列状态（PID + generation 双重验证）
+    if endpoint.owner != receiver || endpoint.owner_generation != receiver_generation {
         return Err(IpcError::AccessDenied);
     }
 

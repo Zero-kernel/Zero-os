@@ -2128,7 +2128,7 @@ pub fn syscall_dispatcher(
         505 => sys_compliance_status(arg0 as *mut ComplianceStatusBuf),
         506 => sys_fips_enable(),
         507 => sys_compliance_query_algo(arg0 as u32),
-        508 => sys_audit_export(arg0 as *mut u8, arg1 as usize, arg2 as *mut usize),
+        508 => sys_audit_export(arg0 as *mut u8, arg1 as usize, arg2 as u64, arg3 as usize),
 
         // G.2 Live Patching syscalls (Zero-OS specific, 509-511)
         509 => sys_kpatch_load(arg0 as usize, arg1 as usize),
@@ -3465,43 +3465,40 @@ fn sys_exec(
         .checked_sub(USER_STACK_SIZE)
         .ok_or(SyscallError::EFAULT)?;
 
-    // Allow supervisor access to user pages for stack construction when SMAP is enabled
-    let _user_access = UserAccessGuard::new();
+    // R106-4 FIX: Build the entire initial user stack in a kernel buffer first,
+    // then copy to user space via a single `copy_to_user()` call.  This eliminates
+    // the wide `UserAccessGuard` that previously covered ~90 lines of direct
+    // user-pointer writes, minimizing the SMAP-disabled window.
+    // `copy_to_user` internally handles SMAP per-chunk (R65-10 chunked copy).
 
     let total_needed = string_bytes + pointer_bytes + 16; // +16 for alignment
     if total_needed > USER_STACK_SIZE {
         return Err(SyscallError::E2BIG);
     }
 
+    // ── Phase 1: Compute user-space addresses without touching user memory ──
+
     let mut sp = stack_top;
     let mut argv_ptrs: Vec<usize> = Vec::with_capacity(argc);
     let mut envp_ptrs: Vec<usize> = Vec::with_capacity(envc);
 
-    // 1. 复制 argv 字符串（从高地址向低地址生长）
+    // 1. 计算 argv 字符串位置（从高地址向低地址生长）
     for s in argv_vec.iter().rev() {
         let len = s.len();
         sp = sp.checked_sub(len + 1).ok_or(SyscallError::EFAULT)?;
         if sp < stack_base {
             return Err(SyscallError::E2BIG);
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(s.as_ptr(), sp as *mut u8, len);
-            *((sp + len) as *mut u8) = 0; // NUL 终止
-        }
         argv_ptrs.push(sp);
     }
     argv_ptrs.reverse(); // 恢复正序
 
-    // 2. 复制 envp 字符串
+    // 2. 计算 envp 字符串位置
     for s in envp_vec.iter().rev() {
         let len = s.len();
         sp = sp.checked_sub(len + 1).ok_or(SyscallError::EFAULT)?;
         if sp < stack_base {
             return Err(SyscallError::E2BIG);
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(s.as_ptr(), sp as *mut u8, len);
-            *((sp + len) as *mut u8) = 0;
         }
         envp_ptrs.push(sp);
     }
@@ -3518,44 +3515,98 @@ fn sys_exec(
     // 5. 确保最终 RSP 满足 SysV AMD64 ABI 要求
     // 进程入口点要求 (RSP % 16) == 8，这样第一个 PUSH 后 RSP 才是 16 字节对齐
     // 注意：直接跳转到 _start 不经过 CALL，所以 RSP 需要预留 8 字节偏移
-    let final_sp = sp - pointer_bytes;
-    if (final_sp & 0xF) == 0 {
-        // 当前是 16 对齐，需要调整为 16+8
-        sp -= word; // 添加填充使最终 RSP % 16 == 8
-        unsafe {
-            *(sp as *mut usize) = 0;
-        }
+    let tentative_rsp = sp.checked_sub(pointer_bytes).ok_or(SyscallError::EFAULT)?;
+    let needs_abi_pad = (tentative_rsp & 0xF) == 0;
+    // If padding is needed, insert one extra word between pointer area and string area
+    if needs_abi_pad {
+        sp = sp.checked_sub(word).ok_or(SyscallError::EFAULT)?;
     }
 
-    // 6. 压入指针区（从高地址向低地址）
-    unsafe {
-        // envp NULL 终止
-        sp -= word;
-        *(sp as *mut usize) = 0;
-
-        // envp 指针数组（逆序压入）
-        for ptr in envp_ptrs.iter().rev() {
-            sp -= word;
-            *(sp as *mut usize) = *ptr;
-        }
-
-        // argv NULL 终止
-        sp -= word;
-        *(sp as *mut usize) = 0;
-
-        // argv 指针数组（逆序压入）
-        for ptr in argv_ptrs.iter().rev() {
-            sp -= word;
-            *(sp as *mut usize) = *ptr;
-        }
-
-        // argc
-        sp -= word;
-        *(sp as *mut usize) = argc;
+    // Final buf_base is where argc will live (lowest address of the buffer)
+    let buf_base = sp.checked_sub(pointer_bytes).ok_or(SyscallError::EFAULT)?;
+    if buf_base < stack_base {
+        return Err(SyscallError::E2BIG);
     }
 
-    let final_rsp = sp as u64;
-    let argv_base = (sp + word) as u64; // argv[0] 的地址
+    // ── Phase 2: Assemble stack content in a kernel-side buffer ──
+
+    let buf_len = stack_top.checked_sub(buf_base).ok_or(SyscallError::EFAULT)?;
+    let mut stack_buf = vec![0u8; buf_len];
+
+    // Helper: write bytes into stack_buf at the position corresponding to `user_addr`
+    let buf_write = |buf: &mut Vec<u8>, user_addr: usize, data: &[u8]| -> Result<(), SyscallError> {
+        let off = user_addr.checked_sub(buf_base).ok_or(SyscallError::EFAULT)?;
+        let end = off.checked_add(data.len()).ok_or(SyscallError::EFAULT)?;
+        if end > buf.len() {
+            return Err(SyscallError::EFAULT);
+        }
+        buf[off..end].copy_from_slice(data);
+        Ok(())
+    };
+
+    // Helper: write a native-endian usize value
+    let buf_write_usize = |buf: &mut Vec<u8>, user_addr: usize, val: usize| -> Result<(), SyscallError> {
+        let off = user_addr.checked_sub(buf_base).ok_or(SyscallError::EFAULT)?;
+        let end = off.checked_add(word).ok_or(SyscallError::EFAULT)?;
+        if end > buf.len() {
+            return Err(SyscallError::EFAULT);
+        }
+        buf[off..end].copy_from_slice(&val.to_ne_bytes());
+        Ok(())
+    };
+
+    // 6. 写入 argv 字符串 + NUL 终止符
+    for (s, &addr) in argv_vec.iter().zip(argv_ptrs.iter()) {
+        buf_write(&mut stack_buf, addr, s)?;
+        // NUL terminator (buffer is zero-initialized, but be explicit)
+        let nul_addr = addr.checked_add(s.len()).ok_or(SyscallError::EFAULT)?;
+        buf_write(&mut stack_buf, nul_addr, &[0u8])?;
+    }
+
+    // 7. 写入 envp 字符串 + NUL 终止符
+    for (s, &addr) in envp_vec.iter().zip(envp_ptrs.iter()) {
+        buf_write(&mut stack_buf, addr, s)?;
+        let nul_addr = addr.checked_add(s.len()).ok_or(SyscallError::EFAULT)?;
+        buf_write(&mut stack_buf, nul_addr, &[0u8])?;
+    }
+
+    // 8. 写入指针区: argc | argv[0..n] | NULL | envp[0..m] | NULL
+    let mut cursor = buf_base;
+
+    // argc
+    buf_write_usize(&mut stack_buf, cursor, argc)?;
+    cursor = cursor.checked_add(word).ok_or(SyscallError::EFAULT)?;
+
+    // argv pointers
+    for &ptr in &argv_ptrs {
+        buf_write_usize(&mut stack_buf, cursor, ptr)?;
+        cursor = cursor.checked_add(word).ok_or(SyscallError::EFAULT)?;
+    }
+    // argv NULL terminator
+    buf_write_usize(&mut stack_buf, cursor, 0)?;
+    cursor = cursor.checked_add(word).ok_or(SyscallError::EFAULT)?;
+
+    // envp pointers
+    for &ptr in &envp_ptrs {
+        buf_write_usize(&mut stack_buf, cursor, ptr)?;
+        cursor = cursor.checked_add(word).ok_or(SyscallError::EFAULT)?;
+    }
+    // envp NULL terminator
+    buf_write_usize(&mut stack_buf, cursor, 0)?;
+
+    // ABI padding word (already zero-initialized in stack_buf, but explicit)
+    if needs_abi_pad {
+        let pad_addr = buf_base.checked_add(pointer_bytes).ok_or(SyscallError::EFAULT)?;
+        buf_write_usize(&mut stack_buf, pad_addr, 0)?;
+    }
+
+    // ── Phase 3: Single copy to user space (SMAP handled internally per chunk) ──
+
+    copy_to_user(buf_base as *mut u8, &stack_buf)?;
+
+    // Final RSP points to argc (lowest address in the buffer)
+    let final_rsp = buf_base as u64;
+    let argv_base = (buf_base + word) as u64; // argv[0] 的地址
 
     // 更新进程 PCB
     let old_space = {
@@ -8893,27 +8944,101 @@ fn sys_compliance_query_algo(algo_id: u32) -> Result<usize, SyscallError> {
     }
 }
 
-/// sys_audit_export - Export audit events to userspace buffer
+// ============================================================================
+// Audit Export — G.fin.2 (cursor-based, non-draining)
+// ============================================================================
+
+/// Token-bucket rate limiter for `sys_audit_export`.
+///
+/// Prevents audit export from becoming a DoS vector: each exported event
+/// consumes one token. Tokens refill at a fixed rate per timer tick.
+///
+/// - Capacity (burst): 1000 records
+/// - Refill: 10 records per tick
+struct AuditExportTokenBucket {
+    tokens: u64,
+    last_tick: u64,
+}
+
+impl AuditExportTokenBucket {
+    const CAPACITY: u64 = 1000;
+    const REFILL_PER_TICK: u64 = 10;
+
+    const fn new() -> Self {
+        Self {
+            tokens: Self::CAPACITY,
+            last_tick: 0,
+        }
+    }
+
+    fn refill(&mut self, now_tick: u64) {
+        if self.last_tick == 0 {
+            self.last_tick = now_tick;
+            return;
+        }
+        // Monotonic time expected; if time goes backwards, skip refill (fail-closed).
+        if now_tick <= self.last_tick {
+            self.last_tick = now_tick;
+            return;
+        }
+        let elapsed = now_tick - self.last_tick;
+        let added = elapsed.saturating_mul(Self::REFILL_PER_TICK);
+        self.tokens = core::cmp::min(Self::CAPACITY, self.tokens.saturating_add(added));
+        self.last_tick = now_tick;
+    }
+
+    fn take(&mut self, now_tick: u64, want: u64) -> u64 {
+        self.refill(now_tick);
+        let grant = core::cmp::min(self.tokens, want);
+        self.tokens -= grant;
+        grant
+    }
+
+    fn refund(&mut self, n: u64) {
+        self.tokens = core::cmp::min(Self::CAPACITY, self.tokens.saturating_add(n));
+    }
+}
+
+static AUDIT_EXPORT_LIMITER: spin::Mutex<AuditExportTokenBucket> =
+    spin::Mutex::new(AuditExportTokenBucket::new());
+
+/// sys_audit_export — Export audit events to userspace buffer (cursor-based, non-draining)
 ///
 /// Requires CAP_AUDIT_READ capability or root privilege.
 ///
 /// # Arguments
-/// * `buf` - Pointer to buffer in userspace
-/// * `buf_len` - Size of the buffer in bytes
-/// * `out_len` - Pointer to store actual bytes written
+/// * `buf`        — Pointer to destination buffer in userspace
+/// * `buf_len`    — Size of the buffer in bytes
+/// * `cursor`     — Starting event ID (inclusive); pass 0 to start from the oldest
+/// * `max_events` — Maximum number of records to export
+///
+/// # ABI
+///
+/// The buffer is filled with:
+/// - [`audit::AuditExportHeader`] (48 bytes): magic `"ZAUD"`, version, record_count, next cursor, tail hash
+/// - [`audit::AuditExportRecord`] array (128 bytes each): fixed-size per-event records
+///
+/// The header's `cursor` field is the next cursor to use (`last_id + 1`).
 ///
 /// # Returns
-/// * On success: 0
+/// * On success: number of events exported (≥ 0)
 /// * On error: Negative errno
 ///   - EPERM: Not privileged
 ///   - EFAULT: Invalid pointer
-///   - ENOSPC: Buffer too small (out_len will contain required size)
-fn sys_audit_export(buf: *mut u8, buf_len: usize, out_len: *mut usize) -> Result<usize, SyscallError> {
-    use crate::usercopy::{copy_to_user_safe, UserAccessGuard};
+///   - ENOSPC: Buffer too small for header + ≥1 record
+///   - EINVAL: `max_events == 0`
+///   - EAGAIN: Rate limited
+fn sys_audit_export(
+    buf: *mut u8,
+    buf_len: usize,
+    cursor: u64,
+    max_events: usize,
+) -> Result<usize, SyscallError> {
+    use crate::usercopy::copy_to_user_safe;
 
-    // Check privilege: require root or CAP_AUDIT_READ
+    // Check privilege: require root or CAP_AUDIT_READ.
     let creds = crate::current_credentials().ok_or(SyscallError::ESRCH)?;
-    let caller_is_root = creds.euid == 0; // R93-2 FIX: Track root status for arg redaction
+    let caller_is_root = creds.euid == 0;
     if !caller_is_root {
         let has_cap = with_current_cap_table(|table| table.has_rights(cap::CapRights::AUDIT_READ));
         if has_cap != Some(true) {
@@ -8921,111 +9046,92 @@ fn sys_audit_export(buf: *mut u8, buf_len: usize, out_len: *mut usize) -> Result
         }
     }
 
-    // Validate user pointers
-    if buf.is_null() || out_len.is_null() {
+    if buf.is_null() {
         return Err(SyscallError::EFAULT);
     }
+    if max_events == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
     let buf_addr = buf as usize;
-    let out_len_addr = out_len as usize;
     if buf_addr < crate::usercopy::MMAP_MIN_ADDR || buf_addr >= USER_SPACE_TOP {
         return Err(SyscallError::EFAULT);
     }
-    if out_len_addr < crate::usercopy::MMAP_MIN_ADDR || out_len_addr >= USER_SPACE_TOP {
-        return Err(SyscallError::EFAULT);
-    }
 
-    // Get audit snapshot
-    let snapshot = match audit::snapshot() {
-        Ok(s) => s,
-        Err(_) => return Err(SyscallError::EPERM),
-    };
+    const HEADER_SIZE: usize = audit::AuditExportHeader::SIZE;
+    const RECORD_SIZE: usize = audit::AuditExportRecord::SIZE;
 
-    // Serialize snapshot to JSON-like format
-    // For MVP, use a simple binary format: [event_count: u32][events...]
-    let events = &snapshot.events;
-    let event_count = events.len();
-
-    // Calculate required size: 4 bytes header + event_count * sizeof(audit event)
-    // Each serialized event: kind(1) + outcome(1) + subject_uid(4) + subject_pid(4) +
-    //                        object_type(1) + errno(4) + timestamp(8) + args[4](32) = 55 bytes
-    const EVENT_SIZE: usize = 55;
-    let required_size: usize = 4 + event_count * EVENT_SIZE;
-
-    // Write required size to out_len
-    {
-        let _guard = UserAccessGuard::new();
-        let size_bytes = (required_size as u64).to_le_bytes();
-        if copy_to_user_safe(out_len as *mut u8, &size_bytes[..core::mem::size_of::<usize>()]).is_err() {
-            return Err(SyscallError::EFAULT);
-        }
-    }
-
-    // Check if buffer is large enough
-    if buf_len < required_size {
+    // Require space for at least the header + one record.
+    if buf_len < HEADER_SIZE + RECORD_SIZE {
         return Err(SyscallError::ENOSPC);
     }
 
-    // Serialize events to buffer
-    let mut offset = 0;
-    let mut temp_buf = vec![0u8; required_size];
-
-    // Write event count header
-    let count_bytes = (event_count as u32).to_le_bytes();
-    temp_buf[offset..offset + 4].copy_from_slice(&count_bytes);
-    offset += 4;
-
-    // Write each event
-    for event in events {
-        temp_buf[offset] = event.kind as u8;
-        offset += 1;
-        temp_buf[offset] = event.outcome as u8;
-        offset += 1;
-        temp_buf[offset..offset + 4].copy_from_slice(&event.subject.uid.to_le_bytes());
-        offset += 4;
-        temp_buf[offset..offset + 4].copy_from_slice(&event.subject.pid.to_le_bytes());
-        offset += 4;
-        // Serialize AuditObject to a simple discriminant byte
-        let object_type: u8 = match event.object {
-            audit::AuditObject::None => 0,
-            audit::AuditObject::Path { .. } => 1,
-            audit::AuditObject::Endpoint { .. } => 2,
-            audit::AuditObject::Process { .. } => 3,
-            audit::AuditObject::Socket { .. } => 4,
-            audit::AuditObject::Memory { .. } => 5,
-            audit::AuditObject::Capability { .. } => 6,
-            audit::AuditObject::Namespace { .. } => 7,
-        };
-        temp_buf[offset] = object_type;
-        offset += 1;
-        temp_buf[offset..offset + 4].copy_from_slice(&event.errno.to_le_bytes());
-        offset += 4;
-        temp_buf[offset..offset + 8].copy_from_slice(&event.timestamp.to_le_bytes());
-        offset += 8;
-        // R93-2 FIX: Write first 4 args (32 bytes total). For non-root callers, redact syscall
-        // arguments to avoid cross-process ASLR/user-pointer leakage.
-        let redact_syscall_args =
-            !caller_is_root && matches!(event.kind, audit::AuditKind::Syscall);
-        for i in 0..4 {
-            let arg = if redact_syscall_args {
-                // Keep only syscall number (arg 0), redact pointers in args 1-3
-                if i == 0 { event.args[0] } else { 0 }
-            } else {
-                event.args[i]
-            };
-            temp_buf[offset..offset + 8].copy_from_slice(&arg.to_le_bytes());
-            offset += 8;
-        }
+    // How many records physically fit in the buffer?
+    let max_fit = (buf_len - HEADER_SIZE) / RECORD_SIZE;
+    let requested = core::cmp::min(max_events, core::cmp::min(max_fit, u16::MAX as usize));
+    if requested == 0 {
+        return Err(SyscallError::ENOSPC);
     }
 
-    // Copy to userspace
-    {
-        let _guard = UserAccessGuard::new();
-        if copy_to_user_safe(buf, &temp_buf).is_err() {
+    // Token-bucket rate limiting: reserve up to `requested` event exports.
+    let now_tick = crate::time::get_ticks();
+    let reserved = {
+        let mut limiter = AUDIT_EXPORT_LIMITER.lock();
+        limiter.take(now_tick, requested as u64)
+    };
+    if reserved == 0 {
+        return Err(SyscallError::EAGAIN);
+    }
+
+    // Perform the non-draining export.
+    let batch = match audit::export(cursor, reserved as usize) {
+        Ok(b) => b,
+        Err(audit::AuditError::AccessDenied) => {
+            AUDIT_EXPORT_LIMITER.lock().refund(reserved);
+            return Err(SyscallError::EPERM);
+        }
+        Err(audit::AuditError::Uninitialized) => {
+            AUDIT_EXPORT_LIMITER.lock().refund(reserved);
+            return Err(SyscallError::ENOSYS);
+        }
+        Err(_) => {
+            AUDIT_EXPORT_LIMITER.lock().refund(reserved);
+            return Err(SyscallError::EIO);
+        }
+    };
+
+    let exported = batch.events.len();
+    let record_count = core::cmp::min(exported, u16::MAX as usize) as u16;
+
+    // Write header.
+    let header = audit::AuditExportHeader::new(record_count, batch.next_cursor, batch.tail_hash);
+    let header_bytes = header.to_bytes();
+    if copy_to_user_safe(buf, &header_bytes).is_err() {
+        AUDIT_EXPORT_LIMITER.lock().refund(reserved);
+        return Err(SyscallError::EFAULT);
+    }
+
+    // Write records. Non-root callers get redacted syscall args.
+    let redact_syscall_args = !caller_is_root;
+    for (i, event) in batch.events.iter().enumerate() {
+        let record = audit::AuditExportRecord::from_event(event, redact_syscall_args);
+        let record_bytes = record.to_bytes();
+
+        let offset = HEADER_SIZE + i * RECORD_SIZE;
+        let dst = (buf as usize).wrapping_add(offset) as *mut u8;
+        if copy_to_user_safe(dst, &record_bytes).is_err() {
+            AUDIT_EXPORT_LIMITER.lock().refund(reserved);
             return Err(SyscallError::EFAULT);
         }
     }
 
-    Ok(0)
+    // Refund any unused tokens (reserved > exported if ring had fewer events).
+    let unused = reserved.saturating_sub(exported as u64);
+    if unused > 0 {
+        AUDIT_EXPORT_LIMITER.lock().refund(unused);
+    }
+
+    Ok(exported)
 }
 
 // ============================================================================

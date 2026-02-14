@@ -209,6 +209,24 @@ pub struct Ext2DirEntryHead {
 // Ext2 Filesystem
 // ============================================================================
 
+/// R106-6 FIX: Centralized sector-size validation.
+///
+/// Returns the device sector size as `u64` after verifying:
+/// - Non-zero (prevents division-by-zero in `read_super`, `read_block`, etc.)
+/// - Power-of-two (hardware sector sizes are always powers of two)
+///
+/// This replaces ad-hoc inline checks that were present only in `read_bgdt`
+/// while `read_super`, `read_block`, `write_block`, and `write_superblock`
+/// divided by sector_size without any validation.
+#[inline]
+fn validated_sector_size(dev: &dyn BlockDevice) -> Result<u64, FsError> {
+    let sector_size = dev.sector_size() as u64;
+    if sector_size == 0 || !sector_size.is_power_of_two() {
+        return Err(FsError::Invalid);
+    }
+    Ok(sector_size)
+}
+
 /// Ext2 filesystem instance
 pub struct Ext2Fs {
     fs_id: u64,
@@ -218,6 +236,10 @@ pub struct Ext2Fs {
     /// Block group descriptor table
     group_descs: RwLock<Vec<Ext2GroupDesc>>,
     block_size: u32,
+    /// R106-6 FIX: Cached validated sector size.  Validated once at mount time
+    /// to be non-zero and power-of-two.  Instance methods use this instead of
+    /// calling `dev.sector_size()` directly, eliminating division-by-zero risk.
+    sector_size: u64,
     /// R99-4 FIX: Cached immutable copy of `blocks_count` for lock-free block
     /// validation.  In ext2 the total block count is fixed at mkfs time and
     /// never changes (only `free_blocks_count` is modified during allocation).
@@ -236,6 +258,13 @@ impl Ext2Fs {
     pub fn mount(dev: Arc<dyn BlockDevice>) -> Result<Arc<Self>, FsError> {
         // Read superblock
         let (superblock, block_size) = Self::read_super(&dev)?;
+
+        // R106-6 FIX: Validate sector size early and cache it.
+        // This ensures all subsequent I/O methods can divide by sector_size safely.
+        let sector_size = validated_sector_size(&*dev)?;
+        if (block_size as u64) % sector_size != 0 {
+            return Err(FsError::Invalid);
+        }
 
         // Load block group descriptors
         let group_descs = Self::load_group_descs(&dev, &superblock, block_size)?;
@@ -269,6 +298,7 @@ impl Ext2Fs {
             superblock: RwLock::new(superblock),
             group_descs: RwLock::new(group_descs),
             block_size,
+            sector_size,
             blocks_count: superblock.blocks_count,
             blocks_per_group: superblock.blocks_per_group,
             inodes_per_group: superblock.inodes_per_group,
@@ -291,7 +321,8 @@ impl Ext2Fs {
 
     /// Read and validate superblock
     fn read_super(dev: &Arc<dyn BlockDevice>) -> Result<(Ext2Superblock, u32), FsError> {
-        let sector_size = dev.sector_size() as u64;
+        // R106-6 FIX: Use validated_sector_size() instead of raw cast.
+        let sector_size = validated_sector_size(&**dev)?;
         let start_sector = SUPERBLOCK_OFFSET / sector_size;
 
         // Read superblock (1024 bytes, may span 2 sectors)
@@ -423,10 +454,8 @@ impl Ext2Fs {
         let bgdt_size = (groups_count as usize)
             .checked_mul(size_of::<Ext2GroupDesc>())
             .ok_or(FsError::Invalid)?;
-        let sector_size = dev.sector_size() as usize;
-        if sector_size == 0 {
-            return Err(FsError::Invalid);
-        }
+        // R106-6 FIX: Use validated_sector_size() — replaces ad-hoc inline zero check.
+        let sector_size = validated_sector_size(&**dev)? as usize;
         let sectors_needed = bgdt_size
             .checked_add(sector_size - 1)
             .ok_or(FsError::Invalid)?
@@ -489,7 +518,8 @@ impl Ext2Fs {
             }
         };
 
-        let sector_size = self.dev.sector_size() as u64;
+        // R106-6 FIX: Use cached, pre-validated sector_size.
+        let sector_size = self.sector_size;
         let block_offset = block_no as u64 * self.block_size as u64;
         let start_sector = block_offset / sector_size;
 
@@ -511,7 +541,8 @@ impl Ext2Fs {
         // Validate block number is within bounds
         let block_no = self.validate_block(block_no)?.ok_or(FsError::Invalid)?;
 
-        let sector_size = self.dev.sector_size() as u64;
+        // R106-6 FIX: Use cached, pre-validated sector_size.
+        let sector_size = self.sector_size;
         let block_offset = block_no as u64 * self.block_size as u64;
         let start_sector = block_offset / sector_size;
 
@@ -660,7 +691,8 @@ impl Ext2Fs {
         };
         buf[..sb_bytes.len()].copy_from_slice(sb_bytes);
 
-        let sector_size = self.dev.sector_size() as u64;
+        // R106-6 FIX: Use cached, pre-validated sector_size.
+        let sector_size = self.sector_size;
         let start_sector = SUPERBLOCK_OFFSET / sector_size;
 
         self.dev

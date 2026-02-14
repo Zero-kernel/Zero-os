@@ -41,12 +41,17 @@ type SnapshotFn = fn() -> Vec<OomProcessInfo>;
 type KillFn = fn(ProcessId, i32);
 type CleanupFn = fn(ProcessId);
 type TimestampFn = fn() -> u64;
+/// R106-8: Callback for emitting tamper-evident audit events.
+/// Args: (pid: u32, uid: u32, nr_pages_needed: u64, rss_pages: u64, oom_score_adj: i64, timestamp: u64)
+type AuditEmitFn = fn(u32, u32, u64, u64, i64, u64);
 
 struct Callbacks {
     snapshot: Option<SnapshotFn>,
     kill: Option<KillFn>,
     cleanup: Option<CleanupFn>,
     timestamp: Option<TimestampFn>,
+    /// R106-8: Audit callback for tamper-evident OOM event recording.
+    audit_emit: Option<AuditEmitFn>,
 }
 
 static CALLBACKS: Mutex<Callbacks> = Mutex::new(Callbacks {
@@ -54,6 +59,7 @@ static CALLBACKS: Mutex<Callbacks> = Mutex::new(Callbacks {
     kill: None,
     cleanup: None,
     timestamp: None,
+    audit_emit: None,
 });
 
 /// Prevent re-entrant OOM handling
@@ -78,6 +84,13 @@ pub fn register_callbacks(
     cb.kill = Some(kill);
     cb.cleanup = Some(cleanup);
     cb.timestamp = Some(timestamp);
+}
+
+/// R106-8: Register the tamper-evident audit callback separately.
+/// Called after audit subsystem is initialized (may be later than process callbacks).
+pub fn register_audit_callback(audit_emit: AuditEmitFn) {
+    let mut cb = CALLBACKS.lock();
+    cb.audit_emit = Some(audit_emit);
 }
 
 /// Entry point when the allocator cannot satisfy a request.
@@ -126,9 +139,9 @@ fn still_under_pressure(nr_pages_needed: usize) -> bool {
 
 /// Select and kill the best victim process
 fn kill_best_candidate(nr_pages_needed: usize) {
-    let (snapshot_cb, kill_cb, cleanup_cb, ts_cb) = {
+    let (snapshot_cb, kill_cb, cleanup_cb, ts_cb, audit_cb) = {
         let cb = CALLBACKS.lock();
-        (cb.snapshot, cb.kill, cb.cleanup, cb.timestamp)
+        (cb.snapshot, cb.kill, cb.cleanup, cb.timestamp, cb.audit_emit)
     };
 
     let snapshot = match snapshot_cb {
@@ -157,7 +170,7 @@ fn kill_best_candidate(nr_pages_needed: usize) {
             cleanup(victim.pid);
         }
 
-        emit_audit(&victim, nr_pages_needed, ts_cb);
+        emit_audit(&victim, nr_pages_needed, ts_cb, audit_cb);
     } else {
         klog_always!("OOM: no eligible processes to kill (protected or kernel threads)");
     }
@@ -213,21 +226,38 @@ fn score_process(info: &OomProcessInfo) -> i64 {
 }
 
 /// Emit audit event for OOM kill
-fn emit_audit(victim: &OomProcessInfo, needed: usize, ts_cb: Option<TimestampFn>) {
+///
+/// R106-8 FIX: In addition to klog_always! (for console visibility), invoke the
+/// tamper-evident audit subsystem via the registered callback. This ensures OOM
+/// kill events are included in the hash-chained audit trail and cannot be silently
+/// dropped or tampered with.
+fn emit_audit(
+    victim: &OomProcessInfo,
+    needed: usize,
+    ts_cb: Option<TimestampFn>,
+    audit_cb: Option<AuditEmitFn>,
+) {
     let timestamp = ts_cb.map(|f| f()).unwrap_or(0);
 
-    // Encode audit arguments
-    let args = [
-        needed as u64,
-        victim.rss_pages,
-        victim.oom_score_adj.saturating_add(1000) as u64,
-        encode_nice(victim.nice),
-    ];
-
+    // Console log for immediate visibility (retained for operational monitoring)
     klog_always!(
         "OOM AUDIT: timestamp={} pid={} needed={} rss={} adj={} nice={}",
         timestamp, victim.pid, needed, victim.rss_pages, victim.oom_score_adj, victim.nice
     );
+
+    // R106-8: Emit tamper-evident audit event via registered callback.
+    // This feeds into the hash-chained audit ring buffer that can be exported
+    // and verified for integrity via sys_audit_export.
+    if let Some(emit) = audit_cb {
+        emit(
+            victim.pid as u32,
+            victim.uid,
+            needed as u64,
+            victim.rss_pages,
+            victim.oom_score_adj as i64,
+            timestamp,
+        );
+    }
 }
 
 /// Encode nice value to unsigned for audit args

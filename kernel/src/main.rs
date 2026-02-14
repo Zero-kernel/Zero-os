@@ -256,14 +256,16 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     {
         let mut frame_allocator = mm::memory::FrameAllocator::new();
 
-        // G.3: Select hardening profile (default: Balanced for development)
-        // In production, this would be set via boot command line: "profile=secure"
-        // For now, use Balanced as default with full security features enabled
+        // G.fin.1: Initialize boot-time locked PolicySurface as single source of truth.
+        // In production, profile would be selected via boot command line: "profile=secure"
         let profile = compliance::HardeningProfile::Balanced;
-        compliance::set_profile(profile);
+        let policy = compliance::init_policy_surface(
+            profile,
+            compliance::ProfileSource::Default,
+        );
 
         // H.2.2: Wire klog filter from hardening profile
-        let klog_profile = match profile {
+        let klog_profile = match policy.profile {
             compliance::HardeningProfile::Secure => klog::KlogProfile::Secure,
             compliance::HardeningProfile::Balanced => klog::KlogProfile::Balanced,
             compliance::HardeningProfile::Performance => klog::KlogProfile::Performance,
@@ -272,12 +274,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
 
         // Generate SecurityConfig from the selected profile
         let phys_offset = mm::page_table::get_physical_memory_offset();
-        let sec_config = profile.security_config(phys_offset);
+        let sec_config = policy.profile.security_config(phys_offset);
 
         klog_always!(
             "      Profile: {} (audit_capacity: {})",
-            profile.name(),
-            profile.audit_capacity()
+            policy.profile.name(),
+            policy.audit_ring_capacity
         );
 
         match security::init(sec_config, &mut frame_allocator) {
@@ -309,7 +311,9 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                     klog_always!("        - Spectre mitigations: {}", spectre.summary());
                 }
 
-                // G.3: Lock profile after security initialization
+                // G.fin.1: Lock profile after security initialization.
+                // PolicySurface already prevents set_profile() changes, but
+                // lock_profile() provides defense-in-depth against direct calls.
                 compliance::lock_profile();
                 klog_always!("        - Profile locked (immutable until reboot)");
             }
@@ -318,7 +322,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 // R102-2 FIX: Secure profile must not boot without core mitigations.
                 // A single hardware/config anomaly should not silently disable all
                 // security hardening (W^X, NX, CSPRNG, Spectre mitigations).
-                if profile == compliance::HardeningProfile::Secure {
+                if policy.profile == compliance::HardeningProfile::Secure {
                     panic!(
                         "Security hardening failed in Secure profile: {:?} \
                          (use Balanced profile to allow degraded boot)",
@@ -579,8 +583,9 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     }
 
     klog_always!("[7.6/8] Initializing audit subsystem...");
-    match audit::init(64) {
-        // Reduced from 256 to save heap memory
+    // G.fin.1: Audit ring capacity is derived from the boot-time PolicySurface.
+    let audit_capacity = compliance::policy().audit_ring_capacity;
+    match audit::init(audit_capacity) {
         Ok(()) => {
             // Emit boot event
             let _ = audit::emit(
@@ -594,7 +599,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             );
             klog_always!(
                 "      ✓ Audit subsystem ready (capacity: {} events)",
-                audit::DEFAULT_CAPACITY
+                audit_capacity
             );
             klog_always!("      ✓ Hash-chained tamper evidence enabled");
 
@@ -686,6 +691,21 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 }
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
+
+            // R106-8: Register OOM killer audit callback for tamper-evident event recording.
+            // OOM kill events are now fed into the hash-chained audit ring buffer.
+            mm::register_oom_audit_callback(|pid, uid, needed, rss, adj, timestamp| {
+                let _ = audit::emit(
+                    audit::AuditKind::Internal,
+                    audit::AuditOutcome::Info,
+                    audit::AuditSubject::new(pid, uid, 0, None),
+                    audit::AuditObject::Process { pid, signal: Some(9) }, // SIGKILL
+                    &[needed, rss, adj as u64],
+                    0,
+                    timestamp,
+                );
+            });
+            klog_always!("      ✓ OOM killer audit callback registered (R106-8)");
         }
         Err(e) => {
             klog_always!("      ! Audit initialization failed: {:?}", e);
@@ -844,12 +864,17 @@ fn panic(info: &PanicInfo) -> ! {
         // further state changes. Safe to call multiple times (atomic guard).
         let crash_dump = trace::kdump::capture_crash_context(info);
 
-        // R93-16 FIX: Check hardening profile for panic output redaction.
+        // R93-16 FIX / G.fin.1: Check PolicySurface for panic output redaction.
         // In Secure profile, suppress detailed panic output to avoid leaking
         // kernel pointers, file paths, and other sensitive information over serial.
         // The encrypted kdump still captures full details for offline analysis.
-        let profile = compliance::current_profile();
-        let suppress_details = matches!(profile, compliance::HardeningProfile::Secure);
+        // Uses is_policy_initialized() to handle panics during very early boot
+        // before PolicySurface exists (fail-open: show details to aid debugging).
+        let suppress_details = if compliance::is_policy_initialized() {
+            compliance::policy().panic_redact_details
+        } else {
+            false
+        };
 
         serial_write_str("KERNEL PANIC");
 

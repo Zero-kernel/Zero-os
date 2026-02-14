@@ -19,6 +19,7 @@ pub mod tlb_shootdown;
 pub use memory::{BootInfo, FrameAllocator, MemoryMapInfo};
 pub use oom_killer::{
     get_stats as get_oom_stats, on_allocation_failure as oom_allocation_failed,
+    register_audit_callback as register_oom_audit_callback,
     register_callbacks as register_oom_callbacks, OomProcessInfo, OomStats,
 };
 pub use page_cache::{

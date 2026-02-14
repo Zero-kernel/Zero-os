@@ -16,7 +16,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use spin::Mutex;
 
 use mm::dma::{alloc_dma_buffer, DmaBuffer};
@@ -25,7 +25,7 @@ use super::{
     blk_features, blk_status, blk_types, mb, rmb, wmb, MmioTransport, VirtioBlkConfig,
     VirtioBlkReqHeader, VirtioPciAddrs, VirtioPciTransport, VirtioTransport, VringAvail, VringDesc,
     VringUsed, VringUsedElem, VIRTIO_DEVICE_BLK, VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE,
-    VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK,
+    VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
     VIRTIO_VERSION_LEGACY, VIRTIO_VERSION_MODERN, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,
 };
 use crate::{Bio, BioOp, BioResult, BioVec, BlockDevice, BlockError};
@@ -44,13 +44,13 @@ const MAX_PENDING: usize = 64;
 // R37-3 FIX (Codex review): Timeout Resource Tracking
 // ============================================================================
 //
-// KNOWN LIMITATION: When a request times out, we keep DMA buffers pinned to
-// prevent UAF (device may complete later, DMAing into freed memory). However,
-// this leaks resources permanently. A proper fix requires a device reset path
-// to safely reclaim the descriptors and buffers.
+// When a request times out, we keep DMA buffers pinned to prevent UAF (the
+// device may complete later, DMAing into freed memory). R106-3 adds a reset &
+// recovery path to reclaim the descriptors and buffers by quiescing the device
+// and re-initializing it.
 //
-// FIXME: Implement virtio-blk device reset to recover from timeouts without
-// leaking resources. This counter tracks how many resources are leaked.
+// This counter tracks how many request resources are currently pinned due to
+// timeouts (should return to 0 after successful recovery).
 use core::sync::atomic::AtomicUsize;
 static TIMEOUT_LEAKED_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
@@ -397,6 +397,8 @@ pub struct VirtioBlkDevice {
     features: u64,
     /// Lock for synchronous operations.
     lock: Mutex<()>,
+    /// R106-3: Set when the device has failed or is being reset to reject new I/O quickly.
+    device_failed: AtomicBool,
     /// Request buffers (header + status).
     req_buffers: Mutex<Vec<RequestBuffer>>,
 }
@@ -643,6 +645,7 @@ impl VirtioBlkDevice {
             read_only,
             features: driver_features,
             lock: Mutex::new(()),
+            device_failed: AtomicBool::new(false),
             req_buffers: Mutex::new(req_buffers),
         }))
     }
@@ -793,8 +796,183 @@ impl VirtioBlkDevice {
         completion
     }
 
+    /// R106-3: Reset and reinitialize the virtio-blk device to recover from timeouts.
+    ///
+    /// This is called when an I/O request times out. It:
+    /// 1. Sets `device_failed` to block new I/O
+    /// 2. Resets the device via VirtIO status register (writing 0)
+    /// 3. Reclaims all in-flight DMA buffers (scrubbed for security)
+    /// 4. Resets virtqueue descriptor/ring state
+    /// 5. Re-initializes the device through the standard VirtIO init sequence
+    /// 6. Clears `device_failed` on successful recovery
+    ///
+    /// Caller must hold `self.lock` (enforced by the guard parameter).
+    fn reset_device(&self, _lock_proof: &spin::MutexGuard<'_, ()>) -> Result<(), BlockError> {
+        // Block new I/O immediately.
+        self.device_failed.store(true, Ordering::Release);
+
+        kprintln!("[virtio-blk] R106-3: initiating device reset for {}", self.name);
+
+        // VirtIO spec §2.1.1: writing 0 to status register resets the device.
+        unsafe {
+            self.transport.reset();
+        }
+        mb();
+
+        // Reclaim all in-use request buffers and their DMA resources.
+        let mut recovered_leaked = 0usize;
+        {
+            let mut buffers = self.req_buffers.lock();
+            for buffer in buffers.iter_mut() {
+                if !buffer.in_use {
+                    continue;
+                }
+
+                let meta = match buffer.pending.take() {
+                    Some(m) => m,
+                    None => {
+                        // No metadata — just release the slot.
+                        buffer.in_use = false;
+                        continue;
+                    }
+                };
+
+                let RequestMeta {
+                    desc_chain,
+                    desc_count,
+                    header_status_dma,
+                    kind,
+                    abandoned,
+                    ..
+                } = meta;
+
+                if abandoned {
+                    recovered_leaked += 1;
+                }
+
+                // Scrub DMA buffers before dropping (prevent data leakage).
+                unsafe {
+                    core::ptr::write_bytes(
+                        header_status_dma.virt_ptr(),
+                        0,
+                        header_status_dma.size(),
+                    );
+                }
+
+                match kind {
+                    RequestKind::Io { data_dma, .. } => unsafe {
+                        core::ptr::write_bytes(data_dma.virt_ptr(), 0, data_dma.size());
+                        // data_dma dropped here → IOMMU unmap
+                    },
+                    RequestKind::Flush => {}
+                }
+                // header_status_dma dropped here → IOMMU unmap
+
+                // Free descriptors back to the queue pool.
+                for idx in desc_chain.iter().take(desc_count) {
+                    self.queue.free_desc(*idx);
+                }
+
+                buffer.in_use = false;
+            }
+        }
+
+        // Reset virtqueue software state: used index, descriptor allocation.
+        self.queue.last_used_idx.store(0, Ordering::Relaxed);
+
+        {
+            let qsz = self.queue.size as usize;
+
+            // Lock ordering: alloc_bitmap → free_list (consistent with alloc/free paths).
+            let mut alloc = self.queue.alloc_bitmap.lock();
+            alloc.clear();
+            alloc.resize(qsz, false);
+
+            let mut free = self.queue.free_list.lock();
+            free.clear();
+            free.reserve(qsz);
+            for i in (0..self.queue.size).rev() {
+                free.push(i);
+            }
+        }
+
+        // Clear ring memory so used/avail indices restart from 0.
+        unsafe {
+            let qsz = self.queue.size;
+            core::ptr::write_bytes(self.queue.desc, 0, qsz as usize);
+            let avail_bytes = 4 + 2 * qsz as usize + 2;
+            core::ptr::write_bytes(self.queue.avail as *mut u8, 0, avail_bytes);
+            let used_bytes = 4 + 8 * qsz as usize + 2;
+            core::ptr::write_bytes(self.queue.used as *mut u8, 0, used_bytes);
+        }
+
+        // Decrement global leaked counter for resources we recovered.
+        if recovered_leaked != 0 {
+            let _ = TIMEOUT_LEAKED_REQUESTS.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| v.checked_sub(recovered_leaked),
+            );
+        }
+
+        // Re-initialize the device: ACKNOWLEDGE → DRIVER → features → FEATURES_OK → queue → DRIVER_OK.
+        let driver_features = self.features;
+        unsafe {
+            self.transport.set_status(VIRTIO_STATUS_ACKNOWLEDGE);
+
+            let status = self.transport.status();
+            self.transport.set_status(status | VIRTIO_STATUS_DRIVER);
+
+            self.transport.write_driver_features(driver_features);
+
+            let status = self.transport.status();
+            self.transport.set_status(status | VIRTIO_STATUS_FEATURES_OK);
+
+            let status = self.transport.status();
+            if status & VIRTIO_STATUS_FEATURES_OK == 0 {
+                self.transport.set_status(status | VIRTIO_STATUS_FAILED);
+                kprintln!("[virtio-blk] R106-3: FEATURES_OK not accepted after reset");
+                return Err(BlockError::NotSupported);
+            }
+
+            // Validate queue size is still compatible.
+            let queue_size_max = self.transport.queue_max(0);
+            if self.queue.size == 0 || self.queue.size > queue_size_max {
+                let status = self.transport.status();
+                self.transport.set_status(status | VIRTIO_STATUS_FAILED);
+                kprintln!("[virtio-blk] R106-3: queue size {} exceeds max {} after reset",
+                    self.queue.size, queue_size_max);
+                return Err(BlockError::NotSupported);
+            }
+
+            self.transport.setup_queue(
+                0,
+                self.queue.size,
+                self.queue.desc_phys,
+                self.queue.avail_phys,
+                self.queue.used_phys,
+            );
+            self.transport.queue_ready(0, true);
+
+            let status = self.transport.status();
+            self.transport.set_status(status | VIRTIO_STATUS_DRIVER_OK);
+        }
+
+        // Recovery complete — accept new I/O.
+        self.device_failed.store(false, Ordering::Release);
+        kprintln!(
+            "[virtio-blk] R106-3: device {} reset successful, recovered {} abandoned requests",
+            self.name, recovered_leaked
+        );
+        Ok(())
+    }
+
     /// Process a single synchronous request.
     fn do_request(&self, sector: u64, buf: &mut [u8], is_write: bool) -> Result<usize, BlockError> {
+        // R106-3: Reject I/O immediately if device is failed/resetting.
+        if self.device_failed.load(Ordering::Acquire) {
+            return Err(BlockError::Offline);
+        }
         if is_write && self.read_only {
             return Err(BlockError::ReadOnly);
         }
@@ -1043,6 +1221,8 @@ impl VirtioBlkDevice {
                     leaked
                 );
                 // Leave req_buffers[buf_idx].in_use = true to prevent reuse until device completes
+                // R106-3: Attempt device reset to recover resources.
+                let _ = self.reset_device(&_lock);
                 return Err(BlockError::Io);
             }
         };
@@ -1203,6 +1383,11 @@ impl BlockDevice for VirtioBlkDevice {
     }
 
     fn flush(&self) -> Result<(), BlockError> {
+        // R106-3: Reject I/O immediately if device is failed/resetting.
+        if self.device_failed.load(Ordering::Acquire) {
+            return Err(BlockError::Offline);
+        }
+
         if self.features & blk_features::VIRTIO_BLK_F_FLUSH == 0 {
             return Ok(()); // No flush support, assume write-through
         }
@@ -1363,7 +1548,8 @@ impl BlockDevice for VirtioBlkDevice {
                     "[virtio-blk] flush timeout head={}, buffers pinned (reset required, total leaked={})",
                     desc0, leaked
                 );
-                // Leave req_buffers[buf_idx].in_use = true to prevent reuse
+                // R106-3: Attempt device reset to recover resources.
+                let _ = self.reset_device(&_lock);
                 return Err(BlockError::Io);
             }
         };

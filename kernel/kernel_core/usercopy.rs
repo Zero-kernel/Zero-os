@@ -293,13 +293,37 @@ impl Drop for UserAccessGuard {
     /// around the AC=1 period.
     #[inline]
     fn drop(&mut self) {
-        // Detect CPU migration which would cause per-CPU depth imbalance
-        // Use assert (not debug_assert) to catch this in release builds
-        assert_eq!(
-            current_cpu_id(),
-            self.cpu_id,
-            "UserAccessGuard dropped on different CPU; per-CPU SMAP depth would be imbalanced"
-        );
+        let current_cpu = current_cpu_id();
+
+        // R106-7 FIX: Detect CPU migration and apply corrective CLAC instead of panicking.
+        // In a non-preemptible kernel this should never happen, but if preemption is added
+        // in the future, a panic here would be fatal. Instead, issue a corrective CLAC on
+        // the current CPU to guarantee SMAP is re-enabled, and log a warning.
+        if current_cpu != self.cpu_id {
+            if self.smap_active {
+                // Corrective: ensure SMAP is re-enabled on the current CPU regardless
+                // of depth counter state. This may leave the original CPU's depth counter
+                // incremented, but that's safer than leaving SMAP disabled anywhere.
+                unsafe {
+                    core::arch::asm!("clac", options(nostack, nomem));
+                }
+                // Best-effort: decrement the *current* CPU's depth counter if possible.
+                // This is imprecise but prevents underflow assertion on subsequent guards.
+                let cur_depth = SMAP_GUARD_DEPTH.with(|d| d.load(Ordering::SeqCst));
+                if cur_depth > 0 {
+                    SMAP_GUARD_DEPTH.with(|d| d.fetch_sub(1, Ordering::SeqCst));
+                }
+                if self.interrupts_were_enabled {
+                    x86_64::instructions::interrupts::enable();
+                }
+            }
+            kprintln!(
+                "[usercopy] R106-7 WARNING: UserAccessGuard created on CPU {} dropped on CPU {}; \
+                 corrective CLAC issued",
+                self.cpu_id, current_cpu
+            );
+            return;
+        }
 
         if self.smap_active {
             // Only execute CLAC when this is the outermost guard (depth 1→0)
