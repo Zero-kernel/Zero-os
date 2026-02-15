@@ -2306,7 +2306,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             // R24-3 fix: 写入 0 到 clear_child_tid 地址（SMAP + fault-tolerant）
             // 注意：需要在正确的地址空间中执行
             unsafe {
-                use crate::usercopy::{copy_to_user_safe, UserAccessGuard};
+                use crate::usercopy::copy_to_user_safe;
                 use x86_64::registers::control::Cr3;
                 use x86_64::structures::paging::PhysFrame;
                 use x86_64::PhysAddr;
@@ -2323,9 +2323,10 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                     Cr3::write(target_frame, current_cr3.1);
 
                     // 将 0 写入 clear_child_tid 地址（带 SMAP 保护和容错处理）
+                    // P1-6 FIX: Removed redundant outer UserAccessGuard —
+                    // copy_to_user_safe creates its own guard internally.
                     let tid_ptr = clear_child_tid as *mut u8;
                     if (tid_ptr as usize) >= 0x1000 && (tid_ptr as usize) < 0x8000_0000_0000 {
-                        let _user = UserAccessGuard::new();
                         let zero = 0i32.to_ne_bytes();
                         // 忽略写入错误（用户可能已 unmap 该地址）
                         let _ = copy_to_user_safe(tid_ptr, &zero);

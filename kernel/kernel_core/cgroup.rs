@@ -684,6 +684,15 @@ pub struct CgroupNode {
     /// attaches could create orphaned tasks in an unregistered cgroup.
     deleted: AtomicBool,
 
+    /// P1-3: Delegated owner UID for this cgroup subtree.
+    ///
+    /// When set, the specified UID may manage this cgroup and all its
+    /// descendants (create/delete children, set limits, migrate tasks)
+    /// without requiring root.  Delegation is set by root via
+    /// `delegate_cgroup()` and inherits downward: `is_delegated_to(uid)`
+    /// walks the ancestor chain.
+    delegate_uid: Mutex<Option<u32>>,
+
     /// F.2: CPU quota tracking state for cpu.max enforcement.
     ///
     /// Tracks per-period CPU usage and throttle state for the CPU controller.
@@ -709,6 +718,7 @@ impl CgroupNode {
             processes: Mutex::new(BTreeSet::new()),
             ref_count: AtomicU32::new(1),
             deleted: AtomicBool::new(false), // R77-1 FIX
+            delegate_uid: Mutex::new(None), // P1-3
             cpu_quota: CpuQuotaState::new(), // F.2: CPU quota tracking
             io_throttle: IoThrottleState::new(), // F.2: IO throttle state
         }
@@ -745,6 +755,170 @@ impl CgroupNode {
     /// Returns the IDs of direct children.
     pub fn children(&self) -> Vec<CgroupId> {
         self.children.lock().iter().copied().collect()
+    }
+
+    // ==================================================================
+    // P1-3: Cgroup Delegation
+    // ==================================================================
+
+    /// Returns the delegate UID for this cgroup, if any.
+    pub fn delegate_uid(&self) -> Option<u32> {
+        *self.delegate_uid.lock()
+    }
+
+    /// Returns `true` if this cgroup (or any ancestor) is delegated to `uid`.
+    ///
+    /// Walks the ancestor chain upward; stops at the first match.
+    pub fn is_delegated_to(&self, uid: u32) -> bool {
+        if self.delegate_uid() == Some(uid) {
+            return true;
+        }
+        let mut cursor = self.parent();
+        while let Some(node) = cursor {
+            if node.delegate_uid() == Some(uid) {
+                return true;
+            }
+            cursor = node.parent();
+        }
+        false
+    }
+
+    /// P1-3: Validate that `updated` limits do not exceed the effective ancestor limits.
+    ///
+    /// Called when a delegated (non-root) user sets limits.  Walks the full
+    /// ancestor chain and finds the tightest (most restrictive) configured
+    /// limit for each resource.  The delegated user's requested limits must
+    /// not exceed those boundaries, preventing privilege escalation through
+    /// the delegation mechanism.
+    ///
+    /// For resources where no ancestor has a configured limit, the check is
+    /// skipped (unlimited parent means no boundary constraint).
+    pub fn check_limit_boundary(&self, updated: &CgroupLimits) -> Result<(), CgroupError> {
+        // Collect effective (tightest) ancestor limits by walking up the chain.
+        let mut eff_cpu_max: Option<(u64, u64)> = None;
+        let mut eff_memory_max: Option<u64> = None;
+        let mut eff_memory_high: Option<u64> = None;
+        let mut eff_pids_max: Option<u64> = None;
+        let mut eff_io_bps: Option<u64> = None;
+        let mut eff_io_iops: Option<u64> = None;
+
+        let mut cursor = self.parent();
+        while let Some(ancestor) = cursor {
+            let al = ancestor.limits();
+
+            // cpu.max: keep the tightest ratio (lowest max/period)
+            if let Some((amax, aperiod)) = al.cpu_max {
+                if amax != u64::MAX && aperiod != 0 {
+                    eff_cpu_max = Some(match eff_cpu_max {
+                        None => (amax, aperiod),
+                        Some((emax, eperiod)) => {
+                            // Compare ratios: amax/aperiod vs emax/eperiod
+                            // via cross-multiplication to avoid floating point.
+                            let a_val = (amax as u128) * (eperiod as u128);
+                            let e_val = (emax as u128) * (aperiod as u128);
+                            if a_val < e_val {
+                                (amax, aperiod) // ancestor is tighter
+                            } else {
+                                (emax, eperiod) // existing is tighter
+                            }
+                        }
+                    });
+                }
+            }
+
+            // Scalar limits: take the minimum non-MAX value
+            if let Some(v) = al.memory_max {
+                if v != u64::MAX {
+                    eff_memory_max = Some(eff_memory_max.map_or(v, |e: u64| e.min(v)));
+                }
+            }
+            if let Some(v) = al.memory_high {
+                if v != u64::MAX {
+                    eff_memory_high = Some(eff_memory_high.map_or(v, |e: u64| e.min(v)));
+                }
+            }
+            if let Some(v) = al.pids_max {
+                if v != u64::MAX {
+                    eff_pids_max = Some(eff_pids_max.map_or(v, |e: u64| e.min(v)));
+                }
+            }
+            if let Some(v) = al.io_max_bytes_per_sec {
+                eff_io_bps = Some(eff_io_bps.map_or(v, |e: u64| e.min(v)));
+            }
+            if let Some(v) = al.io_max_iops_per_sec {
+                eff_io_iops = Some(eff_io_iops.map_or(v, |e: u64| e.min(v)));
+            }
+
+            cursor = ancestor.parent();
+        }
+
+        // --- Validate updated limits against effective boundaries ---
+
+        // cpu.max: compare bandwidth ratio
+        if let Some((max, period)) = updated.cpu_max {
+            if max == 0 || period == 0 {
+                return Err(CgroupError::InvalidLimit);
+            }
+            if let Some((emax, eperiod)) = eff_cpu_max {
+                // Child cannot be unlimited if any ancestor is finite.
+                if max == u64::MAX {
+                    return Err(CgroupError::PermissionDenied);
+                }
+                // child_ratio = max/period ≤ eff_ratio = emax/eperiod
+                let lhs = (max as u128) * (eperiod as u128);
+                let rhs = (emax as u128) * (period as u128);
+                if lhs > rhs {
+                    return Err(CgroupError::PermissionDenied);
+                }
+            }
+        }
+
+        // memory.max
+        if let Some(max) = updated.memory_max {
+            if let Some(emax) = eff_memory_max {
+                if max == u64::MAX || max > emax {
+                    return Err(CgroupError::PermissionDenied);
+                }
+            }
+        }
+
+        // memory.high
+        if let Some(high) = updated.memory_high {
+            if let Some(ehigh) = eff_memory_high {
+                if high == u64::MAX || high > ehigh {
+                    return Err(CgroupError::PermissionDenied);
+                }
+            }
+        }
+
+        // pids.max
+        if let Some(max) = updated.pids_max {
+            if let Some(emax) = eff_pids_max {
+                if max == u64::MAX || max > emax {
+                    return Err(CgroupError::PermissionDenied);
+                }
+            }
+        }
+
+        // io.max bytes per sec
+        if let Some(bps) = updated.io_max_bytes_per_sec {
+            if let Some(ebps) = eff_io_bps {
+                if bps > ebps {
+                    return Err(CgroupError::PermissionDenied);
+                }
+            }
+        }
+
+        // io.max IOPS
+        if let Some(iops) = updated.io_max_iops_per_sec {
+            if let Some(eiops) = eff_io_iops {
+                if iops > eiops {
+                    return Err(CgroupError::PermissionDenied);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns the number of attached tasks.
@@ -810,6 +984,7 @@ impl CgroupNode {
             processes: Mutex::new(BTreeSet::new()),
             ref_count: AtomicU32::new(1),
             deleted: AtomicBool::new(false), // R77-1 FIX
+            delegate_uid: Mutex::new(None), // P1-3
             cpu_quota: CpuQuotaState::new(), // F.2: CPU quota tracking
             io_throttle: IoThrottleState::new(), // F.2: IO throttle state
         });
@@ -1012,9 +1187,19 @@ impl CgroupNode {
             }
         }
 
-        // Validate CPU quota (period > 0, max > 0)
+        // Validate CPU quota (period > 0, max > 0, no overflow when converting to ns)
         if let Some((max, period)) = updated.cpu_max {
             if period == 0 || max == 0 {
+                return Err(CgroupError::InvalidLimit);
+            }
+            // P1-3 FIX: Cap values to prevent saturating_mul(1_000) overflow
+            // in the enforcement path (charge_cpu_quota). u64::MAX is exempt
+            // as it means "unlimited".  1_000_000_000_000 µs ≈ 11.5 days.
+            const MAX_CPU_US: u64 = 1_000_000_000_000;
+            if max != u64::MAX && max > MAX_CPU_US {
+                return Err(CgroupError::InvalidLimit);
+            }
+            if period > MAX_CPU_US {
                 return Err(CgroupError::InvalidLimit);
             }
         }
@@ -1133,6 +1318,28 @@ pub fn create_cgroup(
 ) -> Result<Arc<CgroupNode>, CgroupError> {
     let parent = lookup_cgroup(parent_id).ok_or(CgroupError::NotFound)?;
     CgroupNode::new_child(&parent, controllers)
+}
+
+/// P1-3: Delegate management of a cgroup subtree to `uid`.
+///
+/// Only root (euid 0) may call this.  Once delegated, the specified UID may
+/// create/delete children, set limits (bounded by the parent), and migrate
+/// tasks within this cgroup and all its descendants.
+///
+/// Pass `uid = None` to revoke delegation.
+///
+/// # Errors
+///
+/// * `PermissionDenied` - Caller is not root
+/// * `NotFound` - Cgroup ID does not exist
+pub fn delegate_cgroup(id: CgroupId, uid: Option<u32>) -> Result<(), CgroupError> {
+    let creds = crate::process::current_credentials().ok_or(CgroupError::PermissionDenied)?;
+    if creds.euid != 0 {
+        return Err(CgroupError::PermissionDenied);
+    }
+    let node = lookup_cgroup(id).ok_or(CgroupError::NotFound)?;
+    *node.delegate_uid.lock() = uid;
+    Ok(())
 }
 
 /// Deletes a cgroup by ID.

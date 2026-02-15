@@ -34,7 +34,6 @@ use kernel_core::cgroup::{
     self, CgroupControllers, CgroupError, CgroupId, CgroupLimits, CgroupNode,
 };
 use kernel_core::{process, FileOps};
-use spin::RwLock;
 
 /// Global cgroupfs ID counter (starts at 300 to avoid collision with other FS types)
 static NEXT_FS_ID: AtomicU64 = AtomicU64::new(300);
@@ -214,15 +213,15 @@ impl FileSystem for CgroupFs {
             return Err(FsError::NotSupported);
         }
 
-        // Security check: require root
-        if !is_privileged() {
-            return Err(FsError::PermDenied);
-        }
-
         let dir = parent
             .as_any()
             .downcast_ref::<CgroupDirInode>()
             .ok_or(FsError::NotDir)?;
+
+        // P1-3: Require root or delegated subtree owner on parent cgroup
+        if !is_privileged_or_delegate(dir.cgroup_id) {
+            return Err(FsError::PermDenied);
+        }
 
         // Get parent cgroup to inherit controllers
         let parent_cgroup =
@@ -248,15 +247,15 @@ impl FileSystem for CgroupFs {
     }
 
     fn unlink(&self, parent: &Arc<dyn Inode>, name: &str) -> Result<(), FsError> {
-        // Security check: require root
-        if !is_privileged() {
-            return Err(FsError::PermDenied);
-        }
-
         let dir = parent
             .as_any()
             .downcast_ref::<CgroupDirInode>()
             .ok_or(FsError::NotDir)?;
+
+        // P1-3: Require root or delegated subtree owner on parent cgroup
+        if !is_privileged_or_delegate(dir.cgroup_id) {
+            return Err(FsError::PermDenied);
+        }
 
         // Find child cgroup by name
         let parent_cgroup =
@@ -368,12 +367,15 @@ impl Inode for CgroupDirInode {
     }
 
     fn stat(&self) -> Result<Stat, FsError> {
+        // P1-3: Reflect delegated owner in DAC metadata so non-root
+        // delegated managers pass VFS permission checks.
+        let owner = effective_owner(self.cgroup_id);
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino,
             mode: FileMode::directory(0o755),
             nlink: 2,
-            uid: 0,
+            uid: owner,
             gid: 0,
             rdev: 0,
             size: 0,
@@ -589,12 +591,16 @@ impl CgroupCtrlInode {
             return Err(FsError::PermDenied);
         }
 
-        // Security check
-        if !is_privileged() {
+        // P1-3: Determine caller identity and delegation status.
+        let euid = current_euid().ok_or(FsError::PermDenied)?;
+        let is_root = euid == 0;
+        let cgroup = cgroup::lookup_cgroup(self.cgroup_id).ok_or(FsError::NotFound)?;
+        let is_delegate = !is_root && cgroup.is_delegated_to(euid);
+
+        if !is_root && !is_delegate {
             return Err(FsError::PermDenied);
         }
 
-        let cgroup = cgroup::lookup_cgroup(self.cgroup_id).ok_or(FsError::NotFound)?;
         let data = data.trim();
 
         match self.kind {
@@ -606,6 +612,15 @@ impl CgroupCtrlInode {
                 // Resolve current cgroup from the task struct
                 let proc = process::get_process(pid).ok_or(FsError::NotFound)?;
                 let old_cgroup_id = { proc.lock().cgroup_id };
+
+                // P1-3: Delegated managers can only move tasks within their subtree.
+                if is_delegate {
+                    let old_cg = cgroup::lookup_cgroup(old_cgroup_id)
+                        .ok_or(FsError::NotFound)?;
+                    if !old_cg.is_delegated_to(euid) {
+                        return Err(FsError::PermDenied);
+                    }
+                }
 
                 // Migrate task from old cgroup to this cgroup (atomic detach+attach)
                 cgroup::migrate_task(pid_num, old_cgroup_id, self.cgroup_id)
@@ -626,13 +641,15 @@ impl CgroupCtrlInode {
                 // For now, return success (no-op since we don't have subtree_control field)
                 Ok(())
             }
+            // P1-3 NOTE: All limit-setting branches below use `apply_limit`,
+            // which enforces delegation boundary checks when `is_delegate`.
             CtrlKind::CpuWeight => {
                 let weight: u32 = data.parse().map_err(|_| FsError::Invalid)?;
                 let limits = CgroupLimits {
                     cpu_weight: Some(weight),
                     ..Default::default()
                 };
-                cgroup.set_limit(limits).map_err(|_| FsError::Invalid)?;
+                apply_limit(&cgroup, &limits, is_delegate)?;
                 Ok(())
             }
             CtrlKind::CpuMax => {
@@ -651,7 +668,7 @@ impl CgroupCtrlInode {
                     cpu_max: Some((quota, period)),
                     ..Default::default()
                 };
-                cgroup.set_limit(limits).map_err(|_| FsError::Invalid)?;
+                apply_limit(&cgroup, &limits, is_delegate)?;
                 Ok(())
             }
             CtrlKind::MemoryMax => {
@@ -665,7 +682,7 @@ impl CgroupCtrlInode {
                     memory_max: Some(max),
                     ..Default::default()
                 };
-                cgroup.set_limit(limits).map_err(|_| FsError::Invalid)?;
+                apply_limit(&cgroup, &limits, is_delegate)?;
                 Ok(())
             }
             CtrlKind::MemoryHigh => {
@@ -679,7 +696,7 @@ impl CgroupCtrlInode {
                     memory_high: Some(high),
                     ..Default::default()
                 };
-                cgroup.set_limit(limits).map_err(|_| FsError::Invalid)?;
+                apply_limit(&cgroup, &limits, is_delegate)?;
                 Ok(())
             }
             CtrlKind::PidsMax => {
@@ -693,7 +710,7 @@ impl CgroupCtrlInode {
                     pids_max: Some(max),
                     ..Default::default()
                 };
-                cgroup.set_limit(limits).map_err(|_| FsError::Invalid)?;
+                apply_limit(&cgroup, &limits, is_delegate)?;
                 Ok(())
             }
             CtrlKind::IoMax => {
@@ -725,7 +742,7 @@ impl CgroupCtrlInode {
                     io_max_iops_per_sec: iops,
                     ..Default::default()
                 };
-                cgroup.set_limit(limits).map_err(|_| FsError::Invalid)?;
+                apply_limit(&cgroup, &limits, is_delegate)?;
                 Ok(())
             }
             _ => Err(FsError::NotSupported),
@@ -749,12 +766,16 @@ impl Inode for CgroupCtrlInode {
             FileMode::regular(0o644)
         };
 
+        // P1-3: Reflect delegated owner in DAC metadata so non-root
+        // delegated managers pass VFS permission checks on control files.
+        let owner = effective_owner(self.cgroup_id);
+
         Ok(Stat {
             dev: self.fs_id,
             ino: self.ino,
             mode,
             nlink: 1,
-            uid: 0,
+            uid: owner,
             gid: 0,
             rdev: 0,
             size: 0, // Dynamic content
@@ -817,11 +838,70 @@ impl Inode for CgroupCtrlInode {
 // Helper Functions
 // ============================================================================
 
-/// Check if current process has root/admin privileges
-fn is_privileged() -> bool {
-    kernel_core::current_credentials()
-        .map(|creds| creds.euid == 0)
-        .unwrap_or(false)
+/// Returns the effective UID of the current process, if available.
+fn current_euid() -> Option<u32> {
+    kernel_core::current_credentials().map(|c| c.euid)
+}
+
+/// P1-3: Resolve the effective owner UID for a cgroup inode.
+///
+/// Walks the ancestor chain to find the nearest delegation point.
+/// If a delegation exists, the cgroup directory (and its control files)
+/// are owned by the delegated UID so that DAC permission checks pass
+/// for the delegated manager.  Returns 0 (root) if no delegation.
+fn effective_owner(cgroup_id: CgroupId) -> u32 {
+    if let Some(cg) = cgroup::lookup_cgroup(cgroup_id) {
+        if let Some(uid) = cg.delegate_uid() {
+            return uid;
+        }
+        let mut cursor = cg.parent();
+        while let Some(node) = cursor {
+            if let Some(uid) = node.delegate_uid() {
+                return uid;
+            }
+            cursor = node.parent();
+        }
+    }
+    0
+}
+
+/// P1-3: Check if current process is root OR owns the delegated subtree
+/// containing `cgroup_id`.
+fn is_privileged_or_delegate(cgroup_id: CgroupId) -> bool {
+    match current_euid() {
+        Some(0) => true,
+        Some(uid) => cgroup::lookup_cgroup(cgroup_id)
+            .map(|cg| cg.is_delegated_to(uid))
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// P1-3: Apply a resource limit to a cgroup, enforcing delegation boundaries.
+///
+/// When `is_delegate` is true the caller is a non-root delegated manager.
+/// In that case we first verify that the requested limits do not exceed
+/// the effective ancestor limits (via `check_limit_boundary`, which walks
+/// the full ancestor chain), preventing privilege escalation through the
+/// delegation mechanism.
+fn apply_limit(
+    cgroup: &Arc<CgroupNode>,
+    limits: &CgroupLimits,
+    is_delegate: bool,
+) -> Result<(), FsError> {
+    if is_delegate {
+        cgroup.check_limit_boundary(limits).map_err(|e| match e {
+            CgroupError::PermissionDenied => FsError::PermDenied,
+            CgroupError::InvalidLimit => FsError::Invalid,
+            _ => FsError::Invalid,
+        })?;
+    }
+    cgroup.set_limit(limits.clone()).map_err(|e| match e {
+        CgroupError::ControllerDisabled => FsError::Invalid,
+        CgroupError::InvalidLimit => FsError::Invalid,
+        CgroupError::PermissionDenied => FsError::PermDenied,
+        _ => FsError::Invalid,
+    })
 }
 
 // ============================================================================

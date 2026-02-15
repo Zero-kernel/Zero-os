@@ -14,7 +14,6 @@ use crate::process::{
     get_process, terminate_process, with_current_cap_table, ProcessId, ProcessState,
 };
 use cpu_local::{current_cpu, current_cpu_id, max_cpus};
-use crate::usercopy::UserAccessGuard;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -4640,7 +4639,7 @@ const IOV_MAX: usize = 1024;
 /// # Returns
 /// 成功返回写入的总字节数，失败返回错误码
 fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
-    use crate::usercopy::{copy_from_user_safe, UserAccessGuard};
+    use crate::usercopy::copy_from_user_safe;
 
     // 验证 iovcnt
     if iovcnt == 0 {
@@ -4662,31 +4661,32 @@ fn sys_writev(fd: i32, iov: *const Iovec, iovcnt: usize) -> SyscallResult {
 
     // R24-11 fix: Copy iovec array using fault-tolerant usercopy
     // This prevents kernel panic if user unmaps iovec during copy
+    //
+    // P1-6 FIX: Removed outer UserAccessGuard — copy_from_user_safe creates
+    // its own per-chunk guard internally.  An outer guard prevents the
+    // inter-chunk interrupt-restore window, widening the SMAP-bypass.
     let mut iov_array: Vec<Iovec> = Vec::with_capacity(iovcnt);
-    {
-        let _guard = UserAccessGuard::new();
-        for i in 0..iovcnt {
-            // R97-1 FIX: Use checked_mul/checked_add to prevent integer overflow
-            let entry_offset = i
-                .checked_mul(mem::size_of::<Iovec>())
-                .ok_or(SyscallError::EFAULT)?;
-            let entry_ptr = (iov as usize)
-                .checked_add(entry_offset)
-                .ok_or(SyscallError::EFAULT)? as *const u8;
+    for i in 0..iovcnt {
+        // R97-1 FIX: Use checked_mul/checked_add to prevent integer overflow
+        let entry_offset = i
+            .checked_mul(mem::size_of::<Iovec>())
+            .ok_or(SyscallError::EFAULT)?;
+        let entry_ptr = (iov as usize)
+            .checked_add(entry_offset)
+            .ok_or(SyscallError::EFAULT)? as *const u8;
 
-            // Use fault-tolerant copy for each iovec entry
-            let mut entry_bytes = [0u8; mem::size_of::<Iovec>()];
-            if copy_from_user_safe(&mut entry_bytes, entry_ptr).is_err() {
-                return Err(SyscallError::EFAULT);
-            }
-
-            // Safely transmute bytes to Iovec
-            // SAFETY: Iovec is repr(C) and all byte patterns are valid.
-            // R97-1 FIX: Use read_unaligned since entry_bytes has only 1-byte alignment.
-            let iov_entry: Iovec =
-                unsafe { core::ptr::read_unaligned(entry_bytes.as_ptr() as *const Iovec) };
-            iov_array.push(iov_entry);
+        // Use fault-tolerant copy for each iovec entry
+        let mut entry_bytes = [0u8; mem::size_of::<Iovec>()];
+        if copy_from_user_safe(&mut entry_bytes, entry_ptr).is_err() {
+            return Err(SyscallError::EFAULT);
         }
+
+        // Safely transmute bytes to Iovec
+        // SAFETY: Iovec is repr(C) and all byte patterns are valid.
+        // R97-1 FIX: Use read_unaligned since entry_bytes has only 1-byte alignment.
+        let iov_entry: Iovec =
+            unsafe { core::ptr::read_unaligned(entry_bytes.as_ptr() as *const Iovec) };
+        iov_array.push(iov_entry);
     }
 
     // 逐个写入每个缓冲区
@@ -6450,7 +6450,8 @@ fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> Syscal
     }
 
     // Copy mask from userspace
-    let _guard = UserAccessGuard::new();
+    // P1-6 FIX: Removed redundant outer UserAccessGuard — copy_from_user_safe
+    // creates its own guard internally.
     let mut mask_bytes = [0u8; 8];
     crate::usercopy::copy_from_user_safe(&mut mask_bytes, mask).map_err(|_| SyscallError::EFAULT)?;
     let new_mask = normalize_affinity_mask(u64::from_ne_bytes(mask_bytes))?;
@@ -6543,8 +6544,9 @@ fn sys_sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> SyscallR
     }
 
     // Copy mask to userspace
+    // P1-6 FIX: Removed redundant outer UserAccessGuard — copy_to_user_safe
+    // creates its own guard internally.
     let mask_bytes = affinity.to_ne_bytes();
-    let _guard = UserAccessGuard::new();
     crate::usercopy::copy_to_user_safe(mask, &mask_bytes).map_err(|_| SyscallError::EFAULT)?;
 
     // Return number of bytes written (Linux returns the cpumask size)
@@ -8769,7 +8771,7 @@ fn sys_cgroup_set_limit(cgroup_id: u64, limit_type: u32, value: u64) -> Result<u
 /// * On success: 0
 /// * On error: Negative errno
 fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usize, SyscallError> {
-    use crate::usercopy::{copy_to_user_safe, UserAccessGuard};
+    use crate::usercopy::copy_to_user_safe;
 
     // Validate user pointer
     if buf.is_null() {
@@ -8802,9 +8804,10 @@ fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usiz
         io_throttle_events: stats.io_throttle_events,
     };
 
-    // Copy to userspace with SMAP protection
+    // Copy to userspace
+    // P1-6 FIX: Removed redundant outer UserAccessGuard — copy_to_user_safe
+    // creates its own guard internally.
     unsafe {
-        let _guard = UserAccessGuard::new();
         let result_bytes: [u8; core::mem::size_of::<CgroupStatsBuf>()] =
             core::mem::transmute(result);
         if copy_to_user_safe(buf as *mut u8, &result_bytes).is_err() {
@@ -8844,7 +8847,7 @@ pub struct ComplianceStatusBuf {
 /// * On success: 0
 /// * On error: Negative errno (EFAULT if pointer invalid)
 fn sys_compliance_status(buf: *mut ComplianceStatusBuf) -> Result<usize, SyscallError> {
-    use crate::usercopy::{copy_to_user_safe, UserAccessGuard};
+    use crate::usercopy::copy_to_user_safe;
 
     // Validate user pointer
     if buf.is_null() {
@@ -8865,9 +8868,10 @@ fn sys_compliance_status(buf: *mut ComplianceStatusBuf) -> Result<usize, Syscall
         _padding: [0; 5],
     };
 
-    // Copy to userspace with SMAP protection
+    // Copy to userspace
+    // P1-6 FIX: Removed redundant outer UserAccessGuard — copy_to_user_safe
+    // creates its own guard internally.
     unsafe {
-        let _guard = UserAccessGuard::new();
         let result_bytes: [u8; core::mem::size_of::<ComplianceStatusBuf>()] =
             core::mem::transmute(result);
         if copy_to_user_safe(buf as *mut u8, &result_bytes).is_err() {

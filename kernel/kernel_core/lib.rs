@@ -178,7 +178,7 @@ pub use user_namespace::{
 
 // F.2: Cgroup v2 support
 pub use cgroup::{
-    init as init_cgroup, lookup_cgroup, create_cgroup, delete_cgroup,
+    init as init_cgroup, lookup_cgroup, create_cgroup, delete_cgroup, delegate_cgroup,
     root_cgroup, cgroup_count, migrate_task,
     get_effective_cpu_weight, check_fork_allowed, account_cpu_time,
     // R77-2 FIX: Replaced update_memory_usage with read-only get_memory_usage

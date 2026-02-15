@@ -1324,6 +1324,8 @@ pub struct SocketTable {
     created: AtomicU64,
     closed_count: AtomicU64,
     bind_count: AtomicU64,
+    /// P0-2 FIX: Forced TIME_WAIT evictions to admit SYN cookie completions
+    forced_tw_evictions: AtomicU64,
 }
 
 impl SocketTable {
@@ -1362,6 +1364,7 @@ impl SocketTable {
             created: AtomicU64::new(0),
             closed_count: AtomicU64::new(0),
             bind_count: AtomicU64::new(0),
+            forced_tw_evictions: AtomicU64::new(0),
         }
     }
 
@@ -2872,6 +2875,7 @@ impl SocketTable {
             active: self.sockets.read().len(),
             bound_ports: self.udp_bindings.lock().len(),
             timer_sweeps_skipped: self.timer_sweeps_skipped.load(Ordering::Relaxed),
+            forced_tw_evictions: self.forced_tw_evictions.load(Ordering::Relaxed),
         }
     }
 
@@ -3054,6 +3058,99 @@ impl SocketTable {
                 None
             }
         }
+    }
+
+    /// P0-2 FIX: Attempt to reclaim one TCP connection slot by evicting the
+    /// oldest TIME_WAIT entry from `tcp_conns`.
+    ///
+    /// Called exclusively from the SYN cookie ACK validation path when the
+    /// global connection limit is reached.  Under sustained overload the
+    /// normal periodic `sweep_time_wait` may not have run yet, so we do a
+    /// targeted eviction of the single oldest TIME_WAIT socket.
+    ///
+    /// # Lock ordering
+    ///
+    /// `tcp_conns` is locked briefly to collect candidate sockets, then
+    /// released before calling `cleanup_tcp_connection` (which re-locks
+    /// `tcp_conns` internally).  `sock.tcp` is acquired via `try_lock()` to
+    /// avoid deadlock if another core is already processing that socket.
+    ///
+    /// # Returns
+    ///
+    /// `true` if `tcp_conns.len()` is below `TCP_MAX_ACTIVE_CONNECTIONS`
+    /// after cleanup/eviction (i.e. the caller may proceed to create a
+    /// connection).
+    fn try_evict_time_wait_for_cookie(&self, now_ms: u64) -> bool {
+        // Phase 1: collect live socket Arcs while holding tcp_conns briefly.
+        let candidates: Vec<Arc<SocketState>> = {
+            let mut conns = self.tcp_conns.lock();
+            conns.retain(|_, weak| weak.strong_count() > 0);
+            if conns.len() < TCP_MAX_ACTIVE_CONNECTIONS {
+                return true; // stale-Weak pruning alone freed capacity
+            }
+            conns.values().filter_map(|w| w.upgrade()).collect()
+        };
+
+        // Phase 2: scan for the oldest closed TIME_WAIT socket.
+        // Only consider sockets that are both in TIME_WAIT state AND already
+        // marked closed (user-space FD released).  try_lock avoids deadlock
+        // if another core is mid-operation on a socket.
+        let mut oldest_start: u64 = u64::MAX;
+        let mut victim: Option<Arc<SocketState>> = None;
+
+        for sock in &candidates {
+            if !sock.is_closed() {
+                continue; // still has user-space reference
+            }
+            let guard = match sock.tcp.try_lock() {
+                Some(g) => g,
+                None => continue,
+            };
+            let tcp_state = match guard.as_ref() {
+                Some(s) => s,
+                None => continue,
+            };
+            if tcp_state.control.state != TcpState::TimeWait {
+                continue;
+            }
+            // time_wait_start == 0 means just entered — treat as "now".
+            let start = if tcp_state.control.time_wait_start == 0 {
+                now_ms
+            } else {
+                tcp_state.control.time_wait_start
+            };
+            if start < oldest_start {
+                oldest_start = start;
+                victim = Some(sock.clone());
+            }
+        }
+        // Drop candidate list before cleanup (releases Arc refs).
+        drop(candidates);
+
+        let victim = match victim {
+            Some(v) => v,
+            None => return false, // no eligible TIME_WAIT entries to evict
+        };
+        if let Some(mut guard) = victim.tcp.try_lock() {
+            if let Some(tcp_state) = guard.as_mut() {
+                if tcp_state.control.state == TcpState::TimeWait {
+                    tcp_state.control.state = TcpState::Closed;
+                }
+            }
+        }
+        // cleanup_tcp_connection: removes from tcp_conns + dec_active_conn.
+        self.cleanup_tcp_connection(&victim);
+        // Remove from sockets map + decrement namespace quota (mirrors
+        // the sweep_time_wait cleanup path in run_tcp_timers).
+        if self.sockets.write().remove(&victim.id).is_some() {
+            self.dec_ns_count(victim.net_ns_id);
+        }
+        self.forced_tw_evictions.fetch_add(1, Ordering::Relaxed);
+
+        // Phase 4: re-check capacity.
+        let mut conns = self.tcp_conns.lock();
+        conns.retain(|_, weak| weak.strong_count() > 0);
+        conns.len() < TCP_MAX_ACTIVE_CONNECTIONS
     }
 
     /// Process an inbound TCP segment for handshake completion.
@@ -3465,17 +3562,34 @@ impl SocketTable {
                                 header.src_port,
                             );
 
-                            // Check limits before creating connection
+                            // P0-2 FIX: Check limits before creating connection.
+                            // When at capacity, attempt TIME_WAIT eviction so that
+                            // validated SYN cookie completions are not silently
+                            // dropped under sustained load.
                             {
                                 let mut conns = self.tcp_conns.lock();
                                 conns.retain(|_, weak| weak.strong_count() > 0);
-                                if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
-                                    // Connection limit reached
-                                    return None;
-                                }
-                                // Check for duplicate (race condition guard)
+                                // Check for duplicate first (race condition guard)
                                 if conns.get(&syn_key).and_then(|w| w.upgrade()).is_some() {
                                     return None;
+                                }
+                                if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
+                                    // Release lock — try_evict needs it internally.
+                                    drop(conns);
+                                    if !self.try_evict_time_wait_for_cookie(now_ms) {
+                                        // Genuinely no capacity even after eviction.
+                                        return None;
+                                    }
+                                    // Re-check under fresh lock: another core may have
+                                    // consumed the freed slot or inserted a duplicate.
+                                    let mut conns = self.tcp_conns.lock();
+                                    conns.retain(|_, weak| weak.strong_count() > 0);
+                                    if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
+                                        return None;
+                                    }
+                                    if conns.get(&syn_key).and_then(|w| w.upgrade()).is_some() {
+                                        return None;
+                                    }
                                 }
                             }
 
@@ -6020,6 +6134,8 @@ pub struct TableStats {
     pub bound_ports: usize,
     /// R63-5 FIX: Timer sweeps skipped due to lock contention
     pub timer_sweeps_skipped: u64,
+    /// P0-2 FIX: Forced TIME_WAIT evictions to admit SYN cookie completions
+    pub forced_tw_evictions: u64,
 }
 
 // ============================================================================

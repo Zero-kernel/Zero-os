@@ -14,7 +14,7 @@
 //! 0x00 4  magic              = "ZLP2"
 //! 0x04 2  version            = 1
 //! 0x06 2  header_len         = 72
-//! 0x08 4  flags              (reserved)
+//! 0x08 4  flags              (bit 0: HAS_DEPS)
 //! 0x0C 4  reserved0          = 0
 //! 0x10 8  target_addr        (kernel VA of function entry)
 //! 0x18 8  handler_addr       (kernel VA; 0 means handler is in patch_data)
@@ -22,7 +22,7 @@
 //! 0x24 4  reserved1          = 0
 //! 0x28 32 patch_data_sha256  (SHA-256 of patch_data)
 //! 0x48 64 signature          (ECDSA P-256, r||s; covers header||patch_data)
-//! 0x88 .. patch_data         (optional handler code blob)
+//! 0x88 .. patch_data         (dep table if HAS_DEPS + handler code blob)
 //! ```
 //!
 //! # SMP safety
@@ -35,6 +35,8 @@
 #![feature(abi_x86_interrupt)]
 
 extern crate alloc;
+#[macro_use]
+extern crate klog;
 
 // R93-2 FIX: Never allow the insecure ECDSA stub in production builds.
 // R94-7 FIX: Use `not(debug_assertions)` instead of `feature = "release"`.
@@ -224,6 +226,12 @@ const PATCH_HEADER_LEN: usize = 72;
 const PATCH_SIGNATURE_LEN: usize = 64;
 const INT3: u8 = 0xCC;
 
+/// Flag bit 0: patch_data starts with a dependency table.
+const PATCH_FLAG_HAS_DEPS: u32 = 1;
+
+/// Maximum number of dependencies a single patch may declare.
+const MAX_PATCH_DEPS: usize = 4;
+
 /// Limit patch image size copied from userspace.
 pub const MAX_PATCH_BYTES: usize = 64 * 1024;
 
@@ -310,6 +318,82 @@ impl<'a> PatchImage<'a> {
             patch_data,
         })
     }
+}
+
+// ============================================================================
+// Dependency metadata
+// ============================================================================
+
+/// Per-patch dependency metadata, immutable after registration.
+///
+/// Stored in a parallel table alongside `PatchSlot`, protected by `PATCH_REG_LOCK`.
+#[derive(Clone, Copy, Debug)]
+struct PatchMeta {
+    /// Unique identifier for this patch: SHA-256 of patch_data from the ZLPM header.
+    patch_uid: [u8; 32],
+    /// Number of valid entries in `deps` (0..=MAX_PATCH_DEPS).
+    dep_count: u8,
+    /// UIDs of patches that must be in `Enabled` state before this patch can be enabled.
+    deps: [[u8; 32]; MAX_PATCH_DEPS],
+}
+
+/// Extract dependency metadata from a parsed patch image.
+///
+/// If `PATCH_FLAG_HAS_DEPS` is set in the header flags, `patch_data` is prefixed with:
+///
+/// ```text
+/// [0]       dep_count   (1..=4)
+/// [1..33]   dep_uid[0]  (SHA-256)
+/// [33..65]  dep_uid[1]  (if dep_count >= 2)
+/// ...
+/// ```
+///
+/// Returns `(meta, handler_offset)` where `handler_offset` is the byte offset within
+/// `patch_data` where the actual handler code begins (past the dep table).
+fn extract_patch_meta(img: &PatchImage<'_>) -> Result<(PatchMeta, usize), Errno> {
+    let patch_uid = img.header.patch_data_sha256;
+    let mut meta = PatchMeta {
+        patch_uid,
+        dep_count: 0,
+        deps: [[0u8; 32]; MAX_PATCH_DEPS],
+    };
+
+    if (img.header.flags & PATCH_FLAG_HAS_DEPS) == 0 {
+        return Ok((meta, 0));
+    }
+
+    // HAS_DEPS requires at least 1 byte for dep_count.
+    if img.patch_data.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+
+    let dep_count = img.patch_data[0] as usize;
+    if dep_count == 0 || dep_count > MAX_PATCH_DEPS {
+        return Err(Errno::EINVAL);
+    }
+
+    // dep table = 1 byte count + dep_count * 32 bytes UIDs.
+    let table_len = 1usize
+        .checked_add(dep_count.checked_mul(32).ok_or(Errno::EINVAL)?)
+        .ok_or(Errno::EINVAL)?;
+    if img.patch_data.len() < table_len {
+        return Err(Errno::EINVAL);
+    }
+
+    for i in 0..dep_count {
+        let start = 1 + i * 32;
+        meta.deps[i].copy_from_slice(&img.patch_data[start..start + 32]);
+    }
+    meta.dep_count = dep_count as u8;
+
+    // Self-dependency is structurally invalid.
+    for dep_uid in meta.deps.iter().take(dep_count) {
+        if ct_eq(dep_uid, &meta.patch_uid) {
+            return Err(Errno::EINVAL);
+        }
+    }
+
+    Ok((meta, table_len))
 }
 
 // ============================================================================
@@ -407,6 +491,17 @@ static PATCH_REG_LOCK: Mutex<()> = Mutex::new(());
 /// R94-5 FIX: Serialize text patching to prevent concurrent page-permission conflicts.
 static TEXT_PATCH_LOCK: Mutex<()> = Mutex::new(());
 
+/// Per-slot dependency metadata, parallel to PATCH_TABLE.
+///
+/// # Safety
+///
+/// All reads and writes MUST be performed while holding `PATCH_REG_LOCK`.
+/// Entries are immutable between registration and unload — set during
+/// `register_loaded_patch` and cleared during `kpatch_unload`, both under
+/// `PATCH_REG_LOCK`. Read access in `check_dependencies`/`check_no_dependents`
+/// also acquires `PATCH_REG_LOCK`.
+static mut PATCH_META_TABLE: [Option<PatchMeta>; MAX_PATCHES] = [None; MAX_PATCHES];
+
 fn init_patch_table() -> &'static [PatchSlot] {
     let mut v = Vec::with_capacity(MAX_PATCHES);
     for _ in 0..MAX_PATCHES {
@@ -426,19 +521,128 @@ fn patch_table_get() -> Option<&'static [PatchSlot]> {
     PATCH_TABLE.get().copied()
 }
 
-fn find_slot_by_id(id: u64) -> Option<&'static PatchSlot> {
-    for slot in patch_table().iter() {
+fn find_slot_index_by_id(id: u64) -> Option<(usize, &'static PatchSlot)> {
+    for (idx, slot) in patch_table().iter().enumerate() {
         let st = PatchState::from_u8(slot.state.load(Ordering::Acquire));
         if st != PatchState::Empty && slot.id.load(Ordering::Acquire) == id {
-            return Some(slot);
+            return Some((idx, slot));
         }
     }
     None
 }
 
+fn find_slot_by_id(id: u64) -> Option<&'static PatchSlot> {
+    find_slot_index_by_id(id).map(|(_, slot)| slot)
+}
+
 /// Query current state for a loaded patch id.
 pub fn patch_state(id: u64) -> Option<PatchState> {
     find_slot_by_id(id).map(|s| PatchState::from_u8(s.state.load(Ordering::Acquire)))
+}
+
+// ============================================================================
+// Dependency enforcement
+// ============================================================================
+
+/// Verify that all dependencies of the patch at `slot_index` are currently `Enabled`.
+///
+/// Returns `ENOENT` if a required dependency UID is not loaded at all,
+/// or `EBUSY` if a dependency is loaded but not in `Enabled` state.
+///
+/// Must be called before transitioning a patch to `Enabled`.
+fn check_dependencies(slot_index: usize) -> Result<(), Errno> {
+    let table = patch_table();
+    let _guard = PATCH_REG_LOCK.lock();
+
+    // SAFETY: PATCH_REG_LOCK is held.
+    let meta = match unsafe { PATCH_META_TABLE.get(slot_index).copied().flatten() } {
+        Some(m) => m,
+        None => return Err(Errno::EINVAL),
+    };
+
+    let dep_count = meta.dep_count as usize;
+    if dep_count == 0 {
+        return Ok(());
+    }
+
+    for dep_uid in meta.deps.iter().take(dep_count) {
+        let mut found = false;
+        let mut enabled = false;
+
+        for (other_idx, other_slot) in table.iter().enumerate() {
+            if other_idx == slot_index {
+                continue;
+            }
+            let st = PatchState::from_u8(other_slot.state.load(Ordering::Acquire));
+            if st == PatchState::Empty {
+                continue;
+            }
+            // SAFETY: PATCH_REG_LOCK is held.
+            let other_meta = match unsafe { PATCH_META_TABLE.get(other_idx).copied().flatten() } {
+                Some(m) => m,
+                None => continue,
+            };
+            if ct_eq(&other_meta.patch_uid, dep_uid) {
+                found = true;
+                if st == PatchState::Enabled {
+                    enabled = true;
+                }
+                break;
+            }
+        }
+
+        if !found {
+            return Err(Errno::ENOENT);
+        }
+        if !enabled {
+            return Err(Errno::EBUSY);
+        }
+    }
+
+    Ok(())
+}
+
+/// Verify that no `Enabled`/`Enabling` patch depends on the patch at `slot_index`.
+///
+/// Returns `EBUSY` if any active patch lists this patch's UID as a dependency.
+///
+/// Must be called before transitioning a patch to `Disabled` or unloading it.
+fn check_no_dependents(slot_index: usize) -> Result<(), Errno> {
+    let table = patch_table();
+    let _guard = PATCH_REG_LOCK.lock();
+
+    // SAFETY: PATCH_REG_LOCK is held.
+    let meta = match unsafe { PATCH_META_TABLE.get(slot_index).copied().flatten() } {
+        Some(m) => m,
+        None => return Err(Errno::EINVAL),
+    };
+    let patch_uid = meta.patch_uid;
+
+    for (other_idx, other_slot) in table.iter().enumerate() {
+        if other_idx == slot_index {
+            continue;
+        }
+
+        let st = PatchState::from_u8(other_slot.state.load(Ordering::Acquire));
+        if !matches!(st, PatchState::Enabled | PatchState::Enabling) {
+            continue;
+        }
+
+        // SAFETY: PATCH_REG_LOCK is held.
+        let other_meta = match unsafe { PATCH_META_TABLE.get(other_idx).copied().flatten() } {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let dep_count = other_meta.dep_count as usize;
+        for dep_uid in other_meta.deps.iter().take(dep_count) {
+            if ct_eq(dep_uid, &patch_uid) {
+                return Err(Errno::EBUSY);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -715,6 +919,8 @@ struct LoadedPatch {
     handler: usize,
     exec_addr: usize,
     exec_len: usize,
+    /// Dependency metadata extracted from the ZLPM image.
+    meta: PatchMeta,
 }
 
 fn load_patch_from_bytes(patch_bytes: &[u8]) -> Result<LoadedPatch, Errno> {
@@ -733,6 +939,10 @@ fn load_patch_from_bytes(patch_bytes: &[u8]) -> Result<LoadedPatch, Errno> {
     let target = img.header.target_addr as usize;
     validate_patch_target(target)?;
 
+    // P1-4 FIX: Extract dependency metadata from the ZLPM image.
+    // handler_offset is the byte offset past the dep table within patch_data.
+    let (meta, handler_offset) = extract_patch_meta(&img)?;
+
     let mut exec_addr = 0usize;
     let mut exec_len = 0usize;
 
@@ -747,12 +957,13 @@ fn load_patch_from_bytes(patch_bytes: &[u8]) -> Result<LoadedPatch, Errno> {
         }
         h
     } else {
-        // Handler code is provided by patch_data.
-        if img.header.patch_data_len == 0 {
+        // Handler code is provided by patch_data (after optional dep table).
+        let handler_blob = img.patch_data.get(handler_offset..).ok_or(Errno::EINVAL)?;
+        if handler_blob.is_empty() {
             return Err(Errno::EINVAL);
         }
         let ops = ops()?;
-        let len = img.patch_data.len();
+        let len = handler_blob.len();
         let addr = unsafe { ops.alloc_exec(len)? };
         // R94-4 FIX: Validate allocated address is in kernel space.
         if addr == 0 || !is_kernel_canonical_u64(addr as u64) {
@@ -762,7 +973,7 @@ fn load_patch_from_bytes(patch_bytes: &[u8]) -> Result<LoadedPatch, Errno> {
             return Err(Errno::ENOMEM);
         }
         unsafe {
-            core::ptr::copy_nonoverlapping(img.patch_data.as_ptr(), addr as *mut u8, len);
+            core::ptr::copy_nonoverlapping(handler_blob.as_ptr(), addr as *mut u8, len);
             // R94-4: Seal executable region (W^X transition).
             if let Err(e) = ops.seal_exec(addr, len) {
                 ops.free_exec(addr, len);
@@ -789,6 +1000,7 @@ fn load_patch_from_bytes(patch_bytes: &[u8]) -> Result<LoadedPatch, Errno> {
         handler,
         exec_addr,
         exec_len,
+        meta,
     })
 }
 
@@ -800,16 +1012,24 @@ fn register_loaded_patch(p: &LoadedPatch) -> Result<u64, Errno> {
     let _guard = PATCH_REG_LOCK.lock();
 
     // Reject multiple patches to the same target (now race-free under lock).
-    for slot in table.iter() {
+    // P1-4: Also reject duplicate patch UIDs to ensure UID-based dependency
+    // lookup is unambiguous.
+    for (idx, slot) in table.iter().enumerate() {
         let st = PatchState::from_u8(slot.state.load(Ordering::Acquire));
         if st != PatchState::Empty {
             if slot.target.load(Ordering::Acquire) == p.target {
                 return Err(Errno::EBUSY);
             }
+            // SAFETY: PATCH_REG_LOCK is held.
+            if let Some(existing_meta) = unsafe { PATCH_META_TABLE.get(idx).copied().flatten() } {
+                if ct_eq(&existing_meta.patch_uid, &p.meta.patch_uid) {
+                    return Err(Errno::EEXIST);
+                }
+            }
         }
     }
 
-    for slot in table.iter() {
+    for (slot_index, slot) in table.iter().enumerate() {
         if slot
             .state
             .compare_exchange(
@@ -829,7 +1049,14 @@ fn register_loaded_patch(p: &LoadedPatch) -> Result<u64, Errno> {
             slot.orig_valid.store(0, Ordering::Release);
             slot.orig_byte.store(0, Ordering::Release);
             slot.enabled_tsc.store(0, Ordering::Release);
+            // P1-4: Store immutable dependency metadata (PATCH_REG_LOCK is held).
+            // SAFETY: We hold PATCH_REG_LOCK and slot_index < MAX_PATCHES.
+            unsafe { PATCH_META_TABLE[slot_index] = Some(p.meta) };
             slot.state.store(PatchState::Registered as u8, Ordering::Release);
+            klog_always!(
+                "livepatch: loaded id={} target={:#x} handler={:#x} deps={}",
+                id, p.target, p.handler, p.meta.dep_count
+            );
             return Ok(id);
         }
     }
@@ -853,8 +1080,11 @@ pub fn kpatch_register(patch_bytes: &[u8]) -> Result<u64, Errno> {
 }
 
 /// Enable a previously loaded patch by id (installs INT3 at target entry).
+///
+/// P1-4: Before enabling, verifies all declared dependencies are in `Enabled` state.
+/// Returns `ENOENT` if a dependency UID is not loaded, `EBUSY` if not yet enabled.
 pub fn kpatch_enable(id: u64) -> Result<(), Errno> {
-    let slot = find_slot_by_id(id).ok_or(Errno::ENOENT)?;
+    let (slot_index, slot) = find_slot_index_by_id(id).ok_or(Errno::ENOENT)?;
 
     let prev = loop {
         let st = PatchState::from_u8(slot.state.load(Ordering::Acquire));
@@ -882,12 +1112,22 @@ pub fn kpatch_enable(id: u64) -> Result<(), Errno> {
         }
     };
 
+    // P1-4: Dependency gate — all declared deps must be Enabled.
+    if let Err(e) = check_dependencies(slot_index) {
+        slot.state.store(prev as u8, Ordering::Release);
+        return Err(e);
+    }
+
     let res = unsafe { install_int3_detour(slot) };
     match res {
         Ok(()) => {
             // Record enable timestamp for rollback policy.
             slot.enabled_tsc.store(read_tsc(), Ordering::Release);
             slot.state.store(PatchState::Enabled as u8, Ordering::Release);
+            klog_always!(
+                "livepatch: enabled id={} target={:#x}",
+                id, slot.target.load(Ordering::Acquire)
+            );
             Ok(())
         }
         Err(e) => {
@@ -899,8 +1139,11 @@ pub fn kpatch_enable(id: u64) -> Result<(), Errno> {
 }
 
 /// Disable a previously enabled patch by id (restores original first byte).
+///
+/// P1-4: Before disabling, verifies no `Enabled`/`Enabling` patch depends on this one.
+/// Returns `EBUSY` if active dependents exist.
 pub fn kpatch_disable(id: u64) -> Result<(), Errno> {
-    let slot = find_slot_by_id(id).ok_or(Errno::ENOENT)?;
+    let (slot_index, slot) = find_slot_index_by_id(id).ok_or(Errno::ENOENT)?;
 
     let prev = loop {
         let st = PatchState::from_u8(slot.state.load(Ordering::Acquire));
@@ -928,12 +1171,22 @@ pub fn kpatch_disable(id: u64) -> Result<(), Errno> {
         }
     };
 
+    // P1-4: Dependent gate — refuse disable while active patches depend on us.
+    if let Err(e) = check_no_dependents(slot_index) {
+        slot.state.store(prev as u8, Ordering::Release);
+        return Err(e);
+    }
+
     let res = unsafe { restore_original_byte(slot) };
     match res {
         Ok(()) => {
             // Clear enable timestamp since patch is no longer active.
             slot.enabled_tsc.store(0, Ordering::Release);
             slot.state.store(PatchState::Disabled as u8, Ordering::Release);
+            klog_always!(
+                "livepatch: disabled id={} target={:#x}",
+                id, slot.target.load(Ordering::Acquire)
+            );
             Ok(())
         }
         Err(e) => {
@@ -944,9 +1197,15 @@ pub fn kpatch_disable(id: u64) -> Result<(), Errno> {
 }
 
 /// R93-13 FIX: Unload a previously disabled patch by id (frees exec allocation and clears slot).
+///
+/// P1-4: Before unloading, verifies no `Enabled`/`Enabling` patch depends on this one.
 pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
     let ops = ops()?;
-    let slot = find_slot_by_id(id).ok_or(Errno::ENOENT)?;
+    let (slot_index, slot) = find_slot_index_by_id(id).ok_or(Errno::ENOENT)?;
+    let target_addr = slot.target.load(Ordering::Acquire);
+
+    // P1-4: Dependent gate — refuse unload while active patches depend on us.
+    check_no_dependents(slot_index)?;
 
     // R93-13 FIX: Require patch be fully disabled before freeing exec memory / clearing state.
     let st = PatchState::from_u8(slot.state.load(Ordering::Acquire));
@@ -1031,12 +1290,25 @@ pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
     slot.enabled_tsc.store(0, Ordering::Release);
     slot.in_flight.store(0, Ordering::Release); // R103-2 FIX: reset counter
 
-    // Finally, clear the slot.
-    slot.state.store(PatchState::Empty as u8, Ordering::Release);
+    // P1-4: Clear dependency metadata BEFORE advertising the slot as Empty.
+    //
+    // CRITICAL ORDERING: We must hold PATCH_REG_LOCK across both metadata
+    // clear and the Empty transition. Otherwise, a concurrent register_loaded_patch
+    // could claim the slot (sees Empty) and store new metadata, which we would
+    // then overwrite with None.
+    {
+        let _guard = PATCH_REG_LOCK.lock();
+        // SAFETY: PATCH_REG_LOCK is held; slot_index < MAX_PATCHES.
+        unsafe { PATCH_META_TABLE[slot_index] = None };
+        // Now make the slot reusable while still holding the lock.
+        slot.state.store(PatchState::Empty as u8, Ordering::Release);
+    }
 
     if exec_len != 0 {
         unsafe { ops.free_exec(exec_addr, exec_len) };
     }
+
+    klog_always!("livepatch: unloaded id={} target={:#x}", id, target_addr);
     Ok(())
 }
 

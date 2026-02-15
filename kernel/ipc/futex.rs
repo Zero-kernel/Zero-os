@@ -85,7 +85,7 @@ lazy_static::lazy_static! {
 /// 用于 futex_wait 在入队前二次检查值，防止 lost-wake 竞态
 /// R24-5 fix: 验证跨页、使用 SMAP 保护和容错 usercopy
 fn read_user_u32(uaddr: usize) -> Result<u32, FutexError> {
-    use kernel_core::usercopy::{copy_from_user_safe, UserAccessGuard};
+    use kernel_core::usercopy::copy_from_user_safe;
     use mm::page_table::PageTableManager;
     use x86_64::structures::paging::PageTableFlags;
     use x86_64::VirtAddr;
@@ -116,7 +116,8 @@ fn read_user_u32(uaddr: usize) -> Result<u32, FutexError> {
                 }
 
                 // 使用 SMAP 安全的容错复制
-                let _guard = UserAccessGuard::new();
+                // P1-6 FIX: Removed redundant outer UserAccessGuard —
+                // copy_from_user_safe creates its own guard internally.
                 let mut buf = [0u8; 4];
                 copy_from_user_safe(&mut buf, uaddr as *const u8).map_err(|_| FutexError::Fault)?;
                 Ok(u32::from_ne_bytes(buf))
