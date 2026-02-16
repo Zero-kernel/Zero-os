@@ -1078,6 +1078,14 @@ impl AuditRing {
         self.hmac_key.is_set()
     }
 
+    /// Return `(used, capacity)` for ring buffer occupancy reporting.
+    ///
+    /// Used by `read_from_cursor()` to populate `AuditExportBatch::ring_usage`.
+    #[inline]
+    fn usage_fraction(&self) -> (usize, usize) {
+        (self.len, self.buf.len())
+    }
+
     /// Push an event into the ring buffer
     ///
     /// # R65-15 FIX: HMAC Support
@@ -1139,12 +1147,37 @@ impl AuditRing {
     fn read_from_cursor(&self, cursor: u64, max_events: usize) -> AuditExportBatch {
         let tail_hash = self.tail_hash();
 
-        if self.len == 0 || self.buf.is_empty() || max_events == 0 {
+        // P1-2: Compute ring buffer occupancy in basis points (0–10000).
+        let (used, capacity) = self.usage_fraction();
+        let ring_usage: u16 = if capacity > 0 {
+            ((used as u64 * 10000) / capacity as u64) as u16
+        } else {
+            0
+        };
+
+        // P1-2: Determine oldest_id upfront so we can compute dropped_since_cursor
+        // for all return paths (including empty ring / future cursor).
+        let oldest_id = if used == 0 || capacity == 0 {
+            cursor
+        } else {
+            self.buf[self.head].as_ref().map(|e| e.id).unwrap_or(cursor)
+        };
+
+        // P1-2: Events lost between the caller's cursor and the oldest available.
+        let dropped_since_cursor: u64 = if cursor < oldest_id {
+            oldest_id.saturating_sub(cursor)
+        } else {
+            0
+        };
+
+        if used == 0 || capacity == 0 || max_events == 0 {
             return AuditExportBatch {
                 events: Vec::new(),
                 next_cursor: cursor,
                 has_more: false,
                 tail_hash,
+                ring_usage,
+                dropped_since_cursor,
             };
         }
 
@@ -1154,10 +1187,6 @@ impl AuditRing {
         // - If cursor >= next_id: the caller has a stale/future cursor
         //   (e.g., from a reboot); clamp to next_id so the caller polls
         //   for new events instead of missing them.
-        let oldest_id = self.buf[self.head]
-            .as_ref()
-            .map(|e| e.id)
-            .unwrap_or(cursor);
         let start_cursor = if cursor < oldest_id {
             oldest_id
         } else if cursor >= self.next_id {
@@ -1168,6 +1197,8 @@ impl AuditRing {
                 next_cursor: self.next_id,
                 has_more: false,
                 tail_hash,
+                ring_usage,
+                dropped_since_cursor,
             };
         } else {
             cursor
@@ -1192,6 +1223,8 @@ impl AuditRing {
                 next_cursor: start_cursor,
                 has_more: false,
                 tail_hash,
+                ring_usage,
+                dropped_since_cursor,
             };
         };
 
@@ -1225,6 +1258,8 @@ impl AuditRing {
             next_cursor,
             has_more: available > to_take,
             tail_hash,
+            ring_usage,
+            dropped_since_cursor,
         }
     }
 
@@ -1288,17 +1323,42 @@ pub struct AuditExportBatch {
     pub has_more: bool,
     /// Current tail hash of the audit chain (SHA-256).
     pub tail_hash: [u8; 32],
+    /// P1-2: Ring buffer occupancy in basis points (0–10000).
+    ///
+    /// Enables the userspace audit daemon to detect back-pressure and throttle
+    /// high-rate event producers before ring overflow causes event loss.
+    pub ring_usage: u16,
+    /// P1-2: Estimated events evicted between the caller's cursor and the
+    /// oldest event still available in the ring.
+    ///
+    /// When non-zero the daemon knows it missed `dropped_since_cursor` events
+    /// and can emit a synthetic gap marker in the remote syslog stream.
+    pub dropped_since_cursor: u64,
 }
 
 /// Magic value for [`AuditExportHeader`] ("ZAUD" in little-endian).
 pub const AUDIT_EXPORT_MAGIC: u32 = u32::from_le_bytes(*b"ZAUD");
 
 /// Export format version.
-pub const AUDIT_EXPORT_VERSION: u16 = 1;
+///
+/// Version history:
+/// - v1: Initial format (48-byte header)
+/// - v2: Added ring_usage + dropped_since_cursor for remote delivery (64-byte header)
+pub const AUDIT_EXPORT_VERSION: u16 = 2;
 
 /// Fixed-size export header written before `AuditExportRecord[]`.
 ///
 /// All integer fields are stored in little-endian byte order on the wire.
+///
+/// Layout (v2, 64 bytes):
+///   [0..4)    magic              u32
+///   [4..6)    version            u16
+///   [6..8)    record_count       u16
+///   [8..16)   cursor             u64
+///   [16..48)  tail_hash          [u8; 32]
+///   [48..56)  dropped_since_cursor  u64
+///   [56..58)  ring_usage         u16
+///   [58..64)  _reserved          [u8; 6]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuditExportHeader {
@@ -1312,21 +1372,36 @@ pub struct AuditExportHeader {
     pub cursor: u64,
     /// Current chain tail hash (SHA-256).
     pub tail_hash: [u8; 32],
+    /// P1-2: Estimated events evicted between caller's cursor and oldest available.
+    pub dropped_since_cursor: u64,
+    /// P1-2: Ring buffer occupancy in basis points (0–10000).
+    pub ring_usage: u16,
+    /// Reserved for future use; zero-filled.
+    pub _reserved: [u8; 6],
 }
 
 impl AuditExportHeader {
-    /// Serialized size in bytes.
-    pub const SIZE: usize = 48;
+    /// Serialized size in bytes (v2: 64).
+    pub const SIZE: usize = 64;
 
     /// Construct a new header.
     #[inline]
-    pub const fn new(record_count: u16, next_cursor: u64, tail_hash: [u8; 32]) -> Self {
+    pub const fn new(
+        record_count: u16,
+        next_cursor: u64,
+        tail_hash: [u8; 32],
+        ring_usage: u16,
+        dropped_since_cursor: u64,
+    ) -> Self {
         Self {
             magic: AUDIT_EXPORT_MAGIC,
             version: AUDIT_EXPORT_VERSION,
             record_count,
             cursor: next_cursor,
             tail_hash,
+            dropped_since_cursor,
+            ring_usage,
+            _reserved: [0u8; 6],
         }
     }
 
@@ -1339,6 +1414,9 @@ impl AuditExportHeader {
         out[6..8].copy_from_slice(&self.record_count.to_le_bytes());
         out[8..16].copy_from_slice(&self.cursor.to_le_bytes());
         out[16..48].copy_from_slice(&self.tail_hash);
+        out[48..56].copy_from_slice(&self.dropped_since_cursor.to_le_bytes());
+        out[56..58].copy_from_slice(&self.ring_usage.to_le_bytes());
+        // out[58..64] remains zero (_reserved)
         out
     }
 }

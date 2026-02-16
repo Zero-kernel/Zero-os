@@ -1661,6 +1661,8 @@ fn socket_error_to_syscall(err: net::SocketError) -> SyscallError {
         net::SocketError::QuotaExceeded => SyscallError::EAGAIN,
         net::SocketError::Udp(net::UdpError::PayloadTooLarge) => SyscallError::EMSGSIZE,
         net::SocketError::Udp(_) => SyscallError::EINVAL,
+        // R107-5 FIX: Socket ID counter overflow (u64 exhaustion) maps to ENOSPC
+        net::SocketError::IdExhausted => SyscallError::ENOSPC,
         net::SocketError::Lsm(e) => lsm_error_to_syscall(e),
     }
 }
@@ -2116,12 +2118,13 @@ pub fn syscall_dispatcher(
         ),
         48 => sys_shutdown(arg0 as i32, arg1 as i32),
 
-        // F.2 Cgroup v2 syscalls (Zero-OS specific, 500-504)
+        // F.2 Cgroup v2 syscalls (Zero-OS specific, 500-504, 513)
         500 => sys_cgroup_create(arg0 as u64, arg1 as u32),
         501 => sys_cgroup_destroy(arg0 as u64),
         502 => sys_cgroup_attach(arg0 as u64),
         503 => sys_cgroup_set_limit(arg0 as u64, arg1 as u32, arg2),
         504 => sys_cgroup_get_stats(arg0 as u64, arg1 as *mut CgroupStatsBuf),
+        513 => sys_cgroup_delegate(arg0 as u64, arg1 as u64),
 
         // G.3 Compliance syscalls (Zero-OS specific, 505-508)
         505 => sys_compliance_status(arg0 as *mut ComplianceStatusBuf),
@@ -8484,6 +8487,18 @@ pub struct CgroupStatsBuf {
     pub io_throttle_events: u64,
 }
 
+/// P1-3: Returns `true` if the current process's euid is a delegated owner
+/// of `cgroup_id` (or any ancestor in the delegation chain).
+fn is_cgroup_delegated_to_caller(cgroup_id: u64) -> bool {
+    let euid = match crate::process::current_euid() {
+        Some(uid) => uid,
+        None => return false,
+    };
+    cgroup::lookup_cgroup(cgroup_id)
+        .map(|cg| cg.is_delegated_to(euid))
+        .unwrap_or(false)
+}
+
 /// sys_cgroup_create - Create a child cgroup
 ///
 /// # Arguments
@@ -8503,12 +8518,12 @@ pub struct CgroupStatsBuf {
 /// future namespace-aware delegation.
 fn sys_cgroup_create(parent_id: u64, controllers: u32) -> Result<usize, SyscallError> {
     // R93-17 FIX: Capability-based access control for cgroup creation
-    // Check for CAP_SYS_ADMIN capability, falling back to root check for compatibility
+    // P1-3: Also allow delegated owners of the parent cgroup
     let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
     let has_cap_admin =
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
 
-    if !has_cap_admin && creds.euid != 0 {
+    if !has_cap_admin && creds.euid != 0 && !is_cgroup_delegated_to_caller(parent_id) {
         return Err(SyscallError::EPERM);
     }
 
@@ -8544,11 +8559,13 @@ fn sys_cgroup_create(parent_id: u64, controllers: u32) -> Result<usize, SyscallE
 /// Requires CAP_SYS_ADMIN capability. Cgroup must be empty.
 fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
     // R93-17 FIX: Capability-based access control for cgroup destruction
+    // P1-3: Also allow delegated owners (delegation checked on the cgroup itself,
+    // since delegation inherits from ancestors)
     let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
     let has_cap_admin =
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
 
-    if !has_cap_admin && creds.euid != 0 {
+    if !has_cap_admin && creds.euid != 0 && !is_cgroup_delegated_to_caller(cgroup_id) {
         return Err(SyscallError::EPERM);
     }
 
@@ -8556,6 +8573,44 @@ fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
         Ok(()) => Ok(0),
         Err(cgroup::CgroupError::NotFound) => Err(SyscallError::ENOENT),
         Err(cgroup::CgroupError::NotEmpty) => Err(SyscallError::EBUSY),
+        Err(cgroup::CgroupError::PermissionDenied) => Err(SyscallError::EPERM),
+        Err(_) => Err(SyscallError::EINVAL),
+    }
+}
+
+/// sys_cgroup_delegate (513) — Delegate management of a cgroup subtree to a UID.
+///
+/// # Arguments
+/// * `cgroup_id` - ID of cgroup to delegate
+/// * `uid` - Target UID, or `u64::MAX` to revoke delegation
+///
+/// # Returns
+/// * On success: 0
+/// * On error: Negative errno (EPERM, ENOENT, EINVAL)
+///
+/// # Security
+///
+/// Root-only (euid == 0). Delegation allows the specified UID to create/delete
+/// children, set limits (bounded by parent ceilings), and migrate owned tasks
+/// within the cgroup and its descendants. Pass `uid = u64::MAX` to revoke.
+fn sys_cgroup_delegate(cgroup_id: u64, uid: u64) -> Result<usize, SyscallError> {
+    let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+    if creds.euid != 0 {
+        return Err(SyscallError::EPERM);
+    }
+
+    let delegate_uid = if uid == u64::MAX {
+        None
+    } else {
+        if uid > u32::MAX as u64 {
+            return Err(SyscallError::EINVAL);
+        }
+        Some(uid as u32)
+    };
+
+    match cgroup::delegate_cgroup(cgroup_id, delegate_uid) {
+        Ok(()) => Ok(0),
+        Err(cgroup::CgroupError::NotFound) => Err(SyscallError::ENOENT),
         Err(cgroup::CgroupError::PermissionDenied) => Err(SyscallError::EPERM),
         Err(_) => Err(SyscallError::EINVAL),
     }
@@ -8622,17 +8677,27 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     let is_root = creds.euid == 0;
 
     if !is_root {
-        // Non-root users need CAP_SYS_ADMIN capability
-        let has_cap_admin =
-            with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
-        if !has_cap_admin {
-            return Err(SyscallError::EPERM);
-        }
+        // P1-3: Delegated owners of the target cgroup may attach without
+        // CAP_SYS_ADMIN, but are still subject to the descendant-or-delegated
+        // check to prevent cgroup escape.
+        if is_cgroup_delegated_to_caller(cgroup_id) {
+            // Delegated user: verify target is within the delegated subtree.
+            // is_delegated_to() already walks ancestors, so if the target cgroup
+            // is delegated to us, attaching is safe.
+        } else {
+            // Non-delegated, non-root: need CAP_SYS_ADMIN + descendant check
+            let has_cap_admin =
+                with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN))
+                    .unwrap_or(false);
+            if !has_cap_admin {
+                return Err(SyscallError::EPERM);
+            }
 
-        // R93-5 FIX: Non-root can only move to descendant cgroups to prevent escape
-        // This prevents moving from a restricted child to a less-restricted parent
-        if !cgroup_is_descendant_of(cgroup_id, old_cgroup_id) {
-            return Err(SyscallError::EPERM);
+            // R93-5 FIX: Non-root can only move to descendant cgroups to prevent escape
+            // This prevents moving from a restricted child to a less-restricted parent
+            if !cgroup_is_descendant_of(cgroup_id, old_cgroup_id) {
+                return Err(SyscallError::EPERM);
+            }
         }
     }
 
@@ -8698,11 +8763,13 @@ const CGROUP_LIMIT_IO_MAX_IOPS: u32 = 7;
 /// Requires CAP_SYS_ADMIN capability to set limits.
 fn sys_cgroup_set_limit(cgroup_id: u64, limit_type: u32, value: u64) -> Result<usize, SyscallError> {
     // R93-17 FIX: Capability-based access control for setting limits
+    // P1-3: Delegated owners may set limits bounded by parent ceilings
     let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
     let has_cap_admin =
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
 
-    if !has_cap_admin && creds.euid != 0 {
+    let is_delegated = !has_cap_admin && creds.euid != 0 && is_cgroup_delegated_to_caller(cgroup_id);
+    if !has_cap_admin && creds.euid != 0 && !is_delegated {
         return Err(SyscallError::EPERM);
     }
 
@@ -8751,6 +8818,15 @@ fn sys_cgroup_set_limit(cgroup_id: u64, limit_type: u32, value: u64) -> Result<u
             limits.io_max_iops_per_sec = Some(value);
         }
         _ => return Err(SyscallError::EINVAL),
+    }
+
+    // P1-3: Delegated (non-root, non-admin) users must satisfy hierarchical
+    // boundary checks — they cannot set limits that exceed their ancestors'
+    // effective limits, preventing privilege escalation via delegation.
+    if is_delegated {
+        if let Err(_) = cgroup_node.check_limit_boundary(&limits) {
+            return Err(SyscallError::EPERM);
+        }
     }
 
     match cgroup_node.set_limit(limits) {
@@ -9019,7 +9095,7 @@ static AUDIT_EXPORT_LIMITER: spin::Mutex<AuditExportTokenBucket> =
 /// # ABI
 ///
 /// The buffer is filled with:
-/// - [`audit::AuditExportHeader`] (48 bytes): magic `"ZAUD"`, version, record_count, next cursor, tail hash
+/// - [`audit::AuditExportHeader`] (64 bytes): magic `"ZAUD"`, version 2, record_count, next cursor, tail hash, dropped_since_cursor, ring_usage
 /// - [`audit::AuditExportRecord`] array (128 bytes each): fixed-size per-event records
 ///
 /// The header's `cursor` field is the next cursor to use (`last_id + 1`).
@@ -9058,7 +9134,13 @@ fn sys_audit_export(
     }
 
     let buf_addr = buf as usize;
+    // R107-6 FIX: Validate both buffer start AND end against user-space boundaries.
+    // Without end-of-buffer check, a malicious caller could pass buf near USER_SPACE_TOP
+    // with a large buf_len, causing wrapping_add to produce kernel-space addresses.
     if buf_addr < crate::usercopy::MMAP_MIN_ADDR || buf_addr >= USER_SPACE_TOP {
+        return Err(SyscallError::EFAULT);
+    }
+    if buf_len > USER_SPACE_TOP - buf_addr {
         return Err(SyscallError::EFAULT);
     }
 
@@ -9108,7 +9190,13 @@ fn sys_audit_export(
     let record_count = core::cmp::min(exported, u16::MAX as usize) as u16;
 
     // Write header.
-    let header = audit::AuditExportHeader::new(record_count, batch.next_cursor, batch.tail_hash);
+    let header = audit::AuditExportHeader::new(
+        record_count,
+        batch.next_cursor,
+        batch.tail_hash,
+        batch.ring_usage,
+        batch.dropped_since_cursor,
+    );
     let header_bytes = header.to_bytes();
     if copy_to_user_safe(buf, &header_bytes).is_err() {
         AUDIT_EXPORT_LIMITER.lock().refund(reserved);
@@ -9122,7 +9210,16 @@ fn sys_audit_export(
         let record_bytes = record.to_bytes();
 
         let offset = HEADER_SIZE + i * RECORD_SIZE;
-        let dst = (buf as usize).wrapping_add(offset) as *mut u8;
+        // R107-6 FIX: Use checked_add for defense-in-depth. The upfront buf_len boundary
+        // check guarantees this cannot overflow, but checked_add makes the intent explicit.
+        let dst_addr = match (buf as usize).checked_add(offset) {
+            Some(addr) => addr,
+            None => {
+                AUDIT_EXPORT_LIMITER.lock().refund(reserved);
+                return Err(SyscallError::EFAULT);
+            }
+        };
+        let dst = dst_addr as *mut u8;
         if copy_to_user_safe(dst, &record_bytes).is_err() {
             AUDIT_EXPORT_LIMITER.lock().refund(reserved);
             return Err(SyscallError::EFAULT);

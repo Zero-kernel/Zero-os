@@ -782,6 +782,7 @@ impl NetworkLoopbackTest {
 
         // Check that table can perform lookups (doesn't panic)
         let test_key = conntrack::FlowKey {
+            net_ns_id: 0,
             ip_lo: [10, 0, 0, 1],
             ip_hi: [10, 0, 0, 2],
             port_lo: 80,

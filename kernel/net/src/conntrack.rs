@@ -73,6 +73,9 @@ pub const IPPROTO_UDP: u8 = 17;
 /// Direction is tracked separately in the entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FlowKey {
+    /// R107-2 FIX: Network namespace ID for cross-namespace isolation.
+    /// Uses raw u64 to avoid cap crate dependency in the conntrack module.
+    pub net_ns_id: u64,
     /// Protocol number (TCP=6, UDP=17, ICMP=1)
     pub proto: u8,
     /// Lower IP address (for normalization)
@@ -89,7 +92,9 @@ impl FlowKey {
     /// Create a normalized flow key from packet fields.
     ///
     /// Returns the key and the direction (Original if src < dst, Reply otherwise).
+    /// R107-2 FIX: Includes network namespace ID for cross-namespace isolation.
     pub fn from_packet(
+        net_ns_id: u64,
         proto: u8,
         src_ip: Ipv4Addr,
         dst_ip: Ipv4Addr,
@@ -102,6 +107,7 @@ impl FlowKey {
         if src_tuple <= dst_tuple {
             (
                 Self {
+                    net_ns_id,
                     proto,
                     ip_lo: src_ip.0,
                     ip_hi: dst_ip.0,
@@ -113,6 +119,7 @@ impl FlowKey {
         } else {
             (
                 Self {
+                    net_ns_id,
                     proto,
                     ip_lo: dst_ip.0,
                     ip_hi: src_ip.0,
@@ -125,7 +132,9 @@ impl FlowKey {
     }
 
     /// Create a flow key for ICMP (using type/code/id as port fields).
+    /// R107-2 FIX: Includes network namespace ID for cross-namespace isolation.
     pub fn from_icmp(
+        net_ns_id: u64,
         src_ip: Ipv4Addr,
         dst_ip: Ipv4Addr,
         icmp_type: u8,
@@ -134,7 +143,7 @@ impl FlowKey {
     ) -> (Self, ConntrackDir) {
         // Pack type/code into port_lo, id into port_hi
         let pseudo_port = ((icmp_type as u16) << 8) | (icmp_code as u16);
-        Self::from_packet(IPPROTO_ICMP, src_ip, dst_ip, pseudo_port, icmp_id)
+        Self::from_packet(net_ns_id, IPPROTO_ICMP, src_ip, dst_ip, pseudo_port, icmp_id)
     }
 }
 
@@ -574,8 +583,10 @@ impl ConntrackTable {
     /// Update conntrack state on packet arrival.
     ///
     /// This is the main entry point for packet processing.
+    /// R107-2 FIX: Namespace-isolated conntrack lookup and creation.
     pub fn update_on_packet(
         &self,
+        net_ns_id: u64,
         proto: u8,
         src_ip: Ipv4Addr,
         dst_ip: Ipv4Addr,
@@ -584,7 +595,7 @@ impl ConntrackTable {
         l4: &L4Meta,
         now_ms: u64,
     ) -> CtUpdateResult {
-        let (key, dir) = FlowKey::from_packet(proto, src_ip, dst_ip, src_port, dst_port);
+        let (key, dir) = FlowKey::from_packet(net_ns_id, proto, src_ip, dst_ip, src_port, dst_port);
 
         // Fast path: check existing entry with read lock
         {
@@ -1030,7 +1041,9 @@ pub fn conntrack_table() -> &'static ConntrackTable {
 // ============================================================================
 
 /// Process a TCP packet through conntrack.
+/// R107-2 FIX: Namespace-isolated conntrack processing.
 pub fn ct_process_tcp(
+    net_ns_id: u64,
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
     src_port: u16,
@@ -1040,11 +1053,22 @@ pub fn ct_process_tcp(
     now_ms: u64,
 ) -> CtUpdateResult {
     let l4 = L4Meta::new(tcp_flags, payload_len);
-    conntrack_table().update_on_packet(IPPROTO_TCP, src_ip, dst_ip, src_port, dst_port, &l4, now_ms)
+    conntrack_table().update_on_packet(
+        net_ns_id,
+        IPPROTO_TCP,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        &l4,
+        now_ms,
+    )
 }
 
 /// Process a UDP packet through conntrack.
+/// R107-2 FIX: Namespace-isolated conntrack processing.
 pub fn ct_process_udp(
+    net_ns_id: u64,
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
     src_port: u16,
@@ -1053,7 +1077,16 @@ pub fn ct_process_udp(
     now_ms: u64,
 ) -> CtUpdateResult {
     let l4 = L4Meta::new(0, payload_len);
-    conntrack_table().update_on_packet(IPPROTO_UDP, src_ip, dst_ip, src_port, dst_port, &l4, now_ms)
+    conntrack_table().update_on_packet(
+        net_ns_id,
+        IPPROTO_UDP,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        &l4,
+        now_ms,
+    )
 }
 
 /// Process an ICMP packet through connection tracking.
@@ -1063,7 +1096,10 @@ pub fn ct_process_udp(
 /// - ICMP error messages (Type 3, 11, etc.) are RELATED to existing connections
 /// - Other ICMP messages are treated as NEW
 ///
+/// R107-2 FIX: Namespace-isolated conntrack processing.
+///
 /// # Arguments
+/// * `net_ns_id` - Network namespace ID
 /// * `src_ip` - Source IP address
 /// * `dst_ip` - Destination IP address
 /// * `icmp_type` - ICMP message type
@@ -1071,6 +1107,7 @@ pub fn ct_process_udp(
 /// * `payload_len` - Length of payload
 /// * `now_ms` - Current time in milliseconds
 pub fn ct_process_icmp(
+    net_ns_id: u64,
     src_ip: Ipv4Addr,
     dst_ip: Ipv4Addr,
     icmp_type: u8,
@@ -1099,6 +1136,7 @@ pub fn ct_process_icmp(
     }
 
     conntrack_table().update_on_packet(
+        net_ns_id,
         IPPROTO_ICMP,
         src_ip,
         dst_ip,

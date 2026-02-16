@@ -554,11 +554,61 @@ pub fn get_stats() -> InterruptStatsSnapshot {
 // CPU异常处理器 (0-31)
 // ============================================================================
 
+/// R107-1 FIX: Shared helper for user-mode exception discrimination.
+///
+/// Checks whether the CPU exception originated from Ring 3 (user-mode) by
+/// inspecting the CS RPL (Request Privilege Level) in the saved stack frame.
+/// If user-mode, terminates the offending process with the specified signal
+/// exit code and requests a reschedule. Returns `true` if handled (caller
+/// should return), `false` if kernel-mode (caller should panic).
+///
+/// This prevents user-triggerable kernel panics across all exception handlers.
+/// The CS RPL check is the same technique used by `timer_interrupt_handler`.
+///
+/// # Arguments
+///
+/// * `stack_frame` - Saved interrupt stack frame containing CS selector
+/// * `exit_code` - Process exit code (128 + signal number per POSIX convention)
+///
+/// # Exit Codes
+///
+/// | Signal | Number | Exit Code | Exceptions |
+/// |--------|--------|-----------|------------|
+/// | SIGILL | 4 | 132 | #UD |
+/// | SIGBUS | 7 | 135 | #AC |
+/// | SIGFPE | 8 | 136 | #DE, #OF, #MF, #XM |
+/// | SIGSEGV | 11 | 139 | #BR, #GP |
+#[inline]
+fn handle_user_exception(stack_frame: &InterruptStackFrame, exit_code: i32) -> bool {
+    // CS selector low 2 bits = RPL (Ring Privilege Level).
+    // RPL == 3 indicates the exception occurred in user-mode (Ring 3).
+    let is_user_mode = (stack_frame.code_segment.0 & 0x3) == 3;
+    if !is_user_mode {
+        return false;
+    }
+
+    if let Some(pid) = current_pid() {
+        kernel_core::process::terminate_process(pid, exit_code);
+        kernel_core::request_resched_from_irq();
+        return true;
+    }
+
+    // No current PID despite CS.RPL==3: this is a kernel bug (orphaned user-mode
+    // context). Fall through to panic rather than silently ignoring.
+    false
+}
+
 /// #DE - Divide Error (除法错误)
-extern "x86-interrupt" fn divide_error_handler(_stack_frame: InterruptStackFrame) {
+///
+/// R107-1 FIX: Check user-mode origin before panicking. User-mode divide-by-zero
+/// terminates the process with SIGFPE (exit code 136) instead of crashing the kernel.
+extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
     clac_if_smap();
     INTERRUPT_STATS.divide_error.fetch_add(1, Ordering::Relaxed);
-    // 注意：中断处理程序中不使用 kprintln! 以避免死锁
+    // R107-1 FIX: User-mode #DE → terminate process with SIGFPE (128 + 8 = 136)
+    if handle_user_exception(&stack_frame, 136) {
+        return;
+    }
     panic!("Divide by zero or division overflow");
 }
 
@@ -582,34 +632,58 @@ extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) 
 }
 
 /// #OF - Overflow (溢出)
-extern "x86-interrupt" fn overflow_handler(_stack_frame: InterruptStackFrame) {
+///
+/// R107-1 FIX: User-mode overflow terminates process with SIGFPE instead of kernel panic.
+extern "x86-interrupt" fn overflow_handler(stack_frame: InterruptStackFrame) {
     clac_if_smap();
     INTERRUPT_STATS.overflow.fetch_add(1, Ordering::Relaxed);
+    // R107-1 FIX: User-mode #OF → terminate process with SIGFPE (128 + 8 = 136)
+    if handle_user_exception(&stack_frame, 136) {
+        return;
+    }
     panic!("Arithmetic overflow");
 }
 
 /// #BR - Bound Range Exceeded (边界范围超出)
-extern "x86-interrupt" fn bound_range_exceeded_handler(_stack_frame: InterruptStackFrame) {
+///
+/// R107-1 FIX: User-mode bound violation terminates process with SIGSEGV instead of kernel panic.
+extern "x86-interrupt" fn bound_range_exceeded_handler(stack_frame: InterruptStackFrame) {
     clac_if_smap();
     INTERRUPT_STATS
         .bound_range_exceeded
         .fetch_add(1, Ordering::Relaxed);
+    // R107-1 FIX: User-mode #BR → terminate process with SIGSEGV (128 + 11 = 139)
+    if handle_user_exception(&stack_frame, 139) {
+        return;
+    }
     panic!("Bound range exceeded");
 }
 
 /// #UD - Invalid Opcode (无效操作码)
+///
+/// R107-1 FIX: User-mode invalid opcode terminates process with SIGILL instead of kernel panic.
+/// R107-4 FIX: Serial output guarded by `#[cfg(debug_assertions)]` to prevent KASLR bypass.
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     clac_if_smap();
     INTERRUPT_STATS
         .invalid_opcode
         .fetch_add(1, Ordering::Relaxed);
-    // Debug output for Ring 3 issues
+    // R107-1 FIX: User-mode #UD → terminate process with SIGILL (128 + 4 = 132)
+    if handle_user_exception(&stack_frame, 132) {
+        return;
+    }
+    // R107-4 FIX: Only output RIP/RSP in debug builds to avoid leaking kernel addresses
+    #[cfg(debug_assertions)]
     unsafe {
         serial_write_str("\n[#UD] Invalid opcode at RIP=");
         serial_write_hex(stack_frame.instruction_pointer.as_u64());
         serial_write_str(" RSP=");
         serial_write_hex(stack_frame.stack_pointer.as_u64());
         serial_write_str("\n");
+    }
+    #[cfg(not(debug_assertions))]
+    unsafe {
+        serial_write_str("\n[#UD]\n");
     }
     panic!("Invalid or undefined opcode");
 }
@@ -755,6 +829,10 @@ extern "x86-interrupt" fn stack_segment_fault_handler(
 }
 
 /// #GP - General Protection Fault (一般保护错误)
+///
+/// R107-1 FIX: User-mode #GP (e.g., `cli`/`hlt` in Ring 3) terminates the process
+/// with SIGSEGV instead of crashing the kernel.
+/// R107-4 FIX: Serial output guarded by `#[cfg(debug_assertions)]` to prevent KASLR bypass.
 extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
@@ -762,7 +840,16 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
 
-    // Output to serial immediately - no heap/VGA
+    INTERRUPT_STATS
+        .general_protection_fault
+        .fetch_add(1, Ordering::Relaxed);
+    // R107-1 FIX: User-mode #GP → terminate process with SIGSEGV (128 + 11 = 139)
+    if handle_user_exception(&stack_frame, 139) {
+        return;
+    }
+
+    // R107-4 FIX: Only output RIP in debug builds to prevent leaking kernel addresses
+    #[cfg(debug_assertions)]
     unsafe {
         serial_write_str("\n[GPF] error=");
         serial_write_hex(error_code);
@@ -770,9 +857,12 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         serial_write_hex(stack_frame.instruction_pointer.as_u64());
         serial_write_str("\n");
     }
-    INTERRUPT_STATS
-        .general_protection_fault
-        .fetch_add(1, Ordering::Relaxed);
+    #[cfg(not(debug_assertions))]
+    unsafe {
+        serial_write_str("\n[GPF] error=");
+        serial_write_hex(error_code);
+        serial_write_str("\n");
+    }
     panic!("General protection fault");
 }
 
@@ -947,20 +1037,32 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 /// #MF - x87 Floating-Point Exception (x87浮点异常)
-extern "x86-interrupt" fn x87_floating_point_handler(_stack_frame: InterruptStackFrame) {
+///
+/// R107-1 FIX: User-mode FP exception terminates process with SIGFPE instead of kernel panic.
+extern "x86-interrupt" fn x87_floating_point_handler(stack_frame: InterruptStackFrame) {
     clac_if_smap();
+    // R107-1 FIX: User-mode #MF → terminate process with SIGFPE (128 + 8 = 136)
+    if handle_user_exception(&stack_frame, 136) {
+        return;
+    }
     panic!("x87 floating-point exception");
 }
 
 /// #AC - Alignment Check (对齐检查)
+///
+/// R107-1 FIX: User-mode alignment check terminates process with SIGBUS instead of kernel panic.
 extern "x86-interrupt" fn alignment_check_handler(
-    _stack_frame: InterruptStackFrame,
+    stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) {
     clac_if_smap();
     INTERRUPT_STATS
         .alignment_check
         .fetch_add(1, Ordering::Relaxed);
+    // R107-1 FIX: User-mode #AC → terminate process with SIGBUS (128 + 7 = 135)
+    if handle_user_exception(&stack_frame, 135) {
+        return;
+    }
     panic!("Alignment check failed");
 }
 
@@ -974,11 +1076,17 @@ extern "x86-interrupt" fn machine_check_handler(_stack_frame: InterruptStackFram
 }
 
 /// #XM - SIMD Floating-Point Exception (SIMD浮点异常)
-extern "x86-interrupt" fn simd_floating_point_handler(_stack_frame: InterruptStackFrame) {
+///
+/// R107-1 FIX: User-mode SIMD FP exception terminates process with SIGFPE instead of kernel panic.
+extern "x86-interrupt" fn simd_floating_point_handler(stack_frame: InterruptStackFrame) {
     clac_if_smap();
     INTERRUPT_STATS
         .simd_floating_point
         .fetch_add(1, Ordering::Relaxed);
+    // R107-1 FIX: User-mode #XM → terminate process with SIGFPE (128 + 8 = 136)
+    if handle_user_exception(&stack_frame, 136) {
+        return;
+    }
     panic!("SIMD floating-point exception");
 }
 

@@ -381,6 +381,7 @@ fn process_ipv4(
                 our_mac,
                 our_ip,
                 stats,
+                net_ns_id,
                 now_ms,
                 is_broadcast_dst,
             )
@@ -472,6 +473,8 @@ fn process_udp(
     let ct_result = {
         use crate::conntrack::ct_process_udp;
         Some(ct_process_udp(
+            // R107-2 FIX: Include network namespace in conntrack key.
+            net_ns_id.0,
             ip_hdr.src,
             ip_hdr.dst,
             header.src_port,
@@ -528,6 +531,8 @@ fn process_icmp(
     our_mac: EthAddr,
     our_ip: Ipv4Addr,
     stats: &NetStats,
+    // R107-2 FIX: ICMP conntrack must be namespace-isolated.
+    net_ns_id: NamespaceId,
     now_ms: u64,
     is_broadcast_dst: bool,
 ) -> ProcessResult {
@@ -548,6 +553,8 @@ fn process_icmp(
     let ct_result = {
         use crate::conntrack::ct_process_icmp;
         Some(ct_process_icmp(
+            // R107-2 FIX: Include network namespace in conntrack key.
+            net_ns_id.0,
             ip_hdr.src,
             ip_hdr.dst,
             icmp_hdr.icmp_type,
@@ -693,6 +700,8 @@ fn process_tcp(
     let ct_result = {
         use crate::conntrack::ct_process_tcp;
         Some(ct_process_tcp(
+            // R107-2 FIX: Include network namespace in conntrack key.
+            net_ns_id.0,
             ip_hdr.src,
             ip_hdr.dst,
             tcp_hdr.src_port,

@@ -1238,6 +1238,8 @@ pub enum SocketError {
     PortInUse,
     /// No ephemeral ports available
     NoPorts,
+    /// R107-5: Socket ID space exhausted (u64 counter wrapped around)
+    IdExhausted,
     /// Socket not bound (sendto without prior bind)
     NotBound,
     /// Socket is closed
@@ -1431,8 +1433,20 @@ impl SocketTable {
             return Err(SocketError::PermissionDenied);
         }
 
-        // Allocate socket ID
-        let id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
+        // R107-5 FIX: Allocate socket ID with overflow protection.
+        // Uses fetch_update + checked_add to prevent u64 wrap-around and ID collision,
+        // matching the R105-5 pattern applied to IPC endpoint IDs.
+        let id = match self.next_socket_id.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_add(1),
+        ) {
+            Ok(prev) => prev,
+            Err(_) => {
+                self.dec_ns_count(net_ns_id); // Rollback quota
+                return Err(SocketError::IdExhausted);
+            }
+        };
 
         // Create socket state with namespace binding
         let sock = Arc::new(SocketState::new(
@@ -1488,8 +1502,20 @@ impl SocketTable {
             return Err(SocketError::PermissionDenied);
         }
 
-        // Allocate socket ID
-        let id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
+        // R107-5 FIX: Allocate socket ID with overflow protection.
+        // Uses fetch_update + checked_add to prevent u64 wrap-around and ID collision,
+        // matching the R105-5 pattern applied to IPC endpoint IDs.
+        let id = match self.next_socket_id.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| current.checked_add(1),
+        ) {
+            Ok(prev) => prev,
+            Err(_) => {
+                self.dec_ns_count(net_ns_id); // Rollback quota
+                return Err(SocketError::IdExhausted);
+            }
+        };
 
         // Create socket state with namespace binding
         let sock = Arc::new(SocketState::new(
@@ -3343,6 +3369,34 @@ impl SocketTable {
                                 );
 
                                 // No state allocated - SYN cookie is stateless
+                                // R107-3 FIX: Seed synthetic conntrack state so the
+                                // returning ACK is not classified as invalid mid-stream.
+                                // Step 1: Register the incoming SYN (creates SynSent entry)
+                                // Step 2: Register the outgoing SYN-ACK (advances to SynRecv)
+                                #[cfg(feature = "conntrack")]
+                                {
+                                    use crate::conntrack::ct_process_tcp;
+                                    let _ = ct_process_tcp(
+                                        listener.net_ns_id.0,
+                                        src_ip,
+                                        dst_ip,
+                                        header.src_port,
+                                        header.dst_port,
+                                        header.flags,
+                                        payload.len(),
+                                        now_ms,
+                                    );
+                                    let _ = ct_process_tcp(
+                                        listener.net_ns_id.0,
+                                        dst_ip,
+                                        src_ip,
+                                        header.dst_port,
+                                        header.src_port,
+                                        TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                        0,
+                                        now_ms,
+                                    );
+                                }
                                 return Some(syn_ack);
                             }
 
@@ -3359,7 +3413,18 @@ impl SocketTable {
 
                             // Create child socket inheriting listener properties
                             // R75-1 FIX: Child socket inherits parent listener's network namespace
-                            let child_id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
+                            // R107-5 FIX: Overflow-safe socket ID allocation
+                            let child_id = match self.next_socket_id.fetch_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |current| current.checked_add(1),
+                            ) {
+                                Ok(prev) => prev,
+                                Err(_) => {
+                                    self.dec_ns_count(listener.net_ns_id); // Rollback quota
+                                    return None; // ID space exhausted, drop like backlog-full
+                                }
+                            };
                             let child = Arc::new(SocketState::new(
                                 child_id,
                                 listener.domain,
@@ -3512,6 +3577,32 @@ impl SocketTable {
                                 &syn_ack_options,
                                 &[],
                             );
+                            // R107-3 FIX: Seed synthetic conntrack state for this
+                            // SYN-cookie handshake (SYN-ACK retry path).
+                            #[cfg(feature = "conntrack")]
+                            {
+                                use crate::conntrack::ct_process_tcp;
+                                let _ = ct_process_tcp(
+                                    listener.net_ns_id.0,
+                                    src_ip,
+                                    dst_ip,
+                                    header.src_port,
+                                    header.dst_port,
+                                    header.flags,
+                                    payload.len(),
+                                    now_ms,
+                                );
+                                let _ = ct_process_tcp(
+                                    listener.net_ns_id.0,
+                                    dst_ip,
+                                    src_ip,
+                                    header.dst_port,
+                                    header.src_port,
+                                    TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                    0,
+                                    now_ms,
+                                );
+                            }
                             return Some(cookie_syn_ack);
                         }
                     }
@@ -3616,7 +3707,18 @@ impl SocketTable {
 
                             // Create child socket for the connection
                             // R75-1 FIX: Child socket inherits parent listener's network namespace
-                            let child_id = self.next_socket_id.fetch_add(1, Ordering::Relaxed);
+                            // R107-5 FIX: Overflow-safe socket ID allocation
+                            let child_id = match self.next_socket_id.fetch_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |current| current.checked_add(1),
+                            ) {
+                                Ok(prev) => prev,
+                                Err(_) => {
+                                    self.dec_ns_count(listener.net_ns_id); // Rollback quota
+                                    return self.build_tcp_rst(dst_ip, src_ip, header, payload); // ID exhausted
+                                }
+                            };
                             let child = Arc::new(SocketState::new(
                                 child_id,
                                 listener.domain,

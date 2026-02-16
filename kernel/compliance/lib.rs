@@ -842,6 +842,18 @@ fn emit_profile_validation_audit_event(surface: &PolicySurface, validated: bool)
     );
 }
 
+/// P1-1: Re-emit the policy surface validation audit event.
+///
+/// The initial emission during [`init_policy_surface`] is typically dropped
+/// because the audit subsystem is not yet initialised at that point. This
+/// function should be called **once** after `audit::init()` succeeds to
+/// ensure the profile validation event is recorded in the audit ring.
+pub fn emit_deferred_policy_audit() {
+    if let Some(surface) = POLICY_SURFACE.get() {
+        emit_profile_validation_audit_event(surface, true);
+    }
+}
+
 /// Emit FIPS-related audit event.
 fn emit_fips_audit_event(success: bool, _message: &str) {
     // Use audit subsystem to log FIPS state changes

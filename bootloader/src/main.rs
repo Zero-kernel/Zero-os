@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use log::info;
 use uefi::prelude::*;
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
+use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode};
 use uefi::proto::media::fs::SimpleFileSystem;
 use uefi::table::boot::{AllocateType, MemoryType};
@@ -109,6 +110,41 @@ fn find_rsdp_address(system_table: &SystemTable<Boot>) -> u64 {
     0
 }
 
+/// P1-1: Read UEFI load options (boot command line) into a fixed-size ASCII buffer.
+///
+/// UEFI load options are UCS-2 (little-endian u16) encoded. This function
+/// down-converts ASCII-range code points to single bytes (non-ASCII → `?`)
+/// and truncates to 256 bytes. Returns `(len, buffer)`.
+///
+/// Must be called **before** `exit_boot_services()` — the LoadedImage
+/// protocol becomes inaccessible after that point.
+fn read_uefi_cmdline(handle: Handle, system_table: &SystemTable<Boot>) -> (usize, [u8; 256]) {
+    let mut cmdline = [0u8; 256];
+    let mut cmdline_len = 0usize;
+
+    let boot_services = system_table.boot_services();
+    if let Ok(loaded_image) = boot_services.open_protocol_exclusive::<LoadedImage>(handle) {
+        if let Some(bytes) = loaded_image.load_options_as_bytes() {
+            // UCS-2 little-endian: each character is 2 bytes (lo, hi).
+            let mut i = 0;
+            while i + 1 < bytes.len() && cmdline_len < cmdline.len() {
+                let lo = bytes[i];
+                let hi = bytes[i + 1];
+                i += 2;
+                // Stop at NUL terminator
+                if lo == 0 && hi == 0 {
+                    break;
+                }
+                // ASCII range: hi == 0 && lo <= 0x7F
+                cmdline[cmdline_len] = if hi == 0 && lo <= 0x7F { lo } else { b'?' };
+                cmdline_len += 1;
+            }
+        }
+    }
+
+    (cmdline_len, cmdline)
+}
+
 /// 内存映射信息，传递给内核
 #[repr(C)]
 pub struct MemoryMapInfo {
@@ -157,10 +193,14 @@ pub struct BootInfo {
     pub kaslr_slide: u64,
     /// ACPI RSDP physical address (from UEFI configuration table)
     pub rsdp_address: u64,
+    /// P1-1: UEFI boot command line length in bytes (ASCII, max 256).
+    pub cmdline_len: usize,
+    /// P1-1: UEFI boot command line buffer (ASCII, NUL-padded).
+    pub cmdline: [u8; 256],
 }
 
 #[entry]
-fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
+fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     uefi::helpers::init(&mut system_table).unwrap();
 
     info!("Rust Microkernel Bootloader v0.1");
@@ -395,6 +435,15 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     // Find ACPI RSDP before exiting boot services (EFI config table won't be accessible after)
     let rsdp_address = find_rsdp_address(&system_table);
+
+    // P1-1: Read UEFI load options (boot command line) before exiting boot services.
+    // The LoadedImage protocol is inaccessible after exit_boot_services().
+    let (cmdline_len, cmdline) = read_uefi_cmdline(handle, &system_table);
+    if cmdline_len > 0 {
+        info!("Boot cmdline ({} bytes): {:?}",
+              cmdline_len,
+              core::str::from_utf8(&cmdline[..cmdline_len]).unwrap_or("<invalid>"));
+    }
 
     // 分配 BootInfo 结构的内存（在低于 4GiB 的位置，便于恒等映射访问）
     let boot_info_ptr = {
@@ -672,6 +721,8 @@ fn efi_main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             framebuffer: framebuffer_info,
             kaslr_slide,  // R39-7 FIX: Pass KASLR slide to kernel
             rsdp_address, // ACPI RSDP for SMP CPU enumeration
+            cmdline_len,  // P1-1: Boot command line
+            cmdline,
         };
         // 阻止 memory_map 被释放，因为内核需要访问它
         core::mem::forget(memory_map);

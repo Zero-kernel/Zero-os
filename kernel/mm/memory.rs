@@ -62,6 +62,10 @@ pub struct BootInfo {
     pub kaslr_slide: u64,
     /// ACPI RSDP physical address (from UEFI configuration table)
     pub rsdp_address: u64,
+    /// P1-1: UEFI boot command line length in bytes (ASCII, max 256).
+    pub cmdline_len: usize,
+    /// P1-1: UEFI boot command line buffer (ASCII, NUL-padded).
+    pub cmdline: [u8; 256],
 }
 
 /// UEFI 内存描述符（按 UEFI 规范布局）

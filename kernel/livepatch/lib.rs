@@ -200,6 +200,48 @@ pub fn init(ops: &'static dyn KernelOps) {
     let _ = PATCH_TABLE.call_once(init_patch_table);
 }
 
+// ============================================================================
+// P1-4: Tamper-evident audit integration
+//
+// Livepatch must not depend on the `audit` crate directly to avoid circular
+// dependencies. Instead, the kernel wires in a callback after audit::init()
+// so livepatch lifecycle events (load/enable/disable/unload) are recorded in
+// the hash-chained audit log.
+// ============================================================================
+
+/// Callback signature for emitting tamper-evident audit events.
+///
+/// # Arguments
+/// * `action` — 0=load, 1=enable, 2=disable, 3=unload
+/// * `patch_id` — Patch identifier returned by `kpatch_load`
+/// * `target_addr` — Target function address
+/// * `extra` — Action-specific data: \[handler_addr, dep_count, 0\] for load; \[0;3\] otherwise
+/// * `timestamp` — TSC value at the time of the transition
+pub type LivepatchAuditFn =
+    fn(action: u64, patch_id: u64, target_addr: u64, extra: [u64; 3], timestamp: u64);
+
+/// Registered audit callback. Protected by `Mutex` for IRQ-safe access.
+static LIVEPATCH_AUDIT_CB: Mutex<Option<LivepatchAuditFn>> = Mutex::new(None);
+
+/// Register the tamper-evident audit callback for livepatch lifecycle events.
+///
+/// Called from `main.rs` after the audit subsystem is initialized.
+pub fn register_audit_callback(cb: LivepatchAuditFn) {
+    *LIVEPATCH_AUDIT_CB.lock() = Some(cb);
+}
+
+/// Emit a livepatch lifecycle audit event via the registered callback.
+///
+/// Copies the function pointer out of the lock before invoking it to avoid
+/// holding the callback lock across the audit subsystem call path.
+#[inline]
+fn emit_livepatch_audit(action: u64, patch_id: u64, target_addr: u64, extra: [u64; 3]) {
+    let cb = { *LIVEPATCH_AUDIT_CB.lock() };
+    if let Some(emit) = cb {
+        emit(action, patch_id, target_addr, extra, read_tsc());
+    }
+}
+
 /// R101-4 FIX: Check whether all ECDSA key slots are empty placeholders.
 ///
 /// Returns `true` if all key slots contain all-zero bytes, meaning livepatch
@@ -1057,6 +1099,7 @@ fn register_loaded_patch(p: &LoadedPatch) -> Result<u64, Errno> {
                 "livepatch: loaded id={} target={:#x} handler={:#x} deps={}",
                 id, p.target, p.handler, p.meta.dep_count
             );
+            emit_livepatch_audit(0, id, p.target as u64, [p.handler as u64, p.meta.dep_count as u64, 0]);
             return Ok(id);
         }
     }
@@ -1128,6 +1171,7 @@ pub fn kpatch_enable(id: u64) -> Result<(), Errno> {
                 "livepatch: enabled id={} target={:#x}",
                 id, slot.target.load(Ordering::Acquire)
             );
+            emit_livepatch_audit(1, id, slot.target.load(Ordering::Acquire) as u64, [0, 0, 0]);
             Ok(())
         }
         Err(e) => {
@@ -1187,6 +1231,7 @@ pub fn kpatch_disable(id: u64) -> Result<(), Errno> {
                 "livepatch: disabled id={} target={:#x}",
                 id, slot.target.load(Ordering::Acquire)
             );
+            emit_livepatch_audit(2, id, slot.target.load(Ordering::Acquire) as u64, [0, 0, 0]);
             Ok(())
         }
         Err(e) => {
@@ -1309,6 +1354,7 @@ pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
     }
 
     klog_always!("livepatch: unloaded id={} target={:#x}", id, target_addr);
+    emit_livepatch_audit(3, id, target_addr as u64, [0, 0, 0]);
     Ok(())
 }
 

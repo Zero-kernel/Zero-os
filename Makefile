@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -368,6 +368,32 @@ lint-release:
 	else \
 		echo "OK: No ungated println! found outside drivers/klog."; \
 	fi
+
+# P1-6: SMAP Window Minimization Policy lint.
+# Only copy_from_user_safe / copy_to_user_safe (and their helpers inside
+# usercopy.rs) may instantiate UserAccessGuard.  Any ad-hoc UserAccessGuard::new()
+# in other files widens the SMAP window and bypasses the chunked-copy design.
+lint-smap:
+	@echo "=== Lint: checking for ad-hoc UserAccessGuard usage ==="
+	@HITS=$$(grep -rn 'UserAccessGuard::new()' kernel/ \
+		--include='*.rs' \
+		| grep -v 'usercopy\.rs' \
+		| grep -v '^\s*//' \
+		| grep -v '//.*UserAccessGuard' \
+	) ; \
+	if [ -n "$$HITS" ]; then \
+		echo "ERROR: Ad-hoc UserAccessGuard::new() found outside usercopy.rs:"; \
+		echo "$$HITS"; \
+		echo ""; \
+		echo "SMAP policy: only copy_from_user_safe/copy_to_user_safe may lift SMAP."; \
+		echo "Use copy_from_user_safe() or copy_to_user_safe() instead."; \
+		exit 1; \
+	else \
+		echo "OK: No ad-hoc UserAccessGuard usage outside usercopy.rs."; \
+	fi
+
+# Unified lint target: runs all CI lint checks.
+lint: lint-release lint-smap
 
 clean:
 	cargo clean

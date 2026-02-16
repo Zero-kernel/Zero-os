@@ -78,6 +78,78 @@ unsafe fn serial_write_str(s: &str) {
     }
 }
 
+/// P1-1: Parse the hardening profile from the UEFI boot command line.
+///
+/// Scans `boot_info.cmdline[..cmdline_len]` for a whitespace-delimited token
+/// of the form `profile=<value>` (case-insensitive prefix match). The value
+/// is parsed via [`compliance::HardeningProfile::from_str`], which accepts
+/// "secure", "balanced", "performance" and several aliases.
+///
+/// If multiple `profile=` tokens appear, the **last valid** one wins (this
+/// mirrors Linux kernel cmdline semantics where later values override earlier
+/// ones). Returns `None` when no valid profile token is found.
+fn parse_hardening_profile_from_cmdline(
+    boot_info: &BootInfo,
+) -> Option<compliance::HardeningProfile> {
+    let len = boot_info.cmdline_len.min(boot_info.cmdline.len());
+    let mut cmdline = &boot_info.cmdline[..len];
+
+    // Trim at first NUL byte if present (belt-and-suspenders with cmdline_len).
+    if let Some(nul_pos) = cmdline.iter().position(|&b| b == 0) {
+        cmdline = &cmdline[..nul_pos];
+    }
+
+    const PREFIX: &[u8] = b"profile=";
+    let mut result: Option<compliance::HardeningProfile> = None;
+
+    let mut pos = 0usize;
+    while pos < cmdline.len() {
+        // Skip whitespace
+        while pos < cmdline.len() && cmdline[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= cmdline.len() {
+            break;
+        }
+
+        // Find end of token
+        let token_start = pos;
+        while pos < cmdline.len() && !cmdline[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        let token = &cmdline[token_start..pos];
+
+        // Check for case-insensitive "profile=" prefix
+        if token.len() > PREFIX.len() {
+            let mut prefix_match = true;
+            for i in 0..PREFIX.len() {
+                if token[i].to_ascii_lowercase() != PREFIX[i] {
+                    prefix_match = false;
+                    break;
+                }
+            }
+            if prefix_match {
+                let value = &token[PREFIX.len()..];
+                if let Ok(s) = core::str::from_utf8(value) {
+                    if let Some(profile) = compliance::HardeningProfile::from_str(s) {
+                        result = Some(profile);
+                    } else {
+                        // Operator typo detection: profile= token found but value
+                        // is not recognized. Log a warning so the operator knows
+                        // their intent was not applied.
+                        klog_always!(
+                            "      ! WARNING: Unrecognized profile value '{}', ignoring",
+                            s
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
 /// Test block device write/read path end-to-end
 ///
 /// Writes a test pattern to the last sectors of the device (safe area outside filesystem),
@@ -257,12 +329,16 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         let mut frame_allocator = mm::memory::FrameAllocator::new();
 
         // G.fin.1: Initialize boot-time locked PolicySurface as single source of truth.
-        // In production, profile would be selected via boot command line: "profile=secure"
-        let profile = compliance::HardeningProfile::Balanced;
-        let policy = compliance::init_policy_surface(
-            profile,
-            compliance::ProfileSource::Default,
-        );
+        // P1-1: Profile is now wired from the UEFI boot command line ("profile=secure").
+        // Falls back to Balanced if no valid profile= token is found.
+        let (profile, profile_source) = boot_info
+            .and_then(|info| parse_hardening_profile_from_cmdline(info))
+            .map(|p| (p, compliance::ProfileSource::BootCmdline))
+            .unwrap_or((
+                compliance::HardeningProfile::Balanced,
+                compliance::ProfileSource::Default,
+            ));
+        let policy = compliance::init_policy_surface(profile, profile_source);
 
         // H.2.2: Wire klog filter from hardening profile
         let klog_profile = match policy.profile {
@@ -277,8 +353,9 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         let sec_config = policy.profile.security_config(phys_offset);
 
         klog_always!(
-            "      Profile: {} (audit_capacity: {})",
+            "      Profile: {} (source: {:?}, audit_capacity: {})",
             policy.profile.name(),
+            policy.source,
             policy.audit_ring_capacity
         );
 
@@ -603,6 +680,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             );
             klog_always!("      ✓ Hash-chained tamper evidence enabled");
 
+            // P1-1: Re-emit the profile validation audit event now that audit is
+            // initialised. The initial emission during init_policy_surface() was
+            // silently dropped because audit::init() hadn't run yet.
+            compliance::emit_deferred_policy_audit();
+            klog_always!("      ✓ Deferred profile audit event recorded");
+
             // A.3: Register audit snapshot authorizer (capability gate)
             // Policy: Allow root (euid == 0) OR holders of CAP_AUDIT_READ
             // R72-HMAC FIX: During early boot (no process context), allow kernel init code
@@ -706,6 +789,22 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 );
             });
             klog_always!("      ✓ OOM killer audit callback registered (R106-8)");
+
+            // P1-4: Register livepatch audit callback for tamper-evident lifecycle recording.
+            // Livepatch state transitions (load/enable/disable/unload) are now fed into
+            // the hash-chained audit ring buffer alongside OOM events.
+            livepatch::register_audit_callback(|action, patch_id, target_addr, extra, timestamp| {
+                let _ = audit::emit(
+                    audit::AuditKind::Internal,
+                    audit::AuditOutcome::Info,
+                    audit::AuditSubject::new(0, 0, 0, None),
+                    audit::AuditObject::None,
+                    &[action, patch_id, target_addr, extra[0], extra[1], extra[2]],
+                    0,
+                    timestamp,
+                );
+            });
+            klog_always!("      ✓ Livepatch audit callback registered (P1-4)");
         }
         Err(e) => {
             klog_always!("      ! Audit initialization failed: {:?}", e);
