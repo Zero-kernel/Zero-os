@@ -371,8 +371,13 @@ pub fn is_in_usercopy() -> bool {
 
 /// RAII guard for user copy state with PID binding
 struct UserCopyGuard {
-    /// CPU this guard was created on (per-CPU state must be cleared on same CPU)
+    /// CPU this guard was created on (per-CPU state lives in that CPU's slot)
     cpu_id: usize,
+    /// PID that owns this usercopy operation.
+    ///
+    /// R108-2 FIX: Stored so migration-tolerant drop can clear the originating
+    /// CPU's per-CPU state only if it still belongs to the same process.
+    pid: usize,
 }
 
 impl UserCopyGuard {
@@ -392,31 +397,67 @@ impl UserCopyGuard {
     #[inline]
     fn new(buffer_start: usize, len: usize) -> Self {
         let cpu_id = current_cpu_id();
+        let pid = current_pid_raw();
         USER_COPY_STATE.with(|s| {
-            s.pid.store(current_pid_raw(), Ordering::SeqCst);
+            s.pid.store(pid, Ordering::SeqCst);
             s.start.store(buffer_start, Ordering::SeqCst);
             s.end
                 .store(buffer_start.saturating_add(len), Ordering::SeqCst);
             s.active.store(true, Ordering::SeqCst);
         });
-        UserCopyGuard { cpu_id }
+        UserCopyGuard { cpu_id, pid }
     }
 }
 
 impl Drop for UserCopyGuard {
     #[inline]
     fn drop(&mut self) {
-        // Detect CPU migration which would leave stale state on old CPU
-        // Use assert (not debug_assert) to catch this in release builds
-        assert_eq!(
-            current_cpu_id(),
-            self.cpu_id,
-            "UserCopyGuard dropped on different CPU; per-CPU usercopy state would be stale"
-        );
+        let current_cpu = current_cpu_id();
+
+        // R108-2 FIX: Detect CPU migration and perform best-effort cleanup instead
+        // of panicking.  Follows the same pattern as UserAccessGuard (R106-7 FIX).
+        //
+        // If the guard is dropped on a different CPU, the per-CPU usercopy state on
+        // the originating CPU would otherwise remain active, causing false-positive
+        // fault attribution for subsequent usercopy operations on that CPU.
+        //
+        // We clear the originating CPU's state only if it still belongs to the same
+        // PID (to avoid clearing another task's state that may have legitimately
+        // started a usercopy on that CPU).
+        if current_cpu != self.cpu_id {
+            let cleared = USER_COPY_STATE
+                .with_cpu(self.cpu_id, |s| {
+                    if s.pid.load(Ordering::SeqCst) != self.pid {
+                        return false;
+                    }
+                    s.active.store(false, Ordering::SeqCst);
+                    s.pid.store(0, Ordering::SeqCst);
+                    s.remaining.store(0, Ordering::SeqCst);
+                    s.start.store(0, Ordering::SeqCst);
+                    s.end.store(0, Ordering::SeqCst);
+                    true
+                })
+                .unwrap_or(false);
+
+            kprintln!(
+                "[usercopy] R108-2 WARNING: UserCopyGuard created on CPU {} dropped on CPU {} \
+                 (pid={}); {}",
+                self.cpu_id,
+                current_cpu,
+                self.pid,
+                if cleared {
+                    "stale per-CPU state cleared"
+                } else {
+                    "state not cleared (pid mismatch or CPU out of range)"
+                }
+            );
+            return;
+        }
 
         USER_COPY_STATE.with(|s| {
             s.active.store(false, Ordering::SeqCst);
             s.pid.store(0, Ordering::SeqCst);
+            s.remaining.store(0, Ordering::SeqCst);
             s.start.store(0, Ordering::SeqCst);
             s.end.store(0, Ordering::SeqCst);
         });

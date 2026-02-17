@@ -67,6 +67,15 @@ static GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(1);
 /// callbacks before `synchronize_rcu()` has verified all readers are done.
 static COMPLETED_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+/// R108-4 FIX: Lock-free approximate callback count for adaptive budget.
+///
+/// Incremented in `call_rcu()`, decremented in `drain_callbacks()`.
+/// This avoids locking `CALLBACKS` in `callback_drain_budget()` on the hot
+/// syscall-return path.  The value may be slightly out of date due to
+/// relaxed ordering, but that only causes a momentary under- or over-drain
+/// which is harmless.
+static CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 /// Per-CPU reader nesting counter.
 ///
 /// Non-zero means the CPU is in an RCU read-side critical section.
@@ -103,7 +112,24 @@ static CALLBACKS: Mutex<VecDeque<CallbackBatch>> = Mutex::new(VecDeque::new());
 /// Maximum number of callbacks to drain per `poll()` invocation.
 ///
 /// This prevents a single callback batch from monopolizing the CPU.
-const MAX_CALLBACKS_PER_POLL: usize = 16;
+/// R108-4 FIX: Used as the baseline budget; actual budget scales with backlog.
+const CALLBACK_DRAIN_BUDGET_LOW: usize = 16;
+
+/// R108-4 FIX: Callback backlog thresholds and scaled drain budgets.
+///
+/// When callback backlog grows (e.g., rapid process churn deferring kernel stack
+/// frees via `call_rcu()`), `poll()` increases its drain budget to prevent
+/// unbounded queue growth and heap pressure.
+///
+/// | Backlog | Budget | Rationale |
+/// |---------|--------|-----------|
+/// | < 256   | 16     | Normal: minimal syscall-return overhead |
+/// | < 1024  | 64     | Medium: backlog building, drain faster |
+/// | >= 1024 | 256    | High: prevent heap exhaustion |
+const CALLBACK_BACKLOG_MEDIUM: usize = 256;
+const CALLBACK_BACKLOG_HIGH: usize = 1024;
+const CALLBACK_DRAIN_BUDGET_MEDIUM: usize = 64;
+const CALLBACK_DRAIN_BUDGET_HIGH: usize = 256;
 
 /// R72: One-time guard for timer registration.
 ///
@@ -275,8 +301,10 @@ pub fn synchronize_rcu() {
     // cannot race ahead and see callbacks as ready before grace period ends.
     COMPLETED_EPOCH.store(target, Ordering::Release);
 
-    // Drain any callbacks that are now safe to run
-    drain_callbacks(target);
+    // Drain any callbacks that are now safe to run.
+    // R108-4 FIX: Writers expect `synchronize_rcu()` to leave no completed
+    // callbacks behind, so drain without a budget limit.
+    drain_callbacks(target, usize::MAX);
 }
 
 /// Queue a callback to run after the next grace period.
@@ -365,6 +393,7 @@ where
                 target_epoch: target,
                 func: cb,
             });
+            CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
             return;
         }
     }
@@ -379,13 +408,14 @@ where
         func: cb,
     });
     batches.push_back(batch);
+    CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Poll for and run any callbacks whose grace period has completed.
 ///
 /// This should be called from process context (e.g., syscall return path)
-/// to drain pending callbacks. It's non-blocking and runs at most
-/// `MAX_CALLBACKS_PER_POLL` callbacks per invocation.
+/// to drain pending callbacks. It's non-blocking and runs an adaptive
+/// number of callbacks per invocation (see R108-4 FIX below).
 ///
 /// # Safety
 ///
@@ -401,6 +431,14 @@ where
 /// This ensures `call_rcu()` callbacks make forward progress even without
 /// explicit `synchronize_rcu()` calls.
 ///
+/// # R108-4 FIX: Adaptive Drain Budget
+///
+/// Uses an adaptive drain budget based on callback backlog depth.  Under
+/// normal load (backlog < 256), drains at most 16 callbacks per invocation
+/// to minimize syscall-return overhead.  When the backlog grows (e.g., rapid
+/// fork-exit churn), the budget scales up to 256 to prevent heap pressure
+/// from unbounded queue growth.
+///
 /// # Returns
 ///
 /// The number of callbacks that were executed.
@@ -414,7 +452,8 @@ pub fn poll() -> usize {
     // Using COMPLETED_EPOCH (not GLOBAL_EPOCH) prevents racing ahead
     // of an in-progress synchronize_rcu().
     let completed_epoch = COMPLETED_EPOCH.load(Ordering::Acquire);
-    drain_callbacks(completed_epoch)
+    let budget = callback_drain_budget();
+    drain_callbacks(completed_epoch, budget)
 }
 
 /// Get the current global RCU epoch (for debugging).
@@ -502,6 +541,24 @@ fn all_cpus_quiescent(target: u64) -> bool {
     true
 }
 
+/// R108-4 FIX: Compute the callback drain budget for `poll()`.
+///
+/// Uses the lock-free `CALLBACK_COUNT` atomic to determine queue depth and
+/// selects a drain budget via coarse thresholds.  This keeps the hot
+/// syscall-return path free of `CALLBACKS` lock acquisitions when there are
+/// no callbacks to drain (the common case).
+#[inline]
+fn callback_drain_budget() -> usize {
+    let backlog = CALLBACK_COUNT.load(Ordering::Relaxed);
+    if backlog >= CALLBACK_BACKLOG_HIGH {
+        CALLBACK_DRAIN_BUDGET_HIGH
+    } else if backlog >= CALLBACK_BACKLOG_MEDIUM {
+        CALLBACK_DRAIN_BUDGET_MEDIUM
+    } else {
+        CALLBACK_DRAIN_BUDGET_LOW
+    }
+}
+
 /// Drain callbacks whose grace period has completed.
 ///
 /// R72: Batched callback draining for improved efficiency.
@@ -509,13 +566,19 @@ fn all_cpus_quiescent(target: u64) -> bool {
 /// Callbacks are now grouped by epoch. We pop entire batches (or partial
 /// batches) to reduce lock contention and improve cache locality.
 ///
+/// # R108-4 FIX: Parameterized drain budget
+///
+/// `max_callbacks` bounds the amount of work per invocation.  `poll()` passes
+/// an adaptive budget based on backlog depth; `synchronize_rcu()` passes
+/// `usize::MAX` to drain all completed callbacks before returning.
+///
 /// Returns the number of callbacks executed.
-fn drain_callbacks(done_epoch: u64) -> usize {
+fn drain_callbacks(done_epoch: u64, max_callbacks: usize) -> usize {
     let mut count = 0;
 
-    // Process batches up to MAX_CALLBACKS_PER_POLL total callbacks
+    // Process batches up to max_callbacks total callbacks
     loop {
-        if count >= MAX_CALLBACKS_PER_POLL {
+        if count >= max_callbacks {
             break;
         }
 
@@ -531,11 +594,12 @@ fn drain_callbacks(done_epoch: u64) -> usize {
         match batch.as_mut() {
             Some(b) => {
                 // Process callbacks from this batch until we hit the limit
-                while count < MAX_CALLBACKS_PER_POLL {
+                while count < max_callbacks {
                     if let Some(mut cb) = b.callbacks.pop_front() {
                         // Run the callback outside the lock
                         (cb.func)();
                         count += 1;
+                        CALLBACK_COUNT.fetch_sub(1, Ordering::Relaxed);
                     } else {
                         break; // Batch exhausted
                     }

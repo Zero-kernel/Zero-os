@@ -48,6 +48,13 @@ pub enum RngError {
 /// Maximum bytes to generate before reseeding
 const RESEED_INTERVAL: u64 = 1024 * 1024; // 1MB
 
+/// R108-3 FIX: Maximum bytes to generate per lock acquisition.
+///
+/// `GLOBAL_RNG` is a global spin-mutex; holding it across large buffers (up to
+/// 1MB from `sys_getrandom`) causes system-wide cross-core contention.  Chunking
+/// keeps worst-case lock hold times bounded to a single 4KB page.
+const RNG_FILL_CHUNK_SIZE: usize = 4096;
+
 /// Global CSPRNG instance
 lazy_static! {
     static ref GLOBAL_RNG: Mutex<Option<ChaCha20Rng>> = Mutex::new(None);
@@ -122,23 +129,39 @@ pub fn is_ready() -> bool {
 /// # Returns
 ///
 /// `Ok(())` on success, `Err(RngError)` if RNG not initialized
+///
+/// # R108-3 FIX: Chunked generation
+///
+/// Generates output in `RNG_FILL_CHUNK_SIZE` (4KB) chunks with the global
+/// spin-mutex released between chunks.  This bounds worst-case lock hold time
+/// and reduces cross-core contention for large `getrandom()` calls.
+///
+/// The reseed interval check now resets `bytes_generated` even when hardware
+/// entropy is unavailable, preventing repeated reseed attempts on every
+/// subsequent call during transient entropy failures.
 pub fn fill_random(out: &mut [u8]) -> Result<(), RngError> {
-    let mut guard = GLOBAL_RNG.lock();
-    let rng = guard.as_mut().ok_or(RngError::NotInitialized)?;
+    for chunk in out.chunks_mut(RNG_FILL_CHUNK_SIZE) {
+        let mut guard = GLOBAL_RNG.lock();
+        let rng = guard.as_mut().ok_or(RngError::NotInitialized)?;
 
-    // Check if we need to reseed
-    if rng.bytes_generated > RESEED_INTERVAL {
-        // Attempt to reseed
-        let mut seed = [0u8; 32];
-        if fill_entropy(&mut seed).is_ok() {
-            rng.mix_in(&seed);
+        // Check if we need to reseed
+        if rng.bytes_generated >= RESEED_INTERVAL {
+            // R108-3 FIX: Reset counter unconditionally to avoid retrying on
+            // every subsequent call when entropy is temporarily unavailable.
+            // The CSPRNG remains cryptographically secure even without reseeding.
             rng.bytes_generated = 0;
+
+            let mut seed = [0u8; 32];
+            if fill_entropy(&mut seed).is_ok() {
+                rng.mix_in(&seed);
+            }
             explicit_bzero(&mut seed);
         }
-        // Continue even if reseed fails - the CSPRNG is still secure
-    }
 
-    rng.fill_bytes(out);
+        rng.fill_bytes(chunk);
+        // Lock is released here (guard dropped) before next chunk iteration,
+        // allowing other CPUs to acquire the RNG for their operations.
+    }
     Ok(())
 }
 
@@ -164,14 +187,16 @@ pub fn try_fill_random(out: &mut [u8]) -> Result<(), RngError> {
     if let Some(mut guard) = GLOBAL_RNG.try_lock() {
         if let Some(rng) = guard.as_mut() {
             // Check if we need to reseed
-            if rng.bytes_generated > RESEED_INTERVAL {
-                // Attempt to reseed (best-effort in panic context)
+            if rng.bytes_generated >= RESEED_INTERVAL {
+                // R108-3 FIX: Reset counter unconditionally to prevent repeated
+                // reseed attempts in panic context where entropy may be unavailable.
+                rng.bytes_generated = 0;
+
                 let mut seed = [0u8; 32];
                 if fill_entropy(&mut seed).is_ok() {
                     rng.mix_in(&seed);
-                    rng.bytes_generated = 0;
-                    explicit_bzero(&mut seed);
                 }
+                explicit_bzero(&mut seed);
             }
 
             rng.fill_bytes(out);

@@ -512,6 +512,11 @@ pub unsafe fn rsb_fill() {
     // The LFENCE ensures the CPU doesn't speculate past each call.
     // Finally, we fix up the stack by adding back the space used by
     // the 32 pushed return addresses.
+    // R108-1 FIX: Removed `options(nostack)` — the `call` instructions push
+    // 32 return addresses (256 bytes) onto the stack and `add rsp, 256` adjusts
+    // it back.  Declaring `nostack` was unsound because the compiler may assume
+    // RSP is untouched (including red-zone placement of local variables),
+    // leading to potential stack corruption or miscompilation.
     core::arch::asm!(
         // Fill RSB with 32 entries
         "mov ecx, 32",
@@ -524,7 +529,6 @@ pub unsafe fn rsb_fill() {
         // Clean up stack (32 * 8 bytes of return addresses)
         "add rsp, 256",
         out("ecx") _,
-        options(nostack)
     );
 }
 

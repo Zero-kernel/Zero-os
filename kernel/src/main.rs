@@ -393,6 +393,19 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 // lock_profile() provides defense-in-depth against direct calls.
                 compliance::lock_profile();
                 klog_always!("        - Profile locked (immutable until reboot)");
+
+                // P1-1 FIX: Log PolicySurface enforcement summary so operators
+                // can verify which security features are active at boot.
+                let ps = compliance::policy();
+                klog_always!("      PolicySurface enforcement:");
+                klog_always!("        - panic_redact_details: {}", ps.panic_redact_details);
+                klog_always!("        - kaslr_fail_closed:    {}", ps.kaslr_fail_closed);
+                klog_always!("        - kpti_fail_closed:     {}", ps.kpti_fail_closed);
+                klog_always!("        - debug_interfaces:     {}", ps.debug_interfaces_enabled);
+                klog_always!("        - spectre_mitigations:  {}", ps.spectre_mitigations);
+                klog_always!("        - kptr_guard:           {}", ps.kptr_guard);
+                klog_always!("        - strict_wxorx:         {}", ps.strict_wxorx);
+                klog_always!("        - audit_ring_capacity:  {}", ps.audit_ring_capacity);
             }
             Err(e) => {
                 klog_always!("      ! Security hardening failed: {:?}", e);
@@ -422,6 +435,43 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // R39-7 FIX: Pass KASLR slide from bootloader to kernel
     klog_always!("[2.65/3] Initializing KASLR/KPTI/PCID...");
     security::init_kaslr(boot_info.map(|info| info.kaslr_slide));
+
+    // P1-1 FIX: PolicySurface-driven KASLR/KPTI fail-closed enforcement.
+    // When kaslr_fail_closed is true (Secure profile), the kernel must not
+    // boot with a fully deterministic layout. If full text KASLR is
+    // unavailable, we allow boot only when Partial KASLR is active.
+    let ps = compliance::policy();
+    if ps.kaslr_fail_closed && !security::is_kaslr_enabled() {
+        // Check partial KASLR as a fallback: if partial randomization is
+        // active we log a warning but allow boot (defense-in-depth).
+        if security::is_partial_kaslr_enabled() {
+            klog_always!(
+                "[POLICY] {} profile: full KASLR not active; partial KASLR in use",
+                ps.profile.name()
+            );
+        } else {
+            // Log before panic so operators see the reason even when
+            // panic_redact_details is true (Secure profile).
+            klog_always!(
+                "[POLICY] {} profile: KASLR required but no randomization active — halting",
+                ps.profile.name()
+            );
+            panic!(
+                "KASLR is required in Secure profile but no randomization is active \
+                 (boot with profile=balanced to allow degraded boot)"
+            );
+        }
+    }
+    if ps.kpti_fail_closed && !security::is_kpti_enabled() {
+        klog_always!(
+            "[POLICY] {} profile: KPTI not active — kernel page table isolation \
+             preferred (Meltdown mitigation)",
+            ps.profile.name()
+        );
+        // KPTI is not yet implemented (P2-2), so we warn rather than panic.
+        // Once KPTI is available, this should become a hard panic.
+    }
+
     // Cache INVPCID capability for TLB shootdowns (uses CPUID + PCID state)
     mm::tlb_shootdown::init_invpcid_support();
 
@@ -633,11 +683,14 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 klog_always!("      ✓ Registered /dev/{} in devfs", name);
 
                 // Phase C: Test block write path (uses last sectors, outside filesystem)
-                klog_always!("      [TEST] Block device write/read verification:");
-                if test_block_write(&device) {
-                    klog_always!("      ✓ Block write path verified");
-                } else {
-                    klog_always!("      ! Block write test failed");
+                // P1-1 FIX: Gate destructive block test by debug_interfaces_enabled.
+                if compliance::policy().debug_interfaces_enabled {
+                    klog_always!("      [TEST] Block device write/read verification:");
+                    if test_block_write(&device) {
+                        klog_always!("      ✓ Block write path verified");
+                    } else {
+                        klog_always!("      ! Block write test failed");
+                    }
                 }
 
                 // Phase C: Try to mount as ext2 filesystem
@@ -848,21 +901,30 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     klog_always!("      ✓ Page table manager compiled");
     klog_always!("      ✓ mmap/munmap available");
 
-    // 运行集成测试
-    integration_test::run_all_tests();
+    // P1-1 FIX: Gate debug test interfaces by PolicySurface.
+    // In Secure profile, debug_interfaces_enabled is false — skip integration,
+    // runtime, and Ring 3 usermode tests to reduce the attack surface and
+    // eliminate test-only code paths in production deployments.
+    if compliance::policy().debug_interfaces_enabled {
+        // 运行集成测试
+        integration_test::run_all_tests();
 
-    // 运行运行时功能测试
-    let test_report = runtime_tests::run_all_runtime_tests();
-    if test_report.failed > 0 {
-        klog_always!("WARNING: {} runtime tests failed!", test_report.failed);
-    }
+        // 运行运行时功能测试
+        let test_report = runtime_tests::run_all_runtime_tests();
+        if test_report.failed > 0 {
+            klog_always!("WARNING: {} runtime tests failed!", test_report.failed);
+        }
 
-    // 运行 Ring 3 用户态测试
-    klog_always!("[9/9] Running Ring 3 user mode test...");
-    if usermode_test::run_usermode_test() {
-        klog_always!("      ✓ Ring 3 test process created successfully");
+        // 运行 Ring 3 用户态测试
+        klog_always!("[9/9] Running Ring 3 user mode test...");
+        if usermode_test::run_usermode_test() {
+            klog_always!("      ✓ Ring 3 test process created successfully");
+        } else {
+            klog_always!("      ! Ring 3 test setup failed");
+        }
     } else {
-        klog_always!("      ! Ring 3 test setup failed");
+        klog_always!("[POLICY] {} profile: debug/test interfaces disabled",
+                     compliance::policy().profile.name());
     }
 
     klog_always!("=== System Ready ===");
