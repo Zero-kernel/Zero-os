@@ -2132,12 +2132,15 @@ pub fn syscall_dispatcher(
         507 => sys_compliance_query_algo(arg0 as u32),
         508 => sys_audit_export(arg0 as *mut u8, arg1 as usize, arg2 as u64, arg3 as usize),
 
-        // G.2 Live Patching syscalls (Zero-OS specific, 509-511)
+        // G.2 Live Patching syscalls (Zero-OS specific, 509-512, 514-515)
         509 => sys_kpatch_load(arg0 as usize, arg1 as usize),
         510 => sys_kpatch_enable(arg0 as u64),
         511 => sys_kpatch_disable(arg0 as u64),
         // R104-5 FIX: Wire kpatch_unload to complete the livepatch syscall family
         512 => sys_kpatch_unload(arg0 as u64),
+        // P1-4: Batch enable/disable with topological dependency ordering
+        514 => sys_kpatch_enable_all(),
+        515 => sys_kpatch_disable_all(),
 
         _ => Err(SyscallError::ENOSYS),
     };
@@ -8590,14 +8593,19 @@ fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
 ///
 /// # Security
 ///
-/// Root-only (euid == 0). Delegation allows the specified UID to create/delete
-/// children, set limits (bounded by parent ceilings), and migrate owned tasks
+/// Requires root (euid == 0), CAP_SYS_ADMIN, or delegated subtree ownership
+/// (sub-delegation). Delegation allows the specified UID to create/delete
+/// children, set limits (bounded by ancestor ceilings), and migrate owned tasks
 /// within the cgroup and its descendants. Pass `uid = u64::MAX` to revoke.
 fn sys_cgroup_delegate(cgroup_id: u64, uid: u64) -> Result<usize, SyscallError> {
     let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-    if creds.euid != 0 {
-        return Err(SyscallError::EPERM);
-    }
+    let has_cap_admin =
+        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+
+    // P1-3: Allow root, CAP_SYS_ADMIN, or delegated subtree managers.
+    let authorized = creds.euid == 0
+        || has_cap_admin
+        || is_cgroup_delegated_to_caller(cgroup_id);
 
     let delegate_uid = if uid == u64::MAX {
         None
@@ -8608,8 +8616,28 @@ fn sys_cgroup_delegate(cgroup_id: u64, uid: u64) -> Result<usize, SyscallError> 
         Some(uid as u32)
     };
 
-    match cgroup::delegate_cgroup(cgroup_id, delegate_uid) {
-        Ok(()) => Ok(0),
+    // Determine audit operation type.
+    let op = if delegate_uid.is_some() {
+        audit::AuditCgroupDelegationOp::Grant
+    } else {
+        audit::AuditCgroupDelegationOp::Revoke
+    };
+
+    match cgroup::delegate_cgroup(cgroup_id, delegate_uid, authorized) {
+        Ok(old_uid) => {
+            // P1-3: Emit audit event for delegation lifecycle.
+            let timestamp = crate::time::get_ticks();
+            let _ = audit::emit_cgroup_delegation_event(
+                get_audit_subject(),
+                cgroup_id,
+                op,
+                old_uid,
+                delegate_uid,
+                0,
+                timestamp,
+            );
+            Ok(0)
+        }
         Err(cgroup::CgroupError::NotFound) => Err(SyscallError::ENOENT),
         Err(cgroup::CgroupError::PermissionDenied) => Err(SyscallError::EPERM),
         Err(_) => Err(SyscallError::EINVAL),
@@ -8858,6 +8886,14 @@ fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usiz
         return Err(SyscallError::EFAULT);
     }
 
+    // P1-3: Stats access should respect delegation boundaries.
+    let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+    let has_cap_admin =
+        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    if creds.euid != 0 && !has_cap_admin && !is_cgroup_delegated_to_caller(cgroup_id) {
+        return Err(SyscallError::EPERM);
+    }
+
     let cgroup_node = cgroup::lookup_cgroup(cgroup_id).ok_or(SyscallError::ENOENT)?;
     let stats = cgroup_node.get_stats();
 
@@ -9095,7 +9131,8 @@ static AUDIT_EXPORT_LIMITER: spin::Mutex<AuditExportTokenBucket> =
 /// # ABI
 ///
 /// The buffer is filled with:
-/// - [`audit::AuditExportHeader`] (64 bytes): magic `"ZAUD"`, version 2, record_count, next cursor, tail hash, dropped_since_cursor, ring_usage
+/// - [`audit::AuditExportHeader`] (96 bytes): magic `"ZAUD"`, version 3, record_count, next cursor,
+///   tail_hash, dropped_since_cursor, ring_usage, backpressure_high_water_bps, batch_first_prev_hash
 /// - [`audit::AuditExportRecord`] array (128 bytes each): fixed-size per-event records
 ///
 /// The header's `cursor` field is the next cursor to use (`last_id + 1`).
@@ -9196,6 +9233,7 @@ fn sys_audit_export(
         batch.tail_hash,
         batch.ring_usage,
         batch.dropped_since_cursor,
+        batch.batch_first_prev_hash,
     );
     let header_bytes = header.to_bytes();
     if copy_to_user_safe(buf, &header_bytes).is_err() {
@@ -9335,6 +9373,72 @@ fn sys_kpatch_disable(patch_id: u64) -> Result<usize, SyscallError> {
 /// - `ENOSYS`  — livepatch subsystem not available
 fn sys_kpatch_unload(patch_id: u64) -> Result<usize, SyscallError> {
     let result = livepatch::sys_kpatch_unload(patch_id);
+    if result < 0 {
+        match result {
+            -1 => Err(SyscallError::EPERM),
+            -2 => Err(SyscallError::ENOENT),
+            -16 => Err(SyscallError::EBUSY),
+            -22 => Err(SyscallError::EINVAL),
+            -38 => Err(SyscallError::ENOSYS),
+            _ => Err(SyscallError::EINVAL),
+        }
+    } else {
+        Ok(0)
+    }
+}
+
+/// P1-4: sys_kpatch_enable_all (514) — Enable all loaded patches in topological
+/// dependency order.
+///
+/// Patches already in `Enabled` state are skipped. On failure, all patches
+/// enabled by this batch are rolled back (disabled) in reverse order.
+///
+/// # Arguments
+///
+/// Takes no arguments (operates on all loaded patches).
+///
+/// # Errors
+///
+/// - `EPERM`   — caller lacks privileges
+/// - `ENOENT`  — a dependency UID is not loaded, or a patch disappeared
+/// - `EBUSY`   — a patch is in a transitional state
+/// - `EINVAL`  — dependency cycle detected
+/// - `ENOSYS`  — livepatch subsystem not available
+fn sys_kpatch_enable_all() -> Result<usize, SyscallError> {
+    let result = livepatch::sys_kpatch_enable_all();
+    if result < 0 {
+        match result {
+            -1 => Err(SyscallError::EPERM),
+            -2 => Err(SyscallError::ENOENT),
+            -16 => Err(SyscallError::EBUSY),
+            -22 => Err(SyscallError::EINVAL),
+            -38 => Err(SyscallError::ENOSYS),
+            _ => Err(SyscallError::EINVAL),
+        }
+    } else {
+        Ok(0)
+    }
+}
+
+/// P1-4: sys_kpatch_disable_all (515) — Disable all enabled patches in reverse
+/// topological dependency order.
+///
+/// Patches not in `Enabled` state are skipped. On failure, all patches
+/// disabled by this batch are re-enabled in reverse order.
+///
+/// # Arguments
+///
+/// Takes no arguments (operates on all enabled patches).
+///
+/// # Errors
+///
+/// - `EPERM`   — caller lacks privileges
+/// - `ENOENT`  — a patch disappeared during iteration
+/// - `EBUSY`   — a patch is in a transitional state
+/// - `EINVAL`  — dependency cycle detected
+/// - `ENOSYS`  — livepatch subsystem not available
+fn sys_kpatch_disable_all() -> Result<usize, SyscallError> {
+    let result = livepatch::sys_kpatch_disable_all();
     if result < 0 {
         match result {
             -1 => Err(SyscallError::EPERM),

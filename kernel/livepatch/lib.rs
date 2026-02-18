@@ -66,6 +66,10 @@ pub const SYS_KPATCH_LOAD: u64 = 509;
 pub const SYS_KPATCH_ENABLE: u64 = 510;
 pub const SYS_KPATCH_DISABLE: u64 = 511;
 pub const SYS_KPATCH_UNLOAD: u64 = 512;
+/// P1-4: Enable all loaded patches in topological dependency order.
+pub const SYS_KPATCH_ENABLE_ALL: u64 = 514;
+/// P1-4: Disable all enabled patches in reverse topological dependency order.
+pub const SYS_KPATCH_DISABLE_ALL: u64 = 515;
 
 // ============================================================================
 // Error model (minimal errno subset)
@@ -685,6 +689,216 @@ fn check_no_dependents(slot_index: usize) -> Result<(), Errno> {
     }
 
     Ok(())
+}
+
+// ============================================================================
+// P1-4: Topological ordering for batch enable/disable
+// ============================================================================
+
+/// Collect all non-empty patch slots into a (slot_index, id, meta) list.
+///
+/// Requires `PATCH_REG_LOCK` to be held by the caller for `PATCH_META_TABLE`
+/// access. Returns `EBUSY` if any slot is in a transitional state.
+fn collect_patch_nodes(
+    table: &'static [PatchSlot],
+) -> Result<Vec<(usize, u64, PatchMeta)>, Errno> {
+    let mut nodes = Vec::new();
+    for (slot_index, slot) in table.iter().enumerate() {
+        let st = PatchState::from_u8(slot.state.load(Ordering::Acquire));
+        if st == PatchState::Empty {
+            continue;
+        }
+        if matches!(
+            st,
+            PatchState::Loading | PatchState::Enabling | PatchState::Disabling
+        ) {
+            return Err(Errno::EBUSY);
+        }
+        if st == PatchState::Failed {
+            continue; // Skip failed patches — they cannot participate in batch ops.
+        }
+        // SAFETY: Caller holds PATCH_REG_LOCK.
+        // R110-1 FIX: Treat missing metadata on a non-empty, non-failed slot as an
+        // internal consistency error rather than silently skipping it.  A slot that
+        // is Registered/Enabled/Disabled MUST have associated PatchMeta.
+        let meta = match unsafe { PATCH_META_TABLE.get(slot_index).copied().flatten() } {
+            Some(m) => m,
+            None => return Err(Errno::EINVAL),
+        };
+        let id = slot.id.load(Ordering::Acquire);
+        nodes.push((slot_index, id, meta));
+    }
+    Ok(nodes)
+}
+
+/// Build a topological order of all non-empty patches by UID dependency.
+///
+/// Uses Kahn's algorithm.  Returns patch IDs in dependency-first order
+/// (roots first, leaves last).
+///
+/// - Returns `ENOENT` if a dependency UID is not loaded.
+/// - Returns `EINVAL` on dependency cycle.
+/// - Returns `EBUSY` if any patch is in a transitional state.
+fn topo_sort_patch_ids() -> Result<Vec<u64>, Errno> {
+    let table = patch_table();
+    let _guard = PATCH_REG_LOCK.lock();
+
+    let nodes = collect_patch_nodes(table)?;
+    let n = nodes.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Build adjacency: for each node, compute in-degree and dependents list.
+    let mut indegree = vec![0u16; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (i, (_, _, meta)) in nodes.iter().enumerate() {
+        let dep_count = meta.dep_count as usize;
+        for dep_uid in meta.deps.iter().take(dep_count) {
+            let dep_idx = nodes
+                .iter()
+                .position(|(_, _, m)| ct_eq(&m.patch_uid, dep_uid))
+                .ok_or(Errno::ENOENT)?;
+            dependents[dep_idx].push(i);
+            indegree[i] = indegree[i].checked_add(1).ok_or(Errno::EINVAL)?;
+        }
+    }
+
+    // Kahn's algorithm: repeatedly pick a zero-indegree node.
+    let mut processed = vec![false; n];
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+
+    for _ in 0..n {
+        let next = (0..n).find(|&i| !processed[i] && indegree[i] == 0);
+        let i = next.ok_or(Errno::EINVAL)?; // Cycle detected
+        processed[i] = true;
+        order.push(i);
+        for &child in dependents[i].iter() {
+            indegree[child] = indegree[child].saturating_sub(1);
+        }
+    }
+
+    let ids: Vec<u64> = order.iter().map(|&idx| nodes[idx].1).collect();
+    Ok(ids)
+}
+
+/// P1-4: Enable all loaded patches in topological dependency order.
+///
+/// Patches that are already `Enabled` are skipped.  On failure, all patches
+/// enabled by this batch are rolled back (disabled) in reverse order.
+///
+/// Returns `EPERM` if the caller is not privileged.
+pub fn sys_kpatch_enable_all() -> i64 {
+    match do_sys_kpatch_enable_all() {
+        Ok(()) => 0,
+        Err(e) => e.as_i64(),
+    }
+}
+
+fn do_sys_kpatch_enable_all() -> Result<(), Errno> {
+    let ops = ops()?;
+    let _ = patch_table();
+
+    if !ops.is_privileged() {
+        return Err(Errno::EPERM);
+    }
+
+    let order = topo_sort_patch_ids()?;
+    let mut enabled_by_batch: Vec<u64> = Vec::new();
+
+    for &id in order.iter() {
+        // Recheck state — another thread could have changed it.
+        let st = match patch_state(id) {
+            Some(s) => s,
+            None => {
+                // Patch disappeared (unloaded concurrently); rollback and fail.
+                rollback_batch(&enabled_by_batch);
+                return Err(Errno::ENOENT);
+            }
+        };
+
+        if st == PatchState::Enabled {
+            continue; // Already enabled — skip.
+        }
+        if !matches!(st, PatchState::Registered | PatchState::Disabled) {
+            // Not in an enable-able state — rollback and fail.
+            rollback_batch(&enabled_by_batch);
+            return Err(Errno::EBUSY);
+        }
+
+        ops.check_lsm_kpatch_enable(id)?;
+        if let Err(e) = kpatch_enable(id) {
+            rollback_batch(&enabled_by_batch);
+            return Err(e);
+        }
+        enabled_by_batch.push(id);
+    }
+
+    Ok(())
+}
+
+/// P1-4: Disable all enabled patches in reverse topological dependency order.
+///
+/// Patches that are not `Enabled` are skipped.  On failure, all patches
+/// disabled by this batch are re-enabled in reverse order.
+///
+/// Returns `EPERM` if the caller is not privileged.
+pub fn sys_kpatch_disable_all() -> i64 {
+    match do_sys_kpatch_disable_all() {
+        Ok(()) => 0,
+        Err(e) => e.as_i64(),
+    }
+}
+
+fn do_sys_kpatch_disable_all() -> Result<(), Errno> {
+    let ops = ops()?;
+    let _ = patch_table();
+
+    if !ops.is_privileged() {
+        return Err(Errno::EPERM);
+    }
+
+    let order = topo_sort_patch_ids()?;
+    let mut disabled_by_batch: Vec<u64> = Vec::new();
+
+    // Disable in reverse topological order (leaves first, roots last).
+    for &id in order.iter().rev() {
+        let st = match patch_state(id) {
+            Some(s) => s,
+            None => {
+                reenable_batch(&disabled_by_batch);
+                return Err(Errno::ENOENT);
+            }
+        };
+
+        if st != PatchState::Enabled {
+            continue; // Not enabled — skip.
+        }
+
+        ops.check_lsm_kpatch_disable(id)?;
+        if let Err(e) = kpatch_disable(id) {
+            reenable_batch(&disabled_by_batch);
+            return Err(e);
+        }
+        disabled_by_batch.push(id);
+    }
+
+    Ok(())
+}
+
+/// Rollback helper: disable patches enabled by a failed enable-all batch.
+fn rollback_batch(enabled_ids: &[u64]) {
+    for &id in enabled_ids.iter().rev() {
+        let _ = kpatch_disable(id);
+    }
+}
+
+/// Rollback helper: re-enable patches disabled by a failed disable-all batch.
+fn reenable_batch(disabled_ids: &[u64]) {
+    for &id in disabled_ids.iter().rev() {
+        let _ = kpatch_enable(id);
+    }
 }
 
 // ============================================================================

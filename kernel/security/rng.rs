@@ -136,9 +136,9 @@ pub fn is_ready() -> bool {
 /// spin-mutex released between chunks.  This bounds worst-case lock hold time
 /// and reduces cross-core contention for large `getrandom()` calls.
 ///
-/// The reseed interval check now resets `bytes_generated` even when hardware
-/// entropy is unavailable, preventing repeated reseed attempts on every
-/// subsequent call during transient entropy failures.
+/// The reseed interval check resets `bytes_generated` only after a successful
+/// entropy mix-in, so transient entropy failures will be retried on
+/// subsequent calls rather than silently continuing without reseeding.
 pub fn fill_random(out: &mut [u8]) -> Result<(), RngError> {
     for chunk in out.chunks_mut(RNG_FILL_CHUNK_SIZE) {
         let mut guard = GLOBAL_RNG.lock();
@@ -146,13 +146,12 @@ pub fn fill_random(out: &mut [u8]) -> Result<(), RngError> {
 
         // Check if we need to reseed
         if rng.bytes_generated >= RESEED_INTERVAL {
-            // R108-3 FIX: Reset counter unconditionally to avoid retrying on
-            // every subsequent call when entropy is temporarily unavailable.
-            // The CSPRNG remains cryptographically secure even without reseeding.
-            rng.bytes_generated = 0;
-
             let mut seed = [0u8; 32];
             if fill_entropy(&mut seed).is_ok() {
+                // R109-3 FIX: Only reset counter after successful reseed.
+                // Previously, bytes_generated was reset unconditionally which
+                // masked repeated reseed failures.
+                rng.bytes_generated = 0;
                 rng.mix_in(&seed);
             }
             explicit_bzero(&mut seed);
@@ -188,12 +187,10 @@ pub fn try_fill_random(out: &mut [u8]) -> Result<(), RngError> {
         if let Some(rng) = guard.as_mut() {
             // Check if we need to reseed
             if rng.bytes_generated >= RESEED_INTERVAL {
-                // R108-3 FIX: Reset counter unconditionally to prevent repeated
-                // reseed attempts in panic context where entropy may be unavailable.
-                rng.bytes_generated = 0;
-
                 let mut seed = [0u8; 32];
                 if fill_entropy(&mut seed).is_ok() {
+                    // R109-3 FIX: Only reset counter after successful reseed.
+                    rng.bytes_generated = 0;
                     rng.mix_in(&seed);
                 }
                 explicit_bzero(&mut seed);
@@ -429,6 +426,13 @@ impl ChaCha20Rng {
     /// ChaCha20 constants: "expand 32-byte k"
     const CONSTANTS: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
 
+    /// R109-3 FIX: Usable output bytes per refill after fast-key-erasure.
+    ///
+    /// Each ChaCha20 block produces 64 bytes.  The first 32 bytes (words 0-7)
+    /// are consumed to rekey the state (overwrite key words state[4..12]).
+    /// The remaining 32 bytes (words 8-15) are the usable output.
+    const OUTPUT_BYTES_PER_REFILL: usize = 32;
+
     /// Create a new ChaCha20 RNG with given key and nonce
     pub fn new(key: [u8; 32], nonce: [u8; 12]) -> Self {
         let mut state = [0u32; 16];
@@ -471,6 +475,10 @@ impl ChaCha20Rng {
     }
 
     /// Mix in additional entropy
+    ///
+    /// R109-3 FIX: After XOR-mixing entropy into key words, reset the block
+    /// counter and force a full rekey via `refill()`.  The counter reset ensures
+    /// the new key produces a completely fresh output stream.
     pub fn mix_in(&mut self, extra: &[u8]) {
         // XOR extra bytes into key portion of state
         for (i, byte) in extra.iter().take(32).enumerate() {
@@ -480,12 +488,16 @@ impl ChaCha20Rng {
             self.state[word_idx] ^= mask;
         }
 
-        // Force regeneration
+        // Force regeneration with rekeying
         self.available = 0;
+        self.state[12] = 0; // R109-3 FIX: Reset counter for fresh stream
         self.refill();
     }
 
     /// Fill buffer with random bytes
+    ///
+    /// R109-3 FIX: Adjusted for fast-key-erasure output size (32 bytes per
+    /// refill instead of 64, since the first 32 bytes are consumed for rekeying).
     pub fn fill_bytes(&mut self, out: &mut [u8]) {
         let mut remaining = out.len();
         let mut offset = 0;
@@ -496,7 +508,7 @@ impl ChaCha20Rng {
             }
 
             let to_copy = remaining.min(self.available);
-            let buf_start = 64 - self.available;
+            let buf_start = Self::OUTPUT_BYTES_PER_REFILL - self.available;
 
             out[offset..offset + to_copy]
                 .copy_from_slice(&self.buffer[buf_start..buf_start + to_copy]);
@@ -509,6 +521,18 @@ impl ChaCha20Rng {
     }
 
     /// Refill the output buffer with a new ChaCha20 block
+    ///
+    /// R109-3 FIX: Fast-Key-Erasure (FKE) construction for backtracking resistance.
+    ///
+    /// Each refill generates a 64-byte ChaCha20 block.  The first 32 bytes
+    /// (output words 0-7) are used to immediately rekey the internal state
+    /// (overwriting the 8 key words state[4..12]).  The remaining 32 bytes
+    /// (output words 8-15) are placed in `self.buffer[0..32]` as usable output.
+    /// The block counter is then reset to 0 for the new key.
+    ///
+    /// This ensures that even if the RNG state is disclosed after a refill,
+    /// the attacker cannot compute previous outputs (the old key has been
+    /// overwritten with cryptographically derived material).
     fn refill(&mut self) {
         let mut working = self.state;
 
@@ -532,14 +556,26 @@ impl ChaCha20Rng {
             working[i] = working[i].wrapping_add(self.state[i]);
         }
 
-        // Serialize to buffer
-        for (i, word) in working.iter().enumerate() {
+        // FKE rekeying: use words 0-7 (32 bytes) as the new key
+        for i in 0..8 {
+            self.state[4 + i] = working[i];
+        }
+
+        // FKE output: serialize words 8-15 (32 bytes) into the output buffer
+        for (i, word) in working[8..16].iter().enumerate() {
             self.buffer[i * 4..(i + 1) * 4].copy_from_slice(&word.to_le_bytes());
         }
 
-        // Increment counter
-        self.state[12] = self.state[12].wrapping_add(1);
-        self.available = 64;
+        // Reset counter for the new key (FKE construction requirement)
+        self.state[12] = 0;
+        self.available = Self::OUTPUT_BYTES_PER_REFILL;
+
+        // Defense-in-depth: wipe the working state to prevent disclosure of
+        // the old key material via stack remnants.
+        for w in working.iter_mut() {
+            unsafe { core::ptr::write_volatile(w, 0) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 
     /// ChaCha20 quarter round

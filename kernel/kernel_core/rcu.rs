@@ -109,6 +109,49 @@ struct CallbackBatch {
 /// - Better cache locality
 static CALLBACKS: Mutex<VecDeque<CallbackBatch>> = Mutex::new(VecDeque::new());
 
+/// R109-2 FIX: Single-consumer drain serialization to preserve FIFO ordering.
+///
+/// Without serialization, multiple concurrent drainers (`poll()` on different
+/// CPUs + `synchronize_rcu()`) can pop non-front batches while the front batch
+/// is only partially drained.  This flag ensures only one drainer is active at
+/// a time.  `poll()` callers yield immediately if another drain is in progress
+/// (non-blocking); `synchronize_rcu()` spins briefly to acquire ownership.
+static DRAIN_OWNER: AtomicBool = AtomicBool::new(false);
+
+/// RAII guard for drain ownership.  Releases ownership on drop.
+struct DrainOwnerGuard;
+
+impl DrainOwnerGuard {
+    /// Try to acquire drain ownership (non-blocking).
+    /// Returns `Some(Self)` on success, `None` if another drainer is active.
+    #[inline]
+    fn try_acquire() -> Option<Self> {
+        DRAIN_OWNER
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self)
+    }
+
+    /// Acquire drain ownership, spinning until available.
+    /// Used by `synchronize_rcu()` which must drain all completed callbacks.
+    #[inline]
+    fn acquire_spin() -> Self {
+        loop {
+            if let Some(guard) = Self::try_acquire() {
+                return guard;
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+impl Drop for DrainOwnerGuard {
+    #[inline]
+    fn drop(&mut self) {
+        DRAIN_OWNER.store(false, Ordering::Release);
+    }
+}
+
 /// Maximum number of callbacks to drain per `poll()` invocation.
 ///
 /// This prevents a single callback batch from monopolizing the CPU.
@@ -304,7 +347,12 @@ pub fn synchronize_rcu() {
     // Drain any callbacks that are now safe to run.
     // R108-4 FIX: Writers expect `synchronize_rcu()` to leave no completed
     // callbacks behind, so drain without a budget limit.
-    drain_callbacks(target, usize::MAX);
+    //
+    // R109-2 FIX: Acquire exclusive drain ownership before draining to
+    // preserve FIFO ordering.  synchronize_rcu() must guarantee all
+    // completed callbacks are drained, so spin until ownership is acquired.
+    let _drain_owner = DrainOwnerGuard::acquire_spin();
+    drain_callbacks_inner(target, usize::MAX);
 }
 
 /// Queue a callback to run after the next grace period.
@@ -572,8 +620,34 @@ fn callback_drain_budget() -> usize {
 /// an adaptive budget based on backlog depth; `synchronize_rcu()` passes
 /// `usize::MAX` to drain all completed callbacks before returning.
 ///
+/// # R109-2 FIX: Single-consumer serialization
+///
+/// Only one drainer can be active at a time to preserve FIFO ordering.
+/// `poll()` callers yield immediately if another drain is in progress.
+/// `synchronize_rcu()` uses `DrainOwnerGuard::acquire_spin()` directly
+/// and calls `drain_callbacks_inner()` to guarantee completion.
+///
 /// Returns the number of callbacks executed.
 fn drain_callbacks(done_epoch: u64, max_callbacks: usize) -> usize {
+    // R109-2 FIX: Try to acquire exclusive drain ownership.
+    // If another drainer is active, return immediately to avoid FIFO violations.
+    let _drain_owner = match DrainOwnerGuard::try_acquire() {
+        Some(guard) => guard,
+        None => return 0,
+    };
+
+    drain_callbacks_inner(done_epoch, max_callbacks)
+}
+
+/// Inner drain loop, called with drain ownership already held.
+///
+/// # Reentrancy Warning
+///
+/// Callbacks execute with `DRAIN_OWNER` held.  A callback that calls
+/// `synchronize_rcu()` will spin forever on `DRAIN_OWNER` (self-deadlock).
+/// This is by design: RCU callbacks must not call `synchronize_rcu()` or
+/// `poll()`.  This is the same constraint as Linux kernel RCU callbacks.
+fn drain_callbacks_inner(done_epoch: u64, max_callbacks: usize) -> usize {
     let mut count = 0;
 
     // Process batches up to max_callbacks total callbacks

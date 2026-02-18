@@ -492,6 +492,14 @@ pub const MMAP_MIN_ADDR: usize = 0x10000; // 64KB
 /// - Large enough to amortize the interrupt enable/disable overhead
 const USERCOPY_CHUNK_SIZE: usize = 4096;
 
+/// P1-7: Smaller chunk size for user-string copy helpers.
+///
+/// String copies are byte-by-byte and run in hot syscall paths (open, exec).
+/// Using a smaller SMAP window (256 bytes vs. 4KB) reduces the time spent
+/// with interrupts disabled and SMAP bypassed.  Between chunks, interrupts
+/// are re-enabled and per-CPU state is cleared, making migration safe.
+const USERCOPY_STR_CHUNK_SIZE: usize = 256;
+
 /// Check if a pointer is properly aligned for type T
 #[inline]
 fn is_aligned(ptr: usize, align: usize) -> bool {
@@ -723,9 +731,6 @@ pub fn copy_from_user_safe(dst: &mut [u8], src: *const u8) -> Result<(), ()> {
         return Err(());
     }
 
-    // Set up the copy state with buffer range tracking
-    let _guard = UserCopyGuard::new(src as usize, len);
-    USER_COPY_STATE.with(|s| s.remaining.store(len, Ordering::SeqCst));
     let dst_ptr = dst.as_mut_ptr();
 
     // R65-10 FIX: Copy in chunks to allow interrupt servicing
@@ -735,6 +740,19 @@ pub fn copy_from_user_safe(dst: &mut [u8], src: *const u8) -> Result<(), ()> {
 
         // Allow supervisor access to user pages for this chunk
         let _smap_guard = UserAccessGuard::new();
+
+        // R109-1 FIX: Scope UserCopyGuard to each chunk so per-CPU fault-tracking
+        // state lives only while interrupts are disabled (inside SMAP guard).
+        // Previously, the guard was created once at function entry and spanned
+        // multiple chunks.  Between chunks the SMAP guard is dropped, re-enabling
+        // interrupts and creating a migration window.  If the task migrates, the
+        // destination CPU's per-CPU USER_COPY_STATE is inactive, so the exception-
+        // table fixup would fail and the page-fault handler would panic instead of
+        // returning EFAULT.  By scoping per-CPU state to each chunk, migration
+        // between chunks is harmless — state is always on the executing CPU.
+        let _guard =
+            UserCopyGuard::new((src as usize).wrapping_add(offset), chunk_end - offset);
+        USER_COPY_STATE.with(|s| s.remaining.store(len - offset, Ordering::SeqCst));
 
         // H-26 FIX: Copy using exception-safe helpers
         // R102-I4 FIX: Use integer arithmetic for user pointer (src) offset to
@@ -748,8 +766,8 @@ pub fn copy_from_user_safe(dst: &mut [u8], src: *const u8) -> Result<(), ()> {
 
         offset = chunk_end;
 
-        // R65-10 FIX: SMAP guard dropped here, interrupts re-enabled briefly
-        // This allows pending timer/scheduler interrupts to be serviced
+        // R65-10 FIX: SMAP guard and UserCopyGuard dropped here, clearing per-CPU
+        // state before interrupts are re-enabled.  Migration is now safe.
     }
 
     Ok(())
@@ -786,10 +804,6 @@ pub fn copy_to_user_safe(dst: *mut u8, src: &[u8]) -> Result<(), ()> {
         return Err(());
     }
 
-    // Set up the copy state with buffer range tracking
-    let _guard = UserCopyGuard::new(dst as usize, len);
-    USER_COPY_STATE.with(|s| s.remaining.store(len, Ordering::SeqCst));
-
     // R65-10 FIX: Copy in chunks to allow interrupt servicing
     let mut offset = 0usize;
     while offset < len {
@@ -797,6 +811,11 @@ pub fn copy_to_user_safe(dst: *mut u8, src: &[u8]) -> Result<(), ()> {
 
         // Allow supervisor access to user pages for this chunk
         let _smap_guard = UserAccessGuard::new();
+
+        // R109-1 FIX: Scope UserCopyGuard to each chunk (see copy_from_user_safe).
+        let _guard =
+            UserCopyGuard::new((dst as usize).wrapping_add(offset), chunk_end - offset);
+        USER_COPY_STATE.with(|s| s.remaining.store(len - offset, Ordering::SeqCst));
 
         // H-26 FIX: Copy using exception-safe helpers
         // R102-I4 FIX: Use integer arithmetic for user pointer (dst) offset.
@@ -808,8 +827,8 @@ pub fn copy_to_user_safe(dst: *mut u8, src: &[u8]) -> Result<(), ()> {
 
         offset = chunk_end;
 
-        // R65-10 FIX: SMAP guard dropped here, interrupts re-enabled briefly
-        // This allows pending timer/scheduler interrupts to be serviced
+        // R65-10 FIX: SMAP guard and UserCopyGuard dropped here, clearing per-CPU
+        // state before interrupts are re-enabled.  Migration is now safe.
     }
 
     Ok(())
@@ -906,31 +925,69 @@ pub fn copy_user_cstring(src: *const u8) -> Result<alloc::vec::Vec<u8>, ()> {
         return Err(());
     }
 
-    // Allow supervisor access to user pages when SMAP is enabled
-    let _smap_guard = UserAccessGuard::new();
-
-    // Set up the copy state - we don't know exact length, use max
-    let _guard = UserCopyGuard::new(start_addr, MAX_CSTRING_LEN);
-
     let mut result = Vec::with_capacity(256); // Typical path length
+    let mut offset = 0usize;
 
-    for i in 0..MAX_CSTRING_LEN {
-        // Validate each byte address is still in user space
-        let byte_addr = match start_addr.checked_add(i) {
+    // P1-7: Chunked SMAP windows for string copies.  Each chunk scopes its
+    // own UserAccessGuard (STAC/CLAC) and UserCopyGuard (per-CPU fault state).
+    // Between chunks, interrupts are re-enabled and per-CPU state is cleared,
+    // making task migration safe (same pattern as R109-1 fix for bulk copies).
+    //
+    // R110-1 FIX: Copy bytes into a stack-local buffer inside the SMAP window,
+    // then extend the Vec *outside* the window.  This avoids heap allocation
+    // (Vec growth/realloc) while interrupts are disabled and SMAP is bypassed.
+    while offset < MAX_CSTRING_LEN {
+        let chunk_end = (offset + USERCOPY_STR_CHUNK_SIZE).min(MAX_CSTRING_LEN);
+        let chunk_start = match start_addr.checked_add(offset) {
             Some(addr) if addr < USER_SPACE_TOP => addr,
             _ => return Err(()),
         };
 
-        // H-26 FIX: Read using exception-safe helper
-        let mut byte = 0u8;
-        unsafe { copy_byte_from_user(&mut byte as *mut u8, byte_addr as *const u8) }?;
+        let chunk_len = chunk_end - offset;
+        let mut chunk_buf = [0u8; USERCOPY_STR_CHUNK_SIZE];
+        let mut chunk_count = 0usize;
+        let mut found_nul = false;
 
-        // NUL terminator found - done
-        if byte == 0 {
+        // Scoped: SMAP guard + fault-tracking state live only for this chunk.
+        // No heap allocation occurs inside this block.
+        {
+            let _smap_guard = UserAccessGuard::new();
+            let _guard = UserCopyGuard::new(chunk_start, chunk_len);
+
+            for i in offset..chunk_end {
+                // Validate each byte address is still in user space
+                let byte_addr = match start_addr.checked_add(i) {
+                    Some(addr) if addr < USER_SPACE_TOP => addr,
+                    _ => return Err(()),
+                };
+
+                // H-26 FIX: Read using exception-safe helper
+                let mut byte = 0u8;
+                unsafe { copy_byte_from_user(&mut byte as *mut u8, byte_addr as *const u8) }?;
+
+                // NUL terminator found - done
+                if byte == 0 {
+                    found_nul = true;
+                    break;
+                }
+
+                chunk_buf[chunk_count] = byte;
+                chunk_count += 1;
+            }
+            // Guards dropped here: CLAC executed, interrupts re-enabled.
+        }
+
+        // Heap allocation (Vec extend) happens here, outside the SMAP window,
+        // with interrupts enabled and per-CPU state cleared.
+        if chunk_count > 0 {
+            result.extend_from_slice(&chunk_buf[..chunk_count]);
+        }
+
+        if found_nul {
             return Ok(result);
         }
 
-        result.push(byte);
+        offset = chunk_end;
     }
 
     // String too long (no NUL found within MAX_CSTRING_LEN)
@@ -1351,39 +1408,53 @@ pub fn strncpy_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<usize, User
     }
 
     let start_addr = src.addr();
-
-    // Allow supervisor access to user pages when SMAP is enabled
-    let _smap_guard = UserAccessGuard::new();
-
-    // Set up copy state for fault tracking
-    let _guard = UserCopyGuard::new(start_addr, max_copy);
-    USER_COPY_STATE.with(|s| s.remaining.store(max_copy, Ordering::SeqCst));
-
     let mut copied = 0usize;
     let dst_ptr = dst.as_mut_ptr();
+    let mut offset = 0usize;
 
-    for i in 0..max_copy {
-        // Calculate byte address with overflow check
-        let byte_addr = match start_addr.checked_add(i) {
+    // P1-7: Chunked SMAP windows for string copies.  Each chunk scopes its
+    // own UserAccessGuard (STAC/CLAC) and UserCopyGuard (per-CPU fault state).
+    // Between chunks, interrupts are re-enabled and per-CPU state is cleared,
+    // making task migration safe (same pattern as R109-1 fix for bulk copies).
+    while offset < max_copy {
+        let chunk_end = (offset + USERCOPY_STR_CHUNK_SIZE).min(max_copy);
+        let chunk_start = match start_addr.checked_add(offset) {
             Some(addr) if addr < USER_SPACE_TOP => addr,
             _ => return Err(UsercopyError),
         };
 
-        // H-26 FIX: Read using exception-safe helper
-        unsafe { copy_byte_from_user(dst_ptr.add(i), byte_addr as *const u8) }
-            .map_err(|_| UsercopyError)?;
+        // Scoped: SMAP guard + fault-tracking state live only for this chunk.
+        let _smap_guard = UserAccessGuard::new();
+        let _guard = UserCopyGuard::new(chunk_start, chunk_end - offset);
+        USER_COPY_STATE.with(|s| s.remaining.store(max_copy - offset, Ordering::SeqCst));
 
-        // NUL terminator found
-        if dst[i] == 0 {
-            return Ok(copied);
+        for i in offset..chunk_end {
+            // Calculate byte address with overflow check
+            let byte_addr = match start_addr.checked_add(i) {
+                Some(addr) if addr < USER_SPACE_TOP => addr,
+                _ => return Err(UsercopyError),
+            };
+
+            // H-26 FIX: Read using exception-safe helper
+            unsafe { copy_byte_from_user(dst_ptr.add(i), byte_addr as *const u8) }
+                .map_err(|_| UsercopyError)?;
+
+            // NUL terminator found
+            if dst[i] == 0 {
+                return Ok(copied);
+            }
+
+            copied += 1;
+
+            USER_COPY_STATE.with(|s| {
+                s.remaining
+                    .store(max_copy.saturating_sub(i + 1), Ordering::SeqCst)
+            });
         }
+        // Guards dropped here: CLAC executed, interrupts re-enabled.
+        // Migration between chunks is safe (no active per-CPU state).
 
-        copied += 1;
-
-        USER_COPY_STATE.with(|s| {
-            s.remaining
-                .store(max_copy.saturating_sub(i + 1), Ordering::SeqCst)
-        });
+        offset = chunk_end;
     }
 
     // Reached max_copy without finding NUL

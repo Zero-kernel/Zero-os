@@ -11,7 +11,8 @@
 //! |-------|--------------|---------------|----------|
 //! | [`kprintln!`] | Compiled out | No | Debug diagnostics (replaces `println!`) |
 //! | [`klog!`] | Active | Yes | Operational logging with level filter |
-//! | [`klog_always!`] | Active | No | Boot banners, panic handler |
+//! | [`klog_always!`] | Active | Secure-gated | Boot banners, status messages |
+//! | [`klog_force!`] | Active | No | Pre-panic diagnostics, critical errors |
 //!
 //! # Hardening Profile Integration
 //!
@@ -41,7 +42,7 @@
 
 #![no_std]
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 // ============================================================================
 // Log Levels
@@ -77,6 +78,14 @@ const LEVEL_DISABLED: u8 = u8::MAX;
 /// Initialised to DISABLED; the boot path must call [`set_profile`].
 static LOG_MIN_LEVEL: AtomicU8 = AtomicU8::new(LEVEL_DISABLED);
 
+/// P1-1: Runtime gate for [`klog_always!`].
+///
+/// Defaults to `false` (fail-closed) until [`set_profile`] is called.
+/// In `Secure` profile this remains `false`, suppressing all `klog_always!`
+/// output to minimize information leakage.  Use [`klog_force!`] for
+/// output that must appear regardless of profile (e.g., pre-panic diagnostics).
+static LOG_ALWAYS_ENABLED: AtomicBool = AtomicBool::new(false);
+
 /// Hardening profile identifiers mirroring `compliance::HardeningProfile`.
 ///
 /// Duplicated here to avoid a compile-time dependency on `compliance`.
@@ -96,6 +105,10 @@ pub enum KlogProfile {
 ///
 /// Called once during early boot after the compliance subsystem selects a
 /// profile.  Safe to call again if the profile changes at runtime.
+///
+/// P1-1: Also gates [`klog_always!`] — Secure profile suppresses all
+/// `klog_always!` output.  Use [`klog_force!`] for output that must
+/// appear regardless of profile.
 #[inline]
 pub fn set_profile(profile: KlogProfile) {
     let min = match profile {
@@ -104,6 +117,8 @@ pub fn set_profile(profile: KlogProfile) {
         KlogProfile::Performance => Level::Trace as u8,
     };
     LOG_MIN_LEVEL.store(min, Ordering::Release);
+    // P1-1: Secure profile suppresses klog_always! to minimize info leakage.
+    LOG_ALWAYS_ENABLED.store(profile != KlogProfile::Secure, Ordering::Release);
 }
 
 /// Disable all klog output.  Does **not** affect [`klog_always!`].
@@ -120,6 +135,16 @@ pub fn enabled(level: Level) -> bool {
     level as u8 >= LOG_MIN_LEVEL.load(Ordering::Relaxed)
 }
 
+/// P1-1: Returns `true` if [`klog_always!`] output is currently enabled.
+///
+/// Hot path: single `Relaxed` atomic load.  `klog_always!` output is
+/// suppressed in `Secure` profile to minimize information leakage.
+#[doc(hidden)]
+#[inline(always)]
+pub fn _klog_always_enabled() -> bool {
+    LOG_ALWAYS_ENABLED.load(Ordering::Relaxed)
+}
+
 // ============================================================================
 // Output Helpers (not public API — used by macros)
 // ============================================================================
@@ -134,11 +159,37 @@ pub fn _klog_print(args: core::fmt::Arguments) {
 // Macros
 // ============================================================================
 
-/// Unconditional kernel output (boot banner, panic handler).
+/// Profile-gated kernel output (boot banners, status messages).
 ///
-/// Always active regardless of build mode or hardening profile.
+/// P1-1: Suppressed in [`KlogProfile::Secure`] to minimize information
+/// leakage.  For output that must appear regardless of profile (e.g.,
+/// pre-panic diagnostics, security policy enforcement messages), use
+/// [`klog_force!`] instead.
 #[macro_export]
 macro_rules! klog_always {
+    () => {{
+        if $crate::_klog_always_enabled() {
+            $crate::_klog_print(format_args!("\n"));
+        }
+    }};
+    ($($arg:tt)+) => {{
+        if $crate::_klog_always_enabled() {
+            $crate::_klog_print(format_args!("{}\n", format_args!($($arg)+)));
+        }
+    }};
+}
+
+/// Truly unconditional kernel output — never suppressed by any profile.
+///
+/// Use sparingly: only for output that **must** appear regardless of
+/// hardening profile.  Examples:
+/// - Security policy enforcement messages immediately before `panic!()`
+/// - Critical hardware errors that prevent boot
+/// - Livepatch ECDSA key placeholder warnings
+///
+/// All other boot/status output should use [`klog_always!`] (profile-gated).
+#[macro_export]
+macro_rules! klog_force {
     () => {{
         $crate::_klog_print(format_args!("\n"));
     }};

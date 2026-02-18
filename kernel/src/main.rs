@@ -47,6 +47,16 @@ use trace::counters::{increment_counter, TraceCounter};
 static COUNTERS_READY: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// R109-4 FIX: Flag to distinguish early-boot context from post-boot kernel threads.
+///
+/// Set to `true` just before enabling interrupts (`sti`).  Audit authorizer
+/// closures use this flag to reject `current_credentials() == None` requests
+/// after boot completes.  Without this flag, kernel threads and interrupt
+/// handlers (which also have `None` credentials) would be granted audit
+/// snapshot/HMAC-key access, bypassing capability gates.
+static BOOT_PHASE_COMPLETE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 // 演示模块
 mod demo;
 mod integration_test;
@@ -137,7 +147,8 @@ fn parse_hardening_profile_from_cmdline(
                         // Operator typo detection: profile= token found but value
                         // is not recognized. Log a warning so the operator knows
                         // their intent was not applied.
-                        klog_always!(
+                        // P1-1: Use klog_force! — typo warnings must always be visible.
+                        klog_force!(
                             "      ! WARNING: Unrecognized profile value '{}', ignoring",
                             s
                         );
@@ -280,6 +291,27 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // 初始化VGA驱动（后备，framebuffer 初始化后 VGA 输出会被跳过）
     drivers::vga_buffer::init();
 
+    // P1-1: Wire klog profile as early as possible — before the first
+    // klog_always! banner — so Secure profile suppresses all boot output.
+    // This parse happens before the heap is ready, so it uses only stack
+    // and BootInfo data.  The profile is set again after PolicySurface
+    // initialization for defense-in-depth.
+    if let Some(info) = boot_info {
+        if let Some(early_profile) = parse_hardening_profile_from_cmdline(info) {
+            let klog_profile = match early_profile {
+                compliance::HardeningProfile::Secure => klog::KlogProfile::Secure,
+                compliance::HardeningProfile::Balanced => klog::KlogProfile::Balanced,
+                compliance::HardeningProfile::Performance => klog::KlogProfile::Performance,
+            };
+            klog::set_profile(klog_profile);
+        } else {
+            // Default: Balanced (show boot banners)
+            klog::set_profile(klog::KlogProfile::Balanced);
+        }
+    } else {
+        klog::set_profile(klog::KlogProfile::Balanced);
+    }
+
     klog_always!("==============================");
     klog_always!("  Zero-OS Microkernel v0.1");
     klog_always!("==============================");
@@ -408,7 +440,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 klog_always!("        - audit_ring_capacity:  {}", ps.audit_ring_capacity);
             }
             Err(e) => {
-                klog_always!("      ! Security hardening failed: {:?}", e);
+                // P1-1: klog_force! — hardening failure must be visible in all profiles.
+                klog_force!("      ! Security hardening failed: {:?}", e);
                 // R102-2 FIX: Secure profile must not boot without core mitigations.
                 // A single hardware/config anomaly should not silently disable all
                 // security hardening (W^X, NX, CSPRNG, Spectre mitigations).
@@ -419,16 +452,17 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                         e
                     );
                 }
-                klog_always!("      ! Continuing with reduced security");
+                klog_force!("      ! Continuing with reduced security");
             }
         }
     }
 
     // R101-4 FIX: Boot-time livepatch ECDSA key validation
+    // P1-1: Use klog_force! — critical security warning must appear in all profiles.
     if livepatch::has_placeholder_keys() {
-        klog_always!("      ! WARNING: Livepatch ECDSA public keys are all-zero placeholders!");
-        klog_always!("      ! Livepatch signature verification is non-functional.");
-        klog_always!("      ! Generate production P-256 keys and embed them in livepatch::TRUSTED_P256_PUBKEYS_UNCOMPRESSED.");
+        klog_force!("      ! WARNING: Livepatch ECDSA public keys are all-zero placeholders!");
+        klog_force!("      ! Livepatch signature verification is non-functional.");
+        klog_force!("      ! Generate production P-256 keys and embed them in livepatch::TRUSTED_P256_PUBKEYS_UNCOMPRESSED.");
     }
 
     // KASLR/KPTI/PCID initialization
@@ -445,14 +479,16 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         // Check partial KASLR as a fallback: if partial randomization is
         // active we log a warning but allow boot (defense-in-depth).
         if security::is_partial_kaslr_enabled() {
-            klog_always!(
+            // P1-1: klog_force! — policy enforcement messages must be visible
+            // even in Secure profile so operators can diagnose boot issues.
+            klog_force!(
                 "[POLICY] {} profile: full KASLR not active; partial KASLR in use",
                 ps.profile.name()
             );
         } else {
             // Log before panic so operators see the reason even when
             // panic_redact_details is true (Secure profile).
-            klog_always!(
+            klog_force!(
                 "[POLICY] {} profile: KASLR required but no randomization active — halting",
                 ps.profile.name()
             );
@@ -463,7 +499,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         }
     }
     if ps.kpti_fail_closed && !security::is_kpti_enabled() {
-        klog_always!(
+        klog_force!(
             "[POLICY] {} profile: KPTI not active — kernel page table isolation \
              preferred (Meltdown mitigation)",
             ps.profile.name()
@@ -743,11 +779,15 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             // Policy: Allow root (euid == 0) OR holders of CAP_AUDIT_READ
             // R72-HMAC FIX: During early boot (no process context), allow kernel init code
             audit::register_snapshot_authorizer(|| {
-                // R72-HMAC FIX: Allow during early kernel boot when no process exists yet
+                // R109-4 FIX: Only allow credential-less access during the boot phase.
+                // Post-boot, kernel threads and interrupt handlers also have None
+                // credentials and must not bypass capability gates.
                 let creds = current_credentials();
                 if creds.is_none() {
-                    // Early boot - kernel init context, allow
-                    return Ok(());
+                    if !BOOT_PHASE_COMPLETE.load(core::sync::atomic::Ordering::Acquire) {
+                        return Ok(()); // Still in boot phase
+                    }
+                    return Err(audit::AuditError::AccessDenied);
                 }
 
                 // After boot: Allow root users
@@ -773,12 +813,14 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             // Policy: Allow root (euid == 0) OR holders of CAP_AUDIT_WRITE
             // R72-HMAC FIX: During early boot (no process context), allow kernel init code
             audit::register_hmac_key_authorizer(|| {
-                // R72-HMAC FIX: Allow during early kernel boot when no process exists yet
-                // This is safe because only privileged kernel code runs before processes exist
+                // R109-4 FIX: Only allow credential-less access during the boot phase.
+                // Same rationale as snapshot authorizer above.
                 let creds = current_credentials();
                 if creds.is_none() {
-                    // Early boot - kernel init context, allow
-                    return Ok(());
+                    if !BOOT_PHASE_COMPLETE.load(core::sync::atomic::Ordering::Acquire) {
+                        return Ok(()); // Still in boot phase
+                    }
+                    return Err(audit::AuditError::AccessDenied);
                 }
 
                 // After boot: Allow root users
@@ -874,10 +916,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     COUNTERS_READY.store(true, core::sync::atomic::Ordering::Release);
     // Install read guard for metrics export (CAP_TRACE_READ or root)
     let _ = trace::install_read_guard(|| {
-        // Allow during early kernel boot when no process exists
+        // R109-4 FIX: Only allow credential-less access during the boot phase.
         let creds = current_credentials();
         if creds.is_none() {
-            return true; // Early boot - kernel init context
+            return !BOOT_PHASE_COMPLETE.load(core::sync::atomic::Ordering::Acquire);
         }
         // After boot: Allow root users
         if let Some(ref c) = creds {
@@ -923,7 +965,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             klog_always!("      ! Ring 3 test setup failed");
         }
     } else {
-        klog_always!("[POLICY] {} profile: debug/test interfaces disabled",
+        klog_force!("[POLICY] {} profile: debug/test interfaces disabled",
                      compliance::policy().profile.name());
     }
 
@@ -960,6 +1002,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // 注意：在启用中断前，确保所有中断处理程序已正确设置
     // 启用串口接收中断（在 sti 前，最小化中断禁用期间积压数据的窗口）
     arch::interrupts::enable_serial_interrupts();
+
+    // R109-4 FIX: Mark boot phase as complete before enabling interrupts.
+    // After this point, credential-less contexts (kernel threads, interrupt
+    // handlers) must not bypass audit/trace capability gates.
+    BOOT_PHASE_COMPLETE.store(true, core::sync::atomic::Ordering::Release);
+
     unsafe {
         core::arch::asm!("sti", options(nomem, nostack));
     }

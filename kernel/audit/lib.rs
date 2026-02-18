@@ -161,6 +161,8 @@ pub enum AuditSecurityClass {
     Seccomp = 2,
     /// Capability lifecycle or use.
     Capability = 3,
+    /// P1-3: Cgroup delegation lifecycle (grant/revoke).
+    CgroupDelegation = 4,
 }
 
 /// LSM denial reason code (stored in `args[2]`).
@@ -219,6 +221,16 @@ pub enum AuditCapOperation {
     Use = 4,
     /// Capability lookup failed (invalid/stale).
     LookupFailed = 5,
+}
+
+/// P1-3: Cgroup delegation operations tracked by audit (`args[1]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuditCgroupDelegationOp {
+    /// Delegation granted or updated.
+    Grant = 1,
+    /// Delegation revoked.
+    Revoke = 2,
 }
 
 /// Argument layout for security events (shared across SecurityClass variants).
@@ -1176,6 +1188,7 @@ impl AuditRing {
                 next_cursor: cursor,
                 has_more: false,
                 tail_hash,
+                batch_first_prev_hash: ZERO_HASH,
                 ring_usage,
                 dropped_since_cursor,
             };
@@ -1197,6 +1210,7 @@ impl AuditRing {
                 next_cursor: self.next_id,
                 has_more: false,
                 tail_hash,
+                batch_first_prev_hash: ZERO_HASH,
                 ring_usage,
                 dropped_since_cursor,
             };
@@ -1223,6 +1237,7 @@ impl AuditRing {
                 next_cursor: start_cursor,
                 has_more: false,
                 tail_hash,
+                batch_first_prev_hash: ZERO_HASH,
                 ring_usage,
                 dropped_since_cursor,
             };
@@ -1253,11 +1268,21 @@ impl AuditRing {
             last_id.wrapping_add(1)
         };
 
+        // P1-2: Extract first event's prev_hash for chain continuity verification.
+        // When dropped_since_cursor > 0, the chain is broken so we zero the field
+        // to signal the daemon that continuity cannot be verified for this window.
+        let batch_first_prev_hash = if dropped_since_cursor > 0 {
+            ZERO_HASH
+        } else {
+            events.first().map(|e| e.prev_hash).unwrap_or(ZERO_HASH)
+        };
+
         AuditExportBatch {
             events,
             next_cursor,
             has_more: available > to_take,
             tail_hash,
+            batch_first_prev_hash,
             ring_usage,
             dropped_since_cursor,
         }
@@ -1323,6 +1348,14 @@ pub struct AuditExportBatch {
     pub has_more: bool,
     /// Current tail hash of the audit chain (SHA-256).
     pub tail_hash: [u8; 32],
+    /// P1-2: `prev_hash` of the first exported event (SHA-256).
+    ///
+    /// Enables userspace to verify chain continuity across export windows:
+    /// `batch_first_prev_hash == last_window_last_hash`.
+    ///
+    /// When `events` is empty or `dropped_since_cursor > 0`, this field is
+    /// zero-filled (chain was broken — the daemon must treat it as a gap).
+    pub batch_first_prev_hash: [u8; 32],
     /// P1-2: Ring buffer occupancy in basis points (0–10000).
     ///
     /// Enables the userspace audit daemon to detect back-pressure and throttle
@@ -1344,21 +1377,30 @@ pub const AUDIT_EXPORT_MAGIC: u32 = u32::from_le_bytes(*b"ZAUD");
 /// Version history:
 /// - v1: Initial format (48-byte header)
 /// - v2: Added ring_usage + dropped_since_cursor for remote delivery (64-byte header)
-pub const AUDIT_EXPORT_VERSION: u16 = 2;
+/// - v3: Added batch_first_prev_hash + backpressure_high_water_bps (96-byte header)
+pub const AUDIT_EXPORT_VERSION: u16 = 3;
+
+/// Default high-water mark for userspace backpressure polling (basis points).
+///
+/// Userspace audit daemons should treat `ring_usage >= backpressure_high_water_bps`
+/// as a signal to increase export frequency or throttle high-rate producers.
+pub const AUDIT_BACKPRESSURE_DEFAULT_BPS: u16 = 8000;
 
 /// Fixed-size export header written before `AuditExportRecord[]`.
 ///
 /// All integer fields are stored in little-endian byte order on the wire.
 ///
-/// Layout (v2, 64 bytes):
-///   [0..4)    magic              u32
-///   [4..6)    version            u16
-///   [6..8)    record_count       u16
-///   [8..16)   cursor             u64
-///   [16..48)  tail_hash          [u8; 32]
-///   [48..56)  dropped_since_cursor  u64
-///   [56..58)  ring_usage         u16
-///   [58..64)  _reserved          [u8; 6]
+/// Layout (v3, 96 bytes):
+///   [0..4)    magic                        u32
+///   [4..6)    version                      u16
+///   [6..8)    record_count                 u16
+///   [8..16)   cursor                       u64
+///   [16..48)  tail_hash                    [u8; 32]
+///   [48..56)  dropped_since_cursor         u64
+///   [56..58)  ring_usage                   u16
+///   [58..60)  backpressure_high_water_bps  u16
+///   [60..64)  _reserved                    [u8; 4]
+///   [64..96)  batch_first_prev_hash        [u8; 32]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuditExportHeader {
@@ -1376,13 +1418,24 @@ pub struct AuditExportHeader {
     pub dropped_since_cursor: u64,
     /// P1-2: Ring buffer occupancy in basis points (0–10000).
     pub ring_usage: u16,
+    /// P1-2: Recommended high-water mark for backpressure polling (0–10000).
+    ///
+    /// When `ring_usage >= backpressure_high_water_bps`, userspace should
+    /// increase export frequency or apply upstream throttling.
+    pub backpressure_high_water_bps: u16,
     /// Reserved for future use; zero-filled.
-    pub _reserved: [u8; 6],
+    pub _reserved: [u8; 4],
+    /// P1-2: `prev_hash` of the first exported event (SHA-256).
+    ///
+    /// When `record_count > 0` and `dropped_since_cursor == 0`, userspace can
+    /// verify chain continuity: `batch_first_prev_hash == last_window_last_hash`.
+    /// Zero-filled when no events are exported or the chain has a gap.
+    pub batch_first_prev_hash: [u8; 32],
 }
 
 impl AuditExportHeader {
-    /// Serialized size in bytes (v2: 64).
-    pub const SIZE: usize = 64;
+    /// Serialized size in bytes (v3: 96).
+    pub const SIZE: usize = 96;
 
     /// Construct a new header.
     #[inline]
@@ -1392,6 +1445,7 @@ impl AuditExportHeader {
         tail_hash: [u8; 32],
         ring_usage: u16,
         dropped_since_cursor: u64,
+        batch_first_prev_hash: [u8; 32],
     ) -> Self {
         Self {
             magic: AUDIT_EXPORT_MAGIC,
@@ -1401,7 +1455,9 @@ impl AuditExportHeader {
             tail_hash,
             dropped_since_cursor,
             ring_usage,
-            _reserved: [0u8; 6],
+            backpressure_high_water_bps: AUDIT_BACKPRESSURE_DEFAULT_BPS,
+            _reserved: [0u8; 4],
+            batch_first_prev_hash,
         }
     }
 
@@ -1416,7 +1472,9 @@ impl AuditExportHeader {
         out[16..48].copy_from_slice(&self.tail_hash);
         out[48..56].copy_from_slice(&self.dropped_since_cursor.to_le_bytes());
         out[56..58].copy_from_slice(&self.ring_usage.to_le_bytes());
-        // out[58..64] remains zero (_reserved)
+        out[58..60].copy_from_slice(&self.backpressure_high_water_bps.to_le_bytes());
+        // out[60..64] remains zero (_reserved)
+        out[64..96].copy_from_slice(&self.batch_first_prev_hash);
         out
     }
 }
@@ -2257,6 +2315,44 @@ pub fn emit_capability_event(
         outcome,
         subject,
         AuditObject::Capability { cap_id },
+        &args,
+        errno,
+        timestamp,
+    )
+}
+
+/// P1-3: Emit an audit record for cgroup delegation lifecycle.
+///
+/// # Args Layout
+///
+/// - `args[0]` = `AuditSecurityClass::CgroupDelegation`
+/// - `args[1]` = `AuditCgroupDelegationOp` (Grant / Revoke)
+/// - `args[2]` = cgroup id
+/// - `args[3]` = old delegate UID (or `u64::MAX` if none)
+/// - `args[4]` = new delegate UID (or `u64::MAX` if none / revoke)
+#[inline]
+pub fn emit_cgroup_delegation_event(
+    subject: AuditSubject,
+    cgroup_id: u64,
+    op: AuditCgroupDelegationOp,
+    old_delegate_uid: Option<u32>,
+    new_delegate_uid: Option<u32>,
+    errno: i32,
+    timestamp: u64,
+) -> Result<(), AuditError> {
+    let args = [
+        AuditSecurityClass::CgroupDelegation as u64,
+        op as u64,
+        cgroup_id,
+        old_delegate_uid.map(|uid| uid as u64).unwrap_or(u64::MAX),
+        new_delegate_uid.map(|uid| uid as u64).unwrap_or(u64::MAX),
+    ];
+
+    emit(
+        AuditKind::Security,
+        AuditOutcome::Success,
+        subject,
+        AuditObject::None,
         &args,
         errno,
         timestamp,

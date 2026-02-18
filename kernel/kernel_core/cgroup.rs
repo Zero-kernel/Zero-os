@@ -1322,24 +1322,35 @@ pub fn create_cgroup(
 
 /// P1-3: Delegate management of a cgroup subtree to `uid`.
 ///
-/// Only root (euid 0) may call this.  Once delegated, the specified UID may
-/// create/delete children, set limits (bounded by the parent), and migrate
-/// tasks within this cgroup and all its descendants.
+/// Root (euid 0), holders of CAP_SYS_ADMIN, or existing delegated managers
+/// of this cgroup's subtree may call this.  Delegated managers may sub-delegate
+/// within their delegated scope.
+///
+/// Once delegated, the specified UID may create/delete children, set limits
+/// (bounded by the parent), and migrate tasks within this cgroup and all its
+/// descendants.
 ///
 /// Pass `uid = None` to revoke delegation.
 ///
+/// # Returns
+///
+/// On success, returns the previous `delegate_uid` value for audit trail.
+///
 /// # Errors
 ///
-/// * `PermissionDenied` - Caller is not root
+/// * `PermissionDenied` - Caller lacks root, CAP_SYS_ADMIN, or delegation
 /// * `NotFound` - Cgroup ID does not exist
-pub fn delegate_cgroup(id: CgroupId, uid: Option<u32>) -> Result<(), CgroupError> {
-    let creds = crate::process::current_credentials().ok_or(CgroupError::PermissionDenied)?;
-    if creds.euid != 0 {
+pub fn delegate_cgroup(
+    id: CgroupId,
+    uid: Option<u32>,
+    caller_authorized: bool,
+) -> Result<Option<u32>, CgroupError> {
+    if !caller_authorized {
         return Err(CgroupError::PermissionDenied);
     }
     let node = lookup_cgroup(id).ok_or(CgroupError::NotFound)?;
-    *node.delegate_uid.lock() = uid;
-    Ok(())
+    let old_uid = core::mem::replace(&mut *node.delegate_uid.lock(), uid);
+    Ok(old_uid)
 }
 
 /// Deletes a cgroup by ID.

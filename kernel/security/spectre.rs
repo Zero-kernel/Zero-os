@@ -552,12 +552,17 @@ pub unsafe fn rsb_fill_on_context_switch() {
 ///
 /// This is intended to be called from the scheduler when switching
 /// to user-mode code.
+///
+/// # Safety
+///
+/// R109-5 FIX: Marked `unsafe` because this function executes stack-manipulating
+/// assembly (`rsb_fill`) that pushes 32 return addresses and adjusts RSP.
+/// Callers must ensure a valid kernel stack is active.  Visibility restricted to
+/// `pub(crate)` because external crates should use `rsb_fill_on_context_switch()`
+/// which documents the same safety requirement at a higher abstraction level.
 #[inline]
-pub fn fill_rsb_if_needed() {
-    // Only stuff RSB if switching to potentially untrusted code
-    unsafe {
-        rsb_fill();
-    }
+pub(crate) unsafe fn fill_rsb_if_needed() {
+    rsb_fill();
 }
 
 // ============================================================================
