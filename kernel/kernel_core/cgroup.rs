@@ -268,10 +268,20 @@ impl CgroupStats {
         self.pids_current.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrements the attached task count.
+    /// Decrements the attached task count (saturating at zero).
+    ///
+    /// # R110-1 FIX: Saturating decrement via `fetch_update`
+    ///
+    /// Bare `fetch_sub(1)` could wrap `pids_current` to `u64::MAX` if called
+    /// when the counter is already 0 (double-exit race, cgroup migration during
+    /// exit).  This matches the `uncharge_memory` pattern used elsewhere.
     #[inline]
     fn decrement_pids(&self) {
-        self.pids_current.fetch_sub(1, Ordering::Relaxed);
+        let _ = self.pids_current.fetch_update(
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
     }
 
     /// Records a pids.max exceeded event.
@@ -316,6 +326,7 @@ pub struct CgroupStatsSnapshot {
 /// * `period_usage_ns` - Accumulated CPU time used in the current period
 /// * `throttled_until_ns` - End of throttle window (0 = not throttled)
 /// * `throttle_events` - Counter of throttle events for statistics
+/// * `refreshing` - R110-2 FIX: Lock that serializes window refresh with charging
 #[derive(Debug)]
 struct CpuQuotaState {
     /// Start of the current quota period in nanoseconds since boot
@@ -326,6 +337,11 @@ struct CpuQuotaState {
     throttled_until_ns: AtomicU64,
     /// Number of times this cgroup has been throttled
     throttle_events: AtomicU64,
+    /// R110-2 FIX: True while the CAS winner is resetting per-period counters.
+    /// Chargers that observe `refreshing == true` skip charging for this tick
+    /// (fail-closed: the tick is lost, which is the same behavior as lock
+    /// contention on the limits mutex — documented as safe in charge_cpu_quota).
+    refreshing: AtomicBool,
 }
 
 impl CpuQuotaState {
@@ -336,6 +352,7 @@ impl CpuQuotaState {
             period_usage_ns: AtomicU64::new(0),
             throttled_until_ns: AtomicU64::new(0),
             throttle_events: AtomicU64::new(0),
+            refreshing: AtomicBool::new(false),
         }
     }
 
@@ -343,16 +360,69 @@ impl CpuQuotaState {
     ///
     /// Called before charging or checking throttle state to ensure
     /// we're accounting against the correct period.
+    ///
+    /// # R110-2 FIX: SMP-safe window refresh via refresh lock + CAS
+    ///
+    /// The refresh lock (`refreshing: AtomicBool`) is acquired **before** the
+    /// CAS on `period_start_ns`.  This ensures that:
+    ///
+    /// 1. Only one CPU can enter the refresh critical section at a time.
+    /// 2. `period_start_ns` is only updated **after** `period_usage_ns` and
+    ///    `throttled_until_ns` have been reset to 0.
+    /// 3. Concurrent chargers that observe `refreshing == true` skip the tick
+    ///    (fail-closed, same as limits-lock contention — documented as safe).
+    ///
+    /// The new period start is published last, so any CPU that observes the
+    /// fresh `period_start_ns` is guaranteed to see zeroed usage counters.
     #[inline]
     fn refresh_window(&self, now_ns: u64, period_ns: u64) {
-        let start = self.period_start_ns.load(Ordering::Relaxed);
-        // If this is the first accounting or the period has elapsed,
-        // start a new period with reset usage
-        if start == 0 || now_ns.saturating_sub(start) >= period_ns {
-            self.period_start_ns.store(now_ns, Ordering::Relaxed);
-            self.period_usage_ns.store(0, Ordering::Relaxed);
-            self.throttled_until_ns.store(0, Ordering::Relaxed);
+        let start = self.period_start_ns.load(Ordering::Acquire);
+
+        // Fast-path: still within the current accounting window.
+        if start != 0 && now_ns.saturating_sub(start) < period_ns {
+            return;
         }
+
+        // Try to acquire the refresh lock (non-blocking, single-winner).
+        if self
+            .refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            // Another CPU is already refreshing — this tick is skipped
+            // (fail-closed: chargers also check `is_refreshing()`).
+            return;
+        }
+
+        // We hold the refresh lock.  Re-check the window under the lock
+        // (another CPU may have completed a refresh between our initial
+        // check and the lock acquisition).
+        let start = self.period_start_ns.load(Ordering::Acquire);
+        if start != 0 && now_ns.saturating_sub(start) < period_ns {
+            self.refreshing.store(false, Ordering::Release);
+            return;
+        }
+
+        // Reset per-period counters BEFORE publishing the new start time.
+        // Any concurrent charger will see `refreshing == true` and skip.
+        self.period_usage_ns.store(0, Ordering::Release);
+        self.throttled_until_ns.store(0, Ordering::Release);
+
+        // Publish the new window start — chargers that observe this value
+        // are guaranteed to see zeroed usage/throttle counters above.
+        self.period_start_ns.store(now_ns, Ordering::Release);
+
+        // Release the refresh lock — chargers may resume.
+        self.refreshing.store(false, Ordering::Release);
+    }
+
+    /// Returns true if a window refresh is currently in progress.
+    ///
+    /// Callers (charge_cpu_quota) should skip charging when this is true
+    /// to avoid racing with the usage counter reset.
+    #[inline]
+    fn is_refreshing(&self) -> bool {
+        self.refreshing.load(Ordering::Acquire)
     }
 
     /// Returns the number of throttle events.
@@ -1103,9 +1173,14 @@ impl CgroupNode {
         for (ancestor, limit) in ancestors.iter().zip(ancestor_limits.iter()) {
             if charge(&ancestor.stats, *limit).is_err() {
                 ancestor.stats.record_pids_max_event();
-                // Rollback all previously charged stats
+                // R110-1 FIX: Rollback with saturating decrement to prevent
+                // underflow if a concurrent exit already decremented.
                 for stats in charged.into_iter() {
-                    stats.pids_current.fetch_sub(1, Ordering::SeqCst);
+                    let _ = stats.pids_current.fetch_update(
+                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                        |current| Some(current.saturating_sub(1)),
+                    );
                 }
                 return Err(CgroupError::PidsLimitExceeded);
             }
@@ -1831,16 +1906,23 @@ pub fn charge_cpu_quota(
             quota.refresh_window(now_ns, period_ns);
 
             // Check if currently throttled
-            let throttle_until = quota.throttled_until_ns.load(Ordering::Relaxed);
+            let throttle_until = quota.throttled_until_ns.load(Ordering::Acquire);
             if throttle_until != 0 {
                 if now_ns < throttle_until {
                     // Still in throttle window
                     return CpuQuotaStatus::Throttled(throttle_until);
                 }
-                // Throttle window expired, start new period
-                quota.throttled_until_ns.store(0, Ordering::Relaxed);
-                quota.period_usage_ns.store(0, Ordering::Relaxed);
-                quota.period_start_ns.store(now_ns, Ordering::Relaxed);
+                // R110-2 FIX: Throttle window expired — delegate to the
+                // CAS-serialized refresh_window() instead of ad-hoc plain stores.
+                quota.refresh_window(now_ns, period_ns);
+            }
+
+            // R110-2 FIX: If a window refresh is in progress on another CPU,
+            // skip charging for this tick.  At most one tick's worth of CPU
+            // time goes unaccounted — bounded and conservative, analogous to
+            // the skip behavior when the limits mutex is contended above.
+            if quota.is_refreshing() {
+                return CpuQuotaStatus::Allowed;
             }
 
             // Charge the time and check if quota exceeded
@@ -1905,16 +1987,15 @@ pub fn cpu_quota_is_throttled(cgroup_id: CgroupId, now_ns: u64) -> Option<u64> {
             // Refresh window first to check if throttle has expired
             quota.refresh_window(now_ns, period_ns);
 
-            let until = quota.throttled_until_ns.load(Ordering::Relaxed);
+            let until = quota.throttled_until_ns.load(Ordering::Acquire);
             if until != 0 {
                 if now_ns < until {
                     // Still throttled
                     return Some(until);
                 }
-                // Throttle expired, clear state and start new period
-                quota.throttled_until_ns.store(0, Ordering::Relaxed);
-                quota.period_usage_ns.store(0, Ordering::Relaxed);
-                quota.period_start_ns.store(now_ns, Ordering::Relaxed);
+                // R110-2 FIX: Throttle expired — delegate to the CAS-serialized
+                // refresh_window() instead of ad-hoc plain stores.
+                quota.refresh_window(now_ns, period_ns);
             }
         }
     }

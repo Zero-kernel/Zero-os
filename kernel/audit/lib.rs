@@ -78,6 +78,12 @@ pub const MAX_CAPACITY: usize = 8192;
 /// Note: We store syscall_num + 6 args, so need 7 slots
 pub const MAX_ARGS: usize = 7;
 
+/// R110-4 FIX: Minimum HMAC key size (128-bit).
+///
+/// Keys shorter than this provide negligible tamper resistance.
+/// FIPS 140-2 / NIST SP 800-107 require HMAC keys >= 128 bits.
+pub const MIN_HMAC_KEY_SIZE: usize = 16;
+
 /// R65-15 FIX: Maximum HMAC key size
 /// Using 32 bytes (256 bits) as recommended for HMAC-SHA256
 pub const MAX_HMAC_KEY_SIZE: usize = 32;
@@ -99,6 +105,8 @@ pub enum AuditError {
     Disabled,
     /// Missing capability to read/export the audit log (CAP_AUDIT_READ)
     AccessDenied,
+    /// R110-4 FIX: HMAC key too small (below MIN_HMAC_KEY_SIZE)
+    KeyTooSmall,
     /// R65-15 FIX: HMAC key too large
     KeyTooLarge,
     /// R65-15 FIX: HMAC key already set (cannot be changed for forward secrecy)
@@ -1066,14 +1074,19 @@ impl AuditRing {
     ///
     /// # Arguments
     ///
-    /// * `key` - The secret key (recommended: 32 bytes of cryptographic randomness)
+    /// * `key` - The secret key (min MIN_HMAC_KEY_SIZE bytes, recommended: 32 bytes)
     ///
     /// # Returns
     ///
     /// * `Ok(())` - Key was set successfully
+    /// * `Err(KeyTooSmall)` - Key is shorter than MIN_HMAC_KEY_SIZE (R110-4 FIX)
     /// * `Err(KeyTooLarge)` - Key exceeds MAX_HMAC_KEY_SIZE
     /// * `Err(KeyAlreadySet)` - Key was already set
     fn set_key(&mut self, key: &[u8]) -> Result<(), AuditError> {
+        // R110-4 FIX: Enforce minimum key length for meaningful tamper resistance.
+        if key.len() < MIN_HMAC_KEY_SIZE {
+            return Err(AuditError::KeyTooSmall);
+        }
         if key.len() > MAX_HMAC_KEY_SIZE {
             return Err(AuditError::KeyTooLarge);
         }
@@ -2033,13 +2046,14 @@ pub fn init(capacity: usize) -> Result<(), AuditError> {
 ///
 /// # Arguments
 ///
-/// * `key` - Secret key (max MAX_HMAC_KEY_SIZE bytes, recommended: 32 bytes)
+/// * `key` - Secret key (min MIN_HMAC_KEY_SIZE bytes, max MAX_HMAC_KEY_SIZE bytes; recommended: 32 bytes)
 ///
 /// # Returns
 ///
 /// * `Ok(())` - Key was set successfully
 /// * `Err(Uninitialized)` - Audit subsystem not initialized
 /// * `Err(AccessDenied)` - Caller lacks CAP_AUDIT_WRITE or no authorizer registered (R66-10)
+/// * `Err(KeyTooSmall)` - Key is shorter than MIN_HMAC_KEY_SIZE (R110-4 FIX)
 /// * `Err(KeyTooLarge)` - Key exceeds MAX_HMAC_KEY_SIZE
 /// * `Err(KeyAlreadySet)` - Key was already set
 ///
