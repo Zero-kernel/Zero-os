@@ -929,6 +929,82 @@ fn flush_range_local(start: u64, len: u64) {
     }
 }
 
+/// P2-7 FIX: Pin execution to a stable CPU for TLB shootdown operations.
+///
+/// Under eventual preemption/migration support, a task performing a TLB
+/// shootdown could migrate between dispatching IPIs and ACKing its own
+/// mailbox. This would cause:
+/// - Target set computed on CPU A but self-ACK on CPU B (wrong mailbox)
+/// - Missed local TLB flush if range partially completed before migration
+/// - Stale per-CPU mailbox reference pointing to wrong CPU's data
+///
+/// The pin guard disables preemption after verifying the CPU ID is stable,
+/// using a retry loop to handle the race window between LAPIC ID read and
+/// preempt_disable(). Preemption is re-enabled on drop.
+struct ShootdownCpuPin {
+    cpu_id: usize,
+    /// PhantomData<*const ()> makes this type !Send + !Sync, preventing
+    /// accidental cross-thread/cross-CPU movement or drop.
+    _not_send: core::marker::PhantomData<*const ()>,
+}
+
+impl ShootdownCpuPin {
+    #[inline]
+    fn new() -> Self {
+        loop {
+            let cpu_id = current_cpu_id();
+
+            // Narrow the race window: if we were already migrated after
+            // sampling cpu_id, retry without touching the stale CPU's
+            // preemption counter.
+            if current_cpu_id() != cpu_id {
+                spin_loop();
+                continue;
+            }
+
+            let per_cpu = PER_CPU_DATA
+                .get_cpu(cpu_id)
+                .unwrap_or_else(|| {
+                    panic!("TLB shootdown: missing per-CPU slot for CPU {}", cpu_id)
+                });
+
+            per_cpu.preempt_disable();
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+
+            if current_cpu_id() == cpu_id {
+                return Self {
+                    cpu_id,
+                    _not_send: core::marker::PhantomData,
+                };
+            }
+
+            // Migration detected — undo and retry on the correct CPU.
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+            per_cpu.preempt_enable();
+            spin_loop();
+        }
+    }
+
+    #[inline]
+    fn cpu_id(&self) -> usize {
+        self.cpu_id
+    }
+}
+
+impl Drop for ShootdownCpuPin {
+    #[inline]
+    fn drop(&mut self) {
+        let per_cpu = PER_CPU_DATA.get_cpu(self.cpu_id).unwrap_or_else(|| {
+            panic!(
+                "TLB shootdown: missing per-CPU slot for CPU {}",
+                self.cpu_id
+            )
+        });
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        per_cpu.preempt_enable();
+    }
+}
+
 /// Flush the entire TLB for the current address space on all CPUs.
 ///
 /// This function should be called after modifying page table entries that
@@ -945,6 +1021,9 @@ fn flush_range_local(start: u64, len: u64) {
 /// IPI acknowledgments.
 #[inline]
 pub fn flush_current_as_all() {
+    // P2-7 FIX: Pin to a stable CPU for the entire shootdown operation.
+    let _pin = ShootdownCpuPin::new();
+
     assert_single_core_mode();
 
     // Dispatch to remote CPUs (if any)
@@ -955,9 +1034,16 @@ pub fn flush_current_as_all() {
 
     // Wait for remote ACKs with retry support
     if let Some(ShootdownDispatch { targets, generation, .. }) = shoot {
-        let mailbox = current_cpu().tlb_mailbox();
-        if mailbox.request_gen.load(Ordering::Acquire) == generation {
-            mailbox.ack_gen.store(generation, Ordering::Release);
+        // P2-7 FIX: Use mailbox_for_cpu() with pinned CPU ID instead of
+        // current_cpu().tlb_mailbox() to prevent stale reference on migration.
+        let local_mailbox = mailbox_for_cpu(_pin.cpu_id()).unwrap_or_else(|| {
+            panic!(
+                "TLB shootdown: missing local mailbox for CPU {}",
+                _pin.cpu_id()
+            )
+        });
+        if local_mailbox.request_gen.load(Ordering::Acquire) == generation {
+            local_mailbox.ack_gen.store(generation, Ordering::Release);
         }
 
         // Get sender for retry
@@ -1016,6 +1102,9 @@ pub fn flush_current_as_range(start: VirtAddr, len: usize) {
             len: aligned_len,
             pages,
         } => {
+            // P2-7 FIX: Pin to a stable CPU for the entire range shootdown.
+            let _pin = ShootdownCpuPin::new();
+
             // Dispatch to remote CPUs
             let shoot = dispatch_shootdown(aligned_start, aligned_len);
 
@@ -1037,9 +1126,15 @@ pub fn flush_current_as_range(start: VirtAddr, len: usize) {
                 // R71-4 FIX: Same self-ACK protection as flush_current_as_all.
                 // Only ACK if the request_gen matches to avoid accidentally
                 // acknowledging a foreign request.
-                let mailbox = current_cpu().tlb_mailbox();
-                if mailbox.request_gen.load(Ordering::Acquire) == generation {
-                    mailbox.ack_gen.store(generation, Ordering::Release);
+                // P2-7 FIX: Use mailbox_for_cpu() with pinned CPU ID.
+                let local_mailbox = mailbox_for_cpu(_pin.cpu_id()).unwrap_or_else(|| {
+                    panic!(
+                        "TLB shootdown: missing local mailbox for CPU {}",
+                        _pin.cpu_id()
+                    )
+                });
+                if local_mailbox.request_gen.load(Ordering::Acquire) == generation {
+                    local_mailbox.ack_gen.store(generation, Ordering::Release);
                 }
 
                 // Get sender for retry

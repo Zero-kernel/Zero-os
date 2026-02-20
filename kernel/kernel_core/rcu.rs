@@ -51,7 +51,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use cpu_local::{current_cpu, num_online_cpus, CpuLocal, PER_CPU_DATA};
+use cpu_local::{current_cpu, current_cpu_id, num_online_cpus, CpuLocal, PER_CPU_DATA};
 use spin::Mutex;
 
 /// Global epoch counter (monotonically increasing).
@@ -184,6 +184,52 @@ static RCU_TIMER_REGISTERED: AtomicBool = AtomicBool::new(false);
 // Read-Side API
 // ============================================================================
 
+/// Disable preemption and return a stable CPU ID.
+///
+/// This helper ensures that the CPU ID sampled at the start is still valid
+/// after preemption is disabled. Under eventual preemption/migration support,
+/// a task could migrate between reading the LAPIC ID and disabling preemption.
+/// The retry loop detects this race and re-pins to the new CPU.
+///
+/// # Returns
+///
+/// The CPU ID that preemption was disabled on. Caller MUST use this ID for
+/// all subsequent per-CPU state access within the critical section.
+#[inline]
+fn rcu_preempt_disable_stable_cpu() -> usize {
+    loop {
+        let cpu_id = current_cpu_id();
+
+        // Narrow the race window: if we were already migrated after sampling
+        // cpu_id, retry without touching the stale CPU's preemption counter.
+        if current_cpu_id() != cpu_id {
+            core::hint::spin_loop();
+            continue;
+        }
+
+        let per_cpu = PER_CPU_DATA
+            .get_cpu(cpu_id)
+            .unwrap_or_else(|| panic!("RCU: missing per-CPU slot for CPU {}", cpu_id));
+
+        per_cpu.preempt_disable();
+
+        // Compiler fence prevents reordering of the CPU ID read across the
+        // preemption disable boundary. This is critical: without it, the
+        // compiler could hoist per-CPU accesses above preempt_disable().
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+
+        if current_cpu_id() == cpu_id {
+            return cpu_id;
+        }
+
+        // Migration detected between sampling cpu_id and disabling preemption.
+        // Undo the preempt_disable on the (now stale) CPU and retry.
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        per_cpu.preempt_enable();
+        core::hint::spin_loop();
+    }
+}
+
 /// Enter an RCU read-side critical section.
 ///
 /// This must be paired with a call to `rcu_read_unlock()`. Nested calls
@@ -199,15 +245,21 @@ static RCU_TIMER_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// Read-side critical sections should be short. Don't sleep, block, or
 /// do anything that could cause a context switch while in an RCU read-side
 /// critical section.
+///
+/// # P2-7 Migration Safety
+///
+/// Uses `rcu_preempt_disable_stable_cpu()` to bind both preemption disable
+/// and reader counter increment to the same CPU ID, preventing counter
+/// mismatch under eventual preemption/migration support.
 #[inline]
 pub fn rcu_read_lock() {
-    // Prevent preemption during the reader accounting.
-    // This ensures the CPU that incremented the counter is the same one
-    // that will decrement it.
-    current_cpu().preempt_disable();
-    RCU_READERS.with(|counter| {
-        counter.fetch_add(1, Ordering::Acquire);
-    });
+    // Disable preemption and bind reader accounting to a stable CPU slot.
+    let cpu_id = rcu_preempt_disable_stable_cpu();
+    RCU_READERS
+        .with_cpu(cpu_id, |counter| {
+            counter.fetch_add(1, Ordering::Acquire);
+        })
+        .expect("RCU: cpu_id out of range for RCU_READERS");
 }
 
 /// Exit an RCU read-side critical section.
@@ -216,16 +268,30 @@ pub fn rcu_read_lock() {
 ///
 /// When the reader count drops to zero, this CPU's quiescent state is
 /// updated to allow pending grace periods to complete.
+///
+/// # P2-7 Migration Safety
+///
+/// Preemption is still disabled from `rcu_read_lock()`, so the CPU ID is
+/// stable. All per-CPU accesses use explicit `cpu_id` rather than implicit
+/// `current_cpu()` to prevent any window for counter mismatch.
 #[inline]
 pub fn rcu_read_unlock() {
-    let remaining = RCU_READERS.with(|counter| {
-        let old = counter.fetch_sub(1, Ordering::Release);
-        if old == 0 {
-            // Underflow - caller bug
-            panic!("RCU: rcu_read_unlock called without matching rcu_read_lock");
-        }
-        old - 1
-    });
+    // Preemption is still disabled from rcu_read_lock(), so CPU ID is stable.
+    let cpu_id = current_cpu_id();
+    let per_cpu = PER_CPU_DATA
+        .get_cpu(cpu_id)
+        .unwrap_or_else(|| panic!("RCU: missing per-CPU slot for CPU {}", cpu_id));
+
+    let remaining = RCU_READERS
+        .with_cpu(cpu_id, |counter| {
+            let old = counter.fetch_sub(1, Ordering::Release);
+            if old == 0 {
+                // Underflow - caller bug
+                panic!("RCU: rcu_read_unlock called without matching rcu_read_lock");
+            }
+            old - 1
+        })
+        .expect("RCU: cpu_id out of range for RCU_READERS");
 
     // If all readers on this CPU are done, mark quiescent state
     if remaining == 0 {
@@ -233,10 +299,12 @@ pub fn rcu_read_unlock() {
         // This ensures we see the latest epoch value and don't store a stale epoch
         // that could cause synchronize_rcu() to block indefinitely.
         let epoch = GLOBAL_EPOCH.load(Ordering::Acquire);
-        current_cpu().rcu_epoch.store(epoch, Ordering::Release);
+        per_cpu.rcu_epoch.store(epoch, Ordering::Release);
     }
 
-    current_cpu().preempt_enable();
+    // Compiler fence ensures all per-CPU operations complete before re-enabling.
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    per_cpu.preempt_enable();
 }
 
 /// Check if the current CPU is in an RCU read-side critical section.

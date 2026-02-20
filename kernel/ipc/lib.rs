@@ -52,7 +52,8 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
     // 创建管道
-    let (read_handle, write_handle) = create_pipe(PipeFlags::default());
+    let (read_handle, write_handle) = create_pipe(PipeFlags::default())
+        .map_err(pipe_error_to_syscall)?;
 
     // 分配文件描述符
     let (read_fd, write_fd) = {
@@ -188,6 +189,7 @@ fn pipe_error_to_syscall(err: PipeError) -> SyscallError {
         PipeError::BrokenPipe => SyscallError::EPIPE,
         PipeError::Closed => SyscallError::EPIPE,
         PipeError::InvalidPipe | PipeError::InvalidOperation => SyscallError::EBADF,
+        PipeError::PipeIdExhausted => SyscallError::ENOMEM,
         PipeError::NoCurrentProcess => SyscallError::ESRCH,
     }
 }

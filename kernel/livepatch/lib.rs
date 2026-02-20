@@ -88,6 +88,7 @@ pub enum Errno {
     EEXIST = -17,
     EINVAL = -22,
     ENOSYS = -38,
+    EOVERFLOW = -75,
     EALREADY = -114,
 }
 
@@ -539,14 +540,12 @@ static TEXT_PATCH_LOCK: Mutex<()> = Mutex::new(());
 
 /// Per-slot dependency metadata, parallel to PATCH_TABLE.
 ///
-/// # Safety
-///
-/// All reads and writes MUST be performed while holding `PATCH_REG_LOCK`.
-/// Entries are immutable between registration and unload — set during
-/// `register_loaded_patch` and cleared during `kpatch_unload`, both under
-/// `PATCH_REG_LOCK`. Read access in `check_dependencies`/`check_no_dependents`
-/// also acquires `PATCH_REG_LOCK`.
-static mut PATCH_META_TABLE: [Option<PatchMeta>; MAX_PATCHES] = [None; MAX_PATCHES];
+/// P2-3 FIX: Replaced `static mut` with `Mutex` to eliminate undefined behavior
+/// from unsynchronized mutable access.  All reads and writes are serialized by
+/// both `PATCH_REG_LOCK` (for the patch lifecycle) and this inner `Mutex` (for
+/// memory safety).  The double-lock is acceptable because `PATCH_META_TABLE` is
+/// only accessed in cold registration/unload/dependency-check paths.
+static PATCH_META_TABLE: Mutex<[Option<PatchMeta>; MAX_PATCHES]> = Mutex::new([None; MAX_PATCHES]);
 
 fn init_patch_table() -> &'static [PatchSlot] {
     let mut v = Vec::with_capacity(MAX_PATCHES);
@@ -599,9 +598,9 @@ pub fn patch_state(id: u64) -> Option<PatchState> {
 fn check_dependencies(slot_index: usize) -> Result<(), Errno> {
     let table = patch_table();
     let _guard = PATCH_REG_LOCK.lock();
+    let meta_table = PATCH_META_TABLE.lock();
 
-    // SAFETY: PATCH_REG_LOCK is held.
-    let meta = match unsafe { PATCH_META_TABLE.get(slot_index).copied().flatten() } {
+    let meta = match meta_table.get(slot_index).copied().flatten() {
         Some(m) => m,
         None => return Err(Errno::EINVAL),
     };
@@ -624,7 +623,7 @@ fn check_dependencies(slot_index: usize) -> Result<(), Errno> {
                 continue;
             }
             // SAFETY: PATCH_REG_LOCK is held.
-            let other_meta = match unsafe { PATCH_META_TABLE.get(other_idx).copied().flatten() } {
+            let other_meta = match meta_table.get(other_idx).copied().flatten() {
                 Some(m) => m,
                 None => continue,
             };
@@ -656,9 +655,9 @@ fn check_dependencies(slot_index: usize) -> Result<(), Errno> {
 fn check_no_dependents(slot_index: usize) -> Result<(), Errno> {
     let table = patch_table();
     let _guard = PATCH_REG_LOCK.lock();
+    let meta_table = PATCH_META_TABLE.lock();
 
-    // SAFETY: PATCH_REG_LOCK is held.
-    let meta = match unsafe { PATCH_META_TABLE.get(slot_index).copied().flatten() } {
+    let meta = match meta_table.get(slot_index).copied().flatten() {
         Some(m) => m,
         None => return Err(Errno::EINVAL),
     };
@@ -675,7 +674,7 @@ fn check_no_dependents(slot_index: usize) -> Result<(), Errno> {
         }
 
         // SAFETY: PATCH_REG_LOCK is held.
-        let other_meta = match unsafe { PATCH_META_TABLE.get(other_idx).copied().flatten() } {
+        let other_meta = match meta_table.get(other_idx).copied().flatten() {
             Some(m) => m,
             None => continue,
         };
@@ -697,11 +696,12 @@ fn check_no_dependents(slot_index: usize) -> Result<(), Errno> {
 
 /// Collect all non-empty patch slots into a (slot_index, id, meta) list.
 ///
-/// Requires `PATCH_REG_LOCK` to be held by the caller for `PATCH_META_TABLE`
-/// access. Returns `EBUSY` if any slot is in a transitional state.
+/// Requires `PATCH_REG_LOCK` to be held by the caller.
+/// Returns `EBUSY` if any slot is in a transitional state.
 fn collect_patch_nodes(
     table: &'static [PatchSlot],
 ) -> Result<Vec<(usize, u64, PatchMeta)>, Errno> {
+    let meta_table = PATCH_META_TABLE.lock();
     let mut nodes = Vec::new();
     for (slot_index, slot) in table.iter().enumerate() {
         let st = PatchState::from_u8(slot.state.load(Ordering::Acquire));
@@ -717,11 +717,10 @@ fn collect_patch_nodes(
         if st == PatchState::Failed {
             continue; // Skip failed patches — they cannot participate in batch ops.
         }
-        // SAFETY: Caller holds PATCH_REG_LOCK.
         // R110-1 FIX: Treat missing metadata on a non-empty, non-failed slot as an
         // internal consistency error rather than silently skipping it.  A slot that
         // is Registered/Enabled/Disabled MUST have associated PatchMeta.
-        let meta = match unsafe { PATCH_META_TABLE.get(slot_index).copied().flatten() } {
+        let meta = match meta_table.get(slot_index).copied().flatten() {
             Some(m) => m,
             None => return Err(Errno::EINVAL),
         };
@@ -1266,6 +1265,7 @@ fn register_loaded_patch(p: &LoadedPatch) -> Result<u64, Errno> {
 
     // R94-3 FIX: Serialize registration to prevent duplicate-target races.
     let _guard = PATCH_REG_LOCK.lock();
+    let mut meta_table = PATCH_META_TABLE.lock();
 
     // Reject multiple patches to the same target (now race-free under lock).
     // P1-4: Also reject duplicate patch UIDs to ensure UID-based dependency
@@ -1277,7 +1277,7 @@ fn register_loaded_patch(p: &LoadedPatch) -> Result<u64, Errno> {
                 return Err(Errno::EBUSY);
             }
             // SAFETY: PATCH_REG_LOCK is held.
-            if let Some(existing_meta) = unsafe { PATCH_META_TABLE.get(idx).copied().flatten() } {
+            if let Some(existing_meta) = meta_table.get(idx).copied().flatten() {
                 if ct_eq(&existing_meta.patch_uid, &p.meta.patch_uid) {
                     return Err(Errno::EEXIST);
                 }
@@ -1296,7 +1296,18 @@ fn register_loaded_patch(p: &LoadedPatch) -> Result<u64, Errno> {
             )
             .is_ok()
         {
-            let id = NEXT_PATCH_ID.fetch_add(1, Ordering::Relaxed);
+            // P2-8 FIX: Use fetch_update + checked_add for overflow safety.
+            // Codex review: if ID exhaustion occurs, we must reset the slot from
+            // Loading back to Empty to avoid a stuck-slot state leak.
+            let id = match NEXT_PATCH_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            {
+                Ok(prev) => prev,
+                Err(_) => {
+                    slot.state.store(PatchState::Empty as u8, Ordering::Release);
+                    return Err(Errno::EOVERFLOW);
+                }
+            };
             slot.id.store(id, Ordering::Release);
             slot.target.store(p.target, Ordering::Release);
             slot.handler.store(p.handler, Ordering::Release);
@@ -1306,8 +1317,7 @@ fn register_loaded_patch(p: &LoadedPatch) -> Result<u64, Errno> {
             slot.orig_byte.store(0, Ordering::Release);
             slot.enabled_tsc.store(0, Ordering::Release);
             // P1-4: Store immutable dependency metadata (PATCH_REG_LOCK is held).
-            // SAFETY: We hold PATCH_REG_LOCK and slot_index < MAX_PATCHES.
-            unsafe { PATCH_META_TABLE[slot_index] = Some(p.meta) };
+            meta_table[slot_index] = Some(p.meta);
             slot.state.store(PatchState::Registered as u8, Ordering::Release);
             // R110-3 FIX: Log lifecycle event without raw kernel addresses.
             // Address detail is relegated to klog!(Info, ...) which is suppressed
@@ -1558,8 +1568,8 @@ pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
     // then overwrite with None.
     {
         let _guard = PATCH_REG_LOCK.lock();
-        // SAFETY: PATCH_REG_LOCK is held; slot_index < MAX_PATCHES.
-        unsafe { PATCH_META_TABLE[slot_index] = None };
+        let mut meta_table = PATCH_META_TABLE.lock();
+        meta_table[slot_index] = None;
         // Now make the slot reusable while still holding the lock.
         slot.state.store(PatchState::Empty as u8, Ordering::Release);
     }

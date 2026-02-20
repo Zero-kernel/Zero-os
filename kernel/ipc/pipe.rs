@@ -35,6 +35,8 @@ pub enum PipeError {
     InvalidPipe,
     /// 权限错误（尝试在错误的端读/写）
     InvalidOperation,
+    /// 管道 ID 分配耗尽
+    PipeIdExhausted,
 }
 
 /// 管道标志
@@ -511,19 +513,24 @@ static NEXT_PIPE_ID: AtomicUsize = AtomicUsize::new(1);
 /// 创建管道
 ///
 /// 返回 (读端句柄, 写端句柄)
-pub fn create_pipe(flags: PipeFlags) -> (PipeHandle, PipeHandle) {
+pub fn create_pipe(flags: PipeFlags) -> Result<(PipeHandle, PipeHandle), PipeError> {
     create_pipe_with_capacity(DEFAULT_PIPE_CAPACITY, flags)
 }
 
 /// 创建指定容量的管道
-pub fn create_pipe_with_capacity(capacity: usize, flags: PipeFlags) -> (PipeHandle, PipeHandle) {
-    let id = NEXT_PIPE_ID.fetch_add(1, Ordering::SeqCst) as PipeId;
+pub fn create_pipe_with_capacity(capacity: usize, flags: PipeFlags) -> Result<(PipeHandle, PipeHandle), PipeError> {
+    // R111-3 FIX: Use fetch_update + checked_add to prevent wrapping to 0
+    // on usize overflow.  Follows the R105-5 pattern established for IPC
+    // endpoint IDs and socket IDs.
+    let id = NEXT_PIPE_ID
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+        .map_err(|_| PipeError::PipeIdExhausted)? as PipeId;
     let pipe = Arc::new(Pipe::new(id, capacity));
 
     let read_handle = PipeHandle::new_read(pipe.clone(), flags);
     let write_handle = PipeHandle::new_write(pipe, flags);
 
-    (read_handle, write_handle)
+    Ok((read_handle, write_handle))
 }
 
 #[cfg(test)]
@@ -533,7 +540,7 @@ mod tests {
     // 基本管道测试（在内核环境中运行）
     fn test_pipe_basic() {
         let flags = PipeFlags::default();
-        let (read_end, write_end) = create_pipe(flags);
+        let (read_end, write_end) = create_pipe(flags).unwrap();
 
         // 写入数据
         let data = b"Hello, Pipe!";

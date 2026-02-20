@@ -13,8 +13,14 @@ pub type Pid = u64;
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 
 /// 生成新的进程ID
-pub fn allocate_pid() -> Pid {
-    NEXT_PID.fetch_add(1, Ordering::SeqCst)
+///
+/// P2-8 FIX: Use fetch_update + checked_add to prevent wrapping to 0 on u64
+/// overflow, following the R105-5 pattern.  Returns None if the ID space is
+/// exhausted (practically unreachable with u64).
+pub fn allocate_pid() -> Option<Pid> {
+    NEXT_PID
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+        .ok()
 }
 
 /// 进程状态
@@ -105,11 +111,11 @@ pub struct FileDescriptor {
 
 impl ProcessControlBlock {
     /// 创建新的进程控制块
-    pub fn new(name: String, entry_point: u64, kernel_stack: u64) -> Self {
-        let pid = allocate_pid();
+    pub fn new(name: String, entry_point: u64, kernel_stack: u64) -> Option<Self> {
+        let pid = allocate_pid()?;
         let context = arch::Context::init_for_process(entry_point, kernel_stack);
-        
-        ProcessControlBlock {
+
+        Some(ProcessControlBlock {
             pid,
             parent_pid: None,
             name,
@@ -125,20 +131,20 @@ impl ProcessControlBlock {
             exit_code: None,
             file_descriptors: Vec::new(),
             working_directory: String::from("/"),
-        }
+        })
     }
     
     /// 创建用户态进程
     pub fn new_user_process(
-        name: String, 
-        entry_point: u64, 
+        name: String,
+        entry_point: u64,
         kernel_stack: u64,
         user_stack: u64,
-    ) -> Self {
-        let pid = allocate_pid();
+    ) -> Option<Self> {
+        let pid = allocate_pid()?;
         let context = arch::Context::init_for_user_process(entry_point, user_stack);
-        
-        ProcessControlBlock {
+
+        Some(ProcessControlBlock {
             pid,
             parent_pid: None,
             name,
@@ -154,7 +160,7 @@ impl ProcessControlBlock {
             exit_code: None,
             file_descriptors: Vec::new(),
             working_directory: String::from("/"),
-        }
+        })
     }
     
     /// 标记进程为就绪态

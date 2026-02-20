@@ -4127,12 +4127,12 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
     let _action = send_signal(target_global_pid, signal)?;
 
     // R101-2 FIX: Gate signal dispatch debug print behind debug_assertions.
-    // Leaking global PID breaks PID namespace isolation.
+    // R111-4 FIX: Remove target_global_pid from output to preserve PID namespace
+    // isolation even in debug builds.
     kprintln!(
-        "sys_kill: sent {} to PID {} (global={}, action: {:?})",
+        "sys_kill: sent {} to PID {} (action: {:?})",
         signal_name(signal),
         pid,
-        target_global_pid,
         _action
     );
 

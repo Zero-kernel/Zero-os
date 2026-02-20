@@ -1028,11 +1028,13 @@ impl CgroupNode {
             return Err(CgroupError::DepthLimit);
         }
 
-        // Allocate unique ID
-        let id = NEXT_CGROUP_ID.fetch_add(1, Ordering::SeqCst);
-        if id == u64::MAX {
-            return Err(CgroupError::CgroupLimit);
-        }
+        // R111-1 FIX: Use fetch_update + checked_add to prevent wrapping to 0
+        // on u64 overflow.  A bare fetch_add wraps the counter past 0 (root cgroup
+        // ID), which would shadow the root cgroup in the registry.  This follows the
+        // R105-5 pattern established for IPC endpoint IDs and socket IDs.
+        let id = NEXT_CGROUP_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+            .map_err(|_| CgroupError::CgroupLimit)?;
 
         // Check global count limit (with lock held to prevent TOCTOU)
         {
@@ -1563,19 +1565,32 @@ pub fn get_effective_cpu_weight(cgroup_id: CgroupId) -> u32 {
 
 /// Checks if a task can be forked based on cgroup pids.max limit.
 ///
+/// R111-2 FIX: Walks the ancestor chain (up to MAX_CGROUP_DEPTH levels) so that
+/// a parent or grandparent `pids.max` limit is also checked.  This is a best-effort
+/// pre-check — the authoritative hierarchical CAS-based check remains in `attach_task()`.
+/// Using `Ordering::Acquire` ensures visibility of concurrent PID counter increments.
+///
 /// Returns `true` if fork is allowed, `false` if pids.max would be exceeded.
 pub fn check_fork_allowed(cgroup_id: CgroupId) -> bool {
-    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
+    while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::PIDS) {
             let limits = cgroup.limits.lock();
             if let Some(max) = limits.pids_max {
-                let current = cgroup.stats.pids_current.load(Ordering::Relaxed);
+                let current = cgroup.stats.pids_current.load(Ordering::Acquire);
                 if current >= max {
                     cgroup.stats.record_pids_max_event();
                     return false;
                 }
             }
         }
+
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = cgroup.parent();
     }
     true
 }
@@ -1611,86 +1626,157 @@ pub fn get_memory_usage(cgroup_id: CgroupId) -> Option<u64> {
 
 /// Checks if memory allocation would exceed cgroup limit.
 ///
+/// P2-9 FIX: Walks the ancestor chain (up to MAX_CGROUP_DEPTH levels) so that
+/// a parent or grandparent `memory.max` limit is also checked.  This is a
+/// best-effort pre-check — the authoritative hierarchical CAS-based enforcement
+/// is in `try_charge_memory()`.  Uses `Ordering::Acquire` to ensure visibility
+/// of concurrent memory counter increments.
+///
 /// Returns `true` if allocation is allowed.
 pub fn check_memory_allowed(cgroup_id: CgroupId, allocation_bytes: u64) -> bool {
-    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
+    while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::MEMORY) {
             let limits = cgroup.limits.lock();
             if let Some(max) = limits.memory_max {
-                let current = cgroup.stats.memory_current.load(Ordering::Relaxed);
+                let current = cgroup.stats.memory_current.load(Ordering::Acquire);
                 if current.saturating_add(allocation_bytes) > max {
                     cgroup.stats.record_memory_max();
                     return false;
                 }
             }
         }
+
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = cgroup.parent();
     }
     true
 }
 
 /// Atomically charges memory usage to a cgroup, enforcing memory.max.
 ///
-/// Uses CAS (compare-and-swap) to close the TOCTOU race between limit check
-/// and accounting update that exists when separate check + store operations
-/// are used by concurrent mmap callers.
+/// P2-9 FIX: Hierarchical memory.max enforcement.
+///
+/// In cgroups v2, ancestor `memory.max` limits apply to all descendants.
+/// This function charges `memory_current` on the target cgroup **and** every
+/// ancestor with the MEMORY controller enabled.  On failure at any level,
+/// all previously charged ancestors are rolled back (saturating subtract).
+///
+/// This follows the same charge-then-rollback pattern as hierarchical
+/// `pids.max` enforcement in `attach_task()` (R83-3 + R90-3).
+///
+/// Uses CAS (`fetch_update`) for each cgroup to atomically check the limit
+/// and increment the counter, closing the TOCTOU race between concurrent
+/// mmap callers (CODEX FIX).
 ///
 /// # Errors
 ///
 /// * `MemoryLimitExceeded` - Adding `allocation_bytes` would exceed memory.max
-///
-/// # CODEX FIX: Atomic charge/uncharge
-///
-/// This replaces the two-step "check_memory_allowed + update_memory_usage"
-/// pattern which was vulnerable to races where two concurrent mmaps both
-/// pass the limit check before either commits the accounting update.
+///   at this cgroup or any ancestor.
 pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(), CgroupError> {
-    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
+    if allocation_bytes == 0 {
+        return Ok(());
+    }
+
+    // Collect the chain: target cgroup + ancestors with MEMORY controller.
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
+    let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
+    while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::MEMORY) {
-            let limits = cgroup.limits.lock();
-            let mut current = cgroup.stats.memory_current.load(Ordering::Relaxed);
+            chain.push(cgroup.clone());
+        }
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = cgroup.parent();
+    }
 
-            loop {
+    if chain.is_empty() {
+        return Ok(()); // No memory controller anywhere in the chain
+    }
+
+    // Snapshot limits to avoid holding multiple locks during CAS charging.
+    let limits_snapshot: Vec<(Option<u64>, Option<u64>)> = chain
+        .iter()
+        .map(|c| {
+            let l = c.limits.lock();
+            (l.memory_max, l.memory_high)
+        })
+        .collect();
+
+    // Track indices of charged cgroups for rollback on failure.
+    let mut charged: Vec<usize> = Vec::new();
+
+    for (idx, cgroup) in chain.iter().enumerate() {
+        let (max, high) = limits_snapshot[idx];
+
+        match cgroup.stats.memory_current.fetch_update(
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+            |current| {
                 let new = current.saturating_add(allocation_bytes);
-
-                // Check hard limit
-                if let Some(max) = limits.memory_max {
+                if let Some(max) = max {
                     if new > max {
-                        cgroup.stats.record_memory_max();
-                        return Err(CgroupError::MemoryLimitExceeded);
+                        return None; // Reject: would exceed limit
                     }
+                }
+                Some(new)
+            },
+        ) {
+            Ok(old) => {
+                // Check high watermark event
+                let new = old.saturating_add(allocation_bytes);
+                if let Some(high) = high {
+                    if new > high {
+                        cgroup.stats.record_memory_high();
+                    }
+                }
+                charged.push(idx);
+            }
+            Err(_) => {
+                // Limit exceeded at this level — record event and rollback.
+                cgroup.stats.record_memory_max();
+
+                // R110-1 pattern: Rollback with saturating decrement to
+                // prevent underflow if a concurrent uncharge raced.
+                for &j in &charged {
+                    let _ = chain[j].stats.memory_current.fetch_update(
+                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                        |current| Some(current.saturating_sub(allocation_bytes)),
+                    );
                 }
 
-                // CAS: atomically update if no concurrent modification
-                match cgroup.stats.memory_current.compare_exchange(
-                    current,
-                    new,
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        // Check high watermark
-                        if let Some(high) = limits.memory_high {
-                            if new > high {
-                                cgroup.stats.record_memory_high();
-                            }
-                        }
-                        return Ok(());
-                    }
-                    Err(actual) => current = actual, // Retry with actual value
-                }
+                return Err(CgroupError::MemoryLimitExceeded);
             }
         }
     }
 
-    Ok(()) // No memory controller enabled, allow
+    Ok(())
 }
 
 /// Atomically uncharges memory from a cgroup (saturating at zero).
 ///
+/// P2-9 FIX: Walks the same ancestor chain as `try_charge_memory()` to
+/// uncharge `memory_current` at each level.  Without this, ancestor counters
+/// would permanently leak, eventually DoS-ing the subtree by "stuck" usage.
+///
 /// Called when memory is released (munmap, process exit, etc.).
 /// Uses fetch_update for atomic subtract-with-floor-at-zero.
 pub fn uncharge_memory(cgroup_id: CgroupId, bytes: u64) {
-    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
+    if bytes == 0 {
+        return;
+    }
+
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
+    while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::MEMORY) {
             let _ = cgroup.stats.memory_current.fetch_update(
                 Ordering::SeqCst,
@@ -1698,6 +1784,12 @@ pub fn uncharge_memory(cgroup_id: CgroupId, bytes: u64) {
                 |current| Some(current.saturating_sub(bytes)),
             );
         }
+
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = cgroup.parent();
     }
 }
 
@@ -1733,19 +1825,97 @@ pub fn charge_io(
         return IoThrottleStatus::Allowed;
     }
 
-    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
+    // P2-9 FIX: Hierarchical io.max enforcement.
+    //
+    // In cgroups v2, ancestor io.max limits apply to all descendants.
+    // Walk the ancestor chain and charge each level's IO token bucket.
+    // If any level is throttled, return the most restrictive deadline.
+    //
+    // Two-phase approach to avoid partial token consumption:
+    //   Phase 1: Query all ancestors to determine if any are throttled,
+    //            WITHOUT consuming tokens.
+    //   Phase 2: If none are throttled, commit token consumption at
+    //            every level.
+    //
+    // This prevents "token leakage" where a child's tokens are consumed
+    // but the IO is not issued because an ancestor is throttled.
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
+    let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
+
+    // Collect ancestors with IO controller and configured io.max limits.
+    while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::IO) {
             let limits = cgroup.limits.lock();
-            if limits.io_max_bytes_per_sec.is_none() && limits.io_max_iops_per_sec.is_none() {
-                return IoThrottleStatus::Unlimited;
+            if limits.io_max_bytes_per_sec.is_some() || limits.io_max_iops_per_sec.is_some() {
+                chain.push(cgroup.clone());
             }
-            return cgroup
-                .io_throttle
-                .charge(&limits, bytes, now_ns, &cgroup.stats);
+        }
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = cgroup.parent();
+    }
+
+    if chain.is_empty() {
+        return IoThrottleStatus::Unlimited;
+    }
+
+    // Phase 1: Check all levels for throttle status WITHOUT consuming tokens.
+    // We use the IoThrottleState's existing throttle_until_ns window to detect
+    // active throttling, and check token availability without decrementing.
+    let mut overall_throttle_until: u64 = 0;
+
+    for cgroup in &chain {
+        let limits = cgroup.limits.lock();
+        let bucket = cgroup.io_throttle.state.lock();
+
+        // Check if currently in a throttle window.
+        if bucket.throttle_until_ns != 0 && now_ns < bucket.throttle_until_ns {
+            overall_throttle_until = overall_throttle_until.max(bucket.throttle_until_ns);
+            continue;
+        }
+
+        // Check byte budget (without consuming).
+        if let Some(bps) = limits.io_max_bytes_per_sec {
+            if bucket.byte_tokens < bytes {
+                let deficit = bytes - bucket.byte_tokens;
+                let wait_ns =
+                    ((deficit as u128 * 1_000_000_000u128) + (bps as u128 - 1)) / bps as u128;
+                let until = now_ns.saturating_add(wait_ns as u64);
+                overall_throttle_until = overall_throttle_until.max(until);
+            }
+        }
+
+        // Check IOPS budget (without consuming).
+        if let Some(iops) = limits.io_max_iops_per_sec {
+            if bucket.iops_tokens == 0 {
+                let nanos_per_io = 1_000_000_000u64
+                    .checked_div(iops.max(1))
+                    .unwrap_or(1_000_000_000);
+                let until = now_ns.saturating_add(nanos_per_io);
+                overall_throttle_until = overall_throttle_until.max(until);
+            }
         }
     }
 
-    IoThrottleStatus::Unlimited
+    // If any level would throttle, return the most restrictive deadline
+    // WITHOUT consuming any tokens.
+    if overall_throttle_until != 0 {
+        return IoThrottleStatus::Throttled(overall_throttle_until);
+    }
+
+    // Phase 2: All levels have sufficient tokens.  Commit consumption at
+    // every level by calling the existing charge() method.
+    for cgroup in &chain {
+        let limits = cgroup.limits.lock();
+        let _ = cgroup
+            .io_throttle
+            .charge(&limits, bytes, now_ns, &cgroup.stats);
+    }
+
+    IoThrottleStatus::Allowed
 }
 
 /// Block until IO tokens are available (process context only).
@@ -1862,91 +2032,103 @@ pub fn charge_cpu_quota(
         return CpuQuotaStatus::Allowed;
     }
 
-    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
+    // P2-9 FIX: Hierarchical cpu.max enforcement.
+    //
+    // In cgroups v2, ancestor cpu.max quotas apply to all descendants.
+    // We charge CPU time at each level of the hierarchy and return the
+    // most restrictive throttle deadline.
+    //
+    // Design: walk from leaf to root.  At each node with a CPU controller
+    // and cpu.max configured, charge time and record throttle status.  The
+    // overall result is the latest (most restrictive) throttle deadline
+    // among all ancestors, or Allowed if none are throttled.
+    const LOCK_CONTENTION_THROTTLE_NS: u64 = 10_000_000; // 10ms
+
+    let mut any_quota = false;
+    let mut overall_throttle_until: u64 = 0;
+
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
+    while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::CPU) {
             // IRQ-safe: Use try_lock() to avoid deadlock when process-context
             // code holds the limits lock (e.g., sys_cgroup_set_limit).
             //
-            // R83-5 FIX: Fail-closed when lock is contended
-            //
-            // Previously, we returned Allowed when the lock was contended, which
-            // allowed an attacker to bypass quota enforcement by keeping the mutex
-            // busy (e.g., looping on sys_cgroup_set_limit).
-            //
-            // Now we return Throttled with a conservative throttle window. The
-            // LOCK_CONTENTION_THROTTLE_NS value (10ms) is chosen to be:
-            // - Long enough to outlast brief lock contention
-            // - Short enough to not excessively impact legitimate workloads
-            // - Approximately 10 timer ticks, ensuring the lock will be released
-            //
-            // This is a fail-closed approach: when in doubt, throttle.
-            const LOCK_CONTENTION_THROTTLE_NS: u64 = 10_000_000; // 10ms
-            let (max_us, period_us) = match cgroup.limits.try_lock() {
-                Some(limits) => match limits.cpu_max {
-                    Some(v) => v,
-                    None => return CpuQuotaStatus::Unlimited,
-                },
+            // R83-5 FIX: Fail-closed when lock is contended (prevents bypass).
+            let cpu_max = match cgroup.limits.try_lock() {
+                Some(limits) => limits.cpu_max,
                 None => {
-                    // R83-5 FIX: Fail-closed with conservative throttle window
-                    return CpuQuotaStatus::Throttled(now_ns.saturating_add(LOCK_CONTENTION_THROTTLE_NS));
+                    return CpuQuotaStatus::Throttled(
+                        now_ns.saturating_add(LOCK_CONTENTION_THROTTLE_NS),
+                    );
                 }
             };
 
-            // u64::MAX means "max" (no quota) - mirrors Linux semantics
-            if max_us == u64::MAX {
-                return CpuQuotaStatus::Unlimited;
-            }
+            if let Some((max_us, period_us)) = cpu_max {
+                // u64::MAX means "max" (no quota) - mirrors Linux semantics
+                if max_us != u64::MAX {
+                    any_quota = true;
 
-            // Convert microseconds to nanoseconds
-            let period_ns = period_us.saturating_mul(1_000);
-            let max_ns = max_us.saturating_mul(1_000);
-            let quota = &cgroup.cpu_quota;
+                    let period_ns = period_us.saturating_mul(1_000);
+                    let max_ns = max_us.saturating_mul(1_000);
+                    let quota = &cgroup.cpu_quota;
 
-            // Refresh the window if the period has elapsed
-            quota.refresh_window(now_ns, period_ns);
+                    // Refresh the window if the period has elapsed
+                    quota.refresh_window(now_ns, period_ns);
 
-            // Check if currently throttled
-            let throttle_until = quota.throttled_until_ns.load(Ordering::Acquire);
-            if throttle_until != 0 {
-                if now_ns < throttle_until {
-                    // Still in throttle window
-                    return CpuQuotaStatus::Throttled(throttle_until);
+                    // Check if currently throttled
+                    let throttle_until = quota.throttled_until_ns.load(Ordering::Acquire);
+                    let mut should_charge = true;
+                    if throttle_until != 0 {
+                        if now_ns < throttle_until {
+                            // Still in throttle window
+                            overall_throttle_until =
+                                overall_throttle_until.max(throttle_until);
+                            should_charge = false;
+                        } else {
+                            // R110-2 FIX: Throttle expired — delegate to
+                            // CAS-serialized refresh_window().
+                            quota.refresh_window(now_ns, period_ns);
+                        }
+                    }
+
+                    // R110-2 FIX: Skip charging while a refresh is in progress.
+                    if should_charge && !quota.is_refreshing() {
+                        let used = quota
+                            .period_usage_ns
+                            .fetch_add(delta_ns, Ordering::SeqCst)
+                            .saturating_add(delta_ns);
+
+                        if used > max_ns {
+                            // Quota exceeded — throttle until end of current period
+                            let until = quota
+                                .period_start_ns
+                                .load(Ordering::Relaxed)
+                                .saturating_add(period_ns);
+                            quota.throttled_until_ns.store(until, Ordering::SeqCst);
+                            quota.throttle_events.fetch_add(1, Ordering::Relaxed);
+                            overall_throttle_until =
+                                overall_throttle_until.max(until);
+                        }
+                    }
                 }
-                // R110-2 FIX: Throttle window expired — delegate to the
-                // CAS-serialized refresh_window() instead of ad-hoc plain stores.
-                quota.refresh_window(now_ns, period_ns);
             }
-
-            // R110-2 FIX: If a window refresh is in progress on another CPU,
-            // skip charging for this tick.  At most one tick's worth of CPU
-            // time goes unaccounted — bounded and conservative, analogous to
-            // the skip behavior when the limits mutex is contended above.
-            if quota.is_refreshing() {
-                return CpuQuotaStatus::Allowed;
-            }
-
-            // Charge the time and check if quota exceeded
-            let used = quota
-                .period_usage_ns
-                .fetch_add(delta_ns, Ordering::SeqCst)
-                .saturating_add(delta_ns);
-
-            if used > max_ns {
-                // Quota exceeded - throttle until end of current period
-                let until = quota
-                    .period_start_ns
-                    .load(Ordering::Relaxed)
-                    .saturating_add(period_ns);
-                quota.throttled_until_ns.store(until, Ordering::SeqCst);
-                quota.throttle_events.fetch_add(1, Ordering::Relaxed);
-                return CpuQuotaStatus::Throttled(until);
-            }
-
-            return CpuQuotaStatus::Allowed;
         }
+
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = cgroup.parent();
     }
 
-    CpuQuotaStatus::Unlimited
+    if overall_throttle_until != 0 {
+        CpuQuotaStatus::Throttled(overall_throttle_until)
+    } else if any_quota {
+        CpuQuotaStatus::Allowed
+    } else {
+        CpuQuotaStatus::Unlimited
+    }
 }
 
 /// Fast-path check if a cgroup is currently throttled.
@@ -1971,35 +2153,51 @@ pub fn charge_cpu_quota(
 /// * `Some(until_ns)` - Cgroup is throttled until the specified time
 /// * `None` - Cgroup is not throttled (or no CPU controller/quota)
 pub fn cpu_quota_is_throttled(cgroup_id: CgroupId, now_ns: u64) -> Option<u64> {
-    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
+    // P2-9 FIX: Walk ancestors so parent throttling also blocks descendants.
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
+    let mut overall_until: u64 = 0;
+
+    while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::CPU) {
-            // IRQ-safe: Use try_lock() to avoid deadlock in scheduler context
-            let period_ns = match cgroup.limits.try_lock() {
-                Some(limits) => match limits.cpu_max {
-                    Some((_max, period_us)) => period_us.saturating_mul(1_000),
-                    None => return None,
-                },
-                None => return None, // Lock contended, assume not throttled
+            // IRQ-safe: Use try_lock() to avoid deadlock in scheduler context.
+            // If contended, return None (existing conservative behavior).
+            let cpu_max = match cgroup.limits.try_lock() {
+                Some(limits) => limits.cpu_max,
+                None => return None,
             };
 
-            let quota = &cgroup.cpu_quota;
+            if let Some((max_us, period_us)) = cpu_max {
+                if max_us != u64::MAX {
+                    let period_ns = period_us.saturating_mul(1_000);
+                    let quota = &cgroup.cpu_quota;
 
-            // Refresh window first to check if throttle has expired
-            quota.refresh_window(now_ns, period_ns);
+                    // Refresh window first to check if throttle has expired
+                    quota.refresh_window(now_ns, period_ns);
 
-            let until = quota.throttled_until_ns.load(Ordering::Acquire);
-            if until != 0 {
-                if now_ns < until {
-                    // Still throttled
-                    return Some(until);
+                    let until = quota.throttled_until_ns.load(Ordering::Acquire);
+                    if until != 0 {
+                        if now_ns < until {
+                            // Still throttled at this level
+                            overall_until = overall_until.max(until);
+                        } else {
+                            // R110-2 FIX: Throttle expired — delegate to
+                            // CAS-serialized refresh_window().
+                            quota.refresh_window(now_ns, period_ns);
+                        }
+                    }
                 }
-                // R110-2 FIX: Throttle expired — delegate to the CAS-serialized
-                // refresh_window() instead of ad-hoc plain stores.
-                quota.refresh_window(now_ns, period_ns);
             }
         }
+
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = cgroup.parent();
     }
-    None
+
+    if overall_until != 0 { Some(overall_until) } else { None }
 }
 
 // ============================================================================

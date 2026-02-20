@@ -298,9 +298,16 @@ static BIO_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl Bio {
     /// Create a new BIO for the given operation and starting sector.
-    pub fn new(op: BioOp, sector: u64) -> Self {
-        Self {
-            id: BIO_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ///
+    /// P2-8 FIX: Use fetch_update + checked_add to prevent ID wrapping on u64
+    /// overflow, following the R105-5 pattern.
+    pub fn new(op: BioOp, sector: u64) -> Result<Self, BlockError> {
+        let id = BIO_ID_COUNTER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| BlockError::NoMem)?;
+
+        Ok(Self {
+            id,
             op,
             sector,
             num_sectors: 0,
@@ -309,13 +316,17 @@ impl Bio {
             sec_tag: None,
             private: 0,
             timestamp: 0, // Will be set by request queue
-        }
+        })
     }
 
     /// Create a new Discard BIO with explicit sector count.
-    pub fn new_discard(sector: u64, num_sectors: u64) -> Self {
-        Self {
-            id: BIO_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+    pub fn new_discard(sector: u64, num_sectors: u64) -> Result<Self, BlockError> {
+        let id = BIO_ID_COUNTER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| BlockError::NoMem)?;
+
+        Ok(Self {
+            id,
             op: BioOp::Discard,
             sector,
             num_sectors,
@@ -324,7 +335,7 @@ impl Bio {
             sec_tag: None,
             private: 0,
             timestamp: 0,
-        }
+        })
     }
 
     /// Set the completion callback.
@@ -711,7 +722,11 @@ impl BlockDeviceRegistry {
             return Err(BlockError::Invalid);
         }
 
-        let minor = self.next_minor.fetch_add(1, Ordering::SeqCst) as u32;
+        // P2-8 FIX: Use fetch_update + checked_add to prevent minor number
+        // wrapping on overflow, following the R105-5 pattern.
+        let minor = self.next_minor
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+            .map_err(|_| BlockError::NoMem)? as u32;
 
         devices.push(RegisteredDevice {
             name,
@@ -1048,7 +1063,7 @@ mod tests {
 
     #[test]
     fn test_bio_creation() {
-        let bio = Bio::new(BioOp::Read, 0);
+        let bio = Bio::new(BioOp::Read, 0).unwrap();
         assert!(bio.is_read());
         assert!(!bio.is_write());
         assert_eq!(bio.total_len(), 0);
@@ -1056,7 +1071,7 @@ mod tests {
 
     #[test]
     fn test_bio_validation() {
-        let mut bio = Bio::new(BioOp::Read, 0);
+        let mut bio = Bio::new(BioOp::Read, 0).unwrap();
         let buf = [0u8; 512];
         bio.push_vec(BioVec::new(buf.as_ptr() as *mut u8, 512))
             .unwrap();
@@ -1068,12 +1083,12 @@ mod tests {
         assert!(bio.validate(1024, 1024, 1000).is_err());
 
         // Should fail if exceeds device capacity
-        let mut bio2 = Bio::new(BioOp::Read, 999);
+        let mut bio2 = Bio::new(BioOp::Read, 999).unwrap();
         bio2.push_vec(BioVec::new(buf.as_ptr() as *mut u8, 512))
             .unwrap();
         assert!(bio2.validate(512, 1024, 1000).is_ok()); // sector 999 + 1 = 1000, OK
 
-        let mut bio3 = Bio::new(BioOp::Read, 1000);
+        let mut bio3 = Bio::new(BioOp::Read, 1000).unwrap();
         bio3.push_vec(BioVec::new(buf.as_ptr() as *mut u8, 512))
             .unwrap();
         assert!(bio3.validate(512, 1024, 1000).is_err()); // sector 1000 + 1 = 1001, exceeds
@@ -1081,7 +1096,7 @@ mod tests {
 
     #[test]
     fn test_discard_bio() {
-        let bio = Bio::new_discard(0, 100);
+        let bio = Bio::new_discard(0, 100).unwrap();
         assert_eq!(bio.op, BioOp::Discard);
         assert_eq!(bio.num_sectors, 100);
 
@@ -1089,7 +1104,7 @@ mod tests {
         assert!(bio.validate(512, 1024, 1000).is_ok());
 
         // Should fail if exceeds capacity
-        let bio2 = Bio::new_discard(950, 100);
+        let bio2 = Bio::new_discard(950, 100).unwrap();
         assert!(bio2.validate(512, 1024, 1000).is_err()); // 950 + 100 = 1050 > 1000
     }
 
@@ -1098,7 +1113,7 @@ mod tests {
         let queue = RequestQueue::new(512, 1024, 16, 10000);
         assert!(queue.is_empty());
 
-        let mut bio = Bio::new(BioOp::Read, 0);
+        let mut bio = Bio::new(BioOp::Read, 0).unwrap();
         let buf = [0u8; 512];
         bio.push_vec(BioVec::new(buf.as_ptr() as *mut u8, 512))
             .unwrap();
