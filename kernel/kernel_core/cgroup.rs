@@ -253,19 +253,19 @@ impl CgroupStats {
     /// Records a memory.high exceeded event.
     #[inline]
     pub fn record_memory_high(&self) {
-        self.memory_events_high.fetch_add(1, Ordering::Relaxed);
+        self.memory_events_high.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
     }
 
     /// Records a memory.max (OOM) event.
     #[inline]
     pub fn record_memory_max(&self) {
-        self.memory_events_max.fetch_add(1, Ordering::Relaxed);
+        self.memory_events_max.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
     }
 
     /// Increments the attached task count.
     #[inline]
     fn increment_pids(&self) {
-        self.pids_current.fetch_add(1, Ordering::Relaxed);
+        self.pids_current.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
     }
 
     /// Decrements the attached task count (saturating at zero).
@@ -287,7 +287,7 @@ impl CgroupStats {
     /// Records a pids.max exceeded event.
     #[inline]
     fn record_pids_max_event(&self) {
-        self.pids_events_max.fetch_add(1, Ordering::Relaxed);
+        self.pids_events_max.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
     }
 }
 
@@ -648,7 +648,7 @@ impl IoThrottleState {
 
         if throttle_until != 0 {
             bucket.throttle_until_ns = throttle_until;
-            stats.io_throttle_events.fetch_add(1, Ordering::Relaxed);
+            stats.io_throttle_events.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
             return IoThrottleStatus::Throttled(throttle_until);
         }
 
@@ -1156,7 +1156,7 @@ impl CgroupNode {
                     .map_err(|_| ())
             } else {
                 // No limit set, always allow
-                stats.pids_current.fetch_add(1, Ordering::SeqCst);
+                stats.pids_current.fetch_add(1, Ordering::SeqCst); // lint-fetch-add: allow (statistics counter)
                 Ok(())
             }
         };
@@ -1325,9 +1325,11 @@ impl CgroupNode {
         self.stats.snapshot()
     }
 
-    /// Increments the manual reference count.
+    /// Increments the manual reference count (R112-2: overflow-safe).
     pub fn inc_ref(&self) {
-        self.ref_count.fetch_add(1, Ordering::SeqCst);
+        self.ref_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .expect("CgroupNode refcount overflow");
     }
 
     /// Decrements the manual reference count.
@@ -1982,12 +1984,12 @@ pub fn record_io_completion(cgroup_id: CgroupId, bytes: u64, op: IoDirection) {
         if cgroup.controllers.contains(CgroupControllers::IO) {
             match op {
                 IoDirection::Read => {
-                    cgroup.stats.io_read_bytes.fetch_add(bytes, Ordering::Relaxed);
-                    cgroup.stats.io_read_ios.fetch_add(1, Ordering::Relaxed);
+                    cgroup.stats.io_read_bytes.fetch_add(bytes, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
+                    cgroup.stats.io_read_ios.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
                 }
                 IoDirection::Write => {
-                    cgroup.stats.io_write_bytes.fetch_add(bytes, Ordering::Relaxed);
-                    cgroup.stats.io_write_ios.fetch_add(1, Ordering::Relaxed);
+                    cgroup.stats.io_write_bytes.fetch_add(bytes, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
+                    cgroup.stats.io_write_ios.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
                 }
             }
         }
@@ -2106,7 +2108,7 @@ pub fn charge_cpu_quota(
                                 .load(Ordering::Relaxed)
                                 .saturating_add(period_ns);
                             quota.throttled_until_ns.store(until, Ordering::SeqCst);
-                            quota.throttle_events.fetch_add(1, Ordering::Relaxed);
+                            quota.throttle_events.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
                             overall_throttle_until =
                                 overall_throttle_until.max(until);
                         }

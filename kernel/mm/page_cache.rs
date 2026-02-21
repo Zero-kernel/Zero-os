@@ -145,7 +145,7 @@ impl PageCacheEntry {
     /// Increment reference count
     #[inline]
     pub fn get(&self) -> u32 {
-        self.refcount.fetch_add(1, Ordering::AcqRel)
+        self.refcount.fetch_add(1, Ordering::AcqRel) // lint-fetch-add: allow (page refcount)
     }
 
     /// Decrement reference count, returns true if this was the last reference
@@ -440,7 +440,7 @@ impl AddressSpace {
             return false;
         }
         pages.insert(index, page);
-        self.nr_pages.fetch_add(1, Ordering::Relaxed);
+        self.nr_pages.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
         true
     }
 
@@ -462,7 +462,7 @@ impl AddressSpace {
     pub fn mark_dirty(&self, page: &PageCacheEntry) {
         if !page.is_dirty() {
             page.set_dirty();
-            self.nr_dirty.fetch_add(1, Ordering::Relaxed);
+            self.nr_dirty.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
         }
     }
 
@@ -618,7 +618,7 @@ impl GlobalPageCache {
 
         // Insert new page
         bucket.insert((inode_id, index), page.clone());
-        self.nr_pages.fetch_add(1, Ordering::Relaxed);
+        self.nr_pages.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
 
         // R28-3 Fix: Add to LRU with rollback on failure
         // If LRU is full and push_front fails, we must roll back the bucket insertion
@@ -667,7 +667,7 @@ impl GlobalPageCache {
     pub fn mark_dirty(&self, page: &PageCacheEntry) {
         if !page.is_dirty() {
             page.set_dirty();
-            self.nr_dirty.fetch_add(1, Ordering::Relaxed);
+            self.nr_dirty.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
         }
     }
 

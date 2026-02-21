@@ -72,6 +72,8 @@ pub enum PidNamespaceError {
     NamespaceShuttingDown,
     /// Invalid operation on root namespace
     InvalidOnRoot,
+    /// R112-2 FIX: Namespace ID counter overflow (u64 exhausted)
+    NamespaceIdOverflow,
 }
 
 // ============================================================================
@@ -209,15 +211,21 @@ impl PidNamespace {
         // This prevents an attacker from creating unbounded namespaces and
         // exhausting kernel memory. We use compare-exchange loop to avoid
         // TOCTOU race condition between check and increment.
-        let prev = PID_NS_COUNT.fetch_add(1, Ordering::SeqCst);
+        let prev = PID_NS_COUNT.fetch_add(1, Ordering::SeqCst); // lint-fetch-add: allow (count guard with immediate rollback)
         if prev >= MAX_PID_NS_COUNT {
             // Restore count and fail
             PID_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
             return Err(PidNamespaceError::MaxNamespaces);
         }
 
-        // Generate unique namespace ID
-        let id = NEXT_NS_ID.fetch_add(1, Ordering::SeqCst);
+        // Generate unique namespace ID (R112-2: overflow-safe allocation)
+        let id = NEXT_NS_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .map_err(|_| {
+                // Rollback the NS count since we can't allocate an ID
+                PID_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
+                PidNamespaceError::NamespaceIdOverflow
+            })?;
 
         let child = Arc::new(PidNamespace {
             id: NamespaceId::new(id),

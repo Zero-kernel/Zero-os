@@ -72,6 +72,10 @@ pub enum IpcNsError {
     PermissionDenied,
     /// Invalid namespace state
     InvalidState,
+    /// R112-2 FIX: Namespace ID counter overflow (u64 exhausted)
+    NamespaceIdOverflow,
+    /// R112-2 FIX: IPC key counter overflow (u64 exhausted)
+    KeyOverflow,
 }
 
 // ============================================================================
@@ -112,7 +116,7 @@ impl NsCountGuard {
     ///
     /// Returns error if the count would exceed the limit.
     fn new(counter: &'static AtomicU32, max_count: u32) -> Result<Self, IpcNsError> {
-        let prev = counter.fetch_add(1, Ordering::SeqCst);
+        let prev = counter.fetch_add(1, Ordering::SeqCst); // lint-fetch-add: allow (count guard with immediate rollback)
         if prev >= max_count {
             counter.fetch_sub(1, Ordering::SeqCst);
             return Err(IpcNsError::MaxNamespaces);
@@ -220,7 +224,13 @@ impl IpcNamespace {
         // The guard increments the count and will auto-decrement on drop unless committed.
         let count_guard = NsCountGuard::new(&IPC_NS_COUNT, MAX_IPC_NS_COUNT)?;
 
-        let id = NEXT_IPC_NS_ID.fetch_add(1, Ordering::SeqCst);
+        // R112-2: overflow-safe namespace ID allocation
+        let id = NEXT_IPC_NS_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .map_err(|_| {
+                // count_guard will auto-rollback on drop (R77-5 pattern)
+                IpcNsError::NamespaceIdOverflow
+            })?;
 
         let child = Arc::new(Self {
             id: NamespaceId::new(id),
@@ -266,10 +276,12 @@ impl IpcNamespace {
         self.refcount.load(Ordering::Acquire)
     }
 
-    /// Increment reference count.
+    /// Increment reference count (R112-2: overflow-safe).
     #[inline]
     pub fn inc_ref(&self) {
-        self.refcount.fetch_add(1, Ordering::AcqRel);
+        self.refcount
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
+            .expect("IpcNamespace refcount overflow");
     }
 
     /// Decrement reference count.
@@ -279,8 +291,12 @@ impl IpcNamespace {
     }
 
     /// Allocate a new IPC key within this namespace.
-    pub fn alloc_key(&self) -> u64 {
-        self.next_key.fetch_add(1, Ordering::SeqCst)
+    ///
+    /// Returns `Err(KeyOverflow)` if the key counter is exhausted (u64::MAX).
+    pub fn alloc_key(&self) -> Result<u64, IpcNsError> {
+        self.next_key
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .map_err(|_| IpcNsError::KeyOverflow)
     }
 }
 

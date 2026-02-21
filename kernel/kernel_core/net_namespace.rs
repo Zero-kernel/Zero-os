@@ -80,6 +80,8 @@ pub enum NetNsError {
     DeviceNotFound,
     /// Invalid namespace state
     InvalidState,
+    /// R112-2 FIX: Namespace ID counter overflow (u64 exhausted)
+    NamespaceIdOverflow,
 }
 
 // ============================================================================
@@ -120,7 +122,7 @@ impl NsCountGuard {
     ///
     /// Returns error if the count would exceed the limit.
     fn new(counter: &'static AtomicU32, max_count: u32) -> Result<Self, NetNsError> {
-        let prev = counter.fetch_add(1, Ordering::SeqCst);
+        let prev = counter.fetch_add(1, Ordering::SeqCst); // lint-fetch-add: allow (count guard with immediate rollback)
         if prev >= max_count {
             counter.fetch_sub(1, Ordering::SeqCst);
             return Err(NetNsError::MaxNamespaces);
@@ -235,7 +237,13 @@ impl NetNamespace {
         // The guard increments the count and will auto-decrement on drop unless committed.
         let count_guard = NsCountGuard::new(&NET_NS_COUNT, MAX_NET_NS_COUNT)?;
 
-        let id = NEXT_NET_NS_ID.fetch_add(1, Ordering::SeqCst);
+        // R112-2: overflow-safe namespace ID allocation
+        let id = NEXT_NET_NS_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .map_err(|_| {
+                // count_guard will auto-rollback on drop (R77-5 pattern)
+                NetNsError::NamespaceIdOverflow
+            })?;
 
         let child = Arc::new(Self {
             id: NamespaceId::new(id),
@@ -282,10 +290,12 @@ impl NetNamespace {
         self.refcount.load(Ordering::Acquire)
     }
 
-    /// Increment reference count.
+    /// Increment reference count (R112-2: overflow-safe).
     #[inline]
     pub fn inc_ref(&self) {
-        self.refcount.fetch_add(1, Ordering::AcqRel);
+        self.refcount
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
+            .expect("NetNamespace refcount overflow");
     }
 
     /// Decrement reference count.

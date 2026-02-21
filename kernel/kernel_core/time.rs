@@ -58,7 +58,7 @@ pub fn init() {
 /// 应由定时器中断处理程序调用
 #[inline]
 pub fn on_timer_tick() {
-    let current = TICK_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+    let current = TICK_COUNT.fetch_add(1, Ordering::SeqCst) + 1; // lint-fetch-add: allow (monotonic counter)
 
     // R53-3 FIX: Drive TCP timers at two frequencies:
     // - Fast timer (200ms): Data/FIN retransmission checks

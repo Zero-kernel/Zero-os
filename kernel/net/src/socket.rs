@@ -62,13 +62,14 @@ use crate::stack::transmit_tcp_segment;
 use crate::tcp::{
     build_tcp_segment, build_tcp_segment_with_options, calc_wscale, decode_window, encode_window,
     generate_isn, generate_syn_cookie_isn, handle_ack, handle_retransmission_timeout, initial_cwnd,
-    seq_ge, seq_gt, seq_in_window, syn_cookie_select_mss, update_congestion_control,
-    validate_cwnd_after_idle, validate_syn_cookie, CongestionAction, TcpConnKey, TcpControlBlock,
-    TcpHeader, TcpOptionKind, TcpOptions, TcpSegment, TcpState, TCP_DEFAULT_WINDOW,
-    TCP_ETHERNET_MSS, TCP_FIN_TIMEOUT_MS, TCP_FIN_WAIT_2_TIMEOUT_MS, TCP_FLAG_ACK, TCP_FLAG_FIN,
-    TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_MAX_ACCEPT_BACKLOG, TCP_MAX_ACTIVE_CONNECTIONS,
-    TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES, TCP_MAX_RTO_MS, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG,
-    TCP_MAX_WINDOW_SCALE, TCP_PROTO, TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
+    seq_ge, seq_gt, seq_in_window, syn_cookie_select_mss,
+    update_congestion_control, validate_cwnd_after_idle, validate_syn_cookie, CongestionAction,
+    SackBlock, TcpConnKey, TcpControlBlock, TcpHeader, TcpOptionKind, TcpOptions, TcpSegment,
+    TcpState, TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS, TCP_FIN_TIMEOUT_MS, TCP_FIN_WAIT_2_TIMEOUT_MS,
+    TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN,
+    TCP_MAX_ACCEPT_BACKLOG, TCP_MAX_ACTIVE_CONNECTIONS, TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES,
+    TCP_MAX_RTO_MS, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_WINDOW_SCALE, TCP_PROTO,
+    TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
 };
 use crate::udp::{
     build_udp_datagram, UdpError, EPHEMERAL_PORT_END, EPHEMERAL_PORT_START, UDP_PROTO,
@@ -1343,12 +1344,56 @@ impl SocketTable {
 
     /// Compute current advertised receive window (scaled if negotiated).
     ///
-    /// This is a convenience method for computing the window advertisement
-    /// when buffer state is already available in the TCB.
+    /// Accounts for both in-order receive buffer and out-of-order queue bytes
+    /// to accurately reflect available space.
     #[inline]
     fn current_adv_window(tcb: &TcpControlBlock) -> u16 {
-        let available = tcb.rcv_wnd.saturating_sub(tcb.recv_buffer.len() as u32);
+        let consumed = (tcb.recv_buffer.len() as u32).saturating_add(tcb.ooo_bytes);
+        let available = tcb.rcv_wnd.saturating_sub(consumed);
         Self::encode_adv_window(tcb, available)
+    }
+
+    /// Build an ACK segment carrying SACK blocks (RFC 2018).
+    ///
+    /// If SACK is negotiated and the OOO queue is non-empty, SACK blocks are
+    /// serialized into TCP options. Otherwise a plain ACK is emitted.
+    ///
+    /// The most recently received OOO range is placed first in the SACK block
+    /// list per RFC 2018 Section 3 recommendation.
+    fn build_sack_ack(
+        tcb: &TcpControlBlock,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        window: u16,
+    ) -> Vec<u8> {
+        let sack_blocks = if tcb.sack_enabled() {
+            tcb.generate_sack_blocks()
+        } else {
+            Vec::new()
+        };
+
+        if sack_blocks.is_empty() {
+            // Plain ACK — no SACK blocks to report
+            return build_tcp_segment(
+                src_ip, dst_ip, src_port, dst_port,
+                tcb.snd_nxt, tcb.rcv_nxt, TCP_FLAG_ACK, window, &[],
+            );
+        }
+
+        // Build ACK with SACK option (kind=5).
+        // NOP padding before SACK aligns to 32-bit boundary:
+        //   NOP, NOP, SACK(blocks...)
+        let mut opts: Vec<TcpOptionKind> = Vec::with_capacity(3);
+        opts.push(TcpOptionKind::Nop);
+        opts.push(TcpOptionKind::Nop);
+        opts.push(TcpOptionKind::Sack(sack_blocks));
+
+        build_tcp_segment_with_options(
+            src_ip, dst_ip, src_port, dst_port,
+            tcb.snd_nxt, tcb.rcv_nxt, TCP_FLAG_ACK, window, &opts, &[],
+        )
     }
 
     /// Create a new socket table.
@@ -2056,14 +2101,21 @@ impl SocketTable {
         tcb.rcv_wscale = calc_wscale(tcb.rcv_wnd);
         tcb.wscale_requested = true;
 
+        // SACK-Permitted (RFC 2018): advertise SACK capability in SYN
+        tcb.sack_requested = true;
+
         // Calculate scaled window for SYN
         let syn_wnd = Self::encode_adv_window(&tcb, tcb.rcv_wnd);
         sock.attach_tcp(tcb);
 
-        // Build the SYN segment with Window Scale option
-        let syn_options = [TcpOptionKind::WindowScale(
-            sock.tcp.lock().as_ref().unwrap().control.rcv_wscale,
-        )];
+        // Build the SYN segment with Window Scale + SACK-Permitted options
+        let tcp_guard = sock.tcp.lock();
+        let tcb_ref = tcp_guard.as_ref().unwrap();
+        let syn_options = [
+            TcpOptionKind::WindowScale(tcb_ref.control.rcv_wscale),
+            TcpOptionKind::SackPermitted,
+        ];
+        drop(tcp_guard);
         let segment = build_tcp_segment_with_options(
             local_ip,
             dst_ip,
@@ -2342,6 +2394,8 @@ impl SocketTable {
                 data: seg_payload.to_vec(),
                 sent_at: now_ms,
                 retrans_count: 0,
+                sacked: false,
+                lost: false,
             });
 
             segments.push(segment);
@@ -3471,6 +3525,13 @@ impl SocketTable {
                                 tcb.wscale_requested = true;
                             }
 
+                            // RFC 2018: SACK negotiation — record peer's SACK-Permitted
+                            // and advertise our own capability in the SYN-ACK.
+                            if options.sack_permitted {
+                                tcb.sack_received = true;
+                            }
+                            tcb.sack_requested = true;
+
                             child.attach_tcp(tcb);
 
                             // R58: Calculate window for SYN-ACK (unscaled per RFC 7323)
@@ -3486,10 +3547,10 @@ impl SocketTable {
                                 }
                             };
 
-                            // Build SYN-ACK segment with MSS and optional WSopt
+                            // Build SYN-ACK segment with MSS, SACK-Permitted, and optional WSopt
                             // RFC 793: SYN consumes 1 sequence number
                             let syn_ack = if options.window_scale.is_some() {
-                                // Include MSS and WSopt in response
+                                // Include MSS, WSopt, and SACK-Permitted in response
                                 let our_scale = {
                                     let guard = child.tcp.lock();
                                     guard.as_ref().map(|ts| ts.control.rcv_wscale).unwrap_or(0)
@@ -3497,6 +3558,7 @@ impl SocketTable {
                                 let syn_ack_options = [
                                     TcpOptionKind::Mss(cookie_mss),
                                     TcpOptionKind::WindowScale(our_scale),
+                                    TcpOptionKind::SackPermitted,
                                 ];
                                 build_tcp_segment_with_options(
                                     dst_ip,
@@ -3511,8 +3573,11 @@ impl SocketTable {
                                     &[],
                                 )
                             } else {
-                                // Include MSS only
-                                let syn_ack_options = [TcpOptionKind::Mss(cookie_mss)];
+                                // Include MSS and SACK-Permitted
+                                let syn_ack_options = [
+                                    TcpOptionKind::Mss(cookie_mss),
+                                    TcpOptionKind::SackPermitted,
+                                ];
                                 build_tcp_segment_with_options(
                                     dst_ip,
                                     src_ip,
@@ -3873,6 +3938,13 @@ impl SocketTable {
                     // (snd_wscale remains 0, wscale_received remains false)
                 }
 
+                // RFC 2018: SACK negotiation — record peer's SACK capability.
+                // SACK is active only when both sides exchanged SACK-Permitted
+                // during the SYN/SYN-ACK handshake.
+                if tcp_state.control.sack_requested && options.sack_permitted {
+                    tcp_state.control.sack_received = true;
+                }
+
                 // Initialize send window from SYN-ACK (window field is never scaled on SYNs)
                 // RFC 7323 Section 2.2: Scaling takes effect only after SYN exchange completes
                 tcp_state.control.snd_wnd = decode_window(
@@ -3960,80 +4032,46 @@ impl SocketTable {
                 let mut fast_retransmit_seg: Option<Vec<u8>> = None;
 
                 if ack_in_range {
-                    // Update snd_una to acknowledge sent data and refresh RTT/RTO
-                    let ack_update =
-                        handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
+                    // RFC 2018 / RFC 6675: Extract SACK blocks from incoming segment
+                    // for sender scoreboard processing and loss-based retransmission.
+                    let sack_blocks = if tcp_state.control.sack_enabled() {
+                        options.sack_blocks.as_slice()
+                    } else {
+                        &[]
+                    };
 
-                    // R58: Decode peer's advertised window once for both dup-ACK check and update
+                    // Combined ACK processing + SACK scoreboard + congestion control.
+                    // apply_ack_and_cc returns (Some(segment), _) if fast retransmit was triggered,
+                    // and (_, true) if RFC 3042 Limited Transmit requests new data.
+                    let (retransmit_seg, limited_transmit) = self.apply_ack_and_cc(
+                        &mut tcp_state.control,
+                        header.ack_num,
+                        advertised_wnd,
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
+                        self.time_wait_now(),
+                        sack_blocks,
+                        !payload.is_empty(),
+                        header.window,
+                    );
+                    fast_retransmit_seg = retransmit_seg;
+
+                    // R56-1: RFC 3042 Limited Transmit — wake sender to push new data
+                    if limited_transmit {
+                        sock.wake_tcp_waiters();
+                    }
+
+                    // R58: Decode peer's advertised window and update send window
                     let peer_adv_wnd =
                         decode_window(header.window, tcp_state.control.effective_snd_wscale());
-
-                    // RFC 5681 §3.2: Duplicate ACK definition
-                    // A duplicate ACK must:
-                    // - Have the same acknowledgment number as a previous ACK
-                    // - Carry no data (payload empty)
-                    // - NOT be a pure window update (window must be same as before)
-                    // Segments with data or window changes are NOT duplicate ACKs
-                    let is_window_update = peer_adv_wnd != tcp_state.control.snd_wnd;
-                    let is_pure_dup_ack =
-                        ack_update.duplicate && payload.is_empty() && !is_window_update;
-
-                    // RFC 5681: Update congestion control and check for fast retransmit
-                    // R55-1: Pass ack_num for NewReno partial ACK detection
-                    let action = update_congestion_control(
-                        &mut tcp_state.control,
-                        ack_update.newly_acked,
-                        is_pure_dup_ack,
-                        header.ack_num,
-                    );
-
-                    // Handle congestion control actions
-                    match action {
-                        // Fast retransmit or partial ACK retransmit: resend first unacked segment
-                        // R55-1: RetransmitNext handles NewReno partial ACK in fast recovery
-                        CongestionAction::FastRetransmit | CongestionAction::RetransmitNext => {
-                            if let Some(seg) = tcp_state.control.send_buffer.front_mut() {
-                                let flags = TCP_FLAG_ACK
-                                    | if !seg.data.is_empty() {
-                                        TCP_FLAG_PSH
-                                    } else {
-                                        0
-                                    };
-                                seg.retrans_count = seg.retrans_count.saturating_add(1);
-                                let now = self.time_wait_now();
-                                seg.sent_at = now;
-                                tcp_state.control.last_activity = now;
-
-                                fast_retransmit_seg = Some(build_tcp_segment(
-                                    dst_ip,
-                                    src_ip,
-                                    header.dst_port,
-                                    header.src_port,
-                                    seg.seq,
-                                    tcp_state.control.rcv_nxt,
-                                    flags,
-                                    advertised_wnd,
-                                    &seg.data,
-                                ));
-                            }
-                        }
-                        // R56-1: RFC 3042 Limited Transmit - signal that new data can be sent.
-                        // The congestion control has determined conditions permit sending new data
-                        // beyond the normal cwnd limit. Wake any blocked senders to utilize this.
-                        CongestionAction::LimitedTransmit => {
-                            // Wake blocked tcp_send() callers to send more data if available.
-                            // Uses state_waiters as send window opening is similar to state change.
-                            sock.wake_tcp_waiters();
-                        }
-                        CongestionAction::None => {}
-                    }
 
                     // R50-2 FIX: Use seq_gt/seq_ge for wraparound-safe window update (RFC 793)
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
                             && seq_ge(header.ack_num, tcp_state.control.snd_wl2))
                     {
-                        // R58: Use pre-decoded peer window for update
                         tcp_state.control.snd_wnd = peer_adv_wnd;
                         tcp_state.control.snd_wl1 = header.seq_num;
                         tcp_state.control.snd_wl2 = header.ack_num;
@@ -4060,44 +4098,8 @@ impl SocketTable {
 
                 // Process incoming data if present
                 if !payload.is_empty() {
-                    // Recalculate window after ACK processing
-                    let window_after_ack = tcp_state
-                        .control
-                        .rcv_wnd
-                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
-
-                    // Check if segment is in-order (seq == rcv_nxt)
-                    if header.seq_num != tcp_state.control.rcv_nxt {
-                        // Out-of-order segment: send ACK with expected seq
-                        let dup_ack = build_tcp_segment(
-                            dst_ip,
-                            src_ip,
-                            header.dst_port,
-                            header.src_port,
-                            tcp_state.control.snd_nxt,
-                            tcp_state.control.rcv_nxt,
-                            TCP_FLAG_ACK,
-                            Self::encode_adv_window(&tcp_state.control, window_after_ack),
-                            &[],
-                        );
-                        return Some(dup_ack);
-                    }
-
-                    // Drop data that would overrun the advertised receive window
-                    if (payload.len() as u32) > window_after_ack {
-                        let win_ack = build_tcp_segment(
-                            dst_ip,
-                            src_ip,
-                            header.dst_port,
-                            header.src_port,
-                            tcp_state.control.snd_nxt,
-                            tcp_state.control.rcv_nxt,
-                            TCP_FLAG_ACK,
-                            Self::encode_adv_window(&tcp_state.control, window_after_ack),
-                            &[],
-                        );
-                        return Some(win_ack);
-                    }
+                    // Recalculate window after ACK processing (includes OOO bytes)
+                    let window_after_ack = Self::current_adv_window(&tcp_state.control);
 
                     // LSM check before buffering data
                     let mut ctx = self.ctx_from_socket(&sock);
@@ -4108,35 +4110,60 @@ impl SocketTable {
                         return None;
                     }
 
-                    // Buffer the in-order data
-                    tcp_state
-                        .control
-                        .recv_buffer
-                        .extend(payload.iter().copied());
+                    // Check if segment is in-order (seq == rcv_nxt)
+                    if header.seq_num == tcp_state.control.rcv_nxt {
+                        // In-order: buffer directly into receive buffer
+                        let consumed = (tcp_state.control.recv_buffer.len() as u32)
+                            .saturating_add(tcp_state.control.ooo_bytes);
+                        let available = tcp_state.control.rcv_wnd.saturating_sub(consumed);
 
-                    // Update rcv_nxt
-                    tcp_state.control.rcv_nxt =
-                        tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
+                        if (payload.len() as u32) > available {
+                            // Would overrun advertised window — send ACK with current window
+                            let win_ack = Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                window_after_ack,
+                            );
+                            return Some(win_ack);
+                        }
 
-                    // Recalculate window after buffering
-                    let window_after = tcp_state
-                        .control
-                        .rcv_wnd
-                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                        tcp_state.control.recv_buffer.extend(payload.iter().copied());
+                        tcp_state.control.rcv_nxt =
+                            tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
 
-                    // Build ACK for the received data
-                    response = Some(build_tcp_segment(
-                        dst_ip,
-                        src_ip,
-                        header.dst_port,
-                        header.src_port,
-                        tcp_state.control.snd_nxt,
-                        tcp_state.control.rcv_nxt,
-                        TCP_FLAG_ACK,
-                        Self::encode_adv_window(&tcp_state.control, window_after),
-                        &[],
-                    ));
-                    data_received = true;
+                        // Drain contiguous data from OOO queue that now abuts rcv_nxt
+                        tcp_state.control.ooo_drain_contiguous();
+
+                        // Build ACK (plain — no SACK blocks needed for in-order data
+                        // with empty OOO queue; includes SACK if OOO queue is non-empty)
+                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                        response = Some(Self::build_sack_ack(
+                            &tcp_state.control,
+                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            ack_wnd,
+                        ));
+                        data_received = true;
+                    } else if seq_gt(header.seq_num, tcp_state.control.rcv_nxt) {
+                        // Out-of-order: buffer in OOO queue and send SACK-bearing ACK
+                        tcp_state.control.ooo_insert(header.seq_num, payload);
+
+                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                        let sack_ack = Self::build_sack_ack(
+                            &tcp_state.control,
+                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            ack_wnd,
+                        );
+                        return Some(sack_ack);
+                    } else {
+                        // Retransmitted/duplicate data (seq < rcv_nxt): ACK with current state
+                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                        let dup_ack = Self::build_sack_ack(
+                            &tcp_state.control,
+                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            ack_wnd,
+                        );
+                        return Some(dup_ack);
+                    }
                 }
 
                 // RFC 793: Handle FIN flag - peer wants to close
@@ -4291,6 +4318,13 @@ impl SocketTable {
                     return Some(dup_ack);
                 }
 
+                // RFC 6675: Update sender SACK scoreboard in closing states,
+                // so retransmit timer selects the right segment if data remains.
+                if tcp_state.control.sack_enabled() && !options.sack_blocks.is_empty() {
+                    tcp_state.control.process_sack_blocks(&options.sack_blocks);
+                    tcp_state.control.sack_mark_lost();
+                }
+
                 // Check if our FIN was ACKed
                 let acked_fin = seq_ge(header.ack_num, tcp_state.control.snd_nxt);
                 if acked_fin {
@@ -4307,40 +4341,7 @@ impl SocketTable {
 
                 // Process incoming data (we can still receive in FIN_WAIT_1)
                 if !payload.is_empty() {
-                    let window_after_ack = tcp_state
-                        .control
-                        .rcv_wnd
-                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
-
-                    if header.seq_num != tcp_state.control.rcv_nxt {
-                        let dup_ack = build_tcp_segment(
-                            dst_ip,
-                            src_ip,
-                            header.dst_port,
-                            header.src_port,
-                            tcp_state.control.snd_nxt,
-                            tcp_state.control.rcv_nxt,
-                            TCP_FLAG_ACK,
-                            Self::encode_adv_window(&tcp_state.control, window_after_ack),
-                            &[],
-                        );
-                        return Some(dup_ack);
-                    }
-
-                    if (payload.len() as u32) > window_after_ack {
-                        let win_ack = build_tcp_segment(
-                            dst_ip,
-                            src_ip,
-                            header.dst_port,
-                            header.src_port,
-                            tcp_state.control.snd_nxt,
-                            tcp_state.control.rcv_nxt,
-                            TCP_FLAG_ACK,
-                            Self::encode_adv_window(&tcp_state.control, window_after_ack),
-                            &[],
-                        );
-                        return Some(win_ack);
-                    }
+                    let window_after_ack = Self::current_adv_window(&tcp_state.control);
 
                     let mut ctx = self.ctx_from_socket(&sock);
                     ctx.remote = ipv4_to_u64(src_ip.0);
@@ -4349,30 +4350,50 @@ impl SocketTable {
                         return None;
                     }
 
-                    tcp_state
-                        .control
-                        .recv_buffer
-                        .extend(payload.iter().copied());
-                    tcp_state.control.rcv_nxt =
-                        tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
+                    if header.seq_num == tcp_state.control.rcv_nxt {
+                        let consumed = (tcp_state.control.recv_buffer.len() as u32)
+                            .saturating_add(tcp_state.control.ooo_bytes);
+                        let available = tcp_state.control.rcv_wnd.saturating_sub(consumed);
 
-                    let window_after = tcp_state
-                        .control
-                        .rcv_wnd
-                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                        if (payload.len() as u32) > available {
+                            let win_ack = Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                window_after_ack,
+                            );
+                            return Some(win_ack);
+                        }
 
-                    response = Some(build_tcp_segment(
-                        dst_ip,
-                        src_ip,
-                        header.dst_port,
-                        header.src_port,
-                        tcp_state.control.snd_nxt,
-                        tcp_state.control.rcv_nxt,
-                        TCP_FLAG_ACK,
-                        Self::encode_adv_window(&tcp_state.control, window_after),
-                        &[],
-                    ));
-                    data_received = true;
+                        tcp_state.control.recv_buffer.extend(payload.iter().copied());
+                        tcp_state.control.rcv_nxt =
+                            tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
+                        tcp_state.control.ooo_drain_contiguous();
+
+                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                        response = Some(Self::build_sack_ack(
+                            &tcp_state.control,
+                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            ack_wnd,
+                        ));
+                        data_received = true;
+                    } else if seq_gt(header.seq_num, tcp_state.control.rcv_nxt) {
+                        tcp_state.control.ooo_insert(header.seq_num, payload);
+                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                        let sack_ack = Self::build_sack_ack(
+                            &tcp_state.control,
+                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            ack_wnd,
+                        );
+                        return Some(sack_ack);
+                    } else {
+                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                        let dup_ack = Self::build_sack_ack(
+                            &tcp_state.control,
+                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            ack_wnd,
+                        );
+                        return Some(dup_ack);
+                    }
                 }
 
                 // Handle peer's FIN
@@ -4521,45 +4542,18 @@ impl SocketTable {
                     return Some(dup_ack);
                 }
 
+                // RFC 6675: Update sender SACK scoreboard in FIN_WAIT_2.
+                if tcp_state.control.sack_enabled() && !options.sack_blocks.is_empty() {
+                    tcp_state.control.process_sack_blocks(&options.sack_blocks);
+                    tcp_state.control.sack_mark_lost();
+                }
+
                 let mut data_received = false;
                 let mut response: Option<Vec<u8>> = None;
 
                 // We can still receive data in FIN_WAIT_2
                 if !payload.is_empty() {
-                    let window_after_ack = tcp_state
-                        .control
-                        .rcv_wnd
-                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
-
-                    if header.seq_num != tcp_state.control.rcv_nxt {
-                        let dup_ack = build_tcp_segment(
-                            dst_ip,
-                            src_ip,
-                            header.dst_port,
-                            header.src_port,
-                            tcp_state.control.snd_nxt,
-                            tcp_state.control.rcv_nxt,
-                            TCP_FLAG_ACK,
-                            Self::encode_adv_window(&tcp_state.control, window_after_ack),
-                            &[],
-                        );
-                        return Some(dup_ack);
-                    }
-
-                    if (payload.len() as u32) > window_after_ack {
-                        let win_ack = build_tcp_segment(
-                            dst_ip,
-                            src_ip,
-                            header.dst_port,
-                            header.src_port,
-                            tcp_state.control.snd_nxt,
-                            tcp_state.control.rcv_nxt,
-                            TCP_FLAG_ACK,
-                            Self::encode_adv_window(&tcp_state.control, window_after_ack),
-                            &[],
-                        );
-                        return Some(win_ack);
-                    }
+                    let window_after_ack = Self::current_adv_window(&tcp_state.control);
 
                     let mut ctx = self.ctx_from_socket(&sock);
                     ctx.remote = ipv4_to_u64(src_ip.0);
@@ -4568,30 +4562,50 @@ impl SocketTable {
                         return None;
                     }
 
-                    tcp_state
-                        .control
-                        .recv_buffer
-                        .extend(payload.iter().copied());
-                    tcp_state.control.rcv_nxt =
-                        tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
+                    if header.seq_num == tcp_state.control.rcv_nxt {
+                        let consumed = (tcp_state.control.recv_buffer.len() as u32)
+                            .saturating_add(tcp_state.control.ooo_bytes);
+                        let available = tcp_state.control.rcv_wnd.saturating_sub(consumed);
 
-                    let window_after = tcp_state
-                        .control
-                        .rcv_wnd
-                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                        if (payload.len() as u32) > available {
+                            let win_ack = Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                window_after_ack,
+                            );
+                            return Some(win_ack);
+                        }
 
-                    response = Some(build_tcp_segment(
-                        dst_ip,
-                        src_ip,
-                        header.dst_port,
-                        header.src_port,
-                        tcp_state.control.snd_nxt,
-                        tcp_state.control.rcv_nxt,
-                        TCP_FLAG_ACK,
-                        Self::encode_adv_window(&tcp_state.control, window_after),
-                        &[],
-                    ));
-                    data_received = true;
+                        tcp_state.control.recv_buffer.extend(payload.iter().copied());
+                        tcp_state.control.rcv_nxt =
+                            tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
+                        tcp_state.control.ooo_drain_contiguous();
+
+                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                        response = Some(Self::build_sack_ack(
+                            &tcp_state.control,
+                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            ack_wnd,
+                        ));
+                        data_received = true;
+                    } else if seq_gt(header.seq_num, tcp_state.control.rcv_nxt) {
+                        tcp_state.control.ooo_insert(header.seq_num, payload);
+                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                        let sack_ack = Self::build_sack_ack(
+                            &tcp_state.control,
+                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            ack_wnd,
+                        );
+                        return Some(sack_ack);
+                    } else {
+                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                        let dup_ack = Self::build_sack_ack(
+                            &tcp_state.control,
+                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            ack_wnd,
+                        );
+                        return Some(dup_ack);
+                    }
                 }
 
                 // Handle peer's FIN
@@ -4717,6 +4731,13 @@ impl SocketTable {
                     );
                     drop(guard);
                     return Some(dup_ack);
+                }
+
+                // RFC 6675: Update sender SACK scoreboard in CLOSE_WAIT.
+                // Data may still be sent in this state (application has not closed yet).
+                if tcp_state.control.sack_enabled() && !options.sack_blocks.is_empty() {
+                    tcp_state.control.process_sack_blocks(&options.sack_blocks);
+                    tcp_state.control.sack_mark_lost();
                 }
 
                 // In CLOSE_WAIT, we don't expect more data but still ACK segments
@@ -5159,23 +5180,27 @@ impl SocketTable {
         1 // Minimal non-zero value before any time source is available
     }
 
-    /// Apply ACK processing with RFC 5681 congestion control.
+    /// Apply ACK processing with RFC 5681 congestion control and RFC 6675 SACK recovery.
     ///
-    /// Combines `handle_ack()` and `update_congestion_control()` and returns
-    /// a fast retransmit segment if triggered by triple duplicate ACK.
+    /// Combines `handle_ack()`, SACK scoreboard updates, and `update_congestion_control()`.
     ///
     /// # Arguments
     ///
     /// * `tcb` - TCP control block to update
     /// * `ack_num` - ACK number from incoming segment
-    /// * `advertised_wnd` - Our current advertised window for response
+    /// * `advertised_wnd` - Our current scaled advertised window for response segments
     /// * `local_ip`, `remote_ip` - IP addresses for segment construction
     /// * `local_port`, `remote_port` - Ports for segment construction
     /// * `now_ms` - Current timestamp in milliseconds
+    /// * `sack_blocks` - SACK blocks from incoming segment (empty if SACK disabled)
+    /// * `has_payload` - True if the incoming segment carries data (not a pure ACK)
+    /// * `peer_raw_window` - Raw window field from incoming TCP header (pre-decode)
     ///
     /// # Returns
     ///
-    /// `Some(segment)` if fast retransmit was triggered, `None` otherwise.
+    /// A tuple of:
+    /// - `Option<Vec<u8>>`: Retransmit segment if fast retransmit or partial-ACK was triggered
+    /// - `bool`: True if RFC 3042 Limited Transmit was signaled (caller should wake sender)
     fn apply_ack_and_cc(
         &self,
         tcb: &mut TcpControlBlock,
@@ -5186,49 +5211,81 @@ impl SocketTable {
         local_port: u16,
         remote_port: u16,
         now_ms: u64,
-    ) -> Option<Vec<u8>> {
+        sack_blocks: &[SackBlock],
+        has_payload: bool,
+        peer_raw_window: u16,
+    ) -> (Option<Vec<u8>>, bool) {
         // Process ACK and get update info
         let ack_update = handle_ack(tcb, ack_num, now_ms);
+
+        // RFC 2018 / RFC 6675: Process incoming SACK blocks on the sender scoreboard.
+        // Mark segments as SACKed, update highest_sacked, then detect lost segments.
+        if tcb.sack_enabled() && !sack_blocks.is_empty() {
+            tcb.process_sack_blocks(sack_blocks);
+            tcb.sack_mark_lost();
+        }
+
+        // RFC 5681 §3.2: Duplicate ACK definition — a pure duplicate ACK must:
+        // 1. Have the same acknowledgment number as a previous ACK (ack_update.duplicate)
+        // 2. Carry no data (payload empty)
+        // 3. NOT be a pure window update (window must match current snd_wnd)
+        // Segments with data or window changes are NOT duplicate ACKs.
+        let peer_adv_wnd = decode_window(peer_raw_window, tcb.effective_snd_wscale());
+        let is_window_update = peer_adv_wnd != tcb.snd_wnd;
+        let is_pure_dup_ack = ack_update.duplicate && !has_payload && !is_window_update;
 
         // Update congestion control and check for fast retransmit
         // R55-1: Pass ack_num for NewReno partial ACK detection
         let action =
-            update_congestion_control(tcb, ack_update.newly_acked, ack_update.duplicate, ack_num);
+            update_congestion_control(tcb, ack_update.newly_acked, is_pure_dup_ack, ack_num);
 
         // Handle congestion control actions
         match action {
             // R55-1: Both FastRetransmit and RetransmitNext trigger segment retransmission
             CongestionAction::FastRetransmit | CongestionAction::RetransmitNext => {
-                // Fast retransmit: resend first unacked segment
-                if let Some(seg) = tcb.send_buffer.front_mut() {
-                    let flags = TCP_FLAG_ACK
-                        | if !seg.data.is_empty() {
-                            TCP_FLAG_PSH
-                        } else {
-                            0
-                        };
-                    seg.retrans_count = seg.retrans_count.saturating_add(1);
-                    seg.sent_at = now_ms;
-                    tcb.last_activity = now_ms;
+                // RFC 6675: When SACK is enabled, prefer retransmitting the earliest
+                // segment marked as lost rather than blindly retransmitting the front.
+                let retransmit_idx = if tcb.sack_enabled() {
+                    tcb.sack_find_lost_segment().or(Some(0))
+                } else {
+                    Some(0)
+                };
 
-                    return Some(build_tcp_segment(
-                        local_ip,
-                        remote_ip,
-                        local_port,
-                        remote_port,
-                        seg.seq,
-                        tcb.rcv_nxt,
-                        flags,
-                        advertised_wnd,
-                        &seg.data,
-                    ));
+                if let Some(idx) = retransmit_idx {
+                    if let Some(seg) = tcb.send_buffer.get_mut(idx) {
+                        let flags = TCP_FLAG_ACK
+                            | if !seg.data.is_empty() {
+                                TCP_FLAG_PSH
+                            } else {
+                                0
+                            };
+                        seg.retrans_count = seg.retrans_count.saturating_add(1);
+                        seg.sent_at = now_ms;
+                        tcb.last_activity = now_ms;
+
+                        return (
+                            Some(build_tcp_segment(
+                                local_ip,
+                                remote_ip,
+                                local_port,
+                                remote_port,
+                                seg.seq,
+                                tcb.rcv_nxt,
+                                flags,
+                                advertised_wnd,
+                                &seg.data,
+                            )),
+                            false,
+                        );
+                    }
                 }
             }
-            // R56-1: Limited Transmit - no segment to build here, caller handles wake
-            CongestionAction::LimitedTransmit | CongestionAction::None => {}
+            // R56-1: RFC 3042 Limited Transmit — signal caller to wake sender
+            CongestionAction::LimitedTransmit => return (None, true),
+            CongestionAction::None => {}
         }
 
-        None
+        (None, false)
     }
 
     /// Sweep TIME_WAIT connections and clean up those that exceeded 2MSL.
@@ -5444,6 +5501,10 @@ impl SocketTable {
                             // RFC 5681: Enter loss recovery BEFORE retransmitting
                             // This sets ssthresh = max(FlightSize/2, 2*SMSS) and cwnd = 1*SMSS
                             handle_retransmission_timeout(&mut tcp_state.control);
+
+                            // RFC 6675: Clear SACK scoreboard on RTO — all SACKed/lost flags
+                            // become stale after timeout-based recovery resets the send state.
+                            tcp_state.control.sack_clear_scoreboard();
 
                             // RFC 5681 §3.1: Retransmit ONLY the first unacked segment
                             if let Some(first_seg) = tcp_state.control.send_buffer.front_mut() {

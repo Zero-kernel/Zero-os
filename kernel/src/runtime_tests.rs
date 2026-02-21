@@ -22,6 +22,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
 use core::sync::atomic::Ordering;
@@ -2100,15 +2101,15 @@ impl RuntimeTest for MountNamespaceIsolationTest {
             return TestResult::Fail(String::from("Child namespace should have / mount (inherited)"));
         }
 
-        // Test 8: Reference counting
-        let initial_refcount = child_ns.ref_count();
-        child_ns.inc_ref();
-        if child_ns.ref_count() != initial_refcount + 1 {
-            return TestResult::Fail(String::from("Refcount should increment"));
+        // Test 8: Arc-based reference counting (R112-1: manual refcount removed)
+        let initial_arc_refs = Arc::strong_count(&child_ns);
+        let child_ns_clone = child_ns.clone();
+        if Arc::strong_count(&child_ns) != initial_arc_refs + 1 {
+            return TestResult::Fail(String::from("Arc refcount should increment on clone"));
         }
-        child_ns.dec_ref();
-        if child_ns.ref_count() != initial_refcount {
-            return TestResult::Fail(String::from("Refcount should decrement"));
+        drop(child_ns_clone);
+        if Arc::strong_count(&child_ns) != initial_arc_refs {
+            return TestResult::Fail(String::from("Arc refcount should decrement on drop"));
         }
 
         // Test 9: Verify MAX_MNT_NS_LEVEL limit is enforced

@@ -117,9 +117,11 @@ fn file_type_from_mode(mode: u32) -> Option<FileType> {
     }
 }
 
-/// Allocate a new generated inode number
+/// Allocate a new generated inode number (R112-2: overflow-safe)
 fn alloc_generated_ino() -> u64 {
-    NEXT_GENERATED_INO.fetch_add(1, Ordering::SeqCst)
+    NEXT_GENERATED_INO
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+        .expect("initramfs: NEXT_GENERATED_INO overflow")
 }
 
 // ============================================================================
@@ -135,7 +137,10 @@ pub struct Initramfs {
 impl Initramfs {
     /// Parse a CPIO "newc" archive from a memory buffer
     pub fn from_cpio(buf: &[u8]) -> Result<Arc<Self>, FsError> {
-        let fs_id = NEXT_FS_ID.fetch_add(1, Ordering::SeqCst);
+        // R112-2: overflow-safe ID allocation
+        let fs_id = NEXT_FS_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .map_err(|_| FsError::NoSpace)?;
         let now = TimeSpec::now();
 
         // Create root directory with a generated ino to avoid colliding with archive inodes

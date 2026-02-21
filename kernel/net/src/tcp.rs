@@ -531,8 +531,30 @@ impl TcpHeader {
 // TCP Options
 // ============================================================================
 
-/// TCP option kinds
+/// Maximum number of SACK blocks in a single TCP option (RFC 2018).
+///
+/// Each block is 8 bytes (left_edge + right_edge). With 40 bytes of option
+/// space and kind(1) + length(1) overhead, at most 4 blocks fit without
+/// other variable-length options. We cap at 4 to avoid heap allocation
+/// in the RX hot path.
+pub const TCP_SACK_MAX_BLOCKS: usize = 4;
+
+/// A single SACK block representing a contiguous range of received bytes.
+///
+/// Per RFC 2018, each block describes bytes `[left_edge, right_edge)` that
+/// have been received out of order. `left_edge` is the first sequence number
+/// of the block; `right_edge` is the sequence number immediately following
+/// the last byte in the block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SackBlock {
+    /// First sequence number of the contiguous block
+    pub left_edge: u32,
+    /// Sequence number immediately past the last byte in the block
+    pub right_edge: u32,
+}
+
+/// TCP option kinds
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TcpOptionKind {
     /// End of option list
     EndOfList,
@@ -544,6 +566,8 @@ pub enum TcpOptionKind {
     WindowScale(u8),
     /// Selective Acknowledgment Permitted (RFC 2018)
     SackPermitted,
+    /// Selective Acknowledgment blocks (RFC 2018, kind=5)
+    Sack(Vec<SackBlock>),
     /// Timestamps (RFC 7323)
     Timestamps { ts_val: u32, ts_ecr: u32 },
     /// Unknown option
@@ -557,8 +581,10 @@ pub struct TcpOptions {
     pub mss: Option<u16>,
     /// Window Scale factor
     pub window_scale: Option<u8>,
-    /// SACK permitted
+    /// SACK permitted (kind=4, SYN/SYN-ACK only)
     pub sack_permitted: bool,
+    /// SACK blocks (kind=5, data segments and ACKs)
+    pub sack_blocks: Vec<SackBlock>,
     /// Timestamps
     pub timestamps: Option<(u32, u32)>,
 }
@@ -583,6 +609,19 @@ pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
         }
         TcpOptionKind::WindowScale(scale) => vec![3, 3, scale], // kind=3, len=3, shift
         TcpOptionKind::SackPermitted => vec![4, 2],             // kind=4, len=2
+        TcpOptionKind::Sack(ref blocks) => {
+            // kind=5, len = 2 + 8*n (each block is 4+4 bytes)
+            let count = blocks.len().min(TCP_SACK_MAX_BLOCKS);
+            let len = 2u8.saturating_add((count as u8).saturating_mul(8));
+            let mut bytes = Vec::with_capacity(len as usize);
+            bytes.push(5);   // kind
+            bytes.push(len);
+            for block in blocks.iter().take(count) {
+                bytes.extend_from_slice(&block.left_edge.to_be_bytes());
+                bytes.extend_from_slice(&block.right_edge.to_be_bytes());
+            }
+            bytes
+        }
         TcpOptionKind::Timestamps { ts_val, ts_ecr } => {
             let mut bytes = Vec::with_capacity(10);
             bytes.extend_from_slice(&[8, 10]); // kind=8, len=10
@@ -753,6 +792,16 @@ pub struct TcpControlBlock {
     /// True if peer sent Window Scale option in their SYN/SYN-ACK.
     pub wscale_received: bool,
 
+    // === SACK (RFC 2018 / RFC 6675) ===
+    /// True if we sent SACK-Permitted in our SYN/SYN-ACK.
+    pub sack_requested: bool,
+    /// True if peer sent SACK-Permitted in their SYN/SYN-ACK.
+    pub sack_received: bool,
+    /// Highest SACKed sequence number seen from peer (for RFC 6675 loss detection).
+    pub highest_sacked: u32,
+    /// Number of bytes currently buffered in the OOO queue (for window accounting).
+    pub ooo_bytes: u32,
+
     // === Retransmission State ===
     /// Current retransmission timeout in milliseconds
     pub rto_ms: u64,
@@ -768,8 +817,8 @@ pub struct TcpControlBlock {
     pub send_buffer: VecDeque<TcpSegment>,
     /// Receive buffer (in-order data)
     pub recv_buffer: VecDeque<u8>,
-    /// Out-of-order segments
-    pub ooo_queue: VecDeque<TcpSegment>,
+    /// Out-of-order receive queue (sorted by sequence number)
+    pub ooo_queue: VecDeque<OooSegment>,
 
     // === Flags ===
     /// FIN has been sent
@@ -805,6 +854,29 @@ pub struct TcpSegment {
     pub sent_at: u64,
     /// Number of times retransmitted
     pub retrans_count: u8,
+    /// SACK scoreboard: this segment has been selectively acknowledged by the peer
+    pub sacked: bool,
+    /// SACK scoreboard: this segment has been marked as lost (RFC 6675)
+    pub lost: bool,
+}
+
+/// Maximum number of out-of-order segments buffered per connection.
+///
+/// Bounds CPU cost of OOO insertion/merge and prevents memory exhaustion
+/// from adversarial tiny-segment floods. 64 segments × ~1460 bytes ≈ 93 KB
+/// which is within the default receive window.
+pub const TCP_OOO_MAX_SEGMENTS: usize = 64;
+
+/// A contiguous range of out-of-order received data.
+///
+/// Unlike `TcpSegment` (TX-oriented), this is RX-only and carries no
+/// retransmission metadata.
+#[derive(Debug, Clone)]
+pub struct OooSegment {
+    /// First sequence number of this contiguous range
+    pub seq: u32,
+    /// Contiguous received data
+    pub data: Vec<u8>,
 }
 
 impl TcpControlBlock {
@@ -839,6 +911,10 @@ impl TcpControlBlock {
             rcv_wscale: 0,
             wscale_requested: false,
             wscale_received: false,
+            sack_requested: false,
+            sack_received: false,
+            highest_sacked: iss,
+            ooo_bytes: 0,
             rto_ms: TCP_INITIAL_RTO_MS,
             srtt_us: 0,
             rttvar_us: 0,
@@ -940,6 +1016,281 @@ impl TcpControlBlock {
         } else {
             0
         }
+    }
+
+    /// Check if SACK is enabled for this connection (RFC 2018).
+    ///
+    /// SACK is active only if both sides exchanged SACK-Permitted during the
+    /// SYN/SYN-ACK handshake.
+    #[inline]
+    pub fn sack_enabled(&self) -> bool {
+        self.sack_requested && self.sack_received
+    }
+
+    /// Insert an out-of-order segment into the OOO queue.
+    ///
+    /// Maintains the queue sorted by sequence number. Overlapping and adjacent
+    /// segments are merged to keep the queue compact. Enforces a hard cap on
+    /// the number of entries (`TCP_OOO_MAX_SEGMENTS`) to bound CPU/memory cost.
+    ///
+    /// Returns the byte length of the final merged segment that was inserted.
+    /// This may exceed the input `data.len()` if existing segments were merged.
+    pub fn ooo_insert(&mut self, seq: u32, data: &[u8]) -> u32 {
+        if data.is_empty() {
+            return 0;
+        }
+
+        let mut new_seg = OooSegment {
+            seq,
+            data: data.to_vec(),
+        };
+
+        // Track bytes absorbed from existing segments during merges so we can
+        // correct `ooo_bytes` at the end.  Each removed segment's byte count is
+        // subtracted; the final merged segment's byte count is added once.
+        let mut removed_bytes = 0u32;
+
+        // Merge with any overlapping/adjacent existing segments
+        let mut i = 0;
+        while i < self.ooo_queue.len() {
+            let existing = &self.ooo_queue[i];
+            let ex_end = existing.seq.wrapping_add(existing.data.len() as u32);
+
+            // Recompute the running end of new_seg after each merge iteration
+            // to avoid using a stale value that misses cascading overlaps.
+            let new_seg_end = new_seg.seq.wrapping_add(new_seg.data.len() as u32);
+
+            // Check if new segment overlaps or is adjacent to existing
+            // Two ranges [a, b) and [c, d) overlap or touch if a <= d && c <= b
+            if seq_le(new_seg.seq, ex_end) && seq_le(existing.seq, new_seg_end) {
+                // Merge: remove existing, extend new_seg to cover both
+                let removed = self.ooo_queue.remove(i).unwrap();
+                removed_bytes = removed_bytes.saturating_add(removed.data.len() as u32);
+                let rm_end = removed.seq.wrapping_add(removed.data.len() as u32);
+
+                let merged_start = if seq_le(removed.seq, new_seg.seq) {
+                    removed.seq
+                } else {
+                    new_seg.seq
+                };
+                let cur_end = new_seg.seq.wrapping_add(new_seg.data.len() as u32);
+                let merged_end = if seq_ge(rm_end, cur_end) { rm_end } else { cur_end };
+                let merged_len = merged_end.wrapping_sub(merged_start) as usize;
+
+                let mut merged_data = vec![0u8; merged_len];
+
+                // Copy removed segment's data at its relative offset
+                let rm_off = removed.seq.wrapping_sub(merged_start) as usize;
+                let rm_len = removed.data.len().min(merged_len.saturating_sub(rm_off));
+                merged_data[rm_off..rm_off + rm_len]
+                    .copy_from_slice(&removed.data[..rm_len]);
+
+                // Copy new segment's data (overwrites overlapping region)
+                let ns_off = new_seg.seq.wrapping_sub(merged_start) as usize;
+                let ns_len = new_seg.data.len().min(merged_len.saturating_sub(ns_off));
+                merged_data[ns_off..ns_off + ns_len]
+                    .copy_from_slice(&new_seg.data[..ns_len]);
+
+                new_seg = OooSegment {
+                    seq: merged_start,
+                    data: merged_data,
+                };
+                // Don't increment i; check same position again for cascading merges
+            } else {
+                i += 1;
+            }
+        }
+
+        // Find insertion position (sorted by sequence number)
+        let pos = self
+            .ooo_queue
+            .iter()
+            .position(|s| seq_gt(s.seq, new_seg.seq))
+            .unwrap_or(self.ooo_queue.len());
+
+        let new_bytes = new_seg.data.len() as u32;
+
+        // Enforce segment count limit — drop if full (tail drop policy)
+        if self.ooo_queue.len() >= TCP_OOO_MAX_SEGMENTS {
+            return 0;
+        }
+
+        self.ooo_queue.insert(pos, new_seg);
+
+        // Correct ooo_bytes: subtract all removed segments, add the final merged one.
+        // This prevents ooo_bytes from drifting upward on successive overlapping inserts,
+        // which would shrink the advertised receive window to zero (DoS vector).
+        self.ooo_bytes = self
+            .ooo_bytes
+            .saturating_sub(removed_bytes)
+            .saturating_add(new_bytes);
+        new_bytes
+    }
+
+    /// Drain contiguous data from the front of the OOO queue into the receive
+    /// buffer, advancing `rcv_nxt`.
+    ///
+    /// Returns the total number of bytes delivered to the receive buffer.
+    pub fn ooo_drain_contiguous(&mut self) -> u32 {
+        let mut delivered = 0u32;
+
+        while let Some(front) = self.ooo_queue.front() {
+            let front_end = front.seq.wrapping_add(front.data.len() as u32);
+
+            if seq_le(front.seq, self.rcv_nxt) {
+                // This segment starts at or before rcv_nxt
+                if seq_gt(front_end, self.rcv_nxt) {
+                    // Some new data past rcv_nxt
+                    let skip = self.rcv_nxt.wrapping_sub(front.seq) as usize;
+                    let useful = &self.ooo_queue.front().unwrap().data[skip..];
+                    self.recv_buffer.extend(useful);
+                    let useful_len = useful.len() as u32;
+                    self.rcv_nxt = self.rcv_nxt.wrapping_add(useful_len);
+                    delivered = delivered.saturating_add(useful_len);
+                }
+                // Remove the segment (fully consumed or redundant)
+                let removed = self.ooo_queue.pop_front().unwrap();
+                self.ooo_bytes = self
+                    .ooo_bytes
+                    .saturating_sub(removed.data.len() as u32);
+            } else {
+                // Gap — stop draining
+                break;
+            }
+        }
+
+        delivered
+    }
+
+    /// Generate SACK blocks from the current OOO queue.
+    ///
+    /// Returns up to `TCP_SACK_MAX_BLOCKS` blocks describing the contiguous
+    /// ranges in the OOO queue. The most recently inserted range is placed
+    /// first (RFC 2018 Section 3 recommendation), followed by earlier ranges.
+    pub fn generate_sack_blocks(&self) -> Vec<SackBlock> {
+        let mut blocks = Vec::with_capacity(TCP_SACK_MAX_BLOCKS);
+        for seg in self.ooo_queue.iter().rev().take(TCP_SACK_MAX_BLOCKS) {
+            blocks.push(SackBlock {
+                left_edge: seg.seq,
+                right_edge: seg.seq.wrapping_add(seg.data.len() as u32),
+            });
+        }
+        blocks
+    }
+
+    /// Process incoming SACK blocks from the peer and update the sender-side
+    /// scoreboard.
+    ///
+    /// Marks TX segments as `sacked` if fully covered by any SACK block.
+    /// Updates `highest_sacked` for loss detection.
+    /// Clamps SACK blocks to `[snd_una, snd_nxt)` to reject out-of-range blocks.
+    pub fn process_sack_blocks(&mut self, blocks: &[SackBlock]) {
+        if blocks.is_empty() {
+            return;
+        }
+
+        for block in blocks {
+            // Clamp block edges to the valid send window [snd_una, snd_nxt).
+            // This prevents a malicious peer from inflating `highest_sacked` beyond
+            // snd_nxt (which would corrupt loss detection) or referencing data before
+            // snd_una (already freed from send_buffer).
+            let left = if seq_lt(block.left_edge, self.snd_una) {
+                self.snd_una
+            } else {
+                block.left_edge
+            };
+            let right = if seq_gt(block.right_edge, self.snd_nxt) {
+                self.snd_nxt
+            } else {
+                block.right_edge
+            };
+
+            // After clamping, reject degenerate or empty blocks
+            if !seq_gt(right, left) {
+                continue;
+            }
+
+            // Update highest sacked (now guaranteed <= snd_nxt)
+            if seq_gt(right, self.highest_sacked) {
+                self.highest_sacked = right;
+            }
+
+            // Mark fully-covered TX segments as sacked
+            for seg in self.send_buffer.iter_mut() {
+                let seg_end = seg.seq.wrapping_add(seg.data.len() as u32);
+                if seq_ge(seg.seq, left) && seq_le(seg_end, right) {
+                    seg.sacked = true;
+                    seg.lost = false; // SACKed implies not lost
+                }
+            }
+        }
+    }
+
+    /// RFC 6675 loss detection: mark unsacked segments as `lost` if
+    /// `DupThresh` (3) SACKed segments exist above them.
+    ///
+    /// Walk from highest-sequence backward. Once we've seen 3 SACKed segments
+    /// above an unsacked one, that segment is considered lost.
+    pub fn sack_mark_lost(&mut self) {
+        const DUP_THRESH: usize = 3;
+        let mut sacked_above = 0usize;
+
+        // Walk from tail (highest seq) toward head (lowest seq)
+        for i in (0..self.send_buffer.len()).rev() {
+            let seg = &self.send_buffer[i];
+            let seg_end = seg.seq.wrapping_add(seg.data.len() as u32);
+
+            if seg.sacked {
+                sacked_above += 1;
+            } else if seq_le(seg_end, self.highest_sacked) && sacked_above >= DUP_THRESH {
+                // This segment has 3+ SACKed segments above it → mark lost
+                self.send_buffer[i].lost = true;
+            }
+        }
+    }
+
+    /// Compute the RFC 6675 `pipe` estimate: bytes considered still in the network.
+    ///
+    /// `pipe = bytes_in_flight - sacked_bytes - lost_not_retransmitted_bytes`
+    /// This approximation counts segments that are outstanding (not SACKed, not
+    /// marked Lost) plus segments that were marked Lost and already retransmitted.
+    pub fn sack_pipe(&self) -> u32 {
+        let mut pipe = 0u32;
+        for seg in &self.send_buffer {
+            let seg_len = seg.data.len() as u32;
+            if seg.sacked {
+                // SACKed: not in the network
+                continue;
+            }
+            if seg.lost {
+                // Lost and retransmitted: counts toward pipe
+                if seg.retrans_count > 0 {
+                    pipe = pipe.saturating_add(seg_len);
+                }
+                // Lost but not yet retransmitted: does NOT count
+            } else {
+                // Outstanding (not SACKed, not Lost): in the network
+                pipe = pipe.saturating_add(seg_len);
+            }
+        }
+        pipe
+    }
+
+    /// Clear SACK scoreboard state (called on RTO or recovery exit).
+    pub fn sack_clear_scoreboard(&mut self) {
+        self.highest_sacked = self.snd_una;
+        for seg in self.send_buffer.iter_mut() {
+            seg.sacked = false;
+            seg.lost = false;
+        }
+    }
+
+    /// Find the earliest segment marked as `lost` that has not been retransmitted,
+    /// returning its index in the send buffer (if any).
+    pub fn sack_find_lost_segment(&self) -> Option<usize> {
+        self.send_buffer
+            .iter()
+            .position(|seg| seg.lost && seg.retrans_count == 0)
     }
 }
 
@@ -1609,6 +1960,53 @@ pub fn parse_tcp_options(data: &[u8], header: &TcpHeader) -> TcpOptions {
                 } else {
                     break;
                 }
+            }
+            5 => {
+                // SACK Blocks (RFC 2018, kind=5)
+                // Format: kind(1) + length(1) + N * (left_edge(4) + right_edge(4))
+                // Minimum length is 10 (1 block), (length - 2) must be divisible by 8.
+                if i + 2 > opts_data.len() {
+                    break;
+                }
+                let opt_len = opts_data[i + 1] as usize;
+                if opt_len < 10 || (opt_len - 2) % 8 != 0 {
+                    // Malformed SACK option — skip it safely
+                    if let Some(next) = i.checked_add(opt_len.max(2)) {
+                        if next <= opts_data.len() {
+                            i = next;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if i + opt_len > opts_data.len() {
+                    break;
+                }
+                let block_count = (opt_len - 2) / 8;
+                let count = block_count.min(TCP_SACK_MAX_BLOCKS);
+                let mut j = i + 2;
+                for _ in 0..count {
+                    if j + 8 > opts_data.len() {
+                        break;
+                    }
+                    let left = u32::from_be_bytes([
+                        opts_data[j], opts_data[j + 1],
+                        opts_data[j + 2], opts_data[j + 3],
+                    ]);
+                    let right = u32::from_be_bytes([
+                        opts_data[j + 4], opts_data[j + 5],
+                        opts_data[j + 6], opts_data[j + 7],
+                    ]);
+                    // Discard invalid blocks where left >= right (wrap-safe)
+                    if seq_lt(left, right) {
+                        options.sack_blocks.push(SackBlock {
+                            left_edge: left,
+                            right_edge: right,
+                        });
+                    }
+                    j += 8;
+                }
+                i += opt_len;
             }
             8 => {
                 // Timestamps

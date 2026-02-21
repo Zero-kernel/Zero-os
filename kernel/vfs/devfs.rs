@@ -31,7 +31,10 @@ pub struct DevFs {
 impl DevFs {
     /// Create a new device filesystem with standard devices
     pub fn new() -> Arc<Self> {
-        let fs_id = NEXT_FS_ID.fetch_add(1, Ordering::SeqCst);
+        // R112-2: overflow-safe ID allocation (standardized per R105-5 pattern)
+        let fs_id = NEXT_FS_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .expect("devfs: NEXT_FS_ID overflow");
 
         let mut devices: BTreeMap<String, Arc<dyn Inode>> = BTreeMap::new();
 
@@ -76,8 +79,11 @@ impl DevFs {
         }
 
         // Assign a unique inode number
+        // R112-2: overflow-safe inode allocation
         static NEXT_BLOCK_INO: AtomicU64 = AtomicU64::new(100);
-        let ino = NEXT_BLOCK_INO.fetch_add(1, Ordering::SeqCst);
+        let ino = NEXT_BLOCK_INO
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .map_err(|_| FsError::NoSpace)?;
 
         // Create block device inode with self-reference initialized
         // This enables open() to return FileHandle wrapping the inode

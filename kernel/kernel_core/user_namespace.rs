@@ -141,6 +141,8 @@ pub enum UserNsError {
     MappingAlreadySet,
     /// Permission denied for mapping operation.
     PermissionDenied,
+    /// R112-2 FIX: Namespace ID counter overflow (u64 exhausted)
+    NamespaceIdOverflow,
 }
 
 impl fmt::Display for UserNsError {
@@ -158,6 +160,7 @@ impl fmt::Display for UserNsError {
             UserNsError::InvalidMapping => write!(f, "invalid mapping (overlap/overflow/empty)"),
             UserNsError::MappingAlreadySet => write!(f, "mapping already set (single-write)"),
             UserNsError::PermissionDenied => write!(f, "permission denied"),
+            UserNsError::NamespaceIdOverflow => write!(f, "namespace ID counter overflow"),
         }
     }
 }
@@ -307,8 +310,13 @@ impl UserNamespace {
         // Check and increment namespace count atomically
         let guard = NsCountGuard::try_new()?;
 
-        // Allocate unique ID
-        let id = NEXT_USER_NS_ID.fetch_add(1, Ordering::SeqCst);
+        // Allocate unique ID (R112-2: overflow-safe allocation)
+        let id = NEXT_USER_NS_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .map_err(|_| {
+                // guard will auto-rollback on drop (R77-5 pattern)
+                UserNsError::NamespaceIdOverflow
+            })?;
 
         let child = Arc::new(Self {
             id: NamespaceId::new(id),
@@ -358,10 +366,12 @@ impl UserNamespace {
         self.refcount.load(Ordering::Acquire)
     }
 
-    /// Increment reference count.
+    /// Increment reference count (R112-2: overflow-safe).
     #[inline]
     pub fn inc_ref(&self) {
-        self.refcount.fetch_add(1, Ordering::AcqRel);
+        self.refcount
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
+            .expect("UserNamespace refcount overflow");
     }
 
     /// Decrement reference count.

@@ -511,7 +511,10 @@ pub struct RamFs {
 impl RamFs {
     /// Create a new RAM filesystem
     pub fn new() -> Arc<Self> {
-        let fs_id = NEXT_FS_ID.fetch_add(1, Ordering::SeqCst);
+        // R112-2: overflow-safe ID allocation (standardized per R105-5 pattern)
+        let fs_id = NEXT_FS_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .expect("ramfs: NEXT_FS_ID overflow");
         // Root directory is owned by root (uid=0, gid=0)
         let root = RamFsInode::new_dir(fs_id, 1, 0o755, 0, 0);
 
@@ -522,9 +525,11 @@ impl RamFs {
         })
     }
 
-    /// Allocate a new inode number
+    /// Allocate a new inode number (R112-2: overflow-safe)
     fn alloc_ino(&self) -> u64 {
-        self.next_ino.fetch_add(1, Ordering::SeqCst)
+        self.next_ino
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .expect("ramfs: next_ino overflow")
     }
 
     /// Downcast an Inode to RamFsInode
@@ -718,7 +723,10 @@ impl FileSystem for RamFs {
 impl Default for RamFs {
     fn default() -> Self {
         // This creates a non-Arc version for internal use
-        let fs_id = NEXT_FS_ID.fetch_add(1, Ordering::SeqCst);
+        // R112-2: overflow-safe ID allocation
+        let fs_id = NEXT_FS_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .expect("ramfs: NEXT_FS_ID overflow");
         // Root directory is owned by root (uid=0, gid=0)
         let root = RamFsInode::new_dir(fs_id, 1, 0o755, 0, 0);
 

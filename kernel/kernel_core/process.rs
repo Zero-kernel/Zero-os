@@ -702,7 +702,7 @@ impl Process {
     pub fn new(pid: ProcessId, ppid: ProcessId, name: String, priority: Priority) -> Self {
         Process {
             pid,
-            generation: NEXT_GENERATION.fetch_add(1, Ordering::SeqCst),
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::SeqCst), // lint-fetch-add: allow (generation counter)
             tid: pid,  // tid == pid (Linux 语义)
             tgid: pid, // 主线程时 tgid == pid
             ppid,

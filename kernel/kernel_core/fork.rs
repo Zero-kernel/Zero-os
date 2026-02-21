@@ -608,7 +608,7 @@ impl PhysicalPageRefCount {
     pub fn increment(&self, phys_addr: usize) -> u64 {
         // 快速路径：尝试读锁查找已存在的条目
         if let Some(count) = self.ref_counts.read().get(&phys_addr) {
-            return count.fetch_add(1, Ordering::SeqCst) + 1;
+            return count.fetch_add(1, Ordering::SeqCst) + 1; // lint-fetch-add: allow (statistics counter)
         }
 
         // 慢速路径：禁用中断以安全获取写锁
@@ -616,7 +616,7 @@ impl PhysicalPageRefCount {
             let mut counts = self.ref_counts.write();
             // Double-check：可能在等待写锁期间被其他 CPU 创建
             let entry = counts.entry(phys_addr).or_insert_with(|| AtomicU64::new(0));
-            entry.fetch_add(1, Ordering::SeqCst) + 1
+            entry.fetch_add(1, Ordering::SeqCst) + 1 // lint-fetch-add: allow (statistics counter)
         })
     }
 

@@ -32,7 +32,7 @@ use alloc::{
 use alloc::boxed::Box;
 use cap::NamespaceId;
 use core::any::Any;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
 use crate::process::FileOps;
@@ -110,6 +110,11 @@ pub enum MountNsError {
 ///
 /// This structure contains only the namespace identity and hierarchy.
 /// The actual mount table is managed by the VFS layer using the namespace ID.
+///
+/// # Lifecycle
+///
+/// Lifecycle management is handled by `Arc` reference counting.
+/// No manual refcount is needed — `Arc::strong_count()` serves this role.
 pub struct MountNamespace {
     /// Unique namespace identifier
     id: NamespaceId,
@@ -122,9 +127,6 @@ pub struct MountNamespace {
 
     /// Root mount path for this namespace (usually "/")
     root_path: RwLock<String>,
-
-    /// Reference count of processes using this namespace
-    refcount: AtomicU32,
 }
 
 impl MountNamespace {
@@ -135,7 +137,6 @@ impl MountNamespace {
             parent: None,
             level: 0,
             root_path: RwLock::new("/".to_string()),
-            refcount: AtomicU32::new(1),
         }
     }
 
@@ -145,14 +146,15 @@ impl MountNamespace {
             return Err(MountNsError::MaxDepthExceeded);
         }
 
-        let id = NEXT_MNT_NS_ID.fetch_add(1, Ordering::SeqCst);
+        let id = NEXT_MNT_NS_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .map_err(|_| MountNsError::NoMemory)?;
 
         let child = Arc::new(Self {
             id: NamespaceId::new(id),
             parent: Some(parent.clone()),
             level: parent.level.saturating_add(1),
             root_path: RwLock::new(parent.root_path.read().clone()),
-            refcount: AtomicU32::new(1),
         });
 
         Ok(child)
@@ -193,29 +195,6 @@ impl MountNamespace {
         *self.root_path.write() = path;
     }
 
-    /// Increment reference count.
-    #[inline]
-    pub fn inc_ref(&self) {
-        self.refcount.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Decrement reference count. Returns true if this was the last reference.
-    #[inline]
-    pub fn dec_ref(&self) -> bool {
-        let old_count = self.refcount.fetch_sub(1, Ordering::Release);
-        if old_count == 1 {
-            core::sync::atomic::fence(Ordering::Acquire);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Get the current reference count.
-    #[inline]
-    pub fn ref_count(&self) -> u32 {
-        self.refcount.load(Ordering::Acquire)
-    }
 }
 
 impl core::fmt::Debug for MountNamespace {
@@ -223,7 +202,6 @@ impl core::fmt::Debug for MountNamespace {
         f.debug_struct("MountNamespace")
             .field("id", &self.id.raw())
             .field("level", &self.level)
-            .field("refcount", &self.ref_count())
             .finish()
     }
 }
@@ -257,10 +235,10 @@ pub fn clone_namespace(parent: Arc<MountNamespace>) -> Result<Arc<MountNamespace
 /// Print namespace information for debugging.
 pub fn print_namespace_info(ns: &Arc<MountNamespace>) {
     kprintln!(
-        "[MNT NS] id={}, level={}, refcount={}",
+        "[MNT NS] id={}, level={}, arc_refs={}",
         ns.id().raw(),
         ns.level(),
-        ns.ref_count()
+        Arc::strong_count(ns)
     );
 }
 

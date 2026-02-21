@@ -54,7 +54,7 @@ use alloc::{
     vec::Vec,
 };
 use cap::NamespaceId;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
 use crate::traits::FileSystem;
@@ -229,6 +229,10 @@ impl core::fmt::Debug for Mount {
 /// When CLONE_NEWNS is used, the child receives a complete copy of the
 /// parent's mount table. Subsequent mount/umount operations in either
 /// namespace do not affect the other.
+/// # Lifecycle
+///
+/// Lifecycle management is handled by `Arc` reference counting.
+/// No manual refcount is needed — `Arc::strong_count()` serves this role.
 pub struct MountNamespace {
     /// Unique namespace identifier
     id: NamespaceId,
@@ -248,11 +252,6 @@ pub struct MountNamespace {
     ///
     /// Used for pivot_root and chroot operations within the namespace.
     root_path: RwLock<String>,
-
-    /// Reference count of processes using this namespace
-    ///
-    /// Used for garbage collection when no processes reference the namespace.
-    refcount: AtomicU32,
 }
 
 impl MountNamespace {
@@ -269,7 +268,6 @@ impl MountNamespace {
             level: 0,
             mounts: RwLock::new(BTreeMap::new()),
             root_path: RwLock::new("/".to_string()),
-            refcount: AtomicU32::new(1),
         }
     }
 
@@ -300,8 +298,10 @@ impl MountNamespace {
             return Err(MountNsError::MaxDepthExceeded);
         }
 
-        // Generate unique namespace ID
-        let id = NEXT_MNT_NS_ID.fetch_add(1, Ordering::SeqCst);
+        // Generate unique namespace ID (R112-2: overflow-safe allocation)
+        let id = NEXT_MNT_NS_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .map_err(|_| MountNsError::NoMemory)?;
 
         let child = Arc::new(Self {
             id: NamespaceId::new(id),
@@ -309,7 +309,6 @@ impl MountNamespace {
             level: parent.level.saturating_add(1),
             mounts: RwLock::new(BTreeMap::new()),
             root_path: RwLock::new(parent.root_path.read().clone()),
-            refcount: AtomicU32::new(1),
         });
 
         // Emit audit event for namespace creation (use Internal kind)
@@ -355,41 +354,6 @@ impl MountNamespace {
     /// Set the namespace root path (for pivot_root/chroot).
     pub fn set_root_path(&self, path: String) {
         *self.root_path.write() = path;
-    }
-
-    /// Increment reference count.
-    ///
-    /// Called when a process joins this namespace.
-    #[inline]
-    pub fn inc_ref(&self) {
-        self.refcount.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Decrement reference count.
-    ///
-    /// Called when a process leaves this namespace.
-    /// Returns true if this was the last reference.
-    ///
-    /// # Memory Ordering
-    ///
-    /// Uses Release-Acquire ordering to ensure proper synchronization
-    /// when the last reference is dropped.
-    #[inline]
-    pub fn dec_ref(&self) -> bool {
-        let old_count = self.refcount.fetch_sub(1, Ordering::Release);
-        if old_count == 1 {
-            // This was the last reference - acquire fence for proper cleanup
-            core::sync::atomic::fence(Ordering::Acquire);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Get the current reference count.
-    #[inline]
-    pub fn ref_count(&self) -> u32 {
-        self.refcount.load(Ordering::Acquire)
     }
 
     /// Get the number of mounts in this namespace.
@@ -485,7 +449,6 @@ impl core::fmt::Debug for MountNamespace {
             .field("id", &self.id.raw())
             .field("level", &self.level)
             .field("mount_count", &self.mount_count())
-            .field("refcount", &self.ref_count())
             .finish()
     }
 }
@@ -746,11 +709,11 @@ pub fn clone_namespace(parent: Arc<MountNamespace>) -> Result<Arc<MountNamespace
 /// Print namespace information for debugging.
 pub fn print_namespace_info(ns: &Arc<MountNamespace>) {
     kprintln!(
-        "[MNT NS] id={}, level={}, mounts={}, refcount={}",
+        "[MNT NS] id={}, level={}, mounts={}, arc_refs={}",
         ns.id().raw(),
         ns.level(),
         ns.mount_count(),
-        ns.ref_count()
+        Arc::strong_count(ns)
     );
 
     let mounts = ns.mounts.read();

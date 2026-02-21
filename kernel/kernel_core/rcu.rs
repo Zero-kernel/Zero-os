@@ -257,7 +257,7 @@ pub fn rcu_read_lock() {
     let cpu_id = rcu_preempt_disable_stable_cpu();
     RCU_READERS
         .with_cpu(cpu_id, |counter| {
-            counter.fetch_add(1, Ordering::Acquire);
+            counter.fetch_add(1, Ordering::Acquire); // lint-fetch-add: allow (per-CPU depth counter)
         })
         .expect("RCU: cpu_id out of range for RCU_READERS");
 }
@@ -397,7 +397,7 @@ pub unsafe fn rcu_quiescent_state_force() {
 /// For non-blocking operation, use `call_rcu()` instead.
 pub fn synchronize_rcu() {
     // Advance global epoch to start a new grace period
-    let target = GLOBAL_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    let target = GLOBAL_EPOCH.fetch_add(1, Ordering::SeqCst) + 1; // lint-fetch-add: allow (monotonic counter)
 
     // Mark our own CPU as quiescent (we're not in a read-side section here)
     rcu_quiescent_state();
@@ -509,7 +509,7 @@ where
                 target_epoch: target,
                 func: cb,
             });
-            CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
             return;
         }
     }
@@ -524,7 +524,7 @@ where
         func: cb,
     });
     batches.push_back(batch);
-    CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+    CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
 }
 
 /// Poll for and run any callbacks whose grace period has completed.

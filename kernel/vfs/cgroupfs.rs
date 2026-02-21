@@ -165,7 +165,10 @@ pub struct CgroupFs {
 impl CgroupFs {
     /// Create a new cgroupfs mounted at root cgroup
     pub fn new() -> Arc<Self> {
-        let fs_id = NEXT_FS_ID.fetch_add(1, Ordering::SeqCst);
+        // R112-2: overflow-safe ID allocation (standardized per R105-5 pattern)
+        let fs_id = NEXT_FS_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .expect("cgroupfs: NEXT_FS_ID overflow");
 
         // Root directory maps to root cgroup (id=0)
         let root = Arc::new(CgroupDirInode {
@@ -231,7 +234,9 @@ impl FileSystem for CgroupFs {
         // Create child cgroup
         match cgroup::create_cgroup(dir.cgroup_id, controllers) {
             Ok(child) => {
-                let ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+                let ino = NEXT_INO
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+                    .expect("cgroupfs: NEXT_INO overflow");
                 Ok(Arc::new(CgroupDirInode {
                     fs_id: self.fs_id,
                     ino,
@@ -306,7 +311,9 @@ impl CgroupDirInode {
                 }
             }
 
-            let ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+            let ino = NEXT_INO
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+                .expect("cgroupfs: NEXT_INO overflow");
             return Ok(Arc::new(CgroupCtrlInode {
                 fs_id,
                 ino,
@@ -323,7 +330,9 @@ impl CgroupDirInode {
             // Simple matching: name could be the cgroup name or ID
             let id_str = format!("{}", child_id);
             if name == id_str {
-                let ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+                let ino = NEXT_INO
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+                    .expect("cgroupfs: NEXT_INO overflow");
                 return Ok(Arc::new(CgroupDirInode {
                     fs_id,
                     ino,
@@ -415,7 +424,9 @@ impl Inode for CgroupDirInode {
                 offset + 1,
                 DirEntry {
                     name: String::from(kind.filename()),
-                    ino: NEXT_INO.fetch_add(1, Ordering::SeqCst),
+                    ino: NEXT_INO
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+                        .expect("cgroupfs: NEXT_INO overflow"),
                     file_type: FileType::Regular,
                 },
             )));
@@ -432,7 +443,9 @@ impl Inode for CgroupDirInode {
                 offset + 1,
                 DirEntry {
                     name: format!("{}", child_id),
-                    ino: NEXT_INO.fetch_add(1, Ordering::SeqCst),
+                    ino: NEXT_INO
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+                        .expect("cgroupfs: NEXT_INO overflow"),
                     file_type: FileType::Directory,
                 },
             )));

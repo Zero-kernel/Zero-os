@@ -250,7 +250,7 @@ impl UserAccessGuard {
         if smap_active {
             // Only execute STAC when this is the outermost guard (depth 0→1)
             // V-5 fix: Use per-CPU depth counter
-            let prev_depth = SMAP_GUARD_DEPTH.with(|d| d.fetch_add(1, Ordering::SeqCst));
+            let prev_depth = SMAP_GUARD_DEPTH.with(|d| d.fetch_add(1, Ordering::SeqCst)); // lint-fetch-add: allow (per-CPU depth counter)
             if prev_depth == 0 {
                 // R25-10 FIX: Disable interrupts before setting AC flag
                 // This prevents interrupt handlers from running with user access allowed

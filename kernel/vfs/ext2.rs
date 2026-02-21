@@ -290,7 +290,10 @@ impl Ext2Fs {
             128 // Rev 0 uses fixed 128-byte inodes
         };
 
-        let fs_id = NEXT_FS_ID.fetch_add(1, Ordering::SeqCst);
+        // R112-2: overflow-safe ID allocation (standardized per R105-5 pattern)
+        let fs_id = NEXT_FS_ID
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .map_err(|_| FsError::NoSpace)?;
 
         let fs = Arc::new(Self {
             fs_id,

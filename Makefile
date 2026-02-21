@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -392,8 +392,35 @@ lint-smap:
 		echo "OK: No ad-hoc UserAccessGuard usage outside usercopy.rs."; \
 	fi
 
+# R112-2 / P3-5: Catch bare fetch_add(1 in kernel core / VFS / namespace code.
+# ID counters and refcounts MUST use fetch_update + checked_add (R105-5 pattern).
+# Legitimate counter-style uses (statistics, events, ticks) annotate with:
+#   // lint-fetch-add: allow
+# Scoped to high-risk paths; bulk statistics dirs (net/, arch/, sched/, etc.) excluded.
+lint-fetch-add:
+	@echo "=== Lint: checking for bare fetch_add(1) in core/VFS/namespace paths ==="
+	@HITS=$$(grep -rn 'fetch_add(1' \
+		kernel/kernel_core/ \
+		kernel/vfs/ \
+		kernel/mm/page_cache.rs \
+		--include='*.rs' \
+		| grep -v '// lint-fetch-add: allow' \
+		| grep -v '^\s*//' \
+		| grep -v '//.*fetch_add' \
+	) ; \
+	if [ -n "$$HITS" ]; then \
+		echo "ERROR: Bare fetch_add(1 found in core/VFS/namespace code:"; \
+		echo "$$HITS"; \
+		echo ""; \
+		echo "ID counters and refcounts MUST use fetch_update + checked_add."; \
+		echo "If this is a legitimate counter, add '// lint-fetch-add: allow' on the same line."; \
+		exit 1; \
+	else \
+		echo "OK: No unguarded fetch_add(1 in core/VFS/namespace paths."; \
+	fi
+
 # Unified lint target: runs all CI lint checks.
-lint: lint-release lint-smap
+lint: lint-release lint-smap lint-fetch-add
 
 clean:
 	cargo clean
