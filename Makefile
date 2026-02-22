@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -419,8 +419,41 @@ lint-fetch-add:
 		echo "OK: No unguarded fetch_add(1 in core/VFS/namespace paths."; \
 	fi
 
+# R113-1 / P3-6 / H.0.3: Catch unannotated struct-to-bytes copies in syscall paths.
+# Any from_raw_parts, copy_nonoverlapping, or transmute on #[repr(C)] structs
+# at the kernel-userspace boundary MUST carry a lint-repr-c-copy annotation
+# documenting why the struct is padding-safe (or be replaced with a zeroed-buffer copy).
+lint-repr-c-copy:
+	@echo "=== Lint: checking for unannotated repr(C) struct copies ==="
+	@HITS=$$(grep -n 'from_raw_parts\|copy_nonoverlapping\|mem::transmute' \
+		kernel/kernel_core/syscall.rs \
+		| grep -v '^\s*//' \
+		| grep -v '//.*from_raw_parts\|//.*copy_nonoverlapping\|//.*transmute' \
+		| grep -v 'as_mut_ptr() as \*mut u8, total' \
+	) ; \
+	FAIL=""; \
+	for line in $$HITS; do \
+		LINENO_PART=$$(echo "$$line" | cut -d: -f1); \
+		if [ -n "$$LINENO_PART" ] && [ "$$LINENO_PART" -eq "$$LINENO_PART" ] 2>/dev/null; then \
+			PREV=$$(sed -n "$$((LINENO_PART-3)),$$((LINENO_PART-1))p" kernel/kernel_core/syscall.rs); \
+			if ! echo "$$PREV" | grep -q 'lint-repr-c-copy: allow'; then \
+				echo "  syscall.rs:$$line"; \
+				FAIL="1"; \
+			fi; \
+		fi; \
+	done; \
+	if [ -n "$$FAIL" ]; then \
+		echo ""; \
+		echo "ERROR: Unannotated struct-to-bytes copy found in syscall.rs."; \
+		echo "Add '// lint-repr-c-copy: allow (<reason>)' within 2 lines above each site."; \
+		echo "Or use a zeroed-buffer copy pattern (see copy_vfs_stat_to_user)."; \
+		exit 1; \
+	else \
+		echo "OK: All repr(C) struct copies in syscall.rs are annotated."; \
+	fi
+
 # Unified lint target: runs all CI lint checks.
-lint: lint-release lint-smap lint-fetch-add
+lint: lint-release lint-smap lint-fetch-add lint-repr-c-copy
 
 clean:
 	cargo clean

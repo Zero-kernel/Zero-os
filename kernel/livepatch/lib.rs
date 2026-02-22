@@ -1322,7 +1322,7 @@ fn register_loaded_patch(p: &LoadedPatch) -> Result<u64, Errno> {
             // R110-3 FIX: Log lifecycle event without raw kernel addresses.
             // Address detail is relegated to klog!(Info, ...) which is suppressed
             // under Secure and Balanced profiles, preventing KASLR leaks.
-            klog_always!("livepatch: loaded id={} deps={}", id, p.meta.dep_count);
+            klog!(Info, "livepatch: loaded id={} deps={}", id, p.meta.dep_count);
             klog!(Info, "livepatch: loaded id={} target={:#x} handler={:#x}", id, p.target, p.handler);
             emit_livepatch_audit(0, id, p.target as u64, [p.handler as u64, p.meta.dep_count as u64, 0]);
             return Ok(id);
@@ -1394,7 +1394,7 @@ pub fn kpatch_enable(id: u64) -> Result<(), Errno> {
             slot.state.store(PatchState::Enabled as u8, Ordering::Release);
             // R110-3 FIX: Avoid raw address in profile-visible output.
             let target = slot.target.load(Ordering::Acquire);
-            klog_always!("livepatch: enabled id={}", id);
+            klog!(Info, "livepatch: enabled id={}", id);
             klog!(Info, "livepatch: enabled id={} target={:#x}", id, target);
             emit_livepatch_audit(1, id, target as u64, [0, 0, 0]);
             Ok(())
@@ -1454,7 +1454,7 @@ pub fn kpatch_disable(id: u64) -> Result<(), Errno> {
             slot.state.store(PatchState::Disabled as u8, Ordering::Release);
             // R110-3 FIX: Avoid raw address in profile-visible output.
             let target = slot.target.load(Ordering::Acquire);
-            klog_always!("livepatch: disabled id={}", id);
+            klog!(Info, "livepatch: disabled id={}", id);
             klog!(Info, "livepatch: disabled id={} target={:#x}", id, target);
             emit_livepatch_audit(2, id, target as u64, [0, 0, 0]);
             Ok(())
@@ -1579,7 +1579,7 @@ pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
     }
 
     // R110-3 FIX: Avoid raw address in profile-visible output.
-    klog_always!("livepatch: unloaded id={}", id);
+    klog!(Info, "livepatch: unloaded id={}", id);
     klog!(Info, "livepatch: unloaded id={} target={:#x}", id, target_addr);
     emit_livepatch_audit(3, id, target_addr as u64, [0, 0, 0]);
     Ok(())

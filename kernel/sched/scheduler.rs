@@ -224,11 +224,11 @@ pub struct SchedulerStats {
 
 impl SchedulerStats {
     pub fn print(&self) {
-        klog_always!("=== Scheduler Statistics ===");
-        klog_always!("Scheduled:  {}", self.scheduled);
-        klog_always!("Enqueued:   {}", self.enqueued);
-        klog_always!("Woken:      {}", self.woken);
-        klog_always!("Ticks:      {}", self.ticks);
+        klog!(Info, "=== Scheduler Statistics ===");
+        klog!(Info, "Scheduled:  {}", self.scheduled);
+        klog!(Info, "Enqueued:   {}", self.enqueued);
+        klog!(Info, "Woken:      {}", self.woken);
+        klog!(Info, "Ticks:      {}", self.ticks);
     }
 }
 
@@ -247,7 +247,7 @@ pub fn init() {
         .expect("FATAL: Failed to create init process - kernel stack allocation failed");
     SCHEDULER.lock().add_process(init_pid);
 
-    klog_always!("Init process created with PID {}", init_pid);
+    klog!(Info, "Init process created with PID {}", init_pid);
 }
 
 /// 执行调度

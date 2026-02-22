@@ -426,7 +426,7 @@ unsafe fn init_internal() -> Result<HpetInfo, HpetInitError> {
         counter_64bit,
     };
 
-    klog_always!(
+    klog!(Info, 
         "[HPET] Initialized: phys=0x{:x}, virt=0x{:x}, freq={} Hz, timers={}, 64-bit={}",
         base_phys, base_virt, frequency_hz, comparator_count, counter_64bit
     );

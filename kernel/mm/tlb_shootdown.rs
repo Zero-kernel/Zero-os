@@ -630,7 +630,8 @@ fn enqueue_mailbox(
                 // R106-5 FIX: Graceful fallback instead of panic.
                 // Under runtime pressure (rapid mmap/munmap), signal the caller
                 // to perform a full TLB flush rather than crashing the kernel.
-                klog_always!(
+                klog!(
+                    Warn,
                     "[TLB][R106-5] shootdown mailbox saturated (head={}, tail={}) after {} spins; falling back to full flush",
                     head,
                     tail,

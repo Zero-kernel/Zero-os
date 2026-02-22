@@ -300,17 +300,17 @@ pub struct InterruptStatsSnapshot {
 
 impl InterruptStatsSnapshot {
     pub fn print(&self) {
-        klog_always!("=== Interrupt Statistics ===");
-        klog_always!("Exceptions:");
-        klog_always!("  Breakpoint:       {}", self.breakpoint);
-        klog_always!("  Page Fault:       {}", self.page_fault);
-        klog_always!("  Double Fault:     {}", self.double_fault);
-        klog_always!("  GP Fault:         {}", self.general_protection_fault);
-        klog_always!("  Invalid Opcode:   {}", self.invalid_opcode);
-        klog_always!("  Divide Error:     {}", self.divide_error);
-        klog_always!("Hardware Interrupts:");
-        klog_always!("  Timer:            {}", self.timer);
-        klog_always!("  Keyboard:         {}", self.keyboard);
+        klog!(Info, "=== Interrupt Statistics ===");
+        klog!(Info, "Exceptions:");
+        klog!(Info, "  Breakpoint:       {}", self.breakpoint);
+        klog!(Info, "  Page Fault:       {}", self.page_fault);
+        klog!(Info, "  Double Fault:     {}", self.double_fault);
+        klog!(Info, "  GP Fault:         {}", self.general_protection_fault);
+        klog!(Info, "  Invalid Opcode:   {}", self.invalid_opcode);
+        klog!(Info, "  Divide Error:     {}", self.divide_error);
+        klog!(Info, "Hardware Interrupts:");
+        klog!(Info, "  Timer:            {}", self.timer);
+        klog!(Info, "  Keyboard:         {}", self.keyboard);
     }
 }
 

@@ -1149,12 +1149,12 @@ fn generate_kaslr_slide() -> u64 {
             }
             // R101-8 FIX: Warn loudly instead of silent fallback
             // Must be visible to operators even in release builds.
-            klog_always!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-            klog_always!("!! WARNING: KASLR RNG failure - KASLR IS DISABLED   !!");
-            klog_always!("!! The kernel is booting with a DETERMINISTIC memory !!");
-            klog_always!("!! layout. This severely weakens exploit mitigation. !!");
-            klog_always!("!! Ensure hardware RNG (RDRAND) is available.        !!");
-            klog_always!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            klog!(Warn, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            klog!(Warn, "!! WARNING: KASLR RNG failure - KASLR IS DISABLED   !!");
+            klog!(Warn, "!! The kernel is booting with a DETERMINISTIC memory !!");
+            klog!(Warn, "!! layout. This severely weakens exploit mitigation. !!");
+            klog!(Warn, "!! Ensure hardware RNG (RDRAND) is available.        !!");
+            klog!(Warn, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
             0
         }
     }
@@ -1262,7 +1262,7 @@ pub fn init(boot_slide: Option<u64>) {
                 expected, layout.kaslr_slide
             );
             #[cfg(not(debug_assertions))]
-            klog_always!("  ! KASLR slide mismatch detected (details hidden in release mode)");
+            klog!(Info, "  ! KASLR slide mismatch detected (details hidden in release mode)");
         }
     }
 

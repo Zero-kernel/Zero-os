@@ -117,7 +117,8 @@ pub fn on_allocation_failure(nr_pages_needed: usize) {
         return;
     }
 
-    klog_always!(
+    klog!(
+        Error,
         "OOM: cache reclaim insufficient (reclaimed {} pages, needed {})",
         reclaimed, nr_pages_needed
     );
@@ -147,18 +148,19 @@ fn kill_best_candidate(nr_pages_needed: usize) {
     let snapshot = match snapshot_cb {
         Some(f) => f(),
         None => {
-            klog_always!("OOM: no snapshot provider registered");
+            klog!(Error, "OOM: no snapshot provider registered");
             return;
         }
     };
 
     if snapshot.is_empty() {
-        klog_always!("OOM: no eligible processes to kill");
+        klog!(Error, "OOM: no eligible processes to kill");
         return;
     }
 
     if let Some(victim) = select_victim(&snapshot) {
-        klog_always!(
+        klog!(
+            Error,
             "OOM: killing pid={} tgid={} rss={} pages nice={} adj={}",
             victim.pid, victim.tgid, victim.rss_pages, victim.nice, victim.oom_score_adj
         );
@@ -172,7 +174,7 @@ fn kill_best_candidate(nr_pages_needed: usize) {
 
         emit_audit(&victim, nr_pages_needed, ts_cb, audit_cb);
     } else {
-        klog_always!("OOM: no eligible processes to kill (protected or kernel threads)");
+        klog!(Error, "OOM: no eligible processes to kill (protected or kernel threads)");
     }
 }
 
@@ -227,7 +229,7 @@ fn score_process(info: &OomProcessInfo) -> i64 {
 
 /// Emit audit event for OOM kill
 ///
-/// R106-8 FIX: In addition to klog_always! (for console visibility), invoke the
+/// R106-8 FIX: In addition to klog!(Error, ...) (for console visibility), invoke the
 /// tamper-evident audit subsystem via the registered callback. This ensures OOM
 /// kill events are included in the hash-chained audit trail and cannot be silently
 /// dropped or tampered with.
@@ -240,7 +242,8 @@ fn emit_audit(
     let timestamp = ts_cb.map(|f| f()).unwrap_or(0);
 
     // Console log for immediate visibility (retained for operational monitoring)
-    klog_always!(
+    klog!(
+        Error,
         "OOM AUDIT: timestamp={} pid={} needed={} rss={} adj={} nice={}",
         timestamp, victim.pid, needed, victim.rss_pages, victim.oom_score_adj, victim.nice
     );

@@ -281,14 +281,14 @@ pub fn probe_virtio_blk() -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)>
                     Err(iommu::IommuError::NotAvailable) => {
                         // IOMMU not present - proceed without DMA isolation (legacy mode)
                         // This is an explicit acknowledgment of the security tradeoff.
-                        klog_always!(
+                        klog!(Warn,
                             "    ! WARNING: No IOMMU - {:02x}:{:02x}.{} has unprotected DMA access",
                             bus, dev, func
                         );
                     }
                     Err(err) => {
                         // Other IOMMU errors - fail closed (skip device)
-                        klog_always!(
+                        klog!(Warn,
                             "    ! IOMMU attach failed for {:02x}:{:02x}.{}: {:?}",
                             bus, dev, func, err
                         );
@@ -313,7 +313,7 @@ pub fn probe_virtio_blk() -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)>
                     } else {
                         "transitional"
                     };
-                    klog_always!(
+                    klog!(Info, 
                         "    Found virtio-blk ({}) at PCI {:02x}:{:02x}.{}, type={}, common_cfg={:#x}",
                         dev_type, bus, dev, func, subsystem_id, caps.common_cfg
                     );
@@ -329,7 +329,7 @@ pub fn probe_virtio_blk() -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)>
                     } else {
                         "transitional"
                     };
-                    klog_always!(
+                    klog!(Warn,
                         "    virtio-blk ({}) at PCI {:02x}:{:02x}.{} lacks modern capabilities (bus master disabled)",
                         dev_type, bus, dev, func
                     );

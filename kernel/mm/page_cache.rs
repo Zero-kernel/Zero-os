@@ -776,7 +776,8 @@ lazy_static! {
 pub fn init() {
     // Force lazy static initialization
     let stats = PAGE_CACHE.stats();
-    klog_always!(
+    klog!(
+        Info,
         "Page cache initialized: max_pages={}, current={}",
         stats.max_pages,
         stats.nr_pages
@@ -1032,7 +1033,8 @@ impl MemoryPressureHandler for PageCachePressureHandler {
             // Not enough clean pages, need to writeback dirty pages first
             // In a real implementation, this would trigger async writeback
             // For now, we just report how many we could free
-            klog_always!(
+            klog!(
+                Warn,
                 "Page cache: memory pressure, freed {} pages (needed {})",
                 freed,
                 nr_pages_needed

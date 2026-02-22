@@ -288,7 +288,7 @@ pub fn init() -> IommuResult<u32> {
         }
     };
 
-    klog_always!(
+    klog!(Info, 
         "[IOMMU] DMAR table found: {} DRHD units, {} RMRR regions",
         dmar.drhd_count(),
         dmar.rmrr_count()
@@ -318,14 +318,14 @@ pub fn init() -> IommuResult<u32> {
                 match unit.setup_interrupt_remapping(ir_required) {
                     Ok(enabled) => {
                         if enabled {
-                            klog_always!(
+                            klog!(Info, 
                                 "[IOMMU]   Unit {}: base={:#x}, segment={}, IR=enabled",
                                 count,
                                 drhd.register_base(),
                                 drhd.segment()
                             );
                         } else {
-                            klog_always!(
+                            klog!(Info, 
                                 "[IOMMU]   Unit {}: base={:#x}, segment={}, IR=disabled",
                                 count,
                                 drhd.register_base(),
@@ -344,7 +344,7 @@ pub fn init() -> IommuResult<u32> {
                             IOMMU_INIT_FAILED.store(true, Ordering::SeqCst);
                             return Err(IommuError::HardwareInitFailed);
                         } else {
-                            klog_always!(
+                            klog!(Info, 
                                 "[IOMMU]   Unit {}: base={:#x}, segment={}, IR=unsupported",
                                 count,
                                 drhd.register_base(),
@@ -417,7 +417,7 @@ pub fn init() -> IommuResult<u32> {
     // but attach_device() requires a valid SLPT root (fail-closed if missing).
     kernel_domain.ensure_page_table_root()?;
 
-    klog_always!(
+    klog!(Info, 
         "[IOMMU] Kernel domain 0: page-table (AGAW={}-bit, on-demand mappings)",
         kernel_domain_agaw
     );
@@ -427,7 +427,7 @@ pub fn init() -> IommuResult<u32> {
     // Handle RMRR (Reserved Memory Region Reporting)
     // These are memory regions that devices may DMA to before OS takes control
     for rmrr in dmar.rmrr_iter() {
-        klog_always!(
+        klog!(Info, 
             "[IOMMU]   RMRR: {:#x}-{:#x} (segment {})",
             rmrr.base(),
             rmrr.limit(),

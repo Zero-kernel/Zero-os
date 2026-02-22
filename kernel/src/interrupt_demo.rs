@@ -4,69 +4,69 @@ use arch::interrupts::{get_stats, trigger_breakpoint};
 
 /// 演示中断统计
 pub fn demo_interrupt_stats() {
-    klog_always!("\n=== Interrupt Statistics Demo ===\n");
+    klog!(Info, "\n=== Interrupt Statistics Demo ===\n");
 
-    klog_always!("1. Getting current interrupt statistics...");
+    klog!(Info, "1. Getting current interrupt statistics...");
     let stats = get_stats();
     stats.print();
 
-    klog_always!("\n2. Triggering a breakpoint exception...");
+    klog!(Info, "\n2. Triggering a breakpoint exception...");
     trigger_breakpoint();
-    klog_always!("   ✓ Breakpoint handled successfully");
+    klog!(Info, "   ✓ Breakpoint handled successfully");
 
-    klog_always!("\n3. Updated statistics:");
+    klog!(Info, "\n3. Updated statistics:");
     let stats = get_stats();
     stats.print();
 
-    klog_always!("\n✓ Interrupt statistics demo completed!\n");
+    klog!(Info, "\n✓ Interrupt statistics demo completed!\n");
 }
 
 /// 演示异常处理
 pub fn demo_exception_handling() {
-    klog_always!("\n=== Exception Handling Demo ===\n");
+    klog!(Info, "\n=== Exception Handling Demo ===\n");
 
-    klog_always!("1. Testing breakpoint exception (#BP)...");
+    klog!(Info, "1. Testing breakpoint exception (#BP)...");
     trigger_breakpoint();
-    klog_always!("   ✓ Breakpoint exception handled");
+    klog!(Info, "   ✓ Breakpoint exception handled");
 
-    klog_always!("\n2. Exception handlers registered:");
-    klog_always!("   ✓ Divide Error (#DE)");
-    klog_always!("   ✓ Debug (#DB)");
-    klog_always!("   ✓ Non-Maskable Interrupt (NMI)");
-    klog_always!("   ✓ Breakpoint (#BP)");
-    klog_always!("   ✓ Overflow (#OF)");
-    klog_always!("   ✓ Bound Range Exceeded (#BR)");
-    klog_always!("   ✓ Invalid Opcode (#UD)");
-    klog_always!("   ✓ Device Not Available (#NM)");
-    klog_always!("   ✓ Double Fault (#DF)");
-    klog_always!("   ✓ Invalid TSS (#TS)");
-    klog_always!("   ✓ Segment Not Present (#NP)");
-    klog_always!("   ✓ Stack Segment Fault (#SS)");
-    klog_always!("   ✓ General Protection Fault (#GP)");
-    klog_always!("   ✓ Page Fault (#PF)");
-    klog_always!("   ✓ x87 Floating-Point (#MF)");
-    klog_always!("   ✓ Alignment Check (#AC)");
-    klog_always!("   ✓ Machine Check (#MC)");
-    klog_always!("   ✓ SIMD Floating-Point (#XM)");
-    klog_always!("   ✓ Virtualization (#VE)");
+    klog!(Info, "\n2. Exception handlers registered:");
+    klog!(Info, "   ✓ Divide Error (#DE)");
+    klog!(Info, "   ✓ Debug (#DB)");
+    klog!(Info, "   ✓ Non-Maskable Interrupt (NMI)");
+    klog!(Info, "   ✓ Breakpoint (#BP)");
+    klog!(Info, "   ✓ Overflow (#OF)");
+    klog!(Info, "   ✓ Bound Range Exceeded (#BR)");
+    klog!(Info, "   ✓ Invalid Opcode (#UD)");
+    klog!(Info, "   ✓ Device Not Available (#NM)");
+    klog!(Info, "   ✓ Double Fault (#DF)");
+    klog!(Info, "   ✓ Invalid TSS (#TS)");
+    klog!(Info, "   ✓ Segment Not Present (#NP)");
+    klog!(Info, "   ✓ Stack Segment Fault (#SS)");
+    klog!(Info, "   ✓ General Protection Fault (#GP)");
+    klog!(Info, "   ✓ Page Fault (#PF)");
+    klog!(Info, "   ✓ x87 Floating-Point (#MF)");
+    klog!(Info, "   ✓ Alignment Check (#AC)");
+    klog!(Info, "   ✓ Machine Check (#MC)");
+    klog!(Info, "   ✓ SIMD Floating-Point (#XM)");
+    klog!(Info, "   ✓ Virtualization (#VE)");
 
-    klog_always!("\n✓ Exception handling demo completed!\n");
+    klog!(Info, "\n✓ Exception handling demo completed!\n");
 }
 
 /// 演示硬件中断
 pub fn demo_hardware_interrupts() {
-    klog_always!("\n=== Hardware Interrupts Demo ===\n");
+    klog!(Info, "\n=== Hardware Interrupts Demo ===\n");
 
-    klog_always!("1. Hardware interrupt handlers registered:");
-    klog_always!("   ✓ IRQ 0: Timer (PIT)");
-    klog_always!("   ✓ IRQ 1: Keyboard (PS/2)");
+    klog!(Info, "1. Hardware interrupt handlers registered:");
+    klog!(Info, "   ✓ IRQ 0: Timer (PIT)");
+    klog!(Info, "   ✓ IRQ 1: Keyboard (PS/2)");
 
-    klog_always!("\n2. Interrupt statistics:");
+    klog!(Info, "\n2. Interrupt statistics:");
     let stats = get_stats();
-    klog_always!("   Timer interrupts:    {}", stats.timer);
-    klog_always!("   Keyboard interrupts: {}", stats.keyboard);
+    klog!(Info, "   Timer interrupts:    {}", stats.timer);
+    klog!(Info, "   Keyboard interrupts: {}", stats.keyboard);
 
-    klog_always!("\n✓ Hardware interrupts demo completed!\n");
+    klog!(Info, "\n✓ Hardware interrupts demo completed!\n");
 }
 
 /// 运行所有中断演示

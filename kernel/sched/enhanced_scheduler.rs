@@ -178,11 +178,11 @@ impl SchedulerStats {
     }
 
     pub fn print(&self) {
-        klog_always!("=== Scheduler Statistics ===");
-        klog_always!("Context switches: {}", self.total_switches);
-        klog_always!("Total ticks:      {}", self.total_ticks);
-        klog_always!("Processes created: {}", self.processes_created);
-        klog_always!("Processes terminated: {}", self.processes_terminated);
+        klog!(Info, "=== Scheduler Statistics ===");
+        klog!(Info, "Context switches: {}", self.total_switches);
+        klog!(Info, "Total ticks:      {}", self.total_ticks);
+        klog!(Info, "Processes created: {}", self.processes_created);
+        klog!(Info, "Processes terminated: {}", self.processes_terminated);
     }
 }
 

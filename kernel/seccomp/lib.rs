@@ -105,7 +105,7 @@ pub fn register_current_hooks(evaluator: SeccompEvaluator, enabled_check: Seccom
     *CURRENT_ENABLED_CHECK.write() = Some(enabled_check);
     // R65-14 FIX: Mark seccomp as initialized - fail-closed after this point
     SECCOMP_INITIALIZED.store(true, Ordering::SeqCst);
-    klog_always!("  Seccomp hooks registered for current-process evaluation (fail-closed mode active)");
+    klog!(Info, "  Seccomp hooks registered for current-process evaluation (fail-closed mode active)");
 }
 
 // ============================================================================

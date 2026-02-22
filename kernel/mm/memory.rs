@@ -178,7 +178,8 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         (false, true) => " (static, validated)",
         (false, false) => " (static)",
     };
-    klog_always!(
+    klog!(
+        Info,
         "Heap allocator initialized: {} KB at 0x{:x}{}",
         HEAP_SIZE / 1024,
         heap_base,
@@ -191,7 +192,8 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         (FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE)
     });
 
-    klog_always!(
+    klog!(
+        Info,
         "  Physical memory region: 0x{:x} - 0x{:x} ({} MB)",
         pmm_base,
         pmm_base + pmm_size as u64,
@@ -218,7 +220,8 @@ pub fn init() {
     } else {
         " (static)"
     };
-    klog_always!(
+    klog!(
+        Info,
         "Heap allocator initialized: {} KB at 0x{:x}{}",
         HEAP_SIZE / 1024,
         heap_base,
@@ -512,7 +515,8 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
         }
     }
 
-    klog_always!(
+    klog!(
+        Info,
         "  Total usable memory: {} MB",
         total_conventional / (1024 * 1024)
     );
@@ -606,26 +610,30 @@ pub struct MemoryStats {
 impl MemoryStats {
     /// 打印内存统计信息
     pub fn print(&self) {
-        klog_always!("=== Memory Statistics ===");
-        klog_always!("Physical Memory:");
-        klog_always!(
+        klog!(Info, "=== Memory Statistics ===");
+        klog!(Info, "Physical Memory:");
+        klog!(
+            Info,
             "  Total: {} pages ({} MB)",
             self.total_physical_pages,
             self.total_physical_pages * 4 / 1024
         );
-        klog_always!(
+        klog!(
+            Info,
             "  Free:  {} pages ({} MB)",
             self.free_physical_pages,
             self.free_physical_pages * 4 / 1024
         );
-        klog_always!(
+        klog!(
+            Info,
             "  Used:  {} pages ({} MB)",
             self.used_physical_pages,
             self.used_physical_pages * 4 / 1024
         );
-        klog_always!("  Fragmentation: {}%", self.fragmentation_percent);
-        klog_always!("Kernel Heap:");
-        klog_always!(
+        klog!(Info, "  Fragmentation: {}%", self.fragmentation_percent);
+        klog!(Info, "Kernel Heap:");
+        klog!(
+            Info,
             "  Used:  {} KB / {} KB",
             self.heap_used_bytes / 1024,
             self.heap_total_bytes / 1024

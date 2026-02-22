@@ -2083,7 +2083,7 @@ pub fn set_hmac_key(key: &[u8]) -> Result<(), AuditError> {
         let mut ring = AUDIT_RING.lock();
         if let Some(ref mut r) = *ring {
             r.set_key(key)?;
-            klog_always!(
+            klog!(Info, 
                 "  Audit HMAC key set ({} bytes) - integrity protection active",
                 key.len()
             );

@@ -1040,6 +1040,23 @@ impl TcpControlBlock {
             return 0;
         }
 
+        // R113-2 FIX: Enforce advertised receive window for OOO buffering.
+        // Without this check, an attacker can send OOO segments that exceed the
+        // advertised window, inflating per-connection memory unboundedly.
+        let consumed = (self.recv_buffer.len() as u32).saturating_add(self.ooo_bytes);
+        let available = self.rcv_wnd.saturating_sub(consumed);
+        if available == 0 {
+            return 0;
+        }
+
+        // Trim payload to the remaining window budget so a single large
+        // OOO segment cannot overshoot the advertised receive window.
+        let data = if (data.len() as u32) > available {
+            &data[..available as usize]
+        } else {
+            data
+        };
+
         let mut new_seg = OooSegment {
             seq,
             data: data.to_vec(),

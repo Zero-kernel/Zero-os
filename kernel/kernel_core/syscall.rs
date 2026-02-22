@@ -4462,6 +4462,7 @@ fn sys_pipe(fds: *mut i32) -> SyscallResult {
 
     // 将文件描述符写回用户空间
     let fd_array = [read_fd, write_fd];
+    // lint-repr-c-copy: allow (no-padding: [i32; 2] = 8 bytes, primitive array)
     let bytes = unsafe {
         core::slice::from_raw_parts(
             fd_array.as_ptr() as *const u8,
@@ -4846,6 +4847,41 @@ fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
     sys_stat_internal(&path_str, statbuf)
 }
 
+/// R113-1 FIX: Copy VfsStat to userspace via a zeroed byte buffer so that
+/// implicit `#[repr(C)]` padding bytes (after `rdev` and after `blksize`) are
+/// guaranteed to be zero, preventing kernel memory disclosure.
+#[inline]
+fn copy_vfs_stat_to_user(user_dst: *mut VfsStat, stat: &VfsStat) -> Result<(), SyscallError> {
+    let mut buf = [0u8; mem::size_of::<VfsStat>()];
+
+    macro_rules! put {
+        ($field:ident) => {
+            let off = mem::offset_of!(VfsStat, $field);
+            let bytes = stat.$field.to_ne_bytes();
+            buf[off..off + bytes.len()].copy_from_slice(&bytes);
+        };
+    }
+
+    put!(dev);
+    put!(ino);
+    put!(mode);
+    put!(nlink);
+    put!(uid);
+    put!(gid);
+    put!(rdev);
+    put!(size);
+    put!(blksize);
+    put!(blocks);
+    put!(atime_sec);
+    put!(atime_nsec);
+    put!(mtime_sec);
+    put!(mtime_nsec);
+    put!(ctime_sec);
+    put!(ctime_nsec);
+
+    copy_to_user(user_dst as *mut u8, &buf)
+}
+
 /// R96-5 FIX: Internal helper for sys_stat that works on already-copied path.
 ///
 /// This eliminates TOCTOU window in sys_fstatat where the path could be modified
@@ -4860,14 +4896,8 @@ fn sys_stat_internal(path_str: &str, statbuf: *mut VfsStat) -> SyscallResult {
     // 调用 VFS stat
     let stat = stat_fn(path_str)?;
 
-    // 将结果写入用户空间
-    let stat_bytes = unsafe {
-        core::slice::from_raw_parts(
-            &stat as *const VfsStat as *const u8,
-            core::mem::size_of::<VfsStat>(),
-        )
-    };
-    copy_to_user(statbuf as *mut u8, stat_bytes)?;
+    // R113-1 FIX: Copy via zeroed buffer to avoid padding info leak
+    copy_vfs_stat_to_user(statbuf, &stat)?;
 
     Ok(0)
 }
@@ -4935,14 +4965,8 @@ fn sys_fstat(fd: i32, statbuf: *mut VfsStat) -> SyscallResult {
         fd_obj.stat()?
     };
 
-    // 将结果写入用户空间
-    let stat_bytes = unsafe {
-        core::slice::from_raw_parts(
-            &stat as *const VfsStat as *const u8,
-            mem::size_of::<VfsStat>(),
-        )
-    };
-    copy_to_user(statbuf as *mut u8, stat_bytes)?;
+    // R113-1 FIX: Copy via zeroed buffer to avoid padding info leak
+    copy_vfs_stat_to_user(statbuf, &stat)?;
 
     Ok(0)
 }
@@ -5804,6 +5828,7 @@ fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFil
 
     // Read program header from userspace
     let mut prog = UserSeccompProg::default();
+    // lint-repr-c-copy: allow (no-padding: UserSeccompProg {u32,u32,u64} = 16 bytes; user→kernel)
     let prog_bytes = unsafe {
         core::slice::from_raw_parts_mut(
             &mut prog as *mut _ as *mut u8,
@@ -7284,21 +7309,14 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
 
         // 构建dirent结构到临时缓冲区
         let mut buf = vec![0u8; reclen];
-        let dirent = LinuxDirent64 {
-            d_ino: entry.ino,
-            d_off: (written + reclen) as i64,
-            d_reclen: reclen as u16,
-            d_type,
-        };
 
-        // 复制header
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                &dirent as *const _ as *const u8,
-                buf.as_mut_ptr(),
-                header_size,
-            );
-        }
+        // R113-1 FIX: Write header fields individually into the zeroed buffer
+        // instead of copy_nonoverlapping from a stack LinuxDirent64, which would
+        // copy 5 bytes of uninitialized tail padding (offsets 19-23).
+        buf[0..8].copy_from_slice(&entry.ino.to_ne_bytes());
+        buf[8..16].copy_from_slice(&(next_written as i64).to_ne_bytes());
+        buf[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+        buf[18] = d_type;
 
         // 复制文件名
         buf[header_size..header_size + name_bytes.len()].copy_from_slice(name_bytes);
@@ -7327,6 +7345,7 @@ fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> SyscallResult {
     }
 
     let mut ts = TimeSpec::default();
+    // lint-repr-c-copy: allow (no-padding: TimeSpec {i64,i64} = 16 bytes; user→kernel)
     let ts_bytes = unsafe {
         core::slice::from_raw_parts_mut(
             &mut ts as *mut TimeSpec as *mut u8,
@@ -7365,6 +7384,7 @@ fn sys_nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> SyscallResult {
             tv_sec: 0,
             tv_nsec: 0,
         };
+        // lint-repr-c-copy: allow (no-padding: TimeSpec {i64,i64} = 16 bytes; all-zero)
         let zero_bytes = unsafe {
             core::slice::from_raw_parts(
                 &zero as *const TimeSpec as *const u8,
@@ -7390,6 +7410,7 @@ fn sys_gettimeofday(tv: *mut TimeVal, _tz: usize) -> SyscallResult {
         tv_usec: ((ms % 1000) * 1000) as i64,
     };
 
+    // lint-repr-c-copy: allow (no-padding: TimeVal {i64,i64} = 16 bytes)
     let tv_bytes = unsafe {
         core::slice::from_raw_parts(
             &timeval as *const TimeVal as *const u8,
@@ -7426,6 +7447,7 @@ fn sys_uname(buf: *mut UtsName) -> SyscallResult {
     fill_field(&mut uts.version, "Security Foundation Phase A");
     fill_field(&mut uts.machine, "x86_64");
 
+    // lint-repr-c-copy: allow (no-padding: UtsName {[u8;65]×5} = 325 bytes, alignment=1)
     let uts_bytes = unsafe {
         core::slice::from_raw_parts(
             &uts as *const UtsName as *const u8,
@@ -7455,6 +7477,7 @@ fn read_sockaddr_in(user: *const SockAddrIn, len: u32) -> Result<SockAddrIn, Sys
     validate_user_ptr(user as *const u8, need as usize)?;
 
     let mut addr = SockAddrIn::default();
+    // lint-repr-c-copy: allow (no-padding: SockAddrIn {u16,u16,u32,[u8;8]} = 16 bytes; user→kernel)
     let addr_bytes = unsafe {
         core::slice::from_raw_parts_mut(
             &mut addr as *mut SockAddrIn as *mut u8,
@@ -7485,6 +7508,7 @@ fn write_sockaddr_in(
         u32::from_ne_bytes(len_bytes)
     };
 
+    // lint-repr-c-copy: allow (no-padding: SockAddrIn {u16,u16,u32,[u8;8]} = 16 bytes)
     let addr_bytes = unsafe {
         core::slice::from_raw_parts(
             addr as *const SockAddrIn as *const u8,
@@ -7926,6 +7950,7 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
             }
 
             // Convert struct to bytes for copy_to_user
+            // lint-repr-c-copy: allow (no-padding: SockAddrIn {u16,u16,u32,[u8;8]} = 16 bytes)
             let out_bytes = unsafe {
                 core::slice::from_raw_parts(
                     &out as *const SockAddrIn as *const u8,
@@ -8919,6 +8944,7 @@ fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usiz
     // Copy to userspace
     // P1-6 FIX: Removed redundant outer UserAccessGuard — copy_to_user_safe
     // creates its own guard internally.
+    // lint-repr-c-copy: allow (explicit _padding:u32 initialized to 0; no implicit gaps)
     unsafe {
         let result_bytes: [u8; core::mem::size_of::<CgroupStatsBuf>()] =
             core::mem::transmute(result);
@@ -8983,6 +9009,7 @@ fn sys_compliance_status(buf: *mut ComplianceStatusBuf) -> Result<usize, Syscall
     // Copy to userspace
     // P1-6 FIX: Removed redundant outer UserAccessGuard — copy_to_user_safe
     // creates its own guard internally.
+    // lint-repr-c-copy: allow (explicit _padding:[u8;5] initialized to [0;5]; alignment=1, no implicit gaps)
     unsafe {
         let result_bytes: [u8; core::mem::size_of::<ComplianceStatusBuf>()] =
             core::mem::transmute(result);
@@ -9476,12 +9503,12 @@ impl SyscallStats {
     }
 
     pub fn print(&self) {
-        klog_always!("=== Syscall Statistics ===");
-        klog_always!("Total calls:  {}", self.total_calls);
-        klog_always!("Exit calls:   {}", self.exit_calls);
-        klog_always!("Fork calls:   {}", self.fork_calls);
-        klog_always!("Read calls:   {}", self.read_calls);
-        klog_always!("Write calls:  {}", self.write_calls);
-        klog_always!("Failed calls: {}", self.failed_calls);
+        klog!(Info, "=== Syscall Statistics ===");
+        klog!(Info, "Total calls:  {}", self.total_calls);
+        klog!(Info, "Exit calls:   {}", self.exit_calls);
+        klog!(Info, "Fork calls:   {}", self.fork_calls);
+        klog!(Info, "Read calls:   {}", self.read_calls);
+        klog!(Info, "Write calls:  {}", self.write_calls);
+        klog!(Info, "Failed calls: {}", self.failed_calls);
     }
 }

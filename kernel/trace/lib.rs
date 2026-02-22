@@ -575,7 +575,7 @@ pub fn init() {
     let _ = register_tracepoint(&watchdog::TRACE_WATCHDOG_HANG);
 
     klog_always!("[trace] Observability subsystem initialized");
-    klog_always!(
+    klog!(Info, 
         "      Max tracepoints: {}, counters: {}, watchdog slots: {}",
         MAX_TRACEPOINTS,
         counters::TRACE_COUNTER_COUNT,

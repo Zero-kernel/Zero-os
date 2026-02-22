@@ -82,7 +82,7 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
 
                 // Debug: Show all PCI devices found
                 if vendor == VIRTIO_VENDOR {
-                    klog_always!(
+                    klog!(Info, 
                         "    [DEBUG] VirtIO device @ {:02x}:{:02x}.{}: device_id={:#x} subsystem_id={:#x}",
                         bus, dev, func, device_id, pci_read16(bus, dev, func, PCI_SUBSYSTEM_ID)
                     );
@@ -118,7 +118,7 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
                     continue;
                 }
 
-                klog_always!(
+                klog!(Info, 
                     "    Probing virtio-net candidate: {:02x}:{:02x}.{} device={:#x} subsys={:#x}",
                     bus,
                     dev,
@@ -136,7 +136,7 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
                     Err(iommu::IommuError::NotAvailable) => {
                         // IOMMU not present - proceed without DMA isolation (legacy mode)
                         // This is an explicit acknowledgment of the security tradeoff.
-                        klog_always!(
+                        klog!(Info, 
                             "    ! WARNING: No IOMMU - {:02x}:{:02x}.{} has unprotected DMA access",
                             bus,
                             dev,
@@ -145,7 +145,7 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
                     }
                     Err(err) => {
                         // Other IOMMU errors - fail closed (skip device)
-                        klog_always!(
+                        klog!(Info, 
                             "    ! IOMMU attach failed for {:02x}:{:02x}.{}: {:?}",
                             bus,
                             dev,
@@ -164,7 +164,7 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
                 if let Some(mut addrs) = read_virtio_caps(bus, dev, func) {
                     addrs.virtio_device_type = 1; // Network device
 
-                    klog_always!(
+                    klog!(Info, 
                         "    Found virtio-net (PCI {:02x}:{:02x}.{}) common_cfg={:#x}",
                         bus,
                         dev,
@@ -185,7 +185,7 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
                     // to prevent orphaned DMA-capable device
                     let cmd = pci_read16(bus, dev, func, PCI_COMMAND);
                     pci_write16(bus, dev, func, PCI_COMMAND, cmd & !0x04);
-                    klog_always!(
+                    klog!(Info, 
                         "    ! virtio-net @ {:02x}:{:02x}.{} lacks modern capabilities (bus master disabled)",
                         bus,
                         dev,

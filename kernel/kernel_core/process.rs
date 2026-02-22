@@ -1362,7 +1362,7 @@ pub fn create_process(
     }
 
     // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-    klog_always!(
+    klog!(Info, 
         "Created process: PID={}, Name={}, Priority={}",
         pid, name, priority
     );
@@ -1533,7 +1533,7 @@ pub fn create_process_in_namespace(
     }
 
     // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-    klog_always!(
+    klog!(Info, 
         "Created process in namespace: PID={}, Name={}, Priority={}, NS={}",
         pid, name, priority, process.lock().pid_ns_for_children.id().raw()
     );
@@ -2925,15 +2925,15 @@ pub struct ProcessStats {
 
 impl ProcessStats {
     pub fn print(&self) {
-        klog_always!("=== Process Statistics ===");
-        klog_always!("Total:      {}", self.total);
-        klog_always!("Ready:      {}", self.ready);
-        klog_always!("Running:    {}", self.running);
-        klog_always!("Stopped:    {}", self.stopped);
-        klog_always!("Blocked:    {}", self.blocked);
-        klog_always!("Sleeping:   {}", self.sleeping);
-        klog_always!("Zombie:     {}", self.zombie);
-        klog_always!("Terminated: {}", self.terminated);
+        klog!(Info, "=== Process Statistics ===");
+        klog!(Info, "Total:      {}", self.total);
+        klog!(Info, "Ready:      {}", self.ready);
+        klog!(Info, "Running:    {}", self.running);
+        klog!(Info, "Stopped:    {}", self.stopped);
+        klog!(Info, "Blocked:    {}", self.blocked);
+        klog!(Info, "Sleeping:   {}", self.sleeping);
+        klog!(Info, "Zombie:     {}", self.zombie);
+        klog!(Info, "Terminated: {}", self.terminated);
     }
 }
 
@@ -3008,5 +3008,5 @@ pub fn oom_timestamp() -> u64 {
 /// 在内核初始化时调用，将进程管理函数注册到 OOM killer
 pub fn register_oom_callbacks() {
     mm::register_oom_callbacks(oom_snapshot, oom_kill, oom_cleanup, oom_timestamp);
-    klog_always!("  OOM killer callbacks registered");
+    klog!(Info, "  OOM killer callbacks registered");
 }

@@ -385,7 +385,7 @@ pub fn init_buddy_allocator(base_addr: PhysAddr, size: usize) {
     *BUDDY_ALLOCATOR.lock() = Some(allocator);
 
     klog_always!("Buddy allocator initialized:");
-    klog_always!("  Base address: 0x{:x}", base_addr);
+    klog!(Info, "  Base address: 0x{:x}", base_addr);
     klog_always!("  Size: {} MB", size / (1024 * 1024));
     klog_always!("  Total pages: {}", size / PAGE_SIZE);
 }

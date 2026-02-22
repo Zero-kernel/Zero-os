@@ -791,7 +791,7 @@ lazy_static::lazy_static! {
 /// Register a block device.
 pub fn register_device(device: Arc<dyn BlockDevice>) -> Result<u32, BlockError> {
     let minor = BLOCK_REGISTRY.register(device.clone())?;
-    klog_always!(
+    klog!(Info, 
         "  Block device registered: {} (minor={}, capacity={}MB)",
         device.name(),
         minor,
@@ -879,14 +879,14 @@ unsafe fn map_high_mmio(phys_base: u64, size: usize) -> Result<i64, BlockError> 
     let offset = HIGH_MMIO_OFFSET.fetch_add(aligned_size as u64, Ordering::SeqCst);
 
     if offset + aligned_size as u64 > HIGH_MMIO_VIRT_SIZE {
-        klog_always!("      [ERROR] High MMIO virtual space exhausted");
+        klog!(Error, "      [ERROR] High MMIO virtual space exhausted");
         return Err(BlockError::NoMem);
     }
 
     let virt_addr = HIGH_MMIO_VIRT_BASE + offset;
     let virt_offset = virt_addr as i64 - phys_base as i64;
 
-    klog_always!(
+    klog!(Info, 
         "      [MMIO] Mapping phys {:#x} -> virt {:#x} (size {:#x})",
         phys_base, virt_addr, aligned_size
     );
@@ -902,11 +902,11 @@ unsafe fn map_high_mmio(phys_base: u64, size: usize) -> Result<i64, BlockError> 
         &mut frame_alloc,
     ) {
         Ok(()) => {
-            klog_always!("      [MMIO] Mapping successful");
+            klog!(Info, "      [MMIO] Mapping successful");
             Ok(virt_offset)
         }
         Err(e) => {
-            klog_always!("      [ERROR] MMIO mapping failed: {:?}", e);
+            klog!(Error, "      [ERROR] MMIO mapping failed: {:?}", e);
             Err(BlockError::NoMem)
         }
     }
@@ -943,7 +943,7 @@ pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
                 let capacity = device.capacity_sectors();
                 let sector_size = device.sector_size();
                 let size_mb = (capacity * sector_size as u64) / (1024 * 1024);
-                klog_always!(
+                klog!(Info, 
                     "    virtio-blk (mmio) /dev/{}: {} MB ({} sectors x {} bytes)",
                     name, size_mb, capacity, sector_size
                 );
@@ -953,7 +953,7 @@ pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
                 // No device at this address, continue silently
             }
             Err(e) => {
-                klog_always!("    MMIO virtio-blk at {:#x} failed: {:?}", base, e);
+                klog!(Warn, "    MMIO virtio-blk at {:#x} failed: {:?}", base, e);
             }
         }
     }
@@ -998,7 +998,7 @@ pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
                 // R82-3 FIX: Disable bus mastering on MMIO mapping failure
                 let cmd = pci::pci_config_read32(pci_id.bus, pci_id.device, pci_id.function, 0x04) as u16;
                 pci::pci_config_write16(pci_id.bus, pci_id.device, pci_id.function, 0x04, cmd & !0x04);
-                klog_always!(
+                klog!(Error,
                     "    Failed to map virtio-blk MMIO region {:#x}-{:#x}: {:?} (bus master disabled)",
                     min_phys, max_phys, e
                 );
@@ -1011,7 +1011,7 @@ pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
                 let capacity = device.capacity_sectors();
                 let sector_size = device.sector_size();
                 let size_mb = (capacity * sector_size as u64) / (1024 * 1024);
-                klog_always!(
+                klog!(Info, 
                     "    virtio-blk (pci) /dev/{} @ {:02x}:{:02x}.{}: {} MB ({} sectors x {} bytes)",
                     name,
                     pci_id.bus,
@@ -1027,7 +1027,7 @@ pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
                 // R82-3 FIX: Disable bus mastering on driver probe failure
                 let cmd = pci::pci_config_read32(pci_id.bus, pci_id.device, pci_id.function, 0x04) as u16;
                 pci::pci_config_write16(pci_id.bus, pci_id.device, pci_id.function, 0x04, cmd & !0x04);
-                klog_always!(
+                klog!(Warn,
                     "    Failed to probe virtio-blk /dev/{} @ {:02x}:{:02x}.{} (pci caps @ {:#x}): {:?} (bus master disabled)",
                     name,
                     pci_id.bus,

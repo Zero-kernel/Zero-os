@@ -171,7 +171,7 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
 
     // Skip if device is read-only
     if device.is_read_only() {
-        klog_always!("        [SKIP] Device is read-only");
+        klog!(Info, "        [SKIP] Device is read-only");
         return true;
     }
 
@@ -180,7 +180,7 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
 
     // Need at least 2 sectors for test (use last 2 sectors)
     if capacity < 4 {
-        klog_always!("        [SKIP] Device too small for write test");
+        klog!(Info, "        [SKIP] Device too small for write test");
         return true;
     }
 
@@ -201,18 +201,18 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
     };
 
     // Write test pattern
-    klog_always!("        Writing test pattern to sector {}...", test_sector);
+    klog!(Info, "        Writing test pattern to sector {}...", test_sector);
     match device.write_sync(test_sector, &test_pattern) {
         Ok(n) if n == sector_size => {}
         Ok(n) => {
-            klog_always!(
+            klog!(Error,
                 "        [FAIL] Write returned {} bytes, expected {}",
                 n, sector_size
             );
             return false;
         }
         Err(e) => {
-            klog_always!("        [FAIL] Write failed: {:?}", e);
+            klog!(Error, "        [FAIL] Write failed: {:?}", e);
             return false;
         }
     }
@@ -222,26 +222,26 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
     match device.read_sync(test_sector, &mut read_buf) {
         Ok(n) if n == sector_size => {}
         Ok(n) => {
-            klog_always!(
+            klog!(Error,
                 "        [FAIL] Read returned {} bytes, expected {}",
                 n, sector_size
             );
             return false;
         }
         Err(e) => {
-            klog_always!("        [FAIL] Read failed: {:?}", e);
+            klog!(Error, "        [FAIL] Read failed: {:?}", e);
             return false;
         }
     }
 
     // Verify
     if read_buf[..512] == test_pattern {
-        klog_always!("        [PASS] Write/read verification successful");
+        klog!(Info, "        [PASS] Write/read verification successful");
         true
     } else {
-        klog_always!("        [FAIL] Data mismatch!");
-        klog_always!("        Expected first 8: {:02x?}", &test_pattern[..8]);
-        klog_always!("        Got first 8:      {:02x?}", &read_buf[..8]);
+        klog!(Error, "        [FAIL] Data mismatch!");
+        klog!(Info, "        Expected first 8: {:02x?}", &test_pattern[..8]);
+        klog!(Info, "        Got first 8:      {:02x?}", &read_buf[..8]);
         false
     }
 }
@@ -348,8 +348,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 klog_always!("      ✓ Guard pages installed for kernel stacks");
             }
             Err(e) => {
-                klog_always!("      ! Failed to install guard pages: {:?}", e);
-                klog_always!("      ! Continuing with static stacks (less safe)");
+                klog!(Warn, "      ! Failed to install guard pages: {:?}", e);
+                klog!(Warn, "      ! Continuing with static stacks (less safe)");
             }
         }
     }
@@ -394,9 +394,9 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         match security::init(sec_config, &mut frame_allocator) {
             Ok(report) => {
                 klog_always!("      ✓ Security hardening applied");
-                klog_always!("        - Identity map: {:?}", report.identity_cleanup);
+                klog!(Info, "        - Identity map: {:?}", report.identity_cleanup);
                 if let Some(nx) = &report.nx_summary {
-                    klog_always!(
+                    klog!(Info, 
                         "        - NX enforced: {} pages protected",
                         nx.data_nx_pages
                     );
@@ -407,17 +407,17 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                     // Printing raw entropy values is unnecessary and could be
                     // sensitive if RNG is not fully initialized.
                     match security::random_u64() {
-                        Ok(_) => klog_always!("        - RNG self-test: passed"),
-                        Err(e) => klog_always!("        ! RNG self-test failed: {:?}", e),
+                        Ok(_) => klog!(Info, "        - RNG self-test: passed"),
+                        Err(e) => klog!(Error, "        ! RNG self-test failed: {:?}", e),
                     }
                 } else {
-                    klog_always!("        ! CSPRNG not ready");
+                    klog!(Warn, "        ! CSPRNG not ready");
                 }
                 if report.kptr_guard_active {
-                    klog_always!("        - kptr guard: active");
+                    klog!(Info, "        - kptr guard: active");
                 }
                 if let Some(spectre) = &report.spectre_status {
-                    klog_always!("        - Spectre mitigations: {}", spectre.summary());
+                    klog!(Info, "        - Spectre mitigations: {}", spectre.summary());
                 }
 
                 // G.fin.1: Lock profile after security initialization.
@@ -518,21 +518,21 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         if cpu_status.smep_enabled {
             klog_always!("        - SMEP: enabled (blocks kernel executing user pages)");
         } else if cpu_status.smep_supported {
-            klog_always!("        ! SMEP: supported but failed to enable");
+            klog!(Warn, "        ! SMEP: supported but failed to enable");
         } else {
             klog_always!("        - SMEP: not supported by CPU");
         }
         if cpu_status.smap_enabled {
             klog_always!("        - SMAP: enabled (blocks kernel accessing user pages)");
         } else if cpu_status.smap_supported {
-            klog_always!("        ! SMAP: supported but failed to enable");
+            klog!(Warn, "        ! SMAP: supported but failed to enable");
         } else {
             klog_always!("        - SMAP: not supported by CPU");
         }
         if cpu_status.umip_enabled {
             klog_always!("        - UMIP: enabled (blocks user SGDT/SIDT/SLDT)");
         } else if cpu_status.umip_supported {
-            klog_always!("        ! UMIP: supported but failed to enable");
+            klog!(Warn, "        ! UMIP: supported but failed to enable");
         } else {
             klog_always!("        - UMIP: not supported by CPU");
         }
@@ -725,7 +725,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                     if test_block_write(&device) {
                         klog_always!("      ✓ Block write path verified");
                     } else {
-                        klog_always!("      ! Block write test failed");
+                        klog!(Error, "      ! Block write test failed");
                     }
                 }
 
@@ -733,18 +733,18 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 match vfs::Ext2Fs::mount(device) {
                     Ok(fs) => match vfs::mount("/mnt", fs) {
                         Ok(()) => klog_always!("      ✓ Mounted /dev/{} on /mnt as ext2", name),
-                        Err(e) => klog_always!(
+                        Err(e) => klog!(Warn,
                             "      ! Registered /dev/{} but failed to mount on /mnt: {:?}",
                             name, e
                         ),
                     },
-                    Err(e) => klog_always!(
+                    Err(e) => klog!(Warn,
                         "      ! Registered /dev/{} but failed to initialize ext2: {:?}",
                         name, e
                     ),
                 }
             }
-            Err(e) => klog_always!("      ! Failed to register /dev/{}: {:?}", name, e),
+            Err(e) => klog!(Error, "      ! Failed to register /dev/{}: {:?}", name, e),
         }
     }
 
@@ -854,12 +854,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                             klog_always!("        - All audit events now HMAC-SHA256 protected");
                         }
                         Err(e) => {
-                            klog_always!("      ! Failed to set audit HMAC key: {:?}", e);
+                            klog!(Error, "      ! Failed to set audit HMAC key: {:?}", e);
                         }
                     },
                     Err(e) => {
-                        klog_always!("      ! Failed to generate audit HMAC key: {:?}", e);
-                        klog_always!("        - Audit events using plain SHA-256 chain only");
+                        klog!(Error, "      ! Failed to generate audit HMAC key: {:?}", e);
+                        klog!(Warn, "        - Audit events using plain SHA-256 chain only");
                     }
                 }
                 // R72-HMAC: Zero key material from stack to limit exposure window
@@ -902,7 +902,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             klog_always!("      ✓ Livepatch audit callback registered (P1-4)");
         }
         Err(e) => {
-            klog_always!("      ! Audit initialization failed: {:?}", e);
+            klog!(Error, "      ! Audit initialization failed: {:?}", e);
         }
     }
 
@@ -954,7 +954,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         // 运行运行时功能测试
         let test_report = runtime_tests::run_all_runtime_tests();
         if test_report.failed > 0 {
-            klog_always!("WARNING: {} runtime tests failed!", test_report.failed);
+            klog!(Warn, "WARNING: {} runtime tests failed!", test_report.failed);
         }
 
         // 运行 Ring 3 用户态测试
@@ -962,7 +962,7 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         if usermode_test::run_usermode_test() {
             klog_always!("      ✓ Ring 3 test process created successfully");
         } else {
-            klog_always!("      ! Ring 3 test setup failed");
+            klog!(Error, "      ! Ring 3 test setup failed");
         }
     } else {
         klog_force!("[POLICY] {} profile: debug/test interfaces disabled",

@@ -294,14 +294,14 @@ unsafe fn map_pci_mmio(phys_base: u64, size: usize) -> Result<i64, NetError> {
     let offset = NET_MMIO_OFFSET.fetch_add(aligned_size as u64, Ordering::SeqCst);
 
     if offset + aligned_size as u64 > NET_MMIO_VIRT_SIZE {
-        klog_always!("      [NET MMIO] Virtual space exhausted");
+        klog!(Error, "      [NET MMIO] Virtual space exhausted");
         return Err(NetError::IoError);
     }
 
     let virt_addr = NET_MMIO_VIRT_BASE + offset;
     let virt_offset = virt_addr as i64 - phys_base as i64;
 
-    klog_always!(
+    klog!(Info, 
         "      [NET MMIO] Mapping phys {:#x} -> virt {:#x} (size {:#x})",
         phys_base,
         virt_addr,
@@ -318,11 +318,11 @@ unsafe fn map_pci_mmio(phys_base: u64, size: usize) -> Result<i64, NetError> {
         &mut frame_alloc,
     ) {
         Ok(()) => {
-            klog_always!("      [NET MMIO] Mapping successful");
+            klog!(Info, "      [NET MMIO] Mapping successful");
             Ok(virt_offset)
         }
         Err(e) => {
-            klog_always!("      [NET MMIO] Mapping failed: {:?}", e);
+            klog!(Error, "      [NET MMIO] Mapping failed: {:?}", e);
             Err(NetError::IoError)
         }
     }
@@ -421,7 +421,7 @@ pub fn init() -> usize {
 
                     match register_device(device) {
                         Ok(_) => {
-                            klog_always!(
+                            klog!(Info, 
                                 "      ✓ {} @ {:02x}:{:02x}.{} MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
                                 name,
                                 pci_dev.slot.bus,
