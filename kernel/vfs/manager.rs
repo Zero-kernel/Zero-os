@@ -1497,8 +1497,17 @@ fn vfs_unlink_callback(path: &str) -> Result<(), SyscallError> {
 
 /// VFS readdir callback for syscall registration
 ///
-/// Called by sys_getdents64 to read directory entries
-fn vfs_readdir_callback(fd: i32) -> Result<alloc::vec::Vec<kernel_core::DirEntry>, SyscallError> {
+/// Called by sys_getdents64 to read directory entries.
+///
+/// R114-2 FIX: Added `max_bytes` budget parameter. The callback estimates the serialized
+/// dirent64 size for each entry (header + name + NUL + 8-byte alignment) and stops
+/// collecting once the estimated total exceeds the budget. This prevents unbounded kernel
+/// heap allocation from large directories, which would trigger OOM panic via
+/// `alloc_error_handler`.
+///
+/// If the first entry alone exceeds the budget, returns `EINVAL` (Linux-compatible behavior
+/// for buffer-too-small).
+fn vfs_readdir_callback(fd: i32, max_bytes: usize) -> Result<alloc::vec::Vec<kernel_core::DirEntry>, SyscallError> {
     use kernel_core::current_pid;
     use kernel_core::get_process;
 
@@ -1533,13 +1542,40 @@ fn vfs_readdir_callback(fd: i32) -> Result<alloc::vec::Vec<kernel_core::DirEntry
         lsm::hook_file_permission(&task, dir_stat.ino, 0x05).map_err(|_| SyscallError::EACCES)?;
     }
 
-    // Read directory entries starting from current offset
+    // R114-2 FIX: Read directory entries with budget enforcement.
+    // Estimate the serialized dirent64 size per entry to bound kernel heap allocation.
+    // IMPORTANT: The header size MUST match `size_of::<LinuxDirent64>()` used in
+    // `sys_getdents64` (24 bytes with #[repr(C)] tail padding: d_ino:8 + d_off:8 +
+    // d_reclen:2 + d_type:1 + 5 bytes padding = 24), NOT the raw field sum (19).
+    // A mismatch would cause the budget to over-collect entries that `sys_getdents64`
+    // then skips (because the serialized reclen is larger), advancing the file offset
+    // past entries never emitted to userspace.
+    const DIRENT64_HEADER_SIZE: usize = 24; // must equal size_of::<LinuxDirent64>()
     let mut entries = Vec::new();
     let mut offset = start_offset;
+    let mut estimated_bytes: usize = 0;
 
     loop {
         match inode.readdir(offset) {
             Ok(Some((next, entry))) => {
+                // Estimate the serialized record length for this entry
+                let reclen = (DIRENT64_HEADER_SIZE + entry.name.len() + 1 + 7) & !7;
+
+                // R114-2 FIX: If the first entry alone exceeds the budget, return EINVAL
+                // (Linux-compatible: buffer too small to fit even one record).
+                if entries.is_empty() && reclen > max_bytes {
+                    return Err(SyscallError::EINVAL);
+                }
+
+                // Stop collecting if adding this entry would exceed the budget.
+                // The entries collected so far are within budget.
+                // R114-2 FIX: Use saturating_add as defensive measure against overflow,
+                // even though max_bytes is capped at 1MB making overflow impossible.
+                if estimated_bytes.saturating_add(reclen) > max_bytes {
+                    break;
+                }
+                estimated_bytes += reclen;
+
                 // Convert VFS DirEntry to kernel_core DirEntry
                 let file_type = match entry.file_type {
                     crate::types::FileType::Regular => kernel_core::FileType::Regular,

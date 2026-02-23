@@ -495,37 +495,43 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
     let virt = VirtAddr::new(fault_addr as u64);
     let page = Page::containing_address(virt);
 
-    // 查找页表项
-    let pte = find_pte(virt).ok_or(ForkError::PageTableCopyFailed)?;
-    let flags = pte.flags();
-
-    // R65-21 FIX: After acquiring the lock, re-check if the page is still COW.
-    // Another thread may have resolved this COW fault while we were waiting for the lock.
-    // If COW flag is no longer set, check if the page is now writable:
-    // - If writable: another thread resolved it, flush TLB and return Ok
-    // - If not writable: this was never a COW page, return error to let caller handle it
-    if !flags.contains(cow_flag()) {
-        if flags.contains(PageTableFlags::WRITABLE) {
-            // COW already resolved by another thread, just ensure TLB is consistent
-            // R68-4 FIX: Use cross-CPU shootdown to ensure all CPUs see the resolution.
-            // On SMP, other CPUs sharing this address space may have stale TLB entries.
-            mm::flush_current_as_page(virt);
-            return Ok(());
-        } else {
-            // Page is not COW and not writable - this is NOT a COW fault
-            // Return error so caller can handle it appropriately (e.g., SIGSEGV)
-            return Err(ForkError::PageTableCopyFailed);
-        }
-    }
+    // R114-3 FIX: ALL PTE flag reads are now performed under PT_LOCK inside
+    // `with_current_manager()`. Previously, `find_pte()` read flags outside the lock,
+    // creating a TOCTOU race on SMP with CLONE_THREAD|CLONE_VM: another thread
+    // could `munmap`/`mprotect` the page between the unlocked `find_pte()` read and
+    // the locked `with_current_manager()` use, leading to stale-flags decisions
+    // and potential use-after-free or wrong-frame deallocation.
 
     // 使用基于当前 CR3 的页表管理器，确保操作正确的地址空间
     let mut frame_alloc = FrameAllocator::new();
 
     with_current_manager(VirtAddr::new(0), |manager| -> Result<(), ForkError> {
-        // 获取原物理地址
-        let old_phys = manager
-            .translate_addr(virt)
+        // R114-3 FIX: Read PTE flags UNDER PT_LOCK via translate_with_flags().
+        // This eliminates the TOCTOU window that existed when find_pte() was called
+        // outside the lock scope.
+        let (old_phys, flags) = manager
+            .translate_with_flags(virt)
             .ok_or(ForkError::PageTableCopyFailed)?;
+
+        // R65-21 FIX: After acquiring the lock, re-check if the page is still COW.
+        // Another thread may have resolved this COW fault while we were waiting for the lock.
+        // If COW flag is no longer set, check if the page is now writable:
+        // - If writable: another thread resolved it, flush TLB and return Ok
+        // - If not writable: this was never a COW page, return error to let caller handle it
+        if !flags.contains(cow_flag()) {
+            if flags.contains(PageTableFlags::WRITABLE) {
+                // COW already resolved by another thread, just ensure TLB is consistent
+                // R68-4 FIX: Use cross-CPU shootdown to ensure all CPUs see the resolution.
+                // On SMP, other CPUs sharing this address space may have stale TLB entries.
+                mm::flush_current_as_page(virt);
+                return Ok(());
+            } else {
+                // Page is not COW and not writable - this is NOT a COW fault
+                // Return error so caller can handle it appropriately (e.g., SIGSEGV)
+                return Err(ForkError::PageTableCopyFailed);
+            }
+        }
+
         let old_frame = PhysFrame::containing_address(old_phys);
 
         // 分配新物理页
@@ -545,6 +551,7 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
         }
 
         // 设置新标志：移除 COW，添加 WRITABLE
+        // R114-3 FIX: `flags` is guaranteed fresh — read under PT_LOCK above.
         let mut new_flags = flags;
         new_flags.remove(cow_flag());
         new_flags.insert(PageTableFlags::WRITABLE);
@@ -569,7 +576,13 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
         mm::flush_current_as_page(virt);
 
         // 减少原页引用计数
-        let remaining = PAGE_REF_COUNT.decrement(old_phys.as_u64() as usize);
+        // R114-3 FIX (Codex review): Use page-aligned frame address for refcount key,
+        // not the offset-adjusted `old_phys`. `translate_with_flags()` returns
+        // `frame.start_address() + offset`, but refcount keys are page-aligned
+        // (set by `PAGE_REF_COUNT.increment(entry.addr().as_u64() as usize)` in fork).
+        // Using unaligned `old_phys` would miss the entry and return 0, causing
+        // premature frame deallocation.
+        let remaining = PAGE_REF_COUNT.decrement(old_frame.start_address().as_u64() as usize);
         if remaining == 0 {
             frame_alloc.deallocate_frame(old_frame);
         }
@@ -917,6 +930,12 @@ fn apply_leaf(
 }
 
 /// 查找虚拟地址对应的页表项
+///
+/// R114-3 FIX: DEPRECATED — This function reads PTE flags without holding PT_LOCK, creating
+/// TOCTOU races on SMP. Use `PageTableManager::translate_with_flags()` under PT_LOCK instead.
+/// Retained only for potential future diagnostic use; all production callers must use the
+/// lock-held API.
+#[allow(dead_code)]
 fn find_pte(addr: VirtAddr) -> Option<&'static mut PageTableEntry> {
     let (root, _) = Cr3::read();
     let mut table = unsafe { phys_to_virt_table(root.start_address()) };

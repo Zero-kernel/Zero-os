@@ -1079,8 +1079,12 @@ pub type VfsUnlinkCallback = fn(&str) -> Result<(), SyscallError>;
 /// VFS 读取目录项回调类型
 ///
 /// 由 vfs 模块注册，处理目录内容读取
-/// 参数: (fd, buf) -> 返回实际读取的目录项列表
-pub type VfsReaddirCallback = fn(i32) -> Result<alloc::vec::Vec<DirEntry>, SyscallError>;
+/// R114-2 FIX: Added `max_bytes` parameter to enforce kernel-side memory budget.
+/// The callback MUST stop collecting entries once the estimated serialized size
+/// (header + name + NUL + alignment) exceeds `max_bytes`. This prevents unbounded
+/// kernel heap allocation from large directories, which could trigger OOM panic.
+/// 参数: (fd, max_bytes) -> 返回实际读取的目录项列表
+pub type VfsReaddirCallback = fn(i32, usize) -> Result<alloc::vec::Vec<DirEntry>, SyscallError>;
 
 /// VFS 截断文件回调类型
 ///
@@ -7265,13 +7269,21 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
         return Err(SyscallError::EINVAL);
     }
 
-    // 通过回调读取目录项
+    // R114-2 FIX: Cap `count` to MAX_RW_SIZE (1 MB) to prevent extreme kernel allocations
+    // even with large user buffers. This matches Linux's practical limit for readdir.
+    const MAX_RW_SIZE: usize = 1024 * 1024; // 1 MB
+    let budget = count.min(MAX_RW_SIZE);
+
+    // 通过回调读取目录项，passing byte budget to limit kernel-side allocation
     let readdir_fn = VFS_READDIR_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
-    let entries = readdir_fn(fd)?;
+    let entries = readdir_fn(fd, budget)?;
 
     // 构建dirent64结构
     let mut written = 0usize;
     let header_size = core::mem::size_of::<LinuxDirent64>();
+    // R114-2 FIX: Validate ABI assumption — vfs_readdir_callback uses DIRENT64_HEADER_SIZE=24
+    // for budget estimation. If repr(C) padding changes, this catches the mismatch.
+    debug_assert_eq!(header_size, 24, "LinuxDirent64 size mismatch: budget estimation assumes 24");
 
     for entry in entries {
         let name_bytes = entry.name.as_bytes();

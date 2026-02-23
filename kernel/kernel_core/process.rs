@@ -68,8 +68,9 @@ type SchedulerCleanupCallback = fn(ProcessId);
 
 /// IPC清理回调类型
 /// R37-2 FIX (Codex review): Pass both PID and TGID to avoid deadlock.
-/// The callback is called from free_process_resources which already holds the process lock,
-/// so the callback must not try to lock the process again.
+/// R114-1 FIX: The callback is invoked by `cleanup_zombie()` AFTER detaching the PCB from
+/// `PROCESS_TABLE` and releasing the table lock. This avoids deadlocks from IPC/futex cleanup
+/// paths that call `thread_group_size()` or `get_process()` (both re-lock `PROCESS_TABLE`).
 /// R75-2 FIX: Also pass IPC namespace ID for per-namespace endpoint cleanup.
 type IpcCleanupCallback = fn(ProcessId, ProcessId, cap::NamespaceId); // (pid, tgid, ipc_ns_id)
 
@@ -2514,16 +2515,28 @@ pub fn wait_process(pid: ProcessId) -> Option<i32> {
 
 /// 清理僵尸进程
 ///
-/// 完全移除进程：
-/// 1. 释放进程持有的内存资源（mmap 区域）
-/// 2. 从 PROCESS_TABLE 中移除
-/// 3. 通知调度器移除该进程
+/// R114-1 FIX: Two-phase reap to prevent deadlock.
+///
+/// Previously, `free_process_resources()` (and its IPC/futex cleanup callbacks) was called
+/// while holding `PROCESS_TABLE`, causing a deterministic deadlock:
+///   `PROCESS_TABLE.lock()` → `free_process_resources()` → `notify_ipc_process_cleanup()`
+///   → `cleanup_process_futexes()` → `thread_group_size(tgid)` → `PROCESS_TABLE.lock()` [DEADLOCK]
+///
+/// The fix splits reaping into two phases:
+/// - **Phase 1 (under `PROCESS_TABLE` lock):** Verify zombie state, check shared address space,
+///   detach the `Arc<Mutex<Process>>` from the table via `slot.take()`, mark Terminated, and
+///   capture IDs needed for cross-subsystem cleanup.
+/// - **Phase 2 (without `PROCESS_TABLE` lock):** Free kernel resources, run IPC/futex/cpuset
+///   cleanup callbacks, and notify the scheduler. These callbacks may safely re-lock
+///   `PROCESS_TABLE` since we no longer hold it.
 pub fn cleanup_zombie(pid: ProcessId) {
-    let removed = {
+    // Phase 1: Detach process from PROCESS_TABLE under lock.
+    // After `slot.take()`, no other code path can look up this PID in the table,
+    // so the extracted Arc is the sole remaining reference to the PCB.
+    let reap_info = {
         let mut table = PROCESS_TABLE.lock();
 
-        // R24-1 fix: 分两阶段处理，避免借用冲突
-        // 阶段1：检查进程状态和共享情况
+        // Phase 1a: Check process state
         let (memory_space, is_zombie) = {
             if let Some(slot) = table.get(pid) {
                 if let Some(process) = slot {
@@ -2542,9 +2555,10 @@ pub fn cleanup_zombie(pid: ProcessId) {
         };
 
         if !is_zombie {
-            false
+            None
         } else {
-            // 阶段2：检查是否有其他进程共享地址空间
+            // Phase 1b: Check if other processes share this address space
+            // (must be done under PROCESS_TABLE lock since we iterate the table)
             let keep_address_space = if memory_space == 0 {
                 false
             } else {
@@ -2562,32 +2576,60 @@ pub fn cleanup_zombie(pid: ProcessId) {
                 })
             };
 
-            // 阶段3：现在可以安全地获取可变引用并清理
+            // Phase 1c: Detach the Arc<Mutex<Process>> from the table and mark Terminated.
+            // `slot.take()` atomically removes the process from the table, ensuring
+            // no concurrent code path can find it by PID while we clean up.
             if let Some(slot) = table.get_mut(pid) {
-                if let Some(process) = slot {
+                if let Some(process) = slot.take() {
                     let mut proc = process.lock();
-                    // 再次验证状态（防止并发修改）
+                    // Re-validate state (defensive against concurrent modification)
                     if proc.state == ProcessState::Zombie {
-                        free_process_resources(&mut proc, keep_address_space);
                         proc.state = ProcessState::Terminated;
+                        // Capture IDs needed for Phase 2 callbacks before dropping the lock
+                        let reaped_pid = proc.pid;
+                        let tgid = proc.tgid;
+                        let ipc_ns_id = proc.ipc_ns.id();
+                        let cpuset_id = proc.cpuset_id;
                         drop(proc);
-                        *slot = None;
-                        true
+                        Some((process, keep_address_space, reaped_pid, tgid, ipc_ns_id, cpuset_id))
                     } else {
-                        false
+                        // Not a zombie anymore (concurrent state change); restore the slot
+                        drop(proc);
+                        *slot = Some(process);
+                        None
                     }
                 } else {
-                    false
+                    None
                 }
             } else {
-                false
+                None
             }
         }
     };
+    // PROCESS_TABLE lock is released here.
 
-    if removed {
-        notify_scheduler_process_removed(pid);
-        klog!(Info, "Cleaned up zombie process {}", pid);
+    // Phase 2: Free resources and run cross-subsystem cleanup WITHOUT holding PROCESS_TABLE.
+    if let Some((process, keep_address_space, reaped_pid, tgid, ipc_ns_id, cpuset_id)) =
+        reap_info
+    {
+        // Free kernel-internal resources (stack, mmap, fd_table, address space).
+        // This is safe because the Arc we hold is the only remaining reference —
+        // the table slot was cleared in Phase 1c.
+        {
+            let mut proc = process.lock();
+            free_process_resources(&mut proc, keep_address_space);
+        }
+
+        // Cross-subsystem cleanup: IPC endpoint teardown + futex waiter cleanup.
+        // These callbacks may re-lock PROCESS_TABLE (e.g., thread_group_size(),
+        // get_process()) which is safe now since we no longer hold it.
+        notify_ipc_process_cleanup(reaped_pid, tgid, ipc_ns_id);
+
+        // E.5 Cpuset: decrement task count when process exits
+        notify_cpuset_task_left(cpuset_id);
+
+        notify_scheduler_process_removed(reaped_pid);
+        klog!(Info, "Cleaned up zombie process {}", reaped_pid);
     }
 }
 
@@ -2665,14 +2707,9 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
         }
     }
 
-    // 通知 IPC 子系统清理进程端点（通过回调避免循环依赖）
-    // R37-2 FIX (Codex review): Pass TGID to avoid deadlock from re-locking this process
-    // R75-2 FIX: Pass IPC namespace ID for per-namespace endpoint cleanup
-    let ipc_ns_id = proc.ipc_ns.id();
-    notify_ipc_process_cleanup(proc.pid, proc.tgid, ipc_ns_id);
-
-    // E.5 Cpuset: decrement task count when process exits
-    notify_cpuset_task_left(proc.cpuset_id);
+    // R114-1 FIX: IPC endpoint cleanup and cpuset task accounting are now performed
+    // by `cleanup_zombie()` AFTER releasing PROCESS_TABLE, to avoid deadlocks from
+    // callbacks that re-lock PROCESS_TABLE (e.g., futex cleanup → thread_group_size()).
 
     if region_count > 0 {
         // R104-2 FIX: Gate diagnostic println behind debug_assertions.

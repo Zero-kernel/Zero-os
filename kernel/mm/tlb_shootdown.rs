@@ -212,12 +212,28 @@ fn is_pcid_enabled() -> bool {
 ///
 /// # Safety
 ///
-/// - Must be called with interrupts disabled (IPI handler context)
+/// - Must be called with interrupts disabled (IPI handler context or wrapped
+///   in `without_interrupts()`)
 /// - Modifies CR3/CR4 which affects page translation
 /// - All kernel mappings must remain valid throughout
 /// - Intel SDM requirement: CR3[11:0] must be 0 when toggling CR4.PCIDE
+///
+/// R114-4 FIX: Callers MUST ensure interrupts are disabled. An interrupt between
+/// CR4.PCIDE clear (step 2) and restore (step 4) would find inconsistent CR3/CR4
+/// state, potentially corrupting page translation or causing a context switch with
+/// PCID disabled. Debug assertion enforces this contract.
+///
+/// NOTE: This function is NOT NMI-safe. A non-maskable interrupt during CR4.PCIDE
+/// manipulation could observe inconsistent page translation state. NMI handlers
+/// must only access kernel-space mappings, which remain valid throughout this
+/// sequence. The window is extremely small (4 control register writes).
 #[inline]
 unsafe fn flush_all_pcid_without_invpcid() {
+    // R114-4 FIX: Assert interrupts are disabled to catch contract violations in debug builds.
+    debug_assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "flush_all_pcid_without_invpcid: interrupts must be disabled during CR3/CR4 manipulation"
+    );
     // Read current CR3 with PCID bits preserved (u16 contains PCID value 0-4095)
     let (frame, raw_pcid) = Cr3::read_raw();
 
@@ -269,7 +285,13 @@ fn flush_all_local() {
         // R74-1 Enhancement: PCID without INVPCID
         // Toggle CR4.PCIDE to invalidate all PCID-tagged translations
         // More expensive (4 control register writes) but necessary for correctness
-        unsafe { flush_all_pcid_without_invpcid() };
+        //
+        // R114-4 FIX: Wrap in without_interrupts() to satisfy the IRQ-disabled contract.
+        // An interrupt during CR3/CR4 manipulation would find inconsistent page translation
+        // state, potentially causing page faults or TLB corruption in the interrupt handler.
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            unsafe { flush_all_pcid_without_invpcid() };
+        });
     } else {
         // No PCID: standard CR3 reload flushes all non-global TLB entries
         // This is the legacy path for older CPUs
