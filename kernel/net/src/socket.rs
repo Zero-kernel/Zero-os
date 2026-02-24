@@ -68,7 +68,7 @@ use crate::tcp::{
     TcpState, TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS, TCP_FIN_TIMEOUT_MS, TCP_FIN_WAIT_2_TIMEOUT_MS,
     TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN,
     TCP_MAX_ACCEPT_BACKLOG, TCP_MAX_ACTIVE_CONNECTIONS, TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES,
-    TCP_MAX_RTO_MS, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_WINDOW_SCALE, TCP_PROTO,
+    TCP_MAX_RTO_MS, TCP_MAX_SEND_BUFFER_BYTES, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_WINDOW_SCALE, TCP_PROTO,
     TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
 };
 use crate::udp::{
@@ -2349,6 +2349,19 @@ impl SocketTable {
             return Err(SocketError::Timeout);
         }
 
+        // R115-3 FIX: Bound total buffered TX bytes per connection to prevent OOM.
+        // The send_buffer_bytes counter tracks cumulative data in the send_buffer.
+        // If adding this payload would exceed the per-socket cap, reject with
+        // WouldBlock so the caller retries after ACKs drain the buffer.
+        let new_total = tcp_state
+            .control
+            .send_buffer_bytes
+            .checked_add(payload.len())
+            .ok_or(SocketError::WouldBlock)?;
+        if new_total > TCP_MAX_SEND_BUFFER_BYTES {
+            return Err(SocketError::WouldBlock);
+        }
+
         // Get current sequence numbers
         let base_seq = tcp_state.control.snd_nxt;
         let ack = tcp_state.control.rcv_nxt;
@@ -2401,6 +2414,9 @@ impl SocketTable {
             segments.push(segment);
             offset = end;
         }
+
+        // R115-3 FIX: Commit the total buffered bytes after all segments are pushed.
+        tcp_state.control.send_buffer_bytes = new_total;
 
         // Update send next sequence number
         tcp_state.control.snd_nxt = base_seq.wrapping_add(payload.len() as u32);

@@ -18,7 +18,6 @@ use mm::page_table::{
     split_2m_entry, MapError, APIC_MMIO_SIZE, APIC_PHYS_ADDR, VGA_PHYS_ADDR,
 };
 use x86_64::{
-    instructions::tlb,
     structures::paging::page_table::PageTableEntry,
     structures::paging::{PageTable, PageTableFlags},
     PhysAddr, VirtAddr,
@@ -145,7 +144,8 @@ pub fn cleanup_identity_map(
                     // Completely remove the identity mapping
                     // WARNING: May break hardware access (VGA at 0xB8000, etc.)
                     entry.set_unused();
-                    tlb::flush_all();
+                    // R115-4 FIX: Use PCID-aware flush instead of raw tlb::flush_all()
+                    mm::tlb_shootdown::flush_all_local();
                     Ok(CleanupOutcome::Unmapped)
                 }
 
@@ -200,7 +200,8 @@ pub fn cleanup_identity_map(
                         }
                     }
 
-                    tlb::flush_all();
+                    // R115-4 FIX: Use PCID-aware flush instead of raw tlb::flush_all()
+                    mm::tlb_shootdown::flush_all_local();
                     Ok(CleanupOutcome::ReadOnlyUpdated {
                         updated_entries: updated,
                     })
@@ -355,7 +356,8 @@ pub fn enforce_nx_for_kernel(
                 &mut summary.data_nx_pages,
             )?;
 
-            tlb::flush_all();
+            // R115-4 FIX: Use PCID-aware flush instead of raw tlb::flush_all()
+            mm::tlb_shootdown::flush_all_local();
             Ok(summary)
         })
     }

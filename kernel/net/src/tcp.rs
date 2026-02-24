@@ -254,6 +254,14 @@ pub const TCP_MAX_ACTIVE_CONNECTIONS: usize = 4096;
 /// Enforced in tcp_send() to protect all send paths from OOM DoS.
 pub const TCP_MAX_SEND_SIZE: usize = 64 * 1024;
 
+/// R115-3 FIX: Maximum per-connection buffered TX bytes (4 MB).
+///
+/// Bounds total memory usage of `send_buffer` per TCP socket. Prevents a sustained
+/// sender (especially with peer-controlled large window or delayed ACKs) from growing
+/// the buffer without bound. Also bounds worst-case CPU cost of ACK/SACK processing
+/// since those iterate the buffer.
+pub const TCP_MAX_SEND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
 // ============================================================================
 // Congestion Control Constants (RFC 5681)
 // ============================================================================
@@ -815,6 +823,10 @@ pub struct TcpControlBlock {
     // === Buffers ===
     /// Send buffer (unacknowledged segments)
     pub send_buffer: VecDeque<TcpSegment>,
+    /// R115-3 FIX: Total bytes currently buffered in `send_buffer`.
+    /// Maintained by tcp_send() (increment) and handle_ack() (decrement).
+    /// Bounded by `TCP_MAX_SEND_BUFFER_BYTES` to prevent OOM.
+    pub send_buffer_bytes: usize,
     /// Receive buffer (in-order data)
     pub recv_buffer: VecDeque<u8>,
     /// Out-of-order receive queue (sorted by sequence number)
@@ -920,6 +932,7 @@ impl TcpControlBlock {
             rttvar_us: 0,
             retries: 0,
             send_buffer: VecDeque::new(),
+            send_buffer_bytes: 0,
             recv_buffer: VecDeque::new(),
             ooo_queue: VecDeque::new(),
             fin_sent: false,
@@ -1198,19 +1211,24 @@ impl TcpControlBlock {
     /// Process incoming SACK blocks from the peer and update the sender-side
     /// scoreboard.
     ///
-    /// Marks TX segments as `sacked` if fully covered by any SACK block.
-    /// Updates `highest_sacked` for loss detection.
-    /// Clamps SACK blocks to `[snd_una, snd_nxt)` to reject out-of-range blocks.
+    /// R115-3 FIX: Rewrote from O(n*m) nested iteration to O(n + m log m)
+    /// single-pass algorithm. SACK blocks are clamped to `[snd_una, snd_nxt)`,
+    /// normalized to relative offsets, sorted, and merged (eliminating overlaps).
+    /// Then a single sweep of `send_buffer` marks covered segments as SACKed.
+    ///
+    /// This prevents CPU amplification where an attacker crafts ACKs with varied
+    /// SACK ranges to trigger O(buffer_len * sack_blocks) processing per packet.
     pub fn process_sack_blocks(&mut self, blocks: &[SackBlock]) {
         if blocks.is_empty() {
             return;
         }
 
-        for block in blocks {
-            // Clamp block edges to the valid send window [snd_una, snd_nxt).
-            // This prevents a malicious peer from inflating `highest_sacked` beyond
-            // snd_nxt (which would corrupt loss detection) or referencing data before
-            // snd_una (already freed from send_buffer).
+        // Phase 1: Clamp blocks to [snd_una, snd_nxt) and normalize to offsets
+        // from snd_una so we can sort/merge safely even when sequence numbers wrap.
+        let mut rel_blocks: Vec<(u32, u32)> = Vec::new();
+        rel_blocks.reserve(blocks.len().min(TCP_SACK_MAX_BLOCKS));
+
+        for block in blocks.iter().take(TCP_SACK_MAX_BLOCKS) {
             let left = if seq_lt(block.left_edge, self.snd_una) {
                 self.snd_una
             } else {
@@ -1222,20 +1240,63 @@ impl TcpControlBlock {
                 block.right_edge
             };
 
-            // After clamping, reject degenerate or empty blocks
+            // Reject degenerate or empty blocks after clamping
             if !seq_gt(right, left) {
                 continue;
             }
 
-            // Update highest sacked (now guaranteed <= snd_nxt)
+            rel_blocks.push((
+                left.wrapping_sub(self.snd_una),
+                right.wrapping_sub(self.snd_una),
+            ));
+        }
+
+        if rel_blocks.is_empty() {
+            return;
+        }
+
+        // Phase 2: Sort by left edge, then merge overlapping/adjacent blocks.
+        rel_blocks.sort_by_key(|(l, _)| *l);
+
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(rel_blocks.len());
+        for (l, r) in rel_blocks {
+            if let Some(last) = merged.last_mut() {
+                if l <= last.1 {
+                    // Overlapping or adjacent — extend the previous block
+                    if r > last.1 {
+                        last.1 = r;
+                    }
+                    continue;
+                }
+            }
+            merged.push((l, r));
+        }
+
+        // Phase 3: Update highest_sacked (guaranteed <= snd_nxt after clamping).
+        for &(_, r_rel) in &merged {
+            let right = self.snd_una.wrapping_add(r_rel);
             if seq_gt(right, self.highest_sacked) {
                 self.highest_sacked = right;
             }
+        }
 
-            // Mark fully-covered TX segments as sacked
-            for seg in self.send_buffer.iter_mut() {
-                let seg_end = seg.seq.wrapping_add(seg.data.len() as u32);
-                if seq_ge(seg.seq, left) && seq_le(seg_end, right) {
+        // Phase 4: Single-pass mark of fully-covered TX segments.
+        // Both send_buffer (sorted by seq) and merged blocks (sorted by left)
+        // are traversed left-to-right, yielding O(n + m) after the sort.
+        let mut bi = 0usize;
+        for seg in self.send_buffer.iter_mut() {
+            let seg_left_rel = seg.seq.wrapping_sub(self.snd_una);
+            let seg_end = seg.seq.wrapping_add(seg.data.len() as u32);
+            let seg_right_rel = seg_end.wrapping_sub(self.snd_una);
+
+            // Advance past merged blocks that end before this segment starts
+            while bi < merged.len() && merged[bi].1 <= seg_left_rel {
+                bi += 1;
+            }
+
+            if bi < merged.len() {
+                let (bl, br) = merged[bi];
+                if bl <= seg_left_rel && seg_right_rel <= br {
                     seg.sacked = true;
                     seg.lost = false; // SACKed implies not lost
                 }
@@ -1518,6 +1579,8 @@ pub fn handle_ack(tcb: &mut TcpControlBlock, ack_num: u32, now_ms: u64) -> AckUp
 
             // Pop the acknowledged segment
             let seg = tcb.send_buffer.pop_front().unwrap();
+            // R115-3 FIX: Decrement byte counter to track cumulative buffer size.
+            tcb.send_buffer_bytes = tcb.send_buffer_bytes.saturating_sub(seg.data.len());
 
             // Karn's algorithm: only sample RTT from non-retransmitted segments
             // This prevents RTT estimate corruption from ambiguous RTT samples

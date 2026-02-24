@@ -2177,6 +2177,22 @@ pub fn syscall_dispatcher(
         let _ = lsm::hook_syscall_exit(ctx, ret);
     }
 
+    // R115-1 FIX: Honor cross-CPU exit requests at syscall return.
+    //
+    // exit_group() may request sibling threads to exit while they are running on
+    // other CPUs. Those threads cannot be terminated remotely (UAF risk), so they
+    // check the pending-kill flag here — the earliest safe point where the thread
+    // is guaranteed to not be in the middle of a kernel operation.
+    if let Some(pid) = current_pid() {
+        if let Some(exit_code) = crate::process::take_pending_process_exit(pid) {
+            terminate_process(pid, exit_code);
+            crate::force_reschedule();
+            loop {
+                x86_64::instructions::hlt();
+            }
+        }
+    }
+
     // 在返回用户态前检查是否需要调度
     // 这是定时器中断设置的 NEED_RESCHED 标志的主要消费点
     crate::reschedule_if_needed();
@@ -2197,11 +2213,9 @@ pub fn syscall_dispatcher(
 /// sys_exit - 终止当前进程
 fn sys_exit(exit_code: i32) -> SyscallResult {
     if let Some(pid) = current_pid() {
-        // LSM hook: notify policy of process exit (informational, doesn't block)
-        if let Some(exit_ctx) = lsm_current_process_ctx() {
-            let _ = lsm::hook_task_exit(&exit_ctx, exit_code);
-        }
-
+        // R115-1 FIX: Removed duplicate hook_task_exit() call.
+        // terminate_process() is the sole call site for the LSM exit hook,
+        // preventing double-fire in audit logs.
         terminate_process(pid, exit_code);
         // R104-2 FIX: Gate to prevent leaking PID in release builds.
         klog_always!("Process {} exited with code {}", pid, exit_code);
@@ -2228,13 +2242,11 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
 ///
 /// R101-9 FIX: Properly terminates all threads sharing the same tgid.
 ///
-/// Previously, exit_group simply delegated to sys_exit, only terminating the
-/// calling thread. With CLONE_THREAD support, multi-threaded processes can be
-/// created, but orphaned threads would continue executing with potentially stale
-/// state (freed address space, invalidated file descriptors), creating UAF risks.
-///
-/// Now iterates the process table to find and terminate all threads in the
-/// same thread group (matching tgid) before terminating the caller.
+/// R115-1 FIX: Cross-CPU safe termination. Sibling threads that may be running
+/// on other CPUs are NOT terminated directly (which would cause UAF on their
+/// kernel stack, FPU state, and cgroup accounting). Instead, a pending-kill
+/// flag is set and the sibling self-terminates at the next syscall return.
+/// The calling thread terminates itself directly (same-CPU, always safe).
 fn sys_exit_group(exit_code: i32) -> SyscallResult {
     if let Some(pid) = current_pid() {
         // Determine our thread group ID
@@ -2244,7 +2256,9 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
             t
         };
 
-        // Collect all PIDs in the same thread group (excluding ourselves)
+        // Collect all other tasks in the same thread group (excluding ourselves).
+        // R115-1 FIX: Include both thread-group leader and child threads (any
+        // process sharing our tgid that is still alive).
         let sibling_pids: alloc::vec::Vec<ProcessId> = {
             let table = crate::process::process_table_snapshot();
             table
@@ -2253,7 +2267,9 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
                 .filter(|&&p| {
                     if let Some(proc_arc) = get_process(p) {
                         let proc = proc_arc.lock();
-                        proc.tgid == tgid && proc.is_thread
+                        proc.tgid == tgid
+                            && proc.state != ProcessState::Zombie
+                            && proc.state != ProcessState::Terminated
                     } else {
                         false
                     }
@@ -2262,22 +2278,23 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
                 .collect()
         };
 
-        // Terminate all sibling threads first
+        // R115-1 FIX: Request termination of siblings via pending-kill flag.
+        // Do NOT call terminate_process() cross-CPU — that causes UAF.
+        let mut marked = 0usize;
         for &sibling_pid in &sibling_pids {
-            terminate_process(sibling_pid, exit_code);
+            if crate::process::request_process_exit(sibling_pid, exit_code) {
+                marked += 1;
+            }
         }
 
-        // Now terminate ourselves (same as sys_exit)
-        // LSM hook: notify policy of process exit (informational, doesn't block)
-        if let Some(exit_ctx) = lsm_current_process_ctx() {
-            let _ = lsm::hook_task_exit(&exit_ctx, exit_code);
-        }
-
+        // R115-1 FIX: Removed duplicate hook_task_exit() call.
+        // terminate_process() is the sole call site for the LSM exit hook.
+        // Now terminate ourselves directly (same CPU, always safe).
         terminate_process(pid, exit_code);
 
         kprintln!(
-            "Process {} (tgid={}) exit_group with code {} ({} siblings terminated)",
-            pid, tgid, exit_code, sibling_pids.len()
+            "Process {} (tgid={}) exit_group with code {} ({} sibling task(s) marked for exit)",
+            pid, tgid, exit_code, marked
         );
 
         crate::force_reschedule();

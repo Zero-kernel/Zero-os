@@ -237,7 +237,7 @@ pub fn default_action(signal: Signal) -> SignalAction {
     }
 }
 
-/// Send a signal to a process
+/// Send a signal to a process (user-facing, enforces POSIX permission checks).
 ///
 /// Executes the default action immediately for SIGKILL/SIGSTOP.
 /// Other signals are queued for later delivery.
@@ -260,6 +260,30 @@ pub fn default_action(signal: Signal) -> SignalAction {
 /// - sender.euid == target.uid
 /// - PID 1 (init) is additionally protected: only self can signal
 pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
+    send_signal_inner(pid, signal, true)
+}
+
+/// R115-2 FIX: Kernel-authoritative signal delivery — bypasses POSIX permission checks.
+///
+/// Only callable from kernel-internal paths that require unconditional authority:
+/// - PID namespace init-death cascade (must SIGKILL all members regardless of UID)
+/// - OOM killer
+/// - Seccomp enforcement
+///
+/// MUST NOT be exposed to user-facing syscalls.
+pub fn send_signal_kernel(pid: ProcessId, signal: Signal) -> Result<SignalAction, SignalError> {
+    send_signal_inner(pid, signal, false)
+}
+
+/// Inner implementation shared by user-facing and kernel-internal signal paths.
+///
+/// When `enforce_permissions` is true, POSIX UID/EUID checks are applied.
+/// When false, the signal is delivered unconditionally (kernel authority).
+fn send_signal_inner(
+    pid: ProcessId,
+    signal: Signal,
+    enforce_permissions: bool,
+) -> Result<SignalAction, SignalError> {
     // 注意：我们需要调用调度器的 resume_stopped，它在 sched crate 中
     // 由于循环依赖的限制，我们通过回调机制实现
 
@@ -270,31 +294,37 @@ pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, Signa
 
     // 【安全修复 Z-9】POSIX 权限检查（深度防御）
     // 使用 UID/EUID 而非仅父子关系
-    if let Some(sender_pid) = process::current_pid() {
-        // PID 1 (init) 保护：只有 init 自己可以向自己发信号
-        if pid == 1 && sender_pid != 1 {
-            return Err(SignalError::PermissionDenied);
-        }
-
-        // 非自己的进程需要进行 POSIX 权限检查
-        if sender_pid != pid {
-            // 获取发送者凭证
-            let sender_creds = process::current_credentials().ok_or(SignalError::NoSuchProcess)?;
-
-            // R65-26 FIX: Read target UID from the same Arc we'll use for signal delivery
-            // This closes the TOCTOU window where PID could be reused between check and delivery
-            let target_uid = process_arc.lock().credentials.read().uid;
-
-            // POSIX 权限检查：
-            // 1. Root (euid == 0) 可以发信号给任何进程
-            // 2. sender.uid == target.uid
-            // 3. sender.euid == target.uid
-            let has_permission = sender_creds.euid == 0
-                || sender_creds.uid == target_uid
-                || sender_creds.euid == target_uid;
-
-            if !has_permission {
+    // R115-2 FIX: Only enforce permission checks on user-facing paths.
+    // Kernel-internal paths (namespace cascade, OOM killer) use send_signal_kernel()
+    // which sets enforce_permissions=false to bypass these checks.
+    if enforce_permissions {
+        if let Some(sender_pid) = process::current_pid() {
+            // PID 1 (init) 保护：只有 init 自己可以向自己发信号
+            if pid == 1 && sender_pid != 1 {
                 return Err(SignalError::PermissionDenied);
+            }
+
+            // 非自己的进程需要进行 POSIX 权限检查
+            if sender_pid != pid {
+                // 获取发送者凭证
+                let sender_creds =
+                    process::current_credentials().ok_or(SignalError::NoSuchProcess)?;
+
+                // R65-26 FIX: Read target UID from the same Arc we'll use for signal delivery
+                // This closes the TOCTOU window where PID could be reused between check and delivery
+                let target_uid = process_arc.lock().credentials.read().uid;
+
+                // POSIX 权限检查：
+                // 1. Root (euid == 0) 可以发信号给任何进程
+                // 2. sender.uid == target.uid
+                // 3. sender.euid == target.uid
+                let has_permission = sender_creds.euid == 0
+                    || sender_creds.uid == target_uid
+                    || sender_creds.euid == target_uid;
+
+                if !has_permission {
+                    return Err(SignalError::PermissionDenied);
+                }
             }
         }
     }
@@ -320,10 +350,6 @@ pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, Signa
         match action {
             SignalAction::Terminate => {
                 terminate_code = Some(signal_exit_code(signal));
-                // Need to reschedule if terminating current process
-                if process::current_pid() == Some(pid) {
-                    needs_reschedule = true;
-                }
             }
             SignalAction::Stop => {
                 // R98-1 FIX: Job-control stop is orthogonal to scheduler state.
@@ -358,9 +384,32 @@ pub fn send_signal(pid: ProcessId, signal: Signal) -> Result<SignalAction, Signa
         }
     } // Release process lock before calling scheduler functions
 
-    // Terminate process if needed
+    // H.0.7 FIX: Cross-CPU-safe fatal signal termination.
+    //
+    // send_signal_inner() may target a process running on another CPU (e.g. via
+    // sys_kill() or namespace cascade). Calling terminate_process() directly on a
+    // remote PID is the same cross-CPU UAF class as R115-1.
+    //
+    // - Self-termination (same CPU): terminate immediately, never return.
+    // - Remote termination (different CPU): defer via request_process_exit();
+    //   the target self-terminates at its next syscall return safe point.
     if let Some(code) = terminate_code {
-        process::terminate_process(pid, code);
+        if process::current_pid() == Some(pid) {
+            // Self: terminate directly (safe — we are on the target's CPU).
+            // Drop the Arc before entering the no-return path to avoid a
+            // permanent refcount leak (Codex review feedback).
+            drop(process_arc);
+            process::terminate_process(pid, code);
+            crate::scheduler_hook::force_reschedule();
+            // SAFETY: terminate_process set us to Zombie; we must never return
+            // to the caller. Halt until the scheduler picks another task.
+            loop {
+                x86_64::instructions::hlt();
+            }
+        } else {
+            // Remote: post a pending-kill flag; target checks at syscall return.
+            let _ = process::request_process_exit(pid, code);
+        }
     }
 
     // Resume stopped process - calls into scheduler to add to ready queue

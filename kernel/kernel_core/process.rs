@@ -12,7 +12,7 @@ use alloc::{
 };
 use cap::CapTable;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use lsm::ProcessCtx as LsmProcessCtx; // R25-7 FIX: Import LSM for task_exit hook
 use mm::memory::FrameAllocator;
 use mm::page_table;
@@ -522,6 +522,17 @@ pub struct Process {
     /// 退出码
     pub exit_code: Option<i32>,
 
+    /// R115-1 FIX: Cross-CPU exit request flag.
+    ///
+    /// `exit_group()` terminates sibling threads that may be running on other CPUs.
+    /// Directly calling `terminate_process()` cross-CPU is unsafe (UAF on kernel
+    /// stack/FPU state). Instead, the requesting CPU sets this flag, and the target
+    /// consumes it at a safe point (syscall return) to self-terminate.
+    pub pending_kill: AtomicBool,
+
+    /// R115-1 FIX: Exit code to use when `pending_kill` is consumed.
+    pub pending_exit_code: AtomicI32,
+
     /// 等待的子进程（Some(0) 表示等待任意子进程，Some(pid) 表示等待特定子进程）
     pub waiting_child: Option<ProcessId>,
 
@@ -730,6 +741,8 @@ impl Process {
             cloexec_fds: BTreeSet::new(),
             cap_table: Arc::new(CapTable::new()),
             exit_code: None,
+            pending_kill: AtomicBool::new(false),
+            pending_exit_code: AtomicI32::new(0),
             waiting_child: None,
             children: Vec::new(),
             cpu_time: 0,
@@ -1656,6 +1669,56 @@ pub fn process_table_snapshot() -> alloc::vec::Vec<ProcessId> {
         .collect()
 }
 
+/// R115-1 FIX: Request that a remote process terminates itself at a safe point.
+///
+/// Used by `exit_group()` to avoid cross-CPU UAF: sibling threads may be running
+/// on other CPUs, so we cannot directly call `terminate_process()`. Instead, we
+/// set a pending-kill flag that the target consumes on its next syscall return.
+///
+/// Returns `true` if the request was posted, `false` if the process does not
+/// exist or is already zombie/terminated.
+pub fn request_process_exit(pid: ProcessId, exit_code: i32) -> bool {
+    let proc_arc = match get_process(pid) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let proc = proc_arc.lock();
+    if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
+        return false;
+    }
+
+    // Store exit code first, then publish the kill flag with Release ordering
+    // so the consumer (AcqRel swap) sees a consistent exit_code.
+    proc.pending_exit_code.store(exit_code, Ordering::Relaxed);
+    proc.pending_kill.store(true, Ordering::Release);
+    true
+}
+
+/// R115-1 FIX: Consume a pending cross-CPU exit request for the given PID.
+///
+/// Returns `Some(exit_code)` if an exit was requested, otherwise `None`.
+/// Called from the syscall return path on the CPU that is actually running
+/// the target thread, ensuring termination happens locally (no cross-CPU UAF).
+pub fn take_pending_process_exit(pid: ProcessId) -> Option<i32> {
+    let proc_arc = get_process(pid)?;
+    let proc = proc_arc.lock();
+
+    if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
+        // Clear stale flag so it doesn't linger in diagnostics.
+        proc.pending_kill.store(false, Ordering::Relaxed);
+        return None;
+    }
+
+    // Swap the flag atomically; Acquire pairs with the Release store in
+    // request_process_exit() to ensure we see the correct exit_code.
+    if !proc.pending_kill.swap(false, Ordering::AcqRel) {
+        return None;
+    }
+
+    Some(proc.pending_exit_code.load(Ordering::Acquire))
+}
+
 /// 设置当前进程ID
 ///
 /// R67-4 FIX: Writes to per-CPU storage to avoid cross-CPU races.
@@ -2218,7 +2281,29 @@ pub fn notify_cpuset_task_left(cpuset_id: u32) {
     }
 }
 
-/// 终止进程
+/// Terminate a process and transition it to Zombie state.
+///
+/// # Process Lifecycle Contract (H.0.7)
+///
+/// **SAFETY:** This function may ONLY be called when the target process is:
+///   1. The currently-executing process on this CPU (`current_pid() == Some(pid)`), OR
+///   2. A process that has never been scheduled (pre-scheduler child during clone error cleanup).
+///
+/// Calling `terminate_process()` on a process that may be running on another CPU
+/// causes use-after-free: FPU state, cgroup accounting, kernel stack, and other
+/// resources are freed while the remote CPU may still be using them.
+///
+/// For remote termination, use `request_process_exit()` which sets a pending-kill
+/// flag that the target consumes at its next syscall return safe point.
+///
+/// # Callers (audited H.0.7):
+/// - `sys_exit()` — self
+/// - `sys_exit_group()` — self (siblings use `request_process_exit`)
+/// - `send_signal_inner()` fatal path — self only (remote uses `request_process_exit`)
+/// - `oom_kill()` — self only (remote uses `request_process_exit`)
+/// - Interrupt/exception handlers — self (`current_pid()`)
+/// - Seccomp Kill/Trap — self
+/// - `sys_clone()` error cleanup — pre-scheduler child
 pub fn terminate_process(pid: ProcessId, exit_code: i32) {
     if let Some(process) = get_process(pid) {
         let children_to_reparent: Vec<ProcessId>;
@@ -2436,7 +2521,12 @@ fn handle_namespace_init_death(
     dying_pid: ProcessId,
     pid_ns_chain: &[crate::pid_namespace::PidNamespaceMembership],
 ) {
-    use crate::signal::{send_signal, Signal};
+    // R115-2 FIX: Use kernel-authoritative signal delivery that bypasses POSIX
+    // permission checks. The dying init may lack CAP_KILL or matching UIDs for
+    // namespace members (e.g., setuid grandchild with UID 0), causing the cascade
+    // to silently fail with EPERM. Namespace teardown MUST unconditionally kill
+    // all members regardless of credentials.
+    use crate::signal::{send_signal_kernel, Signal};
 
     // Check each namespace in the chain (except root, which has no cascade)
     for membership in pid_ns_chain.iter() {
@@ -2473,8 +2563,8 @@ fn handle_namespace_init_death(
                             continue;
                         }
 
-                        // Send SIGKILL (uncatchable) to each process
-                        match send_signal(victim_pid, Signal::SIGKILL) {
+                        // R115-2 FIX: Send SIGKILL via kernel-authority path (no permission checks)
+                        match send_signal_kernel(victim_pid, Signal::SIGKILL) {
                             Ok(_) => {
                                 // R104-2 FIX: Gate victim PID logging.
                                 kprintln!(
@@ -3021,14 +3111,31 @@ pub fn oom_snapshot() -> Vec<mm::OomProcessInfo> {
 
 /// OOM killer 调用的进程终止函数
 ///
-/// 使用指定的退出码终止进程
+/// H.0.7 FIX: OOM victim selection is arbitrary — the victim may be running
+/// on any CPU. Direct `terminate_process()` on a remote PID causes the same
+/// cross-CPU UAF as R115-1. Use `request_process_exit()` for remote targets
+/// so the victim self-terminates at its next syscall return safe point.
 pub fn oom_kill(pid: ProcessId, exit_code: i32) {
-    terminate_process(pid, exit_code);
+    if current_pid() == Some(pid) {
+        // Self: we are on the victim's CPU, safe to terminate directly.
+        terminate_process(pid, exit_code);
+    } else {
+        // Remote: defer termination to avoid cross-CPU UAF.
+        let _ = request_process_exit(pid, exit_code);
+    }
 }
 
 /// OOM killer 调用的进程清理函数
 ///
-/// 清理僵尸进程并释放资源
+/// H.0.7 NOTE: When the OOM victim is on a remote CPU, `oom_kill()` uses
+/// `request_process_exit()` (deferred). The victim may NOT be Zombie yet when
+/// this function is called. `cleanup_zombie()` is a no-op for non-Zombie
+/// processes, so the actual cleanup happens later when:
+///   1. The victim reaches its syscall return safe point and self-terminates
+///   2. The victim's parent reaps it via waitpid/cleanup_zombie
+///
+/// This is the correct safety trade-off: deferred memory reclaim is preferable
+/// to cross-CPU use-after-free.
 pub fn oom_cleanup(pid: ProcessId) {
     cleanup_zombie(pid);
 }

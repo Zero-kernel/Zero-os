@@ -275,8 +275,14 @@ unsafe fn flush_all_pcid_without_invpcid() {
 /// 1. **INVPCID available**: Use INVPCID type 2 (most efficient, flushes all PCIDs)
 /// 2. **PCID enabled, no INVPCID**: Toggle CR4.PCIDE to flush all PCIDs
 /// 3. **No PCID**: Standard CR3 reload (fastest, no PCID tracking overhead)
+/// R115-4 FIX: Made `pub` to allow other kernel crates (security, arch) to use
+/// the PCID-aware flush path instead of raw `tlb::flush_all()`.
+///
+/// This is the **single flush API** that all kernel code should use for local
+/// TLB invalidation. Direct calls to `x86_64::instructions::tlb::flush_all()`
+/// bypass PCID generation tracking and may leave stale entries.
 #[inline]
-fn flush_all_local() {
+pub fn flush_all_local() {
     if is_invpcid_available() {
         // INVPCID type 2: flush all non-global entries for all PCIDs
         // Most efficient path - single instruction

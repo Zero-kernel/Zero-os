@@ -39,7 +39,6 @@ use crate::apic;
 use crate::interrupts;
 use crate::syscall;
 use mm::page_table::recursive_pd;
-use x86_64::instructions::tlb;
 use x86_64::structures::paging::PageTableFlags;
 
 // ============================================================================
@@ -605,7 +604,8 @@ fn make_trampoline_executable() {
                 let mut new_flags = pd_flags;
                 new_flags.remove(PageTableFlags::NO_EXECUTE);
                 pd_entry.set_addr(pd_addr, new_flags);
-                tlb::flush_all();
+                // R115-4 FIX: Use PCID-aware flush instead of raw tlb::flush_all()
+                mm::tlb_shootdown::flush_all_local();
                 klog_always!("[SMP] Trampoline (2MB huge) made executable");
             } else {
                 klog_always!("[SMP] Trampoline (2MB huge) already executable");
@@ -637,7 +637,8 @@ fn make_trampoline_executable() {
                 }
             }
 
-            tlb::flush_all();
+            // R115-4 FIX: Use PCID-aware flush instead of raw tlb::flush_all()
+            mm::tlb_shootdown::flush_all_local();
             klog_always!("[SMP] Trampoline (4KB page) made executable");
         }
     }
