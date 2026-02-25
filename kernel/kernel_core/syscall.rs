@@ -10,8 +10,9 @@
 use crate::cgroup;
 use crate::fork::PAGE_REF_COUNT;
 use crate::process::{
-    cleanup_zombie, create_process, create_process_in_namespace, current_net_ns_id, current_pid,
-    get_process, terminate_process, with_current_cap_table, ProcessId, ProcessState,
+    cleanup_unscheduled_process, cleanup_zombie, create_process, create_process_in_namespace,
+    current_net_ns_id, current_pid, get_process, terminate_process, with_current_cap_table,
+    ProcessId, ProcessState,
 };
 use cpu_local::{current_cpu, current_cpu_id, max_cpus};
 use alloc::format;
@@ -1703,6 +1704,15 @@ fn lsm_process_ctx_from(proc: &crate::process::Process) -> lsm::ProcessCtx {
 
 /// Enforce task_fork LSM hook after fork/clone succeeds.
 /// On denial, cleans up the child process and returns EPERM.
+///
+/// # H.0.9 Restriction
+///
+/// This function uses `cleanup_unscheduled_process()` which skips cpuset/cgroup
+/// teardown. It is ONLY safe to call on children created via `create_process()`
+/// that were never passed through `fork_inner()` (i.e., the CLONE_VM main path
+/// in sys_clone). For fork-based children where fork_inner ran (cpuset joined,
+/// cgroup attached), callers must inline the LSM check and use
+/// `request_process_exit()` + scheduler enqueue instead.
 fn enforce_lsm_task_fork(parent_pid: ProcessId, child_pid: ProcessId) -> Result<(), SyscallError> {
     let parent_arc = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
     let child_arc = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
@@ -1720,8 +1730,9 @@ fn enforce_lsm_task_fork(parent_pid: ProcessId, child_pid: ProcessId) -> Result<
             parent.children.retain(|&pid| pid != child_pid);
         }
         // Use exit code 128 + signal (SIGSYS=31) to indicate security termination
-        terminate_process(child_pid, 128 + 31);
-        cleanup_zombie(child_pid);
+        // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process to
+        // avoid cgroup/cpuset/IPC detach on never-joined subsystems.
+        cleanup_unscheduled_process(child_pid);
         return Err(lsm_error_to_syscall(err));
     }
 
@@ -1890,8 +1901,10 @@ pub fn syscall_dispatcher(
                         timestamp,
                     );
                     // Terminate with SIGSYS exit code (128 + 31 = 159)
+                    // R116-3 FIX: Do NOT call cleanup_zombie() on self — it frees
+                    // the active CR3 page tables while we are still executing.
+                    // Parent will reap via waitpid.
                     crate::process::terminate_process(pid, 128 + 31);
-                    crate::process::cleanup_zombie(pid);
                 }
             }
             // R39-2 FIX: Never return to userspace after fatal seccomp action.
@@ -1919,8 +1932,10 @@ pub fn syscall_dispatcher(
                         timestamp,
                     );
                     // Terminate with SIGSYS semantics until proper signal delivery exists
+                    // R116-3 FIX: Do NOT call cleanup_zombie() on self — it frees
+                    // the active CR3 page tables while we are still executing.
+                    // Parent will reap via waitpid.
                     crate::process::terminate_process(pid, 128 + 31);
-                    crate::process::cleanup_zombie(pid);
                 }
             }
             // R39-2 FIX: Never return to userspace after fatal seccomp action.
@@ -2358,19 +2373,32 @@ fn sys_fork() -> SyscallResult {
     match crate::fork::sys_fork() {
         Ok(child_pid) => {
             // LSM hook: check if policy allows this fork
-            enforce_lsm_task_fork(parent_pid, child_pid)?;
-
-            // R101-3 FIX: Notify scheduler about the new child process.
             //
-            // Previously, sys_fork() did not call notify_scheduler_add_process(),
-            // causing forked children to exist in the process table but never be
-            // added to the scheduler's run queue. This made fork() a resource leak
-            // DoS vector — each call consumed a PID, kernel stack, and page tables
-            // that were never reclaimed because the child never ran to completion.
-            //
-            // This matches the pattern used in sys_clone() at line ~3074.
-            if let Some(child_arc) = get_process(child_pid) {
-                crate::process::notify_scheduler_add_process(child_arc);
+            // H.0.9 FIX: Cannot use enforce_lsm_task_fork() here because it calls
+            // cleanup_unscheduled_process() which skips cpuset/cgroup teardown.
+            // fork::sys_fork() ran fork_inner which joined cpuset and attached cgroup.
+            // On LSM denial, use terminate_process() + cleanup_zombie() for full teardown.
+            // This is safe because the child was never scheduled (no SMP race).
+            {
+                let parent_arc_lsm = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
+                let child_arc_lsm = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
+                let (parent_ctx, child_ctx) = {
+                    let parent = parent_arc_lsm.lock();
+                    let child = child_arc_lsm.lock();
+                    (lsm_process_ctx_from(&parent), lsm_process_ctx_from(&child))
+                };
+                if let Err(err) = lsm::hook_task_fork(&parent_ctx, &child_ctx) {
+                    if let Some(parent) = get_process(parent_pid) {
+                        parent.lock().children.retain(|&pid| pid != child_pid);
+                    }
+                    // H.0.9: Child was fully forked (cpuset/cgroup joined) but never
+                    // scheduled. terminate_process + cleanup_zombie gives full teardown
+                    // including cpuset task_left and cgroup detach. Safe because no CPU
+                    // has ever run this process (no SMP race on PCB).
+                    terminate_process(child_pid, 128 + crate::signal::Signal::SIGKILL.as_i32());
+                    cleanup_zombie(child_pid);
+                    return Err(lsm_error_to_syscall(err));
+                }
             }
 
             // F.1 PID Namespace: Translate child's global PID to parent's namespace view
@@ -2381,16 +2409,48 @@ fn sys_fork() -> SyscallResult {
             // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
             // Falling back to global PID would break PID namespace isolation, allowing
             // processes to observe kernel-internal PIDs across namespace boundaries.
+            //
+            // H.0.9 FIX: PID translation is performed BEFORE scheduler enqueue. On
+            // translation failure, the child is still unscheduled, so we can safely
+            // use terminate_process() + cleanup_zombie() for synchronous full teardown
+            // (no zombie accumulation, no cpuset/cgroup leak).
             let parent_view_pid = {
                 let parent = parent_arc.lock();
                 let owning_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain);
                 if let Some(ns) = owning_ns {
                     crate::pid_namespace::pid_in_namespace(&ns, child_pid)
-                        .ok_or(SyscallError::EFAULT)?
                 } else {
-                    child_pid
+                    Some(child_pid)
                 }
             };
+
+            let parent_view_pid = match parent_view_pid {
+                Some(pid) => pid,
+                None => {
+                    // H.0.9: Child is fully forked (cpuset/cgroup joined) but never
+                    // scheduled. terminate_process + cleanup_zombie gives full teardown.
+                    if let Some(parent) = get_process(parent_pid) {
+                        parent.lock().children.retain(|&p| p != child_pid);
+                    }
+                    terminate_process(child_pid, 128 + crate::signal::Signal::SIGKILL.as_i32());
+                    cleanup_zombie(child_pid);
+                    return Err(SyscallError::EFAULT);
+                }
+            };
+
+            // R101-3 FIX: Notify scheduler about the new child process.
+            //
+            // Previously, sys_fork() did not call notify_scheduler_add_process(),
+            // causing forked children to exist in the process table but never be
+            // added to the scheduler's run queue. This made fork() a resource leak
+            // DoS vector — each call consumed a PID, kernel stack, and page tables
+            // that were never reclaimed because the child never ran to completion.
+            //
+            // H.0.9: Moved AFTER PID translation so translation failure can use
+            // synchronous terminate_process + cleanup_zombie (child not yet enqueued).
+            if let Some(child_arc) = get_process(child_pid) {
+                crate::process::notify_scheduler_add_process(child_arc);
+            }
 
             Ok(parent_view_pid)
         }
@@ -2699,22 +2759,68 @@ fn sys_clone(
             Ok(child_pid) => {
                 // fork 成功，执行 LSM 检查
                 // 这种情况很少见（clone 不带 CLONE_VM 通常就是 fork）
-                enforce_lsm_task_fork(parent_pid, child_pid)?;
+                //
+                // H.0.9 FIX: Cannot use enforce_lsm_task_fork() here because it calls
+                // cleanup_unscheduled_process() which skips cpuset/cgroup teardown.
+                // fork::sys_fork() ran fork_inner (cpuset joined, cgroup attached).
+                // On LSM denial, use terminate_process + cleanup_zombie for full
+                // teardown. Safe because the child was never scheduled (no SMP race).
+                {
+                    let parent_arc_lsm = get_process(parent_pid).ok_or(SyscallError::ESRCH)?;
+                    let child_arc_lsm = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
+                    let (parent_ctx, child_ctx) = {
+                        let p = parent_arc_lsm.lock();
+                        let c = child_arc_lsm.lock();
+                        (lsm_process_ctx_from(&p), lsm_process_ctx_from(&c))
+                    };
+                    if let Err(err) = lsm::hook_task_fork(&parent_ctx, &child_ctx) {
+                        if let Some(parent) = get_process(parent_pid) {
+                            parent.lock().children.retain(|&pid| pid != child_pid);
+                        }
+                        // H.0.9: Child was fully forked (cpuset/cgroup joined) but never
+                        // scheduled. terminate_process + cleanup_zombie gives full teardown.
+                        terminate_process(child_pid, 128 + crate::signal::Signal::SIGKILL.as_i32());
+                        cleanup_zombie(child_pid);
+                        return Err(lsm_error_to_syscall(err));
+                    }
+                }
 
                 // F.1: Translate to parent's namespace view before returning
                 //
                 // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
+                //
+                // H.0.9 FIX: Translation failure must not leak the child. fork::sys_fork()
+                // ran fork_inner (cpuset joined, cgroup attached) but did NOT add to
+                // scheduler. Use terminate_process + cleanup_zombie for synchronous
+                // full teardown (no zombie, no cpuset/cgroup leak).
                 let parent_view_pid = {
                     let parent = parent_arc.lock();
                     let owning_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain);
                     if let Some(ns) = owning_ns {
                         crate::pid_namespace::pid_in_namespace(&ns, child_pid)
-                            .ok_or(SyscallError::EFAULT)?
                     } else {
-                        child_pid
+                        Some(child_pid)
                     }
                 };
-                return Ok(parent_view_pid);
+                match parent_view_pid {
+                    Some(pid) => {
+                        // H.0.9: fork::sys_fork() does not add to scheduler; enqueue now.
+                        if let Some(child_arc) = get_process(child_pid) {
+                            crate::process::notify_scheduler_add_process(child_arc);
+                        }
+                        return Ok(pid);
+                    }
+                    None => {
+                        // Child was fully forked (cpuset/cgroup joined) but never scheduled.
+                        // H.0.9: Use terminate_process + cleanup_zombie for full teardown.
+                        if let Some(parent) = get_process(parent_pid) {
+                            parent.lock().children.retain(|&pid| pid != child_pid);
+                        }
+                        terminate_process(child_pid, 128 + crate::signal::Signal::SIGKILL.as_i32());
+                        cleanup_zombie(child_pid);
+                        return Err(SyscallError::EFAULT);
+                    }
+                }
             }
             Err(_) => return Err(SyscallError::ENOMEM),
         }
@@ -2960,7 +3066,12 @@ fn sys_clone(
         if is_shared_space && parent_seccomp_installing {
             child.state = ProcessState::Terminated;
             drop(child);
-            crate::process::terminate_process(child_pid, -1);
+            // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process
+            // to avoid cgroup/cpuset/IPC detach on never-joined subsystems.
+            if let Some(parent) = get_process(parent_pid) {
+                parent.lock().children.retain(|&p| p != child_pid);
+            }
+            cleanup_unscheduled_process(child_pid);
             // R103-L2 FIX: Gate diagnostic println behind debug_assertions.
             // In release builds this leaks internal PID and seccomp race state.
             kprintln!(
@@ -2979,7 +3090,12 @@ fn sys_clone(
                 // Clean up: terminate the child process we just created
                 child.state = ProcessState::Terminated;
                 drop(child);
-                crate::process::terminate_process(child_pid, -1);
+                // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process
+                // to avoid cgroup/cpuset/IPC detach on never-joined subsystems.
+                if let Some(parent) = get_process(parent_pid) {
+                    parent.lock().children.retain(|&p| p != child_pid);
+                }
+                cleanup_unscheduled_process(child_pid);
                 return Err(SyscallError::EBUSY);
             }
             child.tgid = parent_tgid; // 加入父进程的线程组
@@ -3060,7 +3176,12 @@ fn sys_clone(
             child.state = ProcessState::Terminated;
             child.memory_space = 0; // Do not free shared address space
             drop(child);
-            crate::process::terminate_process(child_pid, -1);
+            // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process
+            // to avoid cgroup/cpuset/IPC detach on never-joined subsystems.
+            if let Some(parent) = get_process(parent_pid) {
+                parent.lock().children.retain(|&p| p != child_pid);
+            }
+            cleanup_unscheduled_process(child_pid);
             return Err(SyscallError::EBUSY);
         }
 
@@ -3086,10 +3207,12 @@ fn sys_clone(
                 child.state = ProcessState::Terminated;
                 child.memory_space = 0; // 不释放共享地址空间
                 drop(child);
-                // 通过cleanup_zombie安全地从进程表移除
-                // 但由于子进程还未设置为Zombie状态，我们直接使用terminate
-                // 注意：此时子进程未被调度，terminate_process安全
-                crate::process::terminate_process(child_pid, -1);
+                // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process
+                // to avoid cgroup/cpuset/IPC detach on never-joined subsystems.
+                if let Some(parent) = get_process(parent_pid) {
+                    parent.lock().children.retain(|&p| p != child_pid);
+                }
+                cleanup_unscheduled_process(child_pid);
                 return Err(SyscallError::EINVAL);
             }
             child.fs_base = tls;
@@ -3216,15 +3339,26 @@ fn sys_clone(
     // For processes in child namespaces, the parent sees a different PID.
     //
     // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
+    // H.0.9 FIX: Translation failure must clean up the unscheduled child.
     let parent_view_pid = {
         let parent = parent_arc.lock();
         let owning_ns = crate::pid_namespace::owning_namespace(&parent.pid_ns_chain);
         if let Some(ns) = owning_ns {
             crate::pid_namespace::pid_in_namespace(&ns, child_pid)
-                .ok_or(SyscallError::EFAULT)?
         } else {
             // No namespace chain (shouldn't happen), fall back to global PID
-            child_pid
+            Some(child_pid)
+        }
+    };
+    let parent_view_pid = match parent_view_pid {
+        Some(pid) => pid,
+        None => {
+            // Child was created via create_process() and never scheduled.
+            if let Some(parent) = get_process(parent_pid) {
+                parent.lock().children.retain(|&p| p != child_pid);
+            }
+            cleanup_unscheduled_process(child_pid);
+            return Err(SyscallError::EFAULT);
         }
     };
 
@@ -3235,10 +3369,21 @@ fn sys_clone(
     // With CLONE_NEWPID, the child's owning namespace is a new child namespace,
     // where it is PID 1 (the init process of that namespace).
     // R94-6 FIX: Translation failure returns EFAULT instead of leaking global PID.
+    // H.0.9 FIX: Translation failure must clean up the unscheduled child.
     let child_view_pid = {
         let child = child_arc.lock();
         crate::pid_namespace::pid_in_owning_namespace(&child.pid_ns_chain)
-            .ok_or(SyscallError::EFAULT)?
+    };
+    let child_view_pid = match child_view_pid {
+        Some(pid) => pid,
+        None => {
+            // Child was created via create_process() and never scheduled.
+            if let Some(parent) = get_process(parent_pid) {
+                parent.lock().children.retain(|&p| p != child_pid);
+            }
+            cleanup_unscheduled_process(child_pid);
+            return Err(SyscallError::EFAULT);
+        }
     };
 
     // R104-3 FIX: Move LSM check BEFORE user memory writes to prevent observable
@@ -3257,11 +3402,12 @@ fn sys_clone(
         if let Err(e) = copy_to_user(parent_tid as *mut u8, &tid_bytes) {
             // R104-3 FIX: Clean up child process on copy_to_user failure to prevent
             // PID / kernel-stack / address-space leak.
+            // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process
+            // to avoid cgroup/cpuset/IPC detach on never-joined subsystems.
             if let Some(parent) = get_process(parent_pid) {
                 parent.lock().children.retain(|&p| p != child_pid);
             }
-            terminate_process(child_pid, -1);
-            cleanup_zombie(child_pid);
+            cleanup_unscheduled_process(child_pid);
             return Err(e);
         }
     }
@@ -3276,11 +3422,12 @@ fn sys_clone(
         let tid_bytes = (child_view_pid as i32).to_ne_bytes();
         if let Err(e) = copy_to_user(child_tid as *mut u8, &tid_bytes) {
             // R104-3 FIX: Clean up child process on copy_to_user failure.
+            // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process
+            // to avoid cgroup/cpuset/IPC detach on never-joined subsystems.
             if let Some(parent) = get_process(parent_pid) {
                 parent.lock().children.retain(|&p| p != child_pid);
             }
-            terminate_process(child_pid, -1);
-            cleanup_zombie(child_pid);
+            cleanup_unscheduled_process(child_pid);
             return Err(e);
         }
     }

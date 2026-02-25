@@ -588,9 +588,19 @@ fn handle_user_exception(stack_frame: &InterruptStackFrame, exit_code: i32) -> b
     }
 
     if let Some(pid) = current_pid() {
+        // R116-1 FIX: After terminate_process(), we MUST NOT return to the caller.
+        // The x86-interrupt ABI will IRET back to the faulting user instruction,
+        // but the process is now Zombie. On SMP, the parent can concurrently reap
+        // via waitpid → cleanup_zombie → free_address_space, freeing the CR3 page
+        // tables and kernel stack while this CPU is still executing the IRET path.
+        // Instead, force a reschedule and halt — same pattern as signal.rs:402-408.
         kernel_core::process::terminate_process(pid, exit_code);
-        kernel_core::request_resched_from_irq();
-        return true;
+        kernel_core::force_reschedule();
+        // SAFETY: terminate_process set us to Zombie; we must never return
+        // to the caller. Halt until the scheduler picks another task.
+        loop {
+            x86_64::instructions::hlt();
+        }
     }
 
     // No current PID despite CS.RPL==3: this is a kernel bug (orphaned user-mode
@@ -962,9 +972,13 @@ extern "x86-interrupt" fn page_fault_handler(
         // if a non-annotated access slips in.
         if let Some(pid) = kernel_core::process::current_pid() {
             // SIGSEGV 的退出码为 128 + 11 = 139
+            // R116-1 FIX: Do NOT return after terminate — IRET would resume the
+            // zombie on freed page tables. Halt loop prevents UAF.
             kernel_core::process::terminate_process(pid, 139);
-            kernel_core::request_resched_from_irq();
-            return;
+            kernel_core::force_reschedule();
+            loop {
+                x86_64::instructions::hlt();
+            }
         }
 
         // 无法识别当前进程时仍保持 panic 以避免静默失败
@@ -989,17 +1003,15 @@ extern "x86-interrupt" fn page_fault_handler(
 
     if is_user_mode && fault_addr < USER_SPACE_TOP {
         if let Some(pid) = kernel_core::process::current_pid() {
-            // 标记进程为待终止状态并设置重调度标志
-            // 实际终止在返回用户态前的安全路径中执行
             // SIGSEGV 的退出码为 128 + 11 = 139
+            // R116-1 FIX: Do NOT return after terminate — IRET would resume the
+            // zombie on freed page tables. On SMP, parent can concurrently reap
+            // via waitpid, freeing CR3 while this CPU is on the IRET path.
             kernel_core::process::terminate_process(pid, 139);
-
-            // 设置重调度标志，让调度器在安全点切换进程
-            kernel_core::request_resched_from_irq();
-
-            // 返回让中断框架执行 iret
-            // 由于进程已被标记为 Zombie，调度器不会再选择它
-            return;
+            kernel_core::force_reschedule();
+            loop {
+                x86_64::instructions::hlt();
+            }
         }
     }
 
@@ -1218,6 +1230,31 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     // 2. 没有正确的 iret 降权路径
     // 实际调度延迟到安全路径（syscall 返回）执行
     if returning_to_user {
+        // R116-2 FIX: Check pending_kill before returning to user-mode.
+        // The R115-1 pending_kill flag is only consumed at syscall return
+        // (syscall.rs:2186). A userspace thread in a tight CPU loop (no syscalls)
+        // never reaches that check. Timer IRQ is the only interrupt that regularly
+        // fires on compute-bound threads, so we must check here to ensure
+        // exit_group()/SIGKILL can terminate such threads.
+        if let Some(pid) = current_pid() {
+            if let Some(exit_code) = kernel_core::process::take_pending_process_exit(pid) {
+                kernel_core::process::terminate_process(pid, exit_code);
+
+                // Must restore FPU and exit IRQ context before entering halt loop,
+                // otherwise we leak IRQ nesting state on this CPU.
+                unsafe {
+                    irq_restore_fpu();
+                }
+                current_cpu().irq_exit();
+
+                kernel_core::force_reschedule();
+                // SAFETY: Process is Zombie; halt until scheduler picks another task.
+                loop {
+                    x86_64::instructions::hlt();
+                }
+            }
+        }
+
         kernel_core::request_resched_from_irq();
     }
 

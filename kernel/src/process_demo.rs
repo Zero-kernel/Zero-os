@@ -1,7 +1,7 @@
 //! 进程管理和调度器演示模块
 
 use kernel_core::process::{
-    create_process, get_process, get_process_stats, terminate_process, ProcessState,
+    create_process, get_process, get_process_stats, request_process_exit,
 };
 use sched::scheduler::{add_process, get_scheduler_stats, ready_count, schedule, tick};
 
@@ -84,10 +84,15 @@ pub fn demo_process_management() {
 
     // 演示7: 终止进程
     klog!(Info, "\n7. Terminating processes...");
-    terminate_process(proc1, 0);
-    terminate_process(proc2, 0);
-    terminate_process(proc3, 0);
-    klog!(Info, "   ✓ All worker processes terminated");
+    // H.0.9 FIX: Use request_process_exit() instead of terminate_process() for
+    // terminate_process() caller contract compliance. These demo processes were
+    // added to the scheduler and could theoretically run on other CPUs in SMP.
+    // (In practice this demo runs during single-CPU boot before APs are online.)
+    // Demo processes have ppid=0 so will remain as zombies until init reaps them.
+    let _ = request_process_exit(proc1, 0);
+    let _ = request_process_exit(proc2, 0);
+    let _ = request_process_exit(proc3, 0);
+    klog!(Info, "   ✓ Exit requested for all worker processes");
 
     // 最终统计
     klog!(Info, "\n8. Final statistics:");

@@ -972,8 +972,10 @@ extern "C" fn syscall_bad_return(user_rip: u64, user_rsp: u64) -> ! {
     // Terminate the current process with SIGSEGV-style exit code
     if let Some(pid) = kernel_core::process::current_pid() {
         // Exit code 128 + 11 = 139 (SIGSEGV)
+        // R116-3 FIX: Do NOT call cleanup_zombie() on self — it frees
+        // the active CR3 page tables and kernel stack while we are still
+        // executing on them. Parent will reap via waitpid.
         kernel_core::process::terminate_process(pid, 139);
-        kernel_core::process::cleanup_zombie(pid);
     }
 
     // Never resume to user; let scheduler pick a new task.

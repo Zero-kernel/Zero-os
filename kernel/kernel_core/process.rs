@@ -2283,27 +2283,41 @@ pub fn notify_cpuset_task_left(cpuset_id: u32) {
 
 /// Terminate a process and transition it to Zombie state.
 ///
-/// # Process Lifecycle Contract (H.0.7)
+/// # Process Lifecycle Contract (H.0.7 + H.0.9)
 ///
 /// **SAFETY:** This function may ONLY be called when the target process is:
 ///   1. The currently-executing process on this CPU (`current_pid() == Some(pid)`), OR
 ///   2. A process that has never been scheduled (pre-scheduler child during clone error cleanup).
+///
+/// **NO-RETURN RULE (H.0.9):** When terminating self (case 1), the caller MUST
+/// enter a no-return halt loop after this call (`force_reschedule()` + `loop { hlt() }`).
+/// Returning to the caller (especially via IRET in exception handlers) allows the zombie
+/// to continue executing on freed page tables — use-after-free.
 ///
 /// Calling `terminate_process()` on a process that may be running on another CPU
 /// causes use-after-free: FPU state, cgroup accounting, kernel stack, and other
 /// resources are freed while the remote CPU may still be using them.
 ///
 /// For remote termination, use `request_process_exit()` which sets a pending-kill
-/// flag that the target consumes at its next syscall return safe point.
+/// flag that the target consumes at its next syscall return or timer IRQ safe point.
 ///
-/// # Callers (audited H.0.7):
-/// - `sys_exit()` — self
-/// - `sys_exit_group()` — self (siblings use `request_process_exit`)
-/// - `send_signal_inner()` fatal path — self only (remote uses `request_process_exit`)
-/// - `oom_kill()` — self only (remote uses `request_process_exit`)
-/// - Interrupt/exception handlers — self (`current_pid()`)
-/// - Seccomp Kill/Trap — self
-/// - `sys_clone()` error cleanup — pre-scheduler child
+/// # Callers (audited H.0.9):
+/// - `sys_exit()` — self + halt loop
+/// - `sys_exit_group()` — self + halt loop (siblings use `request_process_exit`)
+/// - `send_signal_inner()` fatal path — self + halt loop (remote uses `request_process_exit`)
+/// - Interrupt/exception handlers — self + halt loop (`handle_user_exception`, page_fault, usercopy)
+/// - Timer IRQ pending_kill check — self + halt loop
+/// - Seccomp Kill/Trap — self + halt loop
+/// - `syscall_bad_return()` — self + halt loop (fn -> !)
+/// - Syscall return pending_kill check — self + halt loop
+/// - `sys_fork()`/`sys_clone()` LSM denial on fork-based child — remote, never-scheduled
+///   (safe: no CPU has ever run this process; followed immediately by `cleanup_zombie()`)
+/// - `sys_clone()` no-CLONE_VM PID translation failure — remote, never-scheduled
+///   (safe: same reasoning; followed immediately by `cleanup_zombie()`)
+///
+/// Pre-scheduler children created via `create_process()` (sys_clone CLONE_VM error paths,
+/// main-path LSM rollback) use `cleanup_unscheduled_process()` instead, which avoids
+/// cross-subsystem detach on never-joined cgroup/cpuset/IPC subsystems.
 pub fn terminate_process(pid: ProcessId, exit_code: i32) {
     if let Some(process) = get_process(pid) {
         let children_to_reparent: Vec<ProcessId>;
@@ -2605,6 +2619,26 @@ pub fn wait_process(pid: ProcessId) -> Option<i32> {
 
 /// 清理僵尸进程
 ///
+/// # Reaper Contract (H.0.9)
+///
+/// **SAFETY:** This function MUST ONLY be called by a **reaper** — the parent process
+/// via `waitpid()`, the init reaper, or the OOM cleanup path (remote only).
+/// NEVER call on the currently-executing process (`current_pid() == Some(pid)`).
+///
+/// Self-reaping frees the active CR3 page tables and kernel stack while the calling
+/// code is still executing — immediate use-after-free. A `debug_assert!` guards this
+/// invariant; violations are caught in debug builds.
+///
+/// # Callers (audited H.0.9):
+/// - `sys_wait4()` — parent reaps child (waitpid semantics)
+/// - `oom_cleanup()` — remote only (self-reap guarded by H.0.9 early return)
+/// - `sys_fork()`/`sys_clone()` LSM denial on fork-based child — immediately after
+///   `terminate_process()`, never-scheduled (remote-only invariant holds)
+/// - `sys_clone()` no-CLONE_VM PID translation failure — same as above
+///
+/// Pre-scheduler children created via `create_process()` (sys_clone CLONE_VM error paths,
+/// main-path LSM rollback) use `cleanup_unscheduled_process()` instead.
+///
 /// R114-1 FIX: Two-phase reap to prevent deadlock.
 ///
 /// Previously, `free_process_resources()` (and its IPC/futex cleanup callbacks) was called
@@ -2620,6 +2654,14 @@ pub fn wait_process(pid: ProcessId) -> Option<i32> {
 ///   cleanup callbacks, and notify the scheduler. These callbacks may safely re-lock
 ///   `PROCESS_TABLE` since we no longer hold it.
 pub fn cleanup_zombie(pid: ProcessId) {
+    // R116-3 FIX: cleanup_zombie() is designed to be called by a reaper (parent
+    // via waitpid), NOT by the zombie itself. Self-reaping frees the active CR3
+    // page tables and kernel stack while the calling code is still executing.
+    debug_assert!(
+        current_pid() != Some(pid),
+        "cleanup_zombie called on self (pid={}) — self-reaping causes UAF",
+        pid
+    );
     // Phase 1: Detach process from PROCESS_TABLE under lock.
     // After `slot.take()`, no other code path can look up this PID in the table,
     // so the extracted Arc is the sole remaining reference to the PCB.
@@ -2720,6 +2762,118 @@ pub fn cleanup_zombie(pid: ProcessId) {
 
         notify_scheduler_process_removed(reaped_pid);
         klog!(Info, "Cleaned up zombie process {}", reaped_pid);
+    }
+}
+
+/// Clean up a process that was created by `create_process()` but never scheduled.
+///
+/// # Pre-scheduler Child Contract (H.0.9)
+///
+/// This function is for **error-path cleanup only** — when `sys_clone()` or
+/// `enforce_lsm_task_fork()` creates a child via `create_process()` but encounters
+/// an error before the child reaches `notify_scheduler_add_process()`.
+///
+/// Unlike the `terminate_process()` + `cleanup_zombie()` pair, this function
+/// performs **only kernel-internal resource teardown** and PID namespace detachment.
+/// It deliberately skips cross-subsystem callbacks that assume full initialization:
+///
+/// - **No cgroup detach** — `create_process()` does not call `cgroup.attach_task()`
+///   for ppid != 0; that is done later in `fork_inner()`. Detaching an unattached
+///   task causes `fetch_sub` underflow on cgroup task counters.
+///
+/// - **No cpuset task_left** — `notify_cpuset_task_joined()` is called in
+///   `fork_inner()` (fork.rs), not in `create_process()` for ppid != 0. Decrementing
+///   a never-incremented counter causes `fetch_sub` underflow.
+///
+/// - **No IPC cleanup** — the child never registered IPC endpoints.
+///
+/// - **No scheduler removal** — the child was never added to any run queue.
+///
+/// # Arguments
+///
+/// * `pid` - The PID of the pre-scheduler child to clean up
+///
+/// # Panics (debug)
+///
+/// Panics if called on the currently-executing process (self-cleanup is UAF).
+///
+/// # Callers (audited H.0.9)
+///
+/// - `enforce_lsm_task_fork()` — LSM hook denied the fork
+/// - `sys_clone()` error paths (7 sites) — seccomp installing, frame unavailable,
+///   invalid TLS, copy_to_user failure
+pub fn cleanup_unscheduled_process(pid: ProcessId) {
+    debug_assert!(
+        current_pid() != Some(pid),
+        "cleanup_unscheduled_process called on self (pid={}) — self-cleanup causes UAF",
+        pid
+    );
+
+    // Phase 1: Detach from PROCESS_TABLE under lock, capturing info for Phase 2.
+    let cleanup_info = {
+        let mut table = PROCESS_TABLE.lock();
+
+        if let Some(slot) = table.get_mut(pid) {
+            if let Some(process) = slot.take() {
+                let mut proc = process.lock();
+                proc.state = ProcessState::Terminated;
+
+                let memory_space = proc.memory_space;
+                let pid_ns_chain = proc.pid_ns_chain.clone();
+                let watchdog_handle = proc.watchdog_handle.take();
+
+                // Determine whether another live process shares this address space.
+                // If memory_space was already zeroed by the caller (to prevent
+                // freeing a shared CLONE_VM address space), keep_address_space is
+                // irrelevant since free_process_resources won't touch it.
+                let keep_address_space = if memory_space == 0 {
+                    false
+                } else {
+                    table.iter().enumerate().any(|(idx, other_slot)| {
+                        if idx == pid {
+                            return false;
+                        }
+                        if let Some(other_arc) = other_slot {
+                            let other = other_arc.lock();
+                            other.memory_space == memory_space
+                                && other.state != ProcessState::Terminated
+                        } else {
+                            false
+                        }
+                    })
+                };
+
+                drop(proc);
+                Some((process, keep_address_space, pid_ns_chain, watchdog_handle))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    // PROCESS_TABLE lock released here.
+
+    // Phase 2: Free resources without cross-subsystem callbacks.
+    if let Some((process, keep_address_space, pid_ns_chain, watchdog_handle)) = cleanup_info {
+        // G.1 Observability: Unregister watchdog before releasing other resources.
+        if let Some(handle) = watchdog_handle {
+            unregister_watchdog(&handle);
+        }
+
+        // Free kernel-internal resources (stack, mmap, fd_table, address space).
+        {
+            let mut proc = process.lock();
+            free_process_resources(&mut proc, keep_address_space);
+        }
+
+        // F.1 PID Namespace: Detach from all namespaces.
+        crate::pid_namespace::detach_pid_chain(&pid_ns_chain, pid);
+
+        // NOTE: No IPC cleanup, no cpuset task_left, no cgroup detach,
+        // no scheduler removal — none of those subsystems were joined.
+
+        klog!(Info, "Cleaned up unscheduled process {}", pid);
     }
 }
 
@@ -3112,31 +3266,35 @@ pub fn oom_snapshot() -> Vec<mm::OomProcessInfo> {
 /// OOM killer 调用的进程终止函数
 ///
 /// H.0.7 FIX: OOM victim selection is arbitrary — the victim may be running
-/// on any CPU. Direct `terminate_process()` on a remote PID causes the same
-/// cross-CPU UAF as R115-1. Use `request_process_exit()` for remote targets
-/// so the victim self-terminates at its next syscall return safe point.
+/// on any CPU. Use `request_process_exit()` for all targets (self and remote)
+/// so the victim self-terminates at its next syscall return or timer IRQ safe point.
+///
+/// H.0.9 FIX: Always use deferred termination (even for self) so the OOM handler
+/// can unwind normally: `kill_best_candidate()` must clear `OOM_RUNNING` and call
+/// `emit_audit()` after kill() returns. A halt loop in the self branch would wedge
+/// the OOM subsystem permanently and leak stack-local allocations (e.g., `snapshot`).
 pub fn oom_kill(pid: ProcessId, exit_code: i32) {
-    if current_pid() == Some(pid) {
-        // Self: we are on the victim's CPU, safe to terminate directly.
-        terminate_process(pid, exit_code);
-    } else {
-        // Remote: defer termination to avoid cross-CPU UAF.
-        let _ = request_process_exit(pid, exit_code);
-    }
+    let _ = request_process_exit(pid, exit_code);
 }
 
 /// OOM killer 调用的进程清理函数
 ///
-/// H.0.7 NOTE: When the OOM victim is on a remote CPU, `oom_kill()` uses
-/// `request_process_exit()` (deferred). The victim may NOT be Zombie yet when
-/// this function is called. `cleanup_zombie()` is a no-op for non-Zombie
-/// processes, so the actual cleanup happens later when:
-///   1. The victim reaches its syscall return safe point and self-terminates
+/// H.0.9 NOTE: `oom_kill()` always uses `request_process_exit()` (deferred),
+/// so the victim may NOT yet be Zombie when this function is called.
+/// `cleanup_zombie()` is a no-op for non-Zombie processes, so the actual
+/// cleanup happens later when:
+///   1. The victim reaches its next safe point and self-terminates
 ///   2. The victim's parent reaps it via waitpid/cleanup_zombie
 ///
 /// This is the correct safety trade-off: deferred memory reclaim is preferable
-/// to cross-CPU use-after-free.
+/// to cross-CPU use-after-free or OOM subsystem wedge.
 pub fn oom_cleanup(pid: ProcessId) {
+    // H.0.9 DEFENSE: Never self-reap. oom_kill() posted a pending-kill request
+    // and the current process may not yet be Zombie. The parent (or init reaper)
+    // will call cleanup_zombie() via waitpid after the victim self-terminates.
+    if current_pid() == Some(pid) {
+        return;
+    }
     cleanup_zombie(pid);
 }
 

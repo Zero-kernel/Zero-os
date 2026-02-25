@@ -113,11 +113,17 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
     if result.is_err() {
         // 从父进程子列表移除失败的占位 PID，防止悬挂
         parent.children.retain(|&pid| pid != child_pid);
-        // R77-3 FIX: Defensive rollback of cpuset task count.
-        // fork_inner calls notify_cpuset_task_joined() after critical allocations,
-        // so we roll back here for all error paths. If fork_inner failed before
-        // reaching that point, the callback uses saturating_sub to prevent underflow.
-        crate::process::notify_cpuset_task_left(parent_cpuset_id);
+        // H.0.9 FIX: Do NOT roll back cpuset task count on fork_inner failure.
+        //
+        // fork_inner() calls notify_cpuset_task_joined() (line 190) only AFTER
+        // the critical frame allocation succeeds. All error paths that can trigger
+        // (MemoryAllocationFailed, PageTableCopyFailed, ProcessNotFound) occur
+        // either before or independently of the cpuset join. Since the task count
+        // was never incremented, decrementing it causes fetch_sub underflow on the
+        // AtomicU32 counter (cpuset.rs task_left uses fetch_sub, not saturating_sub).
+        //
+        // The cgroup-attach-failure path in the `else` branch below correctly calls
+        // notify_cpuset_task_left because fork_inner succeeded (cpuset WAS joined).
         drop(parent);
         cleanup_partial_child(child_pid);
     } else {
@@ -330,7 +336,13 @@ fn cleanup_partial_child(child_pid: ProcessId) {
 
     // 预先收集需要释放的资源，避免长时间持有 PROCESS_TABLE 锁
     // G.1: Also extract watchdog handle for unregistration
-    let (kstack, addr_space, watchdog_handle): (Option<VirtAddr>, usize, Option<WatchdogHandle>) = {
+    // H.0.9: Also extract PID namespace chain for detachment outside lock
+    let (kstack, addr_space, watchdog_handle, pid_ns_chain): (
+        Option<VirtAddr>,
+        usize,
+        Option<WatchdogHandle>,
+        Vec<crate::pid_namespace::PidNamespaceMembership>,
+    ) = {
         let mut table = PROCESS_TABLE.lock();
         if let Some(slot) = table.get_mut(child_pid) {
             if let Some(process) = slot.take() {
@@ -344,12 +356,17 @@ fn cleanup_partial_child(child_pid: ProcessId) {
                     proc.memory_space,
                     // G.1: Take watchdog handle to unregister outside lock
                     proc.watchdog_handle.take(),
+                    // H.0.9: Capture PID namespace chain for detachment outside lock.
+                    // create_process() calls assign_pid_chain(), so the chain is populated
+                    // even for partially-constructed children. Without detachment, the
+                    // namespace PID slots leak and are never reclaimed.
+                    proc.pid_ns_chain.clone(),
                 )
             } else {
-                (None, 0, None)
+                (None, 0, None, Vec::new())
             }
         } else {
-            (None, 0, None)
+            (None, 0, None, Vec::new())
         }
     };
 
@@ -357,6 +374,12 @@ fn cleanup_partial_child(child_pid: ProcessId) {
     // This prevents false hung-task alerts for the partially-created process
     if let Some(handle) = watchdog_handle {
         unregister_watchdog(&handle);
+    }
+
+    // H.0.9: Detach PID namespace chain to reclaim namespace PID slots.
+    // Must be done outside PROCESS_TABLE lock to avoid lock ordering violation.
+    if !pid_ns_chain.is_empty() {
+        crate::pid_namespace::detach_pid_chain(&pid_ns_chain, child_pid);
     }
 
     // 在 PROCESS_TABLE 锁外释放资源
