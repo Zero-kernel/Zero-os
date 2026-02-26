@@ -11,8 +11,8 @@ use crate::cgroup;
 use crate::fork::PAGE_REF_COUNT;
 use crate::process::{
     cleanup_unscheduled_process, cleanup_zombie, create_process, create_process_in_namespace,
-    current_net_ns_id, current_pid, get_process, terminate_process, with_current_cap_table,
-    ProcessId, ProcessState,
+    current_net_ns_id, current_pid, get_process, terminate_process, terminate_self_and_halt,
+    with_current_cap_table, ProcessId, ProcessState,
 };
 use cpu_local::{current_cpu, current_cpu_id, max_cpus};
 use alloc::format;
@@ -1890,59 +1890,61 @@ pub fn syscall_dispatcher(
             // SECURITY: After terminating the process, we must not return to userspace.
             // The process state is now invalid (PCB cleaned up, memory potentially freed).
             // Returning would cause UAF and complete seccomp bypass.
-            if let Some(creds) = crate::current_credentials() {
-                if let Some(pid) = crate::process::current_pid() {
-                    seccomp::notify_violation(
-                        pid as u32,
-                        creds.uid,
-                        creds.gid,
-                        syscall_num,
-                        &verdict,
-                        timestamp,
-                    );
-                    // Terminate with SIGSYS exit code (128 + 31 = 159)
-                    // R116-3 FIX: Do NOT call cleanup_zombie() on self — it frees
-                    // the active CR3 page tables while we are still executing.
-                    // Parent will reap via waitpid.
-                    crate::process::terminate_process(pid, 128 + 31);
+            let pid = match crate::process::current_pid() {
+                Some(pid) => pid,
+                None => {
+                    // No current PID — should not happen. Force halt as fallback.
+                    crate::scheduler_hook::force_reschedule();
+                    loop {
+                        core::hint::spin_loop();
+                    }
                 }
+            };
+
+            if let Some(creds) = crate::current_credentials() {
+                seccomp::notify_violation(
+                    pid as u32,
+                    creds.uid,
+                    creds.gid,
+                    syscall_num,
+                    &verdict,
+                    timestamp,
+                );
             }
-            // R39-2 FIX: Never return to userspace after fatal seccomp action.
-            // Force scheduler to pick another task. If no tasks exist, CPU halts.
-            crate::scheduler_hook::force_reschedule();
-            // Safety: If reschedule returns (no other tasks), spin forever.
-            // This path should not be reached in normal operation.
-            loop {
-                core::hint::spin_loop();
-            }
+
+            // R117-1 FIX: Use centralized terminate_self_and_halt() which disables
+            // interrupts and switches to boot CR3 before halting, preventing timer
+            // IRQ UAF on the zombie's stack/CR3.
+            terminate_self_and_halt(pid, 128 + 31);
         }
         seccomp::SeccompAction::Trap => {
             increment_counter(TraceCounter::SyscallDenied, 1);
             // R25-4 + R39-2 FIX: Trap treated as fatal until SIGSYS delivery exists
             //
             // SECURITY: Same rationale as Kill - process is terminated, never return.
-            if let Some(creds) = crate::current_credentials() {
-                if let Some(pid) = crate::process::current_pid() {
-                    seccomp::notify_violation(
-                        pid as u32,
-                        creds.uid,
-                        creds.gid,
-                        syscall_num,
-                        &verdict,
-                        timestamp,
-                    );
-                    // Terminate with SIGSYS semantics until proper signal delivery exists
-                    // R116-3 FIX: Do NOT call cleanup_zombie() on self — it frees
-                    // the active CR3 page tables while we are still executing.
-                    // Parent will reap via waitpid.
-                    crate::process::terminate_process(pid, 128 + 31);
+            let pid = match crate::process::current_pid() {
+                Some(pid) => pid,
+                None => {
+                    crate::scheduler_hook::force_reschedule();
+                    loop {
+                        core::hint::spin_loop();
+                    }
                 }
+            };
+
+            if let Some(creds) = crate::current_credentials() {
+                seccomp::notify_violation(
+                    pid as u32,
+                    creds.uid,
+                    creds.gid,
+                    syscall_num,
+                    &verdict,
+                    timestamp,
+                );
             }
-            // R39-2 FIX: Never return to userspace after fatal seccomp action.
-            crate::scheduler_hook::force_reschedule();
-            loop {
-                core::hint::spin_loop();
-            }
+
+            // R117-1 FIX: Use centralized terminate_self_and_halt().
+            terminate_self_and_halt(pid, 128 + 31);
         }
         seccomp::SeccompAction::Errno(e) => {
             increment_counter(TraceCounter::SyscallDenied, 1);
@@ -2200,11 +2202,8 @@ pub fn syscall_dispatcher(
     // is guaranteed to not be in the middle of a kernel operation.
     if let Some(pid) = current_pid() {
         if let Some(exit_code) = crate::process::take_pending_process_exit(pid) {
-            terminate_process(pid, exit_code);
-            crate::force_reschedule();
-            loop {
-                x86_64::instructions::hlt();
-            }
+            // R117-1 FIX: Use centralized terminate_self_and_halt().
+            terminate_self_and_halt(pid, exit_code);
         }
     }
 
@@ -2231,23 +2230,12 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
         // R115-1 FIX: Removed duplicate hook_task_exit() call.
         // terminate_process() is the sole call site for the LSM exit hook,
         // preventing double-fire in audit logs.
-        terminate_process(pid, exit_code);
         // R104-2 FIX: Gate to prevent leaking PID in release builds.
         klog_always!("Process {} exited with code {}", pid, exit_code);
 
-        // 退出的进程不应继续运行，立即让出 CPU
-        // 这也会触发等待中的父进程被调度
-        crate::force_reschedule();
-
-        // 如果调度器选择了其他进程，这里不会返回
-        // 如果没有其他进程，系统会回到这里（但进程已是 Zombie 状态）
-        // 在这种情况下，我们必须阻止返回到用户空间
-        // 进入无限循环等待中断（其他进程可能会在定时器中断中被创建）
-        // R104-2 FIX: Gate idle-loop diagnostic.
-        klog_always!("[sys_exit] No other process to run, entering idle loop");
-        loop {
-            x86_64::instructions::hlt();
-        }
+        // R117-1 FIX: Use centralized terminate_self_and_halt() which disables
+        // interrupts and switches to boot CR3 before halting.
+        terminate_self_and_halt(pid, exit_code);
     } else {
         Err(SyscallError::ESRCH)
     }
@@ -2305,17 +2293,13 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
         // R115-1 FIX: Removed duplicate hook_task_exit() call.
         // terminate_process() is the sole call site for the LSM exit hook.
         // Now terminate ourselves directly (same CPU, always safe).
-        terminate_process(pid, exit_code);
-
         kprintln!(
             "Process {} (tgid={}) exit_group with code {} ({} sibling task(s) marked for exit)",
             pid, tgid, exit_code, marked
         );
 
-        crate::force_reschedule();
-        loop {
-            x86_64::instructions::hlt();
-        }
+        // R117-1 FIX: Use centralized terminate_self_and_halt().
+        terminate_self_and_halt(pid, exit_code);
     } else {
         Err(SyscallError::ESRCH)
     }
@@ -3818,7 +3802,8 @@ fn sys_exec(
         proc.context.r15 = 0;
 
         proc.mmap_regions.clear();
-        proc.next_mmap_addr = 0x4000_0000;
+        // H.2 Partial KASLR: Re-randomize mmap base on exec for ASLR
+        proc.next_mmap_addr = security::randomized_mmap_base(0x4000_0000);
 
         // 初始化堆管理（brk）
         // brk_start 和 brk 初始化为 ELF 最高段末尾（页对齐）

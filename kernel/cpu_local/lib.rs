@@ -201,6 +201,16 @@ pub struct PerCpuData {
     pub rcu_epoch: AtomicU64,
     /// Per-CPU TLB shootdown mailbox for cross-CPU invalidation
     pub tlb_mailbox: TlbShootdownMailbox,
+    // ---- KPTI per-CPU context (H.3) ----
+    /// Seqlock sequence counter for KPTI context consistency.
+    /// Even = no write in progress; odd = write in progress.
+    pub kpti_seq: AtomicU64,
+    /// KPTI user-mode CR3 value for this CPU's current process.
+    pub kpti_user_cr3: AtomicU64,
+    /// KPTI kernel-mode CR3 value for this CPU's current process.
+    pub kpti_kernel_cr3: AtomicU64,
+    /// KPTI PCID value for this CPU's current process.
+    pub kpti_pcid: AtomicU64,
 }
 
 // Safety: PerCpuData uses only atomics, so it's Send+Sync
@@ -224,6 +234,10 @@ impl PerCpuData {
             syscall_stack_top: AtomicUsize::new(0),
             rcu_epoch: AtomicU64::new(0),
             tlb_mailbox: TlbShootdownMailbox::new(),
+            kpti_seq: AtomicU64::new(0),
+            kpti_user_cr3: AtomicU64::new(0),
+            kpti_kernel_cr3: AtomicU64::new(0),
+            kpti_pcid: AtomicU64::new(0),
         }
     }
 

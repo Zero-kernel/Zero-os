@@ -711,7 +711,12 @@ fn make_trampoline_nonexecutable() {
 pub fn set_rsdp_address(rsdp_phys: u64) {
     RSDP_PHYS_ADDR.store(rsdp_phys, Ordering::Release);
     if rsdp_phys != 0 {
-        klog!(Info, "[SMP] RSDP address set to 0x{:x}", rsdp_phys);
+        // I.1 klog containment: Do not leak physical addresses in release builds.
+        // Raw RSDP address would defeat KASLR by revealing physical memory layout.
+        #[cfg(debug_assertions)]
+        kprintln!("[SMP] RSDP address set to 0x{:x}", rsdp_phys);
+        #[cfg(not(debug_assertions))]
+        klog!(Info, "[SMP] RSDP address configured");
     }
 }
 

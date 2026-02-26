@@ -47,9 +47,10 @@ use x86_64::VirtAddr;
 
 // Re-export public types
 pub use kaslr::{
-    enable_partial_kaslr, get_kernel_layout, init as init_kaslr, is_kaslr_enabled,
-    is_kpti_enabled, is_partial_kaslr_enabled, partial_kaslr_status, KernelLayout, KptiContext,
-    PartialKaslrFeature, PartialKaslrStatus, TrampolineDesc, KERNEL_PHYS_BASE, KERNEL_VIRT_BASE,
+    enable_partial_kaslr, get_kernel_layout, init as init_kaslr, install_kpti_context,
+    is_kaslr_enabled, is_kpti_enabled, is_partial_kaslr_enabled, kernel_stack_slide,
+    partial_kaslr_status, randomized_mmap_base, KernelLayout, KptiContext, PartialKaslrFeature,
+    PartialKaslrStatus, TrampolineDesc, KERNEL_PHYS_BASE, KERNEL_VIRT_BASE,
 };
 pub use kptr::KptrGuard;
 pub use memory_hardening::{

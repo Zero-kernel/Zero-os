@@ -975,15 +975,12 @@ extern "C" fn syscall_bad_return(user_rip: u64, user_rsp: u64) -> ! {
         // R116-3 FIX: Do NOT call cleanup_zombie() on self — it frees
         // the active CR3 page tables and kernel stack while we are still
         // executing on them. Parent will reap via waitpid.
-        kernel_core::process::terminate_process(pid, 139);
+        // R117-1 FIX: Use centralized terminate_self_and_halt().
+        kernel_core::process::terminate_self_and_halt(pid, 139);
     }
 
-    // Never resume to user; let scheduler pick a new task.
-    // We're on the kernel stack in interrupt-disabled state (cli was executed in asm).
-    // The scheduler will handle finding the next runnable task.
+    // No current PID — should not happen. Force halt as fallback.
     kernel_core::scheduler_hook::force_reschedule();
-
-    // If schedule() somehow returns (e.g., no other tasks), halt the CPU
     loop {
         x86_64::instructions::hlt();
     }

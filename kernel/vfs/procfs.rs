@@ -1316,40 +1316,79 @@ fn generate_stat(pid: u32) -> String {
     }
 }
 
+/// R117-2 FIX: Maximum number of mmap entries to emit in /proc/[pid]/maps.
+/// Prevents kernel OOM when a process has 100K+ mmap regions.
+const MAX_MAPS_ENTRIES: usize = 1000;
+
+/// R117-2 FIX: Maximum byte budget for /proc/[pid]/maps output.
+/// 64 KiB is sufficient for ~1000 entries at ~60 bytes each.
+const MAX_MAPS_OUTPUT: usize = 64 * 1024;
+
 /// Generate /proc/[pid]/maps content
 ///
 /// Shows the memory mappings for the process in Linux format:
 /// address           perms offset  dev   inode   pathname
+///
+/// R117-2 FIX: Output is bounded by MAX_MAPS_ENTRIES and MAX_MAPS_OUTPUT
+/// to prevent kernel OOM from processes with many mmap regions. When the
+/// budget is exceeded, a `... (truncated)\n` marker is appended.
 fn generate_maps(pid: u32) -> String {
     let table = PROCESS_TABLE.lock();
     if let Some(Some(proc)) = table.get(pid as usize) {
         let proc = proc.lock();
         let mut result = String::new();
+        let mut entries = 0usize;
+        let mut truncated = false;
 
         // Output mmap regions
         // R36-FIX: Use 16 hex digits for 64-bit addresses
         for (&start, &size) in &proc.mmap_regions {
+            if entries >= MAX_MAPS_ENTRIES || result.len() > MAX_MAPS_OUTPUT {
+                truncated = true;
+                break;
+            }
             let end = start + size;
             // Format: start-end perms offset dev:inode pathname
-            result.push_str(&format!(
+            let line = format!(
                 "{:016x}-{:016x} rw-p 00000000 00:00 0    [anon]\n",
                 start, end
-            ));
+            );
+            if result.len().saturating_add(line.len()) > MAX_MAPS_OUTPUT {
+                truncated = true;
+                break;
+            }
+            result.push_str(&line);
+            entries += 1;
         }
 
-        // Add stack mapping if present
-        if let Some(user_stack) = proc.user_stack {
-            let stack_top = user_stack.as_u64();
-            let stack_bottom = stack_top.saturating_sub(0x10000); // 64KB stack
-            result.push_str(&format!(
-                "{:016x}-{:016x} rw-p 00000000 00:00 0    [stack]\n",
-                stack_bottom, stack_top
-            ));
+        // Add stack mapping if present (only if budget allows)
+        if !truncated {
+            if let Some(user_stack) = proc.user_stack {
+                if entries < MAX_MAPS_ENTRIES {
+                    let stack_top = user_stack.as_u64();
+                    let stack_bottom = stack_top.saturating_sub(0x10000); // 64KB stack
+                    let line = format!(
+                        "{:016x}-{:016x} rw-p 00000000 00:00 0    [stack]\n",
+                        stack_bottom, stack_top
+                    );
+                    if result.len().saturating_add(line.len()) <= MAX_MAPS_OUTPUT {
+                        result.push_str(&line);
+                    } else {
+                        truncated = true;
+                    }
+                } else {
+                    truncated = true;
+                }
+            }
         }
 
-        if result.is_empty() {
+        if result.is_empty() && !truncated {
             // Fallback if no mappings
             result.push_str("0000000000400000-0000000000401000 r-xp 00000000 00:00 0    [code]\n");
+        }
+
+        if truncated {
+            result.push_str("... (truncated)\n");
         }
 
         result

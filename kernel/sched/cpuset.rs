@@ -183,7 +183,13 @@ pub fn init() {
     kernel_core::register_cpuset_task_joined(cpuset_task_joined_callback);
     kernel_core::register_cpuset_task_left(cpuset_task_left_callback);
 
-    klog_always!("[CPUSET] Initialized with root mask 0x{:016x}", online_mask);
+    klog_always!(
+        "[CPUSET] Initialized: {} CPU(s) online",
+        online_mask.count_ones()
+    );
+    // I.1 klog containment: Full topology mask only in debug builds.
+    #[cfg(debug_assertions)]
+    kprintln!("[CPUSET] Root mask: 0x{:016x}", online_mask);
 }
 
 /// Get the current online CPU mask.

@@ -123,6 +123,10 @@ static PARTIAL_KASLR_HEAP: AtomicBool = AtomicBool::new(false);
 /// Whether kernel stack randomization is active
 static PARTIAL_KASLR_KERNEL_STACKS: AtomicBool = AtomicBool::new(false);
 
+/// Boot-time slide applied to the per-process kernel stack region base.
+/// 0 = disabled (no randomization).
+static KSTACK_BASE_SLIDE: AtomicU64 = AtomicU64::new(0);
+
 /// Whether userspace ASLR is active
 static PARTIAL_KASLR_USERSPACE: AtomicBool = AtomicBool::new(false);
 
@@ -211,6 +215,90 @@ pub enum PartialKaslrFeature {
     KernelStacks,
     /// Userspace ASLR (mmap, stack, brk)
     UserspaceAslr,
+}
+
+// ============================================================================
+// Partial KASLR: Kernel Stack Base Randomization
+// ============================================================================
+
+/// Maximum slide applied to the kernel stack region base: 256 MiB.
+///
+/// The kernel stack region starts at KSTACK_BASE (0xFFFF_FFFF_0000_0000).
+/// Bounded to avoid overlapping the kernel heap or other reserved high-half regions.
+/// Each process slot is 0x5000 (20 KiB), so even with MAX_PID=65535 processes
+/// the region spans ~1.3 GiB. A 256 MiB slide stays well within the high-half.
+const KSTACK_MAX_SLIDE: u64 = 256 * 1024 * 1024;
+
+/// Kernel stack base slide granularity: 2 MiB.
+///
+/// Keeps the slide huge-page aligned for TLB efficiency. Also a multiple
+/// of common page table entry granularity, preventing partial-page overlap.
+const KSTACK_SLIDE_GRANULARITY: u64 = 2 * 1024 * 1024;
+
+/// Get the active per-process kernel stack base slide (0 if disabled).
+///
+/// Used by `kernel_stack_slot()` in process.rs to offset all per-process
+/// kernel stacks by a boot-time random value.
+#[inline]
+pub fn kernel_stack_slide() -> u64 {
+    KSTACK_BASE_SLIDE.load(Ordering::Acquire)
+}
+
+/// Generate a per-boot kernel stack base slide using the CSPRNG.
+///
+/// Returns 0 on RNG failure (feature disabled, stacks at static base).
+fn generate_kstack_slide() -> u64 {
+    let max_slots = KSTACK_MAX_SLIDE / KSTACK_SLIDE_GRANULARITY;
+    if max_slots == 0 {
+        return 0;
+    }
+
+    // Pick slot in [1, max_slots] to guarantee a non-zero slide when RNG works.
+    match rng::random_range(max_slots) {
+        Ok(slot0) => slot0.saturating_add(1) * KSTACK_SLIDE_GRANULARITY,
+        Err(_) => {
+            klog!(Warn, "WARNING: kernel stack ASLR RNG failure — using static kstack base");
+            0
+        }
+    }
+}
+
+// ============================================================================
+// Partial KASLR: Userspace mmap Base Randomization
+// ============================================================================
+
+/// Maximum randomized offset for the userspace mmap base: 256 MiB.
+///
+/// The default mmap base is 0x4000_0000 (1 GiB). We add a random offset in
+/// [0, MMAP_MAX_OFFSET) so the effective base sits in [1 GiB, ~1.25 GiB).
+/// This stays well within the 47-bit canonical userspace range while providing
+/// meaningful entropy against user-mode ASLR bypass attacks.
+const MMAP_MAX_OFFSET: u64 = 256 * 1024 * 1024;
+
+/// Granularity for mmap base randomization: page-aligned (4 KiB).
+const MMAP_OFFSET_GRANULARITY: u64 = 4096;
+
+/// Generate a per-process randomized mmap base address.
+///
+/// Called during `Process::new()` and `sys_exec` address-space reset.
+/// Returns `default_base` unchanged on RNG failure (graceful degradation).
+pub fn randomized_mmap_base(default_base: usize) -> usize {
+    if !is_partial_kaslr_enabled() {
+        return default_base;
+    }
+
+    let max_slots = MMAP_MAX_OFFSET / MMAP_OFFSET_GRANULARITY;
+    if max_slots == 0 {
+        return default_base;
+    }
+
+    match rng::random_range(max_slots) {
+        Ok(slot) => {
+            let offset = slot.saturating_mul(MMAP_OFFSET_GRANULARITY);
+            (default_base as u64).saturating_add(offset) as usize
+        }
+        Err(_) => default_base,
+    }
 }
 
 // ============================================================================
@@ -591,24 +679,26 @@ impl KptiContext {
 /// A Mutex here would deadlock if an interrupt fires while the lock is held
 /// and the interrupt handler also needs the KPTI context.
 ///
-/// R103-I1 FIX: Added a seqlock (sequence counter) to guarantee consistent
-/// snapshots across the three atomics. Without the seqlock, a concurrent
-/// `install_kpti_context()` call can produce a torn read where `user_cr3`
-/// comes from one context and `kernel_cr3` from another — loading such a
-/// mixed CR3 pair into the CPU would cause an immediate page fault or,
-/// worse, silently bypass KPTI isolation.
+/// # R103-I1 FIX: Seqlock for consistent snapshots
 ///
-/// Protocol:
-/// - Writer increments `KPTI_SEQ` to an odd value (write-in-progress),
+/// Without the seqlock, a concurrent `install_kpti_context()` call can produce
+/// a torn read where `user_cr3` comes from one context and `kernel_cr3` from
+/// another — loading such a mixed CR3 pair into the CPU would cause an
+/// immediate page fault or, worse, silently bypass KPTI isolation.
+///
+/// # H.3 SMP FIX: Per-CPU Storage
+///
+/// The KPTI context is now stored in the per-CPU `PerCpuData` structure
+/// (`cpu_local` crate) instead of global atomics. Each CPU runs a different
+/// process with different CR3 values, so a global context would cause one
+/// CPU to see another CPU's context — producing immediate page faults or
+/// silently bypassing KPTI isolation on SMP systems.
+///
+/// Protocol (unchanged from R103-I1, now applied per-CPU):
+/// - Writer increments `kpti_seq` to an odd value (write-in-progress),
 ///   updates the three fields, then increments to the next even value.
-/// - Reader loads `KPTI_SEQ` (Acquire); if odd, spins. Reads the three
-///   fields (Acquire). Loads `KPTI_SEQ` again; if it changed, retries.
-static KPTI_USER_CR3: AtomicU64 = AtomicU64::new(0);
-static KPTI_KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
-static KPTI_PCID: AtomicU64 = AtomicU64::new(0);
-/// Seqlock sequence counter for KPTI context consistency.
-/// Even = no write in progress; odd = write in progress.
-static KPTI_SEQ: AtomicU64 = AtomicU64::new(0);
+/// - Reader loads `kpti_seq` (Acquire); if odd, spins. Reads the three
+///   fields (Acquire). Loads `kpti_seq` again; if it changed, retries.
 
 /// Install a new KPTI context (enables/disables KPTI based on separation)
 ///
@@ -631,11 +721,18 @@ static KPTI_SEQ: AtomicU64 = AtomicU64::new(0);
 /// **Interrupts must be disabled** (or the caller must otherwise guarantee
 /// that no interrupt handler will call `current_kpti_context()` /
 /// `enter_kernel_mode()` / `return_to_user_mode()` on the same CPU) while
-/// this function is executing.  The seqlock write path sets `KPTI_SEQ` to
+/// this function is executing.  The seqlock write path sets `kpti_seq` to
 /// an odd value; if an interrupt fires in that window and the handler reads
 /// the seqlock, it will spin forever waiting for the writer to complete —
 /// which cannot happen until the interrupt returns.  Process switch paths
 /// already run with interrupts disabled, so this is satisfied in practice.
+///
+/// # H.3 SMP Safety
+///
+/// Per-CPU storage ensures each CPU's KPTI context is independent. The
+/// writer and reader are always on the same CPU (install during context
+/// switch, read during syscall/interrupt entry on the same CPU), so the
+/// seqlock only protects against interrupt-level concurrency, not cross-CPU.
 pub fn install_kpti_context(ctx: KptiContext) {
     // R103-I1 FIX: Debug-mode guard — verify interrupts are disabled to prevent
     // deadlock with interrupt handlers that call current_kpti_context().
@@ -644,19 +741,22 @@ pub fn install_kpti_context(ctx: KptiContext) {
         "install_kpti_context: must be called with interrupts disabled"
     );
 
-    // R103-I1 FIX: Seqlock write protocol.
+    // H.3 SMP FIX: Access this CPU's KPTI context via per-CPU storage.
+    let pcpu = cpu_local::current_cpu();
+
+    // R103-I1 FIX: Seqlock write protocol (per-CPU).
     //
-    // Step 1: Acquire exclusive write access by CAS-ing KPTI_SEQ from an
+    // Step 1: Acquire exclusive write access by CAS-ing kpti_seq from an
     //         even value to odd (write-in-progress).  If another writer is
     //         active (seq is odd), spin until it completes.
     let seq = loop {
-        let s = KPTI_SEQ.load(Ordering::Relaxed);
+        let s = pcpu.kpti_seq.load(Ordering::Relaxed);
         if (s & 1) != 0 {
             // Another writer is in progress; wait.
             core::hint::spin_loop();
             continue;
         }
-        match KPTI_SEQ.compare_exchange_weak(
+        match pcpu.kpti_seq.compare_exchange_weak(
             s,
             s.wrapping_add(1), // odd → write in progress
             Ordering::Acquire,
@@ -671,22 +771,22 @@ pub fn install_kpti_context(ctx: KptiContext) {
     };
 
     // Step 2: Write the three context fields.
-    KPTI_USER_CR3.store(ctx.user_cr3, Ordering::Release);
-    KPTI_KERNEL_CR3.store(ctx.kernel_cr3, Ordering::Release);
-    KPTI_PCID.store(ctx.pcid as u64, Ordering::Release);
+    pcpu.kpti_user_cr3.store(ctx.user_cr3, Ordering::Release);
+    pcpu.kpti_kernel_cr3.store(ctx.kernel_cr3, Ordering::Release);
+    pcpu.kpti_pcid.store(ctx.pcid as u64, Ordering::Release);
 
-    // Step 3: Publish the completed write by advancing KPTI_SEQ to the
+    // Step 3: Publish the completed write by advancing kpti_seq to the
     //         next even value.  Release ordering ensures all field stores
     //         are visible before a reader observes the new sequence number.
-    KPTI_SEQ.store(seq.wrapping_add(2), Ordering::Release);
+    pcpu.kpti_seq.store(seq.wrapping_add(2), Ordering::Release);
 
-    // Update the enabled flag after the seqlock is released so that
+    // Update the global enabled flag after the seqlock is released so that
     // readers who see KPTI_ENABLED == true can immediately obtain a
     // consistent snapshot via current_kpti_context().
     KPTI_ENABLED.store(ctx.has_kpti(), Ordering::SeqCst);
 }
 
-/// Read the current KPTI context (lock-free)
+/// Read the current KPTI context for this CPU (lock-free)
 ///
 /// # R102-1 FIX
 ///
@@ -702,21 +802,27 @@ pub fn install_kpti_context(ctx: KptiContext) {
 /// In practice, `install_kpti_context()` runs only during process switch
 /// or KPTI setup, so contention is extremely rare and the loop typically
 /// completes on the first iteration.
+///
+/// # H.3 SMP Safety
+///
+/// Reads from the current CPU's per-CPU KPTI context. Each CPU has its own
+/// independent context, so this never sees another CPU's CR3 values.
 #[inline]
 pub fn current_kpti_context() -> KptiContext {
+    let pcpu = cpu_local::current_cpu();
     loop {
-        let seq1 = KPTI_SEQ.load(Ordering::Acquire);
+        let seq1 = pcpu.kpti_seq.load(Ordering::Acquire);
         if (seq1 & 1) != 0 {
             // Write in progress — spin.
             core::hint::spin_loop();
             continue;
         }
 
-        let user_cr3 = KPTI_USER_CR3.load(Ordering::Acquire);
-        let kernel_cr3 = KPTI_KERNEL_CR3.load(Ordering::Acquire);
-        let pcid = KPTI_PCID.load(Ordering::Acquire) as u16;
+        let user_cr3 = pcpu.kpti_user_cr3.load(Ordering::Acquire);
+        let kernel_cr3 = pcpu.kpti_kernel_cr3.load(Ordering::Acquire);
+        let pcid = pcpu.kpti_pcid.load(Ordering::Acquire) as u16;
 
-        let seq2 = KPTI_SEQ.load(Ordering::Acquire);
+        let seq2 = pcpu.kpti_seq.load(Ordering::Acquire);
         if seq1 == seq2 {
             return KptiContext {
                 user_cr3,
@@ -1268,7 +1374,16 @@ pub fn init(boot_slide: Option<u64>) {
 
     set_kernel_layout(layout);
 
-    // Step 3: Track Partial KASLR features
+    // Step 3: Generate kernel stack base slide using CSPRNG
+    let kstack_slide = generate_kstack_slide();
+    if kstack_slide != 0 {
+        KSTACK_BASE_SLIDE.store(kstack_slide, Ordering::Release);
+        enable_partial_kaslr(PartialKaslrFeature::KernelStacks);
+        // Userspace mmap ASLR is also RNG-dependent; enable when CSPRNG is healthy
+        enable_partial_kaslr(PartialKaslrFeature::UserspaceAslr);
+    }
+
+    // Step 4: Track Partial KASLR features
     // Heap randomization status is determined during mm::memory::init() (before this runs)
     if mm::memory::heap_randomized() {
         enable_partial_kaslr(PartialKaslrFeature::HeapBase);
@@ -1321,6 +1436,14 @@ pub fn init(boot_slide: Option<u64>) {
         kprintln!(
             "    Heap base: 0x{:x} (randomized)",
             mm::memory::heap_base()
+        );
+    }
+    #[cfg(debug_assertions)]
+    if partial.kernel_stacks {
+        kprintln!(
+            "    Kstack slide: 0x{:x} ({} MiB)",
+            kstack_slide,
+            kstack_slide / (1024 * 1024)
         );
     }
     #[cfg(debug_assertions)]

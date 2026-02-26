@@ -193,10 +193,17 @@ pub const PID_MAX: ProcessId = 32_768;
 pub fn kernel_stack_slot(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), KernelStackError> {
     // R102-8 FIX: Use checked arithmetic to prevent silent wrapping on invalid PID.
     // R103-I2 FIX: Propagate overflow as error instead of panicking.
+    //
+    // H.2 Partial KASLR: Apply boot-time random slide to the kernel stack region
+    // base. This prevents attackers from predicting per-process kernel stack addresses
+    // even when the kernel text is at a fixed address.
+    let kstack_base = KSTACK_BASE
+        .checked_add(security::kernel_stack_slide())
+        .ok_or(KernelStackError::AddressOverflow)?;
     let slot_offset = (pid as u64)
         .checked_mul(KSTACK_STRIDE)
         .ok_or(KernelStackError::AddressOverflow)?;
-    let guard_base_addr = KSTACK_BASE
+    let guard_base_addr = kstack_base
         .checked_add(slot_offset)
         .ok_or(KernelStackError::AddressOverflow)?;
 
@@ -736,7 +743,7 @@ impl Process {
             user_stack: None,
             memory_space: 0,
             mmap_regions: BTreeMap::new(),
-            next_mmap_addr: DEFAULT_MMAP_BASE,
+            next_mmap_addr: security::randomized_mmap_base(DEFAULT_MMAP_BASE),
             fd_table: BTreeMap::new(),
             cloexec_fds: BTreeSet::new(),
             cap_table: Arc::new(CapTable::new()),
@@ -2158,6 +2165,25 @@ pub fn activate_memory_space(memory_space: usize) {
     if target_frame != current_frame {
         unsafe { Cr3::write(target_frame, target_flags) };
 
+        let target_cr3_phys = target_frame.start_address().as_u64();
+
+        // H.3 KPTI: Keep per-CPU KPTI context in sync with the loaded CR3.
+        //
+        // install_kpti_context uses a per-CPU seqlock and must run with
+        // interrupts disabled (its debug_assert enforces this). The scheduler
+        // calls activate_memory_space with interrupts already disabled (cli in
+        // switch_context), but sys_exec also calls it with interrupts enabled,
+        // so we wrap in without_interrupts for safety.
+        //
+        // Currently uses KptiContext::single() since dual page tables are not
+        // yet implemented. When KPTI dual-root support is added, this changes
+        // to KptiContext::dual(user_cr3, kernel_cr3, pcid).
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            security::install_kpti_context(
+                security::KptiContext::single(target_cr3_phys),
+            );
+        });
+
         // R68 Architecture Improvement: Update per-address-space TLB tracking.
         //
         // This allows TLB shootdown to target only CPUs that might have TLB entries
@@ -2171,7 +2197,7 @@ pub fn activate_memory_space(memory_space: usize) {
         // - Writing CR3 flushes all non-global TLB entries on this CPU
         // - We have no stale entries to flush since our TLB is fresh
         // - Any subsequent TLB entries will be populated after the shootdown
-        mm::tlb_shootdown::track_cr3_switch(target_frame.start_address().as_u64());
+        mm::tlb_shootdown::track_cr3_switch(target_cr3_phys);
     }
 }
 
@@ -2278,6 +2304,49 @@ pub fn notify_cpuset_task_left(cpuset_id: u32) {
     let callback = *CPUSET_TASK_LEFT.lock();
     if let Some(cb) = callback {
         cb(cpuset_id);
+    }
+}
+
+/// R117-1 FIX: Centralized self-termination primitive.
+///
+/// Terminates the current process and enters a safe no-return halt loop.
+/// This function guarantees that after self-termination:
+///   1. Interrupts are disabled (no timer IRQ frames on zombie's stack)
+///   2. CR3 is switched to boot page tables (freed user page tables not in TLB)
+///   3. The scheduler is given a chance to pick another task
+///   4. If no task is available, the CPU halts with IF=0 on safe CR3
+///
+/// **DESIGN GOAL (H.0.9 addendum):** No exit path may ever run with IRQs
+/// enabled while still on the exiting task's CR3 or kernel stack.
+///
+/// # Panics
+///
+/// This function never returns (`-> !`).
+pub fn terminate_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
+    terminate_process(pid, exit_code);
+
+    // R117-1 FIX: Disable interrupts immediately after marking Zombie.
+    // Without this, timer IRQs push frames onto the zombie's kernel stack,
+    // and RCU grace periods can complete (quiescent state on timer IRQ),
+    // allowing a concurrent reaper to free the stack via cleanup_zombie().
+    x86_64::instructions::interrupts::disable();
+
+    // R117-1 FIX: Switch to boot CR3 (kernel-global page table cached at init).
+    // The zombie's user page tables may be freed by a concurrent reaper on
+    // another CPU. Switching to BOOT_CR3 ensures no stale TLB entries reference
+    // freed page table frames.
+    activate_memory_space(0);
+
+    // Give the scheduler a chance to context-switch to another task.
+    // force_reschedule() may temporarily re-enable interrupts internally
+    // (spinlock acquisition), but we are now on safe boot CR3.
+    crate::force_reschedule();
+
+    // Re-disable interrupts after force_reschedule returns (it may have
+    // re-enabled them). We must halt with IF=0 to prevent timer IRQs.
+    x86_64::instructions::interrupts::disable();
+    loop {
+        x86_64::instructions::hlt();
     }
 }
 
@@ -2657,6 +2726,13 @@ pub fn cleanup_zombie(pid: ProcessId) {
     // R116-3 FIX: cleanup_zombie() is designed to be called by a reaper (parent
     // via waitpid), NOT by the zombie itself. Self-reaping frees the active CR3
     // page tables and kernel stack while the calling code is still executing.
+    // R117-3 FIX: Runtime guard for release builds. debug_assert! is stripped in
+    // release; this `if` check prevents silent UAF if a regression reintroduces
+    // self-reaping. Cost: single AtomicU32 load (current_pid()).
+    if current_pid() == Some(pid) {
+        klog!(Error, "SECURITY: cleanup_zombie called on self (pid={}) — refusing to prevent UAF", pid);
+        return;
+    }
     debug_assert!(
         current_pid() != Some(pid),
         "cleanup_zombie called on self (pid={}) — self-reaping causes UAF",

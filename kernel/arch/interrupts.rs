@@ -593,19 +593,38 @@ fn handle_user_exception(stack_frame: &InterruptStackFrame, exit_code: i32) -> b
         // but the process is now Zombie. On SMP, the parent can concurrently reap
         // via waitpid → cleanup_zombie → free_address_space, freeing the CR3 page
         // tables and kernel stack while this CPU is still executing the IRET path.
-        // Instead, force a reschedule and halt — same pattern as signal.rs:402-408.
-        kernel_core::process::terminate_process(pid, exit_code);
-        kernel_core::force_reschedule();
-        // SAFETY: terminate_process set us to Zombie; we must never return
-        // to the caller. Halt until the scheduler picks another task.
-        loop {
-            x86_64::instructions::hlt();
-        }
+        // R117-1 FIX: Use centralized terminate_self_and_halt() which disables
+        // interrupts and switches to boot CR3 before halting.
+        kernel_core::process::terminate_self_and_halt(pid, exit_code);
     }
 
     // No current PID despite CS.RPL==3: this is a kernel bug (orphaned user-mode
     // context). Fall through to panic rather than silently ignoring.
     false
+}
+
+/// R117-4 FIX: Check pending-kill before returning from non-fatal exceptions.
+///
+/// Some exception handlers (#DB, #BP, #NM) return to user-mode without passing
+/// through the syscall-return or timer IRQ pending_kill check points. This helper
+/// consumes the flag so cross-CPU exit requests are honored even for threads that
+/// trigger these exceptions without making syscalls.
+///
+/// Must be called at the end of the handler, after all exception-specific work
+/// (e.g., FPU state management for #NM) is complete.
+#[inline]
+fn check_pending_kill_on_exception_return(stack_frame: &InterruptStackFrame) {
+    // Only check if returning to user-mode (CS.RPL == 3).
+    let returning_to_user = (stack_frame.code_segment.0 & 0x3) == 3;
+    if !returning_to_user {
+        return;
+    }
+
+    if let Some(pid) = current_pid() {
+        if let Some(exit_code) = kernel_core::process::take_pending_process_exit(pid) {
+            kernel_core::process::terminate_self_and_halt(pid, exit_code);
+        }
+    }
 }
 
 /// #DE - Divide Error (除法错误)
@@ -623,9 +642,11 @@ extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame)
 }
 
 /// #DB - Debug Exception (调试异常)
-extern "x86-interrupt" fn debug_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn debug_handler(stack_frame: InterruptStackFrame) {
     clac_if_smap();
     // 调试异常：静默处理
+    // R117-4 FIX: Check pending_kill before returning to user-mode.
+    check_pending_kill_on_exception_return(&stack_frame);
 }
 
 /// #NMI - Non-Maskable Interrupt (不可屏蔽中断)
@@ -635,10 +656,12 @@ extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
 }
 
 /// #BP - Breakpoint (断点)
-extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     clac_if_smap();
     INTERRUPT_STATS.breakpoint.fetch_add(1, Ordering::Relaxed);
     // 断点异常：通常用于调试，静默处理
+    // R117-4 FIX: Check pending_kill before returning to user-mode.
+    check_pending_kill_on_exception_return(&stack_frame);
 }
 
 /// #OF - Overflow (溢出)
@@ -714,7 +737,7 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
 ///
 /// This is more efficient than eager save/restore because many processes
 /// never use FPU between context switches.
-extern "x86-interrupt" fn device_not_available_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptStackFrame) {
     clac_if_smap();
 
     // Clear CR0.TS to allow FPU instructions in the handler
@@ -776,6 +799,9 @@ extern "x86-interrupt" fn device_not_available_handler(_stack_frame: InterruptSt
             per_cpu.set_fpu_owner(NO_FPU_OWNER);
         }
     });
+
+    // R117-4 FIX: Check pending_kill after FPU state is settled.
+    check_pending_kill_on_exception_return(&stack_frame);
 }
 
 /// #DF - Double Fault (双重错误)
@@ -974,11 +1000,8 @@ extern "x86-interrupt" fn page_fault_handler(
             // SIGSEGV 的退出码为 128 + 11 = 139
             // R116-1 FIX: Do NOT return after terminate — IRET would resume the
             // zombie on freed page tables. Halt loop prevents UAF.
-            kernel_core::process::terminate_process(pid, 139);
-            kernel_core::force_reschedule();
-            loop {
-                x86_64::instructions::hlt();
-            }
+            // R117-1 FIX: Use centralized terminate_self_and_halt().
+            kernel_core::process::terminate_self_and_halt(pid, 139);
         }
 
         // 无法识别当前进程时仍保持 panic 以避免静默失败
@@ -1007,11 +1030,8 @@ extern "x86-interrupt" fn page_fault_handler(
             // R116-1 FIX: Do NOT return after terminate — IRET would resume the
             // zombie on freed page tables. On SMP, parent can concurrently reap
             // via waitpid, freeing CR3 while this CPU is on the IRET path.
-            kernel_core::process::terminate_process(pid, 139);
-            kernel_core::force_reschedule();
-            loop {
-                x86_64::instructions::hlt();
-            }
+            // R117-1 FIX: Use centralized terminate_self_and_halt().
+            kernel_core::process::terminate_self_and_halt(pid, 139);
         }
     }
 
@@ -1247,8 +1267,18 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                 }
                 current_cpu().irq_exit();
 
+                // R117-1 FIX: Disable interrupts and switch to boot CR3 before
+                // halting. Without this, timer IRQs continue pushing frames onto
+                // the zombie's kernel stack, and freed user page tables remain
+                // in the TLB. Same safety rationale as terminate_self_and_halt().
+                x86_interrupts::disable();
+                kernel_core::process::activate_memory_space(0);
+
                 kernel_core::force_reschedule();
-                // SAFETY: Process is Zombie; halt until scheduler picks another task.
+
+                // Re-disable after force_reschedule which may re-enable interrupts.
+                x86_interrupts::disable();
+                // SAFETY: Process is Zombie on safe boot CR3; halt with IF=0.
                 loop {
                     x86_64::instructions::hlt();
                 }

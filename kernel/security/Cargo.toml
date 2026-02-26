@@ -14,3 +14,4 @@ x86_64 = "0.15"
 mm = { path = "../mm" }
 drivers = { path = "../drivers" }
 klog = { path = "../klog" }
+cpu_local = { path = "../cpu_local" }

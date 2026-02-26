@@ -399,13 +399,9 @@ fn send_signal_inner(
             // Drop the Arc before entering the no-return path to avoid a
             // permanent refcount leak (Codex review feedback).
             drop(process_arc);
-            process::terminate_process(pid, code);
-            crate::scheduler_hook::force_reschedule();
-            // SAFETY: terminate_process set us to Zombie; we must never return
-            // to the caller. Halt until the scheduler picks another task.
-            loop {
-                x86_64::instructions::hlt();
-            }
+            // R117-1 FIX: Use centralized terminate_self_and_halt() which
+            // disables interrupts and switches to boot CR3 before halting.
+            process::terminate_self_and_halt(pid, code);
         } else {
             // Remote: post a pending-kill flag; target checks at syscall return.
             let _ = process::request_process_exit(pid, code);
