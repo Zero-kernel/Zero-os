@@ -228,6 +228,24 @@ pub struct SyscallPerCpu {
     /// Accessed atomically via `lock cmpxchg` in assembly. Plain u64
     /// (not AtomicU64) to maintain Copy trait for array initialization.
     pub syscall_active: u64,
+
+    // ---- H.3 KPTI: Dual-CR3 values for syscall entry/exit CR3 switching ----
+    //
+    // When KPTI is active, `kpti_kernel_cr3 != kpti_user_cr3` and the syscall
+    // trampoline switches CR3 on entry (user → kernel) and exit (kernel → user).
+    // When KPTI is inactive, both values are identical and the `cmp/je` in the
+    // assembly skips the `mov cr3` entirely — zero overhead on non-KPTI systems.
+    //
+    // Written by `arch_set_kpti_cr3s()` during context switch (interrupts disabled).
+    // Read by the syscall entry/exit assembly via GS-relative addressing.
+
+    /// CR3 to load on user→kernel transition (full kernel page tables).
+    pub kpti_kernel_cr3: u64,
+    /// CR3 to load on kernel→user transition (user page tables + trampoline).
+    pub kpti_user_cr3: u64,
+    /// Scratch slot used by the exit trampoline to preserve a user register
+    /// during the CR3 switch (currently: RDX).
+    pub kpti_tmp: u64,
 }
 
 impl SyscallPerCpu {
@@ -237,6 +255,9 @@ impl SyscallPerCpu {
             user_rsp_shadow: 0,
             frame_ptr: 0,
             syscall_active: 0,
+            kpti_kernel_cr3: 0,
+            kpti_user_cr3: 0,
+            kpti_tmp: 0,
         }
     }
 }
@@ -246,6 +267,35 @@ impl SyscallPerCpu {
 #[no_mangle]
 static mut SYSCALL_PERCPU: [SyscallPerCpu; SYSCALL_MAX_CPUS] =
     [SyscallPerCpu::new(); SYSCALL_MAX_CPUS];
+
+/// H.3 KPTI: Update the per-CPU dual-CR3 pair used by the syscall trampoline.
+///
+/// Called from `activate_memory_space()` during context switch when the active
+/// address space changes.  The assembly entry/exit trampoline reads these values
+/// via `gs:[PERCPU_KPTI_KERNEL_CR3_OFFSET]` and `gs:[PERCPU_KPTI_USER_CR3_OFFSET]`.
+///
+/// When KPTI is disabled (user_cr3 == kernel_cr3), the trampoline's `cmp/je` skips
+/// the `mov cr3` instruction entirely — no overhead on non-KPTI configurations.
+///
+/// # Safety
+///
+/// Must be called with interrupts disabled (or from a context where no interrupt
+/// handler on this CPU can observe a partially-written pair).  Context switch paths
+/// already satisfy this constraint.
+pub fn arch_set_kpti_cr3s(user_cr3: u64, kernel_cr3: u64) {
+    let cpu_id = cpu_local::current_cpu_id();
+    if cpu_id >= SYSCALL_MAX_CPUS {
+        return;
+    }
+    // SAFETY: single-writer (interrupts disabled during context switch), no aliasing.
+    // The syscall entry/exit assembly on this CPU reads these fields only while
+    // interrupts are disabled or after SFMASK has cleared IF, so there is no
+    // concurrent reader on the same CPU.
+    unsafe {
+        SYSCALL_PERCPU[cpu_id].kpti_kernel_cr3 = kernel_cr3;
+        SYSCALL_PERCPU[cpu_id].kpti_user_cr3 = user_cr3;
+    }
+}
 
 /// Offset of scratch_top in SyscallPerCpu (for GS-relative addressing)
 ///
@@ -259,6 +309,12 @@ pub const PERCPU_USER_RSP_OFFSET: usize = 8;
 pub const PERCPU_FRAME_PTR_OFFSET: usize = 16;
 /// R67-11 FIX: Offset of syscall_active flag in SyscallPerCpu
 pub const PERCPU_SYSCALL_ACTIVE_OFFSET: usize = 24;
+/// H.3 KPTI: Offset of kpti_kernel_cr3 in SyscallPerCpu
+pub const PERCPU_KPTI_KERNEL_CR3_OFFSET: usize = 32;
+/// H.3 KPTI: Offset of kpti_user_cr3 in SyscallPerCpu
+pub const PERCPU_KPTI_USER_CR3_OFFSET: usize = 40;
+/// H.3 KPTI: Offset of kpti_tmp scratch slot in SyscallPerCpu
+pub const PERCPU_KPTI_TMP_OFFSET: usize = 48;
 
 // R103-3 FIX: Compile-time assertions that the offsets match the struct layout.
 // If SyscallPerCpu is reordered, these will produce a build error.
@@ -278,6 +334,18 @@ const _: () = {
     assert!(
         core::mem::offset_of!(SyscallPerCpu, syscall_active) == PERCPU_SYSCALL_ACTIVE_OFFSET,
         "PERCPU_SYSCALL_ACTIVE_OFFSET does not match struct layout"
+    );
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, kpti_kernel_cr3) == PERCPU_KPTI_KERNEL_CR3_OFFSET,
+        "PERCPU_KPTI_KERNEL_CR3_OFFSET does not match struct layout"
+    );
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, kpti_user_cr3) == PERCPU_KPTI_USER_CR3_OFFSET,
+        "PERCPU_KPTI_USER_CR3_OFFSET does not match struct layout"
+    );
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, kpti_tmp) == PERCPU_KPTI_TMP_OFFSET,
+        "PERCPU_KPTI_TMP_OFFSET does not match struct layout"
     );
 };
 
@@ -731,6 +799,18 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // ========================================
         "mov r12, rsp",                             // r12 = 临时栈上的帧指针
 
+        // H.3 KPTI: Switch to kernel CR3 before touching per-task kernel data.
+        //
+        // At this point user registers are saved to the scratch frame and GS points
+        // to this CPU's SyscallPerCpu.  We can safely clobber RAX (already saved).
+        // If kpti_kernel_cr3 == kpti_user_cr3 (KPTI disabled), the compare-and-skip
+        // avoids the expensive `mov cr3` entirely.
+        "mov rax, qword ptr gs:[{percpu_kpti_kernel_cr3}]",
+        "cmp rax, qword ptr gs:[{percpu_kpti_user_cr3}]",
+        "je 1f",
+        "mov cr3, rax",
+        "1:",
+
         // 获取内核栈顶（TSS RSP0）- 栈已 16B 对齐无需额外调整
         "call {get_rsp0}",                          // 返回值在 rax
         "mov rsp, rax",                             // 切换到内核栈
@@ -880,6 +960,23 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         // ========================================
         // 阶段 7: 返回用户态 (SYSRET 快速路径)
         // ========================================
+        // H.3 KPTI: Switch back to user CR3 immediately before SYSRETQ.
+        //
+        // At this point RSP holds the user RSP and all user registers except RDX
+        // have been restored.  We use the per-CPU kpti_tmp scratch slot to preserve
+        // RDX during the CR3 switch.  GS still points to kernel per-CPU data
+        // (SWAPGS happens next).
+        //
+        // If kpti_user_cr3 == kpti_kernel_cr3 (KPTI disabled), the compare-and-skip
+        // avoids the `mov cr3` entirely.
+        "mov qword ptr gs:[{percpu_kpti_tmp}], rdx",
+        "mov rdx, qword ptr gs:[{percpu_kpti_user_cr3}]",
+        "cmp rdx, qword ptr gs:[{percpu_kpti_kernel_cr3}]",
+        "je 6f",
+        "mov cr3, rdx",
+        "6:",
+        "mov rdx, qword ptr gs:[{percpu_kpti_tmp}]",
+
         // CVE-2019-1125 SWAPGS 防护：
         // 返回用户态前执行 SWAPGS 恢复用户 GS 基址
         // LFENCE 序列化以关闭推测窗口
@@ -909,6 +1006,10 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
         percpu_frame_ptr = const PERCPU_FRAME_PTR_OFFSET,
         // R67-11 FIX: Offset for nested syscall detection flag
         percpu_syscall_active = const PERCPU_SYSCALL_ACTIVE_OFFSET,
+        // H.3 KPTI: Per-CPU dual-CR3 offsets for entry/exit CR3 switching
+        percpu_kpti_kernel_cr3 = const PERCPU_KPTI_KERNEL_CR3_OFFSET,
+        percpu_kpti_user_cr3 = const PERCPU_KPTI_USER_CR3_OFFSET,
+        percpu_kpti_tmp = const PERCPU_KPTI_TMP_OFFSET,
         // R67-11 FIX: Error code for nested syscall rejection (-EBUSY = -16)
         nested_err = const SYSCALL_NESTED_ERROR,
         frame_size = const SYSCALL_FRAME_SIZE,

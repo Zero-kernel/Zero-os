@@ -563,8 +563,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         // 注册 syscall 帧回调，让 kernel_core 能访问当前 syscall 帧
         // 这对于 clone/fork 正确设置子进程上下文至关重要
         arch::register_frame_callback();
+        // H.3 KPTI: Register arch-level per-CPU CR3 updater so kernel_core's
+        // activate_memory_space() can keep the syscall assembly's GS-relative
+        // CR3 pair in sync during context switches.
+        kernel_core::register_kpti_cr3_callback(arch::arch_set_kpti_cr3s);
         klog_always!("      ✓ SYSCALL MSR configured");
         klog_always!("      ✓ Syscall frame callback registered");
+        klog_always!("      ✓ KPTI CR3 callback registered");
         klog_always!("      ✓ Ring 3 transition support ready");
     }
 

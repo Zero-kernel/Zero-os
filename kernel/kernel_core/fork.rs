@@ -182,6 +182,28 @@ fn fork_inner(
 
         child.memory_space = child_root_frame.start_address().as_u64() as usize;
 
+        // H.3 KPTI: Create a user-mode PML4 root for the child's COW-copied kernel PML4.
+        //
+        // The COW fork path allocates an independent kernel PML4 for the child, so the
+        // KPTI user CR3 shadow must be built against that new root — it cannot share
+        // the parent's user PML4 (which points into the parent's kernel PML4 sub-tables).
+        if security::is_kpti_enabled() {
+            match create_kpti_user_pml4(child.memory_space) {
+                Ok((_user_frame, user_phys)) => {
+                    child.user_memory_space = user_phys;
+                }
+                Err(e) => {
+                    // User PML4 creation failed — roll back the child's kernel PML4.
+                    free_address_space(child.memory_space);
+                    child.memory_space = 0;
+                    child.user_memory_space = 0;
+                    return Err(e);
+                }
+            }
+        } else {
+            child.user_memory_space = 0;
+        }
+
         // 复制 CPU 上下文（RAX 在下方置 0）
         child.context = parent.context;
         // Lazy FPU: inherit parent's FPU usage flag
@@ -337,8 +359,9 @@ fn cleanup_partial_child(child_pid: ProcessId) {
     // 预先收集需要释放的资源，避免长时间持有 PROCESS_TABLE 锁
     // G.1: Also extract watchdog handle for unregistration
     // H.0.9: Also extract PID namespace chain for detachment outside lock
-    let (kstack, addr_space, watchdog_handle, pid_ns_chain): (
+    let (kstack, addr_space, user_addr_space, watchdog_handle, pid_ns_chain): (
         Option<VirtAddr>,
+        usize,
         usize,
         Option<WatchdogHandle>,
         Vec<crate::pid_namespace::PidNamespaceMembership>,
@@ -354,6 +377,7 @@ fn cleanup_partial_child(child_pid: ProcessId) {
                         None
                     },
                     proc.memory_space,
+                    proc.user_memory_space, // H.3 KPTI: capture for cleanup
                     // G.1: Take watchdog handle to unregister outside lock
                     proc.watchdog_handle.take(),
                     // H.0.9: Capture PID namespace chain for detachment outside lock.
@@ -363,10 +387,10 @@ fn cleanup_partial_child(child_pid: ProcessId) {
                     proc.pid_ns_chain.clone(),
                 )
             } else {
-                (None, 0, None, Vec::new())
+                (None, 0, 0, None, Vec::new())
             }
         } else {
-            (None, 0, None, Vec::new())
+            (None, 0, 0, None, Vec::new())
         }
     };
 
@@ -385,6 +409,12 @@ fn cleanup_partial_child(child_pid: ProcessId) {
     // 在 PROCESS_TABLE 锁外释放资源
     if let Some(stack_base) = kstack {
         free_kernel_stack(child_pid, stack_base);
+    }
+    // H.3 KPTI: Free user PML4 root BEFORE kernel PML4.
+    // User-half entries are shared pointers into the kernel PML4's sub-tables,
+    // so the root must be deallocated before those sub-tables are freed.
+    if user_addr_space != 0 {
+        free_kpti_user_pml4(user_addr_space);
     }
     if addr_space != 0 {
         free_address_space(addr_space);
@@ -1074,6 +1104,130 @@ pub fn create_fresh_address_space() -> Result<(PhysFrame<Size4KiB>, usize), Fork
 
     let phys_addr = new_pml4_frame.start_address().as_u64() as usize;
     Ok((new_pml4_frame, phys_addr))
+}
+
+/// H.3 KPTI: Create a user-mode PML4 root for KPTI dual page tables.
+///
+/// The user PML4 provides the address space visible under the user CR3:
+/// - **User half (PML4[0..255])**: Shares the same sub-table pointers as the
+///   kernel PML4. Both roots see identical user-space mappings without duplicating
+///   page table frames below PML4 level.
+/// - **Kernel half (PML4[256..510])**: Empty — kernel text/data/heap is NOT mapped.
+///   This is the core KPTI isolation property.
+/// - **Entry island (PML4[511])**: Copied from the kernel PML4 to ensure the
+///   syscall/interrupt entry stubs, GS-based per-CPU data, IDT, GDT, and TSS
+///   remain accessible before the CR3 switch to kernel mode. Mapped as
+///   supervisor-only (USER_ACCESSIBLE cleared).
+/// - **Recursive slot (PML4[510])**: Explicitly empty — user CR3 must not have
+///   self-referencing page table access.
+///
+/// # Bring-Up Note
+///
+/// The current PML4[511] copy is a coarse mapping that exposes more kernel pages
+/// than strictly necessary (the entire high-half direct-map region covered by that
+/// single PML4 entry). A production KPTI implementation should replace this with a
+/// page-granular trampoline island. However, all entries remain supervisor-only,
+/// so user-mode code cannot access them — the exposure is only to Meltdown-class
+/// speculative reads, which KPTI is designed to mitigate.
+///
+/// # Lifetime
+///
+/// The user PML4 root frame is privately owned. User-half entries are shared
+/// pointers into the kernel PML4's sub-tables and MUST NOT be recursively freed.
+/// Call `free_kpti_user_pml4()` to release only the root frame.
+///
+/// # Arguments
+///
+/// * `kernel_pml4_phys` - Physical address of the kernel PML4 root
+///
+/// # Returns
+///
+/// `(PhysFrame, usize)` — the user PML4 frame and its physical address
+pub fn create_kpti_user_pml4(
+    kernel_pml4_phys: usize,
+) -> Result<(PhysFrame<Size4KiB>, usize), ForkError> {
+    let mut frame_alloc = FrameAllocator::new();
+
+    // Mask low 12 bits defensively (PCID bits may be present in raw CR3 values)
+    let kernel_pml4_phys = kernel_pml4_phys & !0xFFF;
+    if kernel_pml4_phys == 0 {
+        return Err(ForkError::PageTableCopyFailed);
+    }
+
+    // Allocate user PML4 root
+    let user_pml4_frame = frame_alloc
+        .allocate_frame()
+        .ok_or(ForkError::MemoryAllocationFailed)?;
+    unsafe {
+        zero_table(user_pml4_frame);
+    }
+
+    let kernel_pml4_frame: PhysFrame<Size4KiB> =
+        PhysFrame::containing_address(PhysAddr::new(kernel_pml4_phys as u64));
+
+    /// User-half boundary: PML4 indices 0..255
+    const USER_HALF_END: usize = 256;
+    /// Recursive page table slot — must be empty in user PML4
+    const RECURSIVE_INDEX: usize = 510;
+    /// Entry island slot — contains kernel text/entry stubs/IDT/GDT/TSS
+    const ENTRY_ISLAND_INDEX: usize = 511;
+
+    unsafe {
+        let kernel_pml4 = phys_to_virt_table(kernel_pml4_frame.start_address());
+        let user_pml4 = phys_to_virt_table(user_pml4_frame.start_address());
+
+        // ── Share user-half entries (PML4[0..255]) ──
+        //
+        // These are raw pointer copies — the user PML4 shares the same PDPT/PD/PT
+        // frames as the kernel PML4. Any PML4-level change to user mappings must
+        // update both roots (currently only create_fresh_address_space modifies
+        // PML4[0], and we mirror it here).
+        for i in 0..USER_HALF_END {
+            user_pml4[i] = kernel_pml4[i].clone();
+        }
+
+        // ── Ensure no recursive mapping ──
+        user_pml4[RECURSIVE_INDEX].set_unused();
+
+        // ── Map entry island (PML4[511]) ──
+        //
+        // Copies the kernel's PML4[511] entry, which covers the high-half direct
+        // mapping region containing kernel text (.text at 0xffffffff80100000),
+        // per-CPU data (SYSCALL_PERCPU), scratch stacks, IDT, GDT, and TSS.
+        //
+        // Defense-in-depth: strip USER_ACCESSIBLE to ensure ring-3 code cannot
+        // access these pages even if Meltdown-class speculative reads are possible.
+        user_pml4[ENTRY_ISLAND_INDEX] = kernel_pml4[ENTRY_ISLAND_INDEX].clone();
+        if !user_pml4[ENTRY_ISLAND_INDEX].is_unused() {
+            let addr = user_pml4[ENTRY_ISLAND_INDEX].addr();
+            let mut flags = user_pml4[ENTRY_ISLAND_INDEX].flags();
+            flags.remove(PageTableFlags::USER_ACCESSIBLE);
+            user_pml4[ENTRY_ISLAND_INDEX].set_addr(addr, flags);
+        }
+    }
+
+    let phys_addr = user_pml4_frame.start_address().as_u64() as usize;
+    Ok((user_pml4_frame, phys_addr))
+}
+
+/// H.3 KPTI: Free a user PML4 root created by `create_kpti_user_pml4()`.
+///
+/// Only deallocates the root PML4 frame. User-half entries (PML4[0..255]) are
+/// shared pointers into the kernel PML4's sub-tables and MUST NOT be freed here
+/// (they are freed when `free_address_space()` is called on the kernel PML4).
+///
+/// # Safety
+///
+/// The caller must ensure the user PML4 is not loaded in any CPU's CR3.
+pub fn free_kpti_user_pml4(user_memory_space: usize) {
+    if user_memory_space == 0 {
+        return;
+    }
+
+    let mut frame_alloc = FrameAllocator::new();
+    let root_frame: PhysFrame<Size4KiB> =
+        PhysFrame::containing_address(PhysAddr::new(user_memory_space as u64));
+    frame_alloc.deallocate_frame(root_frame);
 }
 
 /// 深拷贝恒等映射 PML4[0]，并为用户空间准备 4KB 页映射

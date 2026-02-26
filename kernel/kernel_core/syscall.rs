@@ -2670,6 +2670,7 @@ fn sys_clone(
     // 从父进程收集必要信息
     let (
         parent_space,
+        parent_user_memory_space, // H.3 KPTI: user CR3 root for CLONE_VM sharing
         parent_tgid,
         parent_mmap,
         parent_next_mmap,
@@ -2705,6 +2706,7 @@ fn sys_clone(
         }
         (
             parent.memory_space,
+            parent.user_memory_space, // H.3 KPTI
             parent.tgid,
             parent.mmap_regions.clone(),
             parent.next_mmap_addr,
@@ -3092,6 +3094,10 @@ fn sys_clone(
         // 设置地址空间
         child.memory_space = child_space;
         if is_shared_space {
+            // H.3 KPTI: CLONE_VM shares both kernel and user CR3 roots.
+            // Threads in the same address space use the same KPTI shadow PML4.
+            child.user_memory_space = parent_user_memory_space;
+
             // 共享地址空间时复制相关元数据
             child.mmap_regions = parent_mmap;
             child.next_mmap_addr = parent_next_mmap;
@@ -3525,10 +3531,15 @@ fn sys_exec(
     let (_new_pml4_frame, new_memory_space) =
         create_fresh_address_space().map_err(|_| SyscallError::ENOMEM)?;
 
+    // H.3 KPTI: User PML4 creation is deferred until AFTER load_elf() and stack
+    // setup populate user-space page table entries. create_kpti_user_pml4() snapshots
+    // PML4[0..255], so it must run after all user mappings (code, data, BSS, stack
+    // at PML4[255]) are established. See the "Phase 4: KPTI" block below.
+
     // 保存旧地址空间以便失败时恢复或成功时释放
-    let old_memory_space = {
+    let (old_memory_space, old_user_memory_space) = {
         let proc = process.lock();
-        proc.memory_space
+        (proc.memory_space, proc.user_memory_space)
     };
 
     // S-7 fix: RAII guard to rollback address space on error
@@ -3567,7 +3578,10 @@ fn sys_exec(
     }
 
     // Create the guard before switching CR3
-    let mut space_guard = ExecSpaceGuard::new(old_memory_space, new_memory_space);
+    let mut space_guard = ExecSpaceGuard::new(
+        old_memory_space,
+        new_memory_space,
+    );
 
     // 切换到新地址空间
     activate_memory_space(new_memory_space);
@@ -3761,16 +3775,35 @@ fn sys_exec(
 
     copy_to_user(buf_base as *mut u8, &stack_buf)?;
 
+    // ── Phase 4: KPTI user PML4 creation ──
+    //
+    // Now that load_elf() and stack setup have populated all user-space page table
+    // entries (code/data at PML4[0], stack at PML4[255], etc.), snapshot the kernel
+    // PML4's user half into the KPTI user PML4.  This must happen AFTER all user
+    // mappings are established, because create_kpti_user_pml4() copies PML4[0..255]
+    // entries by value — any entries created later would be invisible under user CR3.
+    let new_user_memory_space = if security::is_kpti_enabled() {
+        let (_user_frame, user_phys) =
+            crate::fork::create_kpti_user_pml4(new_memory_space)
+                .map_err(|_| SyscallError::ENOMEM)?;
+        user_phys
+    } else {
+        0
+    };
+
     // Final RSP points to argc (lowest address in the buffer)
     let final_rsp = buf_base as u64;
     let argv_base = (buf_base + word) as u64; // argv[0] 的地址
 
     // 更新进程 PCB
-    let old_space = {
+    let (old_space, old_user_space) = {
         let mut proc = process.lock();
 
         let old_space = proc.memory_space;
+        let old_user_space = proc.user_memory_space;
         proc.memory_space = new_memory_space;
+        // H.3 KPTI: Set user PML4 root (0 if KPTI disabled)
+        proc.user_memory_space = new_user_memory_space;
         proc.user_stack = Some(VirtAddr::new(load_result.user_stack_top));
 
         // 设置上下文
@@ -3849,14 +3882,26 @@ fn sys_exec(
 
         proc.state = ProcessState::Ready;
 
-        old_space
+        (old_space, old_user_space)
     };
 
     // S-7 fix: Commit the exec - prevent guard from rolling back
     // This must be called after all error-prone operations are complete.
     space_guard.commit();
 
+    // H.3 KPTI: Re-synchronize per-CPU KPTI CR3 pair now that the PCB has been
+    // updated with the new user_memory_space.  activate_memory_space() ran before
+    // the user PML4 existed (it was created in Phase 4 after ELF loading), so the
+    // per-CPU state was installed as "single" context.  This call re-reads the
+    // current CR3, discovers the user PML4 via lookup_user_memory_space(), and
+    // pushes the correct (user_cr3, kernel_cr3) pair to the GS-addressable fields.
+    crate::process::sync_kpti_cr3();
+
     // 释放旧地址空间
+    // H.3 KPTI: Free old user PML4 before old kernel PML4 (shared sub-tables).
+    if old_user_space != 0 {
+        crate::fork::free_kpti_user_pml4(old_user_space);
+    }
     if old_space != 0 {
         free_address_space(old_space);
     }

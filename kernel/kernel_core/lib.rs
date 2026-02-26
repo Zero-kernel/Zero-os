@@ -32,7 +32,10 @@ pub mod time;
 pub mod usercopy;
 
 pub use elf_loader::{load_elf, ElfLoadError, ElfLoadResult, USER_STACK_SIZE, USER_STACK_TOP};
-pub use fork::{create_fresh_address_space, sys_fork, ForkError, ForkResult, PAGE_REF_COUNT};
+pub use fork::{
+    create_fresh_address_space, create_kpti_user_pml4, free_kpti_user_pml4, sys_fork, ForkError,
+    ForkResult, PAGE_REF_COUNT,
+};
 pub use process::{
     add_supplementary_group,
     // CLONE_VM sibling detection (R37-1 fix)
@@ -76,6 +79,11 @@ pub use process::{
     register_cpuset_task_left,
     CpusetTaskJoinedCallback,
     CpusetTaskLeftCallback,
+    // H.3 KPTI: Per-CPU CR3 update callback registration
+    register_kpti_cr3_callback,
+    KptiCr3UpdateCallback,
+    // H.3 KPTI: Re-sync per-CPU KPTI state after PCB user_memory_space update
+    sync_kpti_cr3,
     // DAC support
     Credentials,
     FileDescriptor,

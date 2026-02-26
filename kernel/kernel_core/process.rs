@@ -97,6 +97,16 @@ pub type CpusetTaskJoinedCallback = fn(u32);
 /// Parameter: cpuset_id (u32)
 pub type CpusetTaskLeftCallback = fn(u32);
 
+/// H.3 KPTI: Callback to update per-CPU GS-addressable CR3 pair
+///
+/// Called during context switch to keep the syscall entry/exit assembly's
+/// GS-relative CR3 values in sync with the loaded address space.
+/// Parameters: (user_cr3, kernel_cr3) — physical addresses.
+///
+/// When KPTI is disabled, both values are the same (causing the cmp/je
+/// skip pattern in syscall_entry_stub to bypass the CR3 switch entirely).
+pub type KptiCr3UpdateCallback = fn(u64, u64);
+
 /// 最大文件描述符数量（每进程）
 pub const MAX_FD: i32 = 256;
 
@@ -500,6 +510,22 @@ pub struct Process {
     /// 内存空间（页表基址）
     pub memory_space: usize,
 
+    /// H.3 KPTI: 用户页表根（user CR3 / 用户 PML4 物理地址）
+    ///
+    /// When KPTI dual page tables are active:
+    /// - `memory_space` serves as the **kernel CR3** (full kernel + user mappings)
+    /// - `user_memory_space` serves as the **user CR3** (user mappings + entry trampoline only)
+    ///
+    /// When KPTI is disabled (the default), this field is 0 and `memory_space` is
+    /// used for both kernel and user modes (identical CR3, zero-overhead skip in
+    /// the syscall assembly's `cmp/je` pattern).
+    ///
+    /// The user PML4 shares user-half page table sub-trees (PML4[0..255]) with the
+    /// kernel PML4 — entries point to the same PDPT/PD/PT frames. Only the PML4
+    /// root frame itself is privately owned. When freeing, only the root frame is
+    /// deallocated (no recursion into shared sub-tables).
+    pub user_memory_space: usize,
+
     /// mmap 区域跟踪 (起始地址 -> 长度)
     pub mmap_regions: BTreeMap<usize, usize>,
 
@@ -742,6 +768,7 @@ impl Process {
             kernel_stack_top: VirtAddr::new(0),
             user_stack: None,
             memory_space: 0,
+            user_memory_space: 0,
             mmap_regions: BTreeMap::new(),
             next_mmap_addr: security::randomized_mmap_base(DEFAULT_MMAP_BASE),
             fd_table: BTreeMap::new(),
@@ -1092,6 +1119,8 @@ lazy_static::lazy_static! {
     static ref CPUSET_TASK_JOINED: Mutex<Option<CpusetTaskJoinedCallback>> = Mutex::new(None);
     /// E.5 Cpuset: Task left callback (for process exit)
     static ref CPUSET_TASK_LEFT: Mutex<Option<CpusetTaskLeftCallback>> = Mutex::new(None);
+    /// H.3 KPTI: Per-CPU CR3 update callback (bridges kernel_core → arch)
+    static ref KPTI_CR3_UPDATE: Mutex<Option<KptiCr3UpdateCallback>> = Mutex::new(None);
     /// 缓存引导时的 CR3 值，用于内核进程或 memory_space == 0 的情况
     static ref BOOT_CR3: (PhysFrame<Size4KiB>, Cr3Flags) = Cr3::read();
 }
@@ -2134,6 +2163,33 @@ pub fn has_no_new_privs() -> bool {
     proc.seccomp_state.no_new_privs
 }
 
+/// H.3 KPTI: Look up the user PML4 physical address for a given kernel memory_space.
+///
+/// Scans the process table for a process whose `memory_space` matches the given
+/// kernel CR3, returning its `user_memory_space` (0 if KPTI is not active for that
+/// process, or if no match is found).
+///
+/// This is called from `activate_memory_space()` under interrupts-disabled context
+/// to determine whether to install a dual KPTI context.
+///
+/// # Performance
+///
+/// Linear scan of MAX_PID slots. Since this runs only on context switch (not hot
+/// path), the cost is acceptable. A future optimization could cache the mapping
+/// in the scheduler or pass user_memory_space directly through the context switch.
+fn lookup_user_memory_space(kernel_memory_space: usize) -> usize {
+    let table = PROCESS_TABLE.lock();
+    for slot in table.iter() {
+        if let Some(arc) = slot {
+            let proc = arc.lock();
+            if proc.memory_space == kernel_memory_space {
+                return proc.user_memory_space;
+            }
+        }
+    }
+    0
+}
+
 /// 激活指定的地址空间
 ///
 /// 切换到进程的页表。memory_space 为 0 时使用引导时的页表（内核共享页表）。
@@ -2175,13 +2231,35 @@ pub fn activate_memory_space(memory_space: usize) {
         // switch_context), but sys_exec also calls it with interrupts enabled,
         // so we wrap in without_interrupts for safety.
         //
-        // Currently uses KptiContext::single() since dual page tables are not
-        // yet implemented. When KPTI dual-root support is added, this changes
-        // to KptiContext::dual(user_cr3, kernel_cr3, pcid).
+        // When KPTI dual-root support is active (user_memory_space != 0),
+        // install the dual context so the syscall assembly's GS-relative CR3
+        // switch activates. Otherwise, use a single context (zero-overhead
+        // skip via the cmp/je pattern in syscall_entry_stub).
         x86_64::instructions::interrupts::without_interrupts(|| {
-            security::install_kpti_context(
-                security::KptiContext::single(target_cr3_phys),
-            );
+            // Look up the process to check for a KPTI user CR3.
+            // This is a brief lock acquisition under interrupts-disabled context.
+            let user_cr3 = if memory_space != 0 {
+                lookup_user_memory_space(memory_space)
+            } else {
+                0
+            };
+
+            let kpti_ctx = if user_cr3 != 0 {
+                security::KptiContext::dual(user_cr3 as u64, target_cr3_phys, 0)
+            } else {
+                security::KptiContext::single(target_cr3_phys)
+            };
+
+            security::install_kpti_context(kpti_ctx);
+
+            // H.3 KPTI: Also update the per-CPU GS-addressable CR3 pair used
+            // by the syscall entry/exit assembly trampoline.
+            let user_cr3_val = if user_cr3 != 0 {
+                user_cr3 as u64
+            } else {
+                target_cr3_phys
+            };
+            notify_kpti_cr3_update(user_cr3_val, target_cr3_phys);
         });
 
         // R68 Architecture Improvement: Update per-address-space TLB tracking.
@@ -2199,6 +2277,45 @@ pub fn activate_memory_space(memory_space: usize) {
         // - Any subsequent TLB entries will be populated after the shootdown
         mm::tlb_shootdown::track_cr3_switch(target_cr3_phys);
     }
+}
+
+/// H.3 KPTI: Re-synchronize per-CPU KPTI CR3 pair for the currently loaded address space.
+///
+/// This must be called after `user_memory_space` is updated in the PCB but CR3 has
+/// not changed (e.g., after `sys_execve` commits the new user PML4 into the PCB —
+/// `activate_memory_space` already ran before the user PML4 existed, so the per-CPU
+/// state was installed as "single" context).
+///
+/// The function re-reads the current CR3, looks up the corresponding `user_memory_space`,
+/// and pushes the (user_cr3, kernel_cr3) pair to the per-CPU GS-addressable fields
+/// used by the syscall assembly trampoline.
+pub fn sync_kpti_cr3() {
+    let (current_frame, _) = Cr3::read();
+    let current_cr3_phys = current_frame.start_address().as_u64();
+    let memory_space = current_cr3_phys as usize;
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let user_cr3 = if memory_space != 0 {
+            lookup_user_memory_space(memory_space)
+        } else {
+            0
+        };
+
+        let kpti_ctx = if user_cr3 != 0 {
+            security::KptiContext::dual(user_cr3 as u64, current_cr3_phys, 0)
+        } else {
+            security::KptiContext::single(current_cr3_phys)
+        };
+
+        security::install_kpti_context(kpti_ctx);
+
+        let user_cr3_val = if user_cr3 != 0 {
+            user_cr3 as u64
+        } else {
+            current_cr3_phys
+        };
+        notify_kpti_cr3_update(user_cr3_val, current_cr3_phys);
+    });
 }
 
 /// 获取进程
@@ -2304,6 +2421,24 @@ pub fn notify_cpuset_task_left(cpuset_id: u32) {
     let callback = *CPUSET_TASK_LEFT.lock();
     if let Some(cb) = callback {
         cb(cpuset_id);
+    }
+}
+
+/// H.3 KPTI: Register callback to update per-CPU GS-addressable CR3 pair.
+///
+/// Called by main kernel during initialization to bridge kernel_core → arch.
+/// The callback is `arch::arch_set_kpti_cr3s`.
+pub fn register_kpti_cr3_callback(callback: KptiCr3UpdateCallback) {
+    *KPTI_CR3_UPDATE.lock() = Some(callback);
+}
+
+/// H.3 KPTI: Update per-CPU GS-addressable CR3 pair via registered callback.
+///
+/// No-op if the callback has not been registered (early boot or KPTI disabled).
+fn notify_kpti_cr3_update(user_cr3: u64, kernel_cr3: u64) {
+    let callback = *KPTI_CR3_UPDATE.lock();
+    if let Some(cb) = callback {
+        cb(user_cr3, kernel_cr3);
     }
 }
 
@@ -3013,7 +3148,16 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
                 );
             }
             proc.memory_space = 0;
+            proc.user_memory_space = 0;
         } else {
+            // H.3 KPTI: Free user PML4 root BEFORE freeing the kernel PML4.
+            // The user PML4 shares user-half sub-table pointers with the kernel PML4,
+            // so only the root frame is freed (no recursion into shared sub-tables).
+            if proc.user_memory_space != 0 {
+                crate::fork::free_kpti_user_pml4(proc.user_memory_space);
+                proc.user_memory_space = 0;
+            }
+
             // R104-2 FIX: Capture root before free for debug print, but gate the
             // print behind debug_assertions to avoid leaking PT root addresses.
             #[cfg(debug_assertions)]

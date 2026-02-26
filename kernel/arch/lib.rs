@@ -34,7 +34,7 @@ pub use gdt::{
     DOUBLE_FAULT_STACK_SIZE, KERNEL_STACK_SIZE,
 };
 pub use syscall::{
-    init_syscall_msr, is_initialized as syscall_initialized,
+    arch_set_kpti_cr3s, init_syscall_msr, is_initialized as syscall_initialized,
     register_frame_callback, with_current_syscall_frame, SyscallFrame,
 };
 
