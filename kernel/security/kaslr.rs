@@ -713,8 +713,8 @@ impl KptiContext {
 ///
 /// # R102-1 FIX
 ///
-/// Uses atomic stores with Release ordering to ensure the context is
-/// fully visible before `KPTI_ENABLED` is set.
+/// Uses atomic stores with Release ordering and a per-CPU seqlock to ensure the
+/// context is fully visible before readers observe the updated sequence number.
 ///
 /// # R103-I1 Safety Requirement
 ///
@@ -780,10 +780,15 @@ pub fn install_kpti_context(ctx: KptiContext) {
     //         are visible before a reader observes the new sequence number.
     pcpu.kpti_seq.store(seq.wrapping_add(2), Ordering::Release);
 
-    // Update the global enabled flag after the seqlock is released so that
-    // readers who see KPTI_ENABLED == true can immediately obtain a
-    // consistent snapshot via current_kpti_context().
-    KPTI_ENABLED.store(ctx.has_kpti(), Ordering::SeqCst);
+    // R118-4 FIX: REMOVED dynamic KPTI_ENABLED toggling.
+    //
+    // Previously this line stored `ctx.has_kpti()` into the global KPTI_ENABLED
+    // flag on every context switch. On SMP, when any CPU switched to a non-KPTI
+    // task (e.g., kernel idle), it would clear KPTI_ENABLED for ALL CPUs, causing
+    // other CPUs' fork/exec to skip user PML4 creation.
+    //
+    // KPTI_ENABLED is a system-wide policy flag set once during boot by
+    // enable_kpti() — it must never be toggled per-context-switch.
 }
 
 /// Read the current KPTI context for this CPU (lock-free)

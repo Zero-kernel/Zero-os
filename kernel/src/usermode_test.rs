@@ -272,7 +272,7 @@ pub fn run_usermode_test() -> bool {
     let elf_data = user_elf();
 
     // Switch to user address space for ELF loading
-    kernel_core::process::activate_memory_space(memory_space);
+    kernel_core::process::activate_memory_space(memory_space, None);
 
     let load_result = match load_elf(elf_data) {
         Ok(result) => {
@@ -289,7 +289,7 @@ pub fn run_usermode_test() -> bool {
         Err(e) => {
             klog!(Error, "      ✗ Failed to load ELF: {:?}", e);
             // Restore original CR3
-            kernel_core::process::activate_memory_space(saved_cr3);
+            kernel_core::process::activate_memory_space(saved_cr3, None);
             return false;
         }
     };
@@ -347,7 +347,7 @@ pub fn run_usermode_test() -> bool {
         klog!(Info, "        SS:    0x{:x} (Ring 3)", proc.context.ss);
     } else {
         klog!(Error, "      ✗ Failed to get process");
-        kernel_core::process::activate_memory_space(saved_cr3);
+        kernel_core::process::activate_memory_space(saved_cr3, None);
         return false;
     }
 
@@ -358,7 +358,7 @@ pub fn run_usermode_test() -> bool {
     }
 
     // Restore kernel address space (scheduler will switch when running the process)
-    kernel_core::process::activate_memory_space(saved_cr3);
+    kernel_core::process::activate_memory_space(saved_cr3, None);
 
     klog!(Info, "\n✓ Ring 3 test process ready!");
     klog!(Info, "  The process will execute when scheduled.");
@@ -383,7 +383,7 @@ pub unsafe fn test_direct_ring3_jump() -> ! {
         create_fresh_address_space().expect("Failed to create address space");
 
     // Switch to new address space
-    kernel_core::process::activate_memory_space(memory_space);
+    kernel_core::process::activate_memory_space(memory_space, None);
 
     // Load ELF
     let load_result = load_elf(user_elf()).expect("Failed to load ELF");

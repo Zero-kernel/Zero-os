@@ -3466,8 +3466,8 @@ fn sys_exec(
     use crate::elf_loader::{load_elf, USER_STACK_SIZE};
     use crate::fork::create_fresh_address_space;
     use crate::process::{
-        activate_memory_space, current_pid, free_address_space, get_process, thread_group_size,
-        ProcessState,
+        activate_memory_space, address_space_share_count, current_pid, free_address_space,
+        get_process, thread_group_size, ProcessState,
     };
 
     // 获取当前进程
@@ -3479,15 +3479,35 @@ fn sys_exec(
     // sibling threads are still executing, causing UAF/memory corruption.
     // Linux behavior: exec in multithreaded process kills other threads first,
     // but that requires complex thread group handling. For now, reject with EBUSY.
-    let tgid = {
+    let (tgid, current_memory_space) = {
         let proc = process.lock();
-        proc.tgid
+        (proc.tgid, proc.memory_space)
     };
-    if thread_group_size(tgid) > 1 {
+    let thread_count = thread_group_size(tgid);
+    if thread_count > 1 {
         kprintln!(
             "sys_exec: refusing exec in multithreaded process (tgid={}, threads={})",
             tgid,
-            thread_group_size(tgid)
+            thread_count
+        );
+        return Err(SyscallError::EBUSY);
+    }
+
+    // R118-1 FIX: Refuse exec when other tasks share this address space (CLONE_VM).
+    //
+    // thread_group_size(tgid) only counts CLONE_THREAD siblings (same tgid).
+    // A process created via CLONE_VM without CLONE_THREAD has a different tgid
+    // but shares the same memory_space.  If exec freed the old page tables,
+    // that CLONE_VM sibling would still reference the freed CR3 → UAF.
+    //
+    // address_space_share_count() counts ALL live processes with the same
+    // memory_space, regardless of tgid.
+    let share_count = address_space_share_count(current_memory_space);
+    if share_count > 1 {
+        kprintln!(
+            "sys_exec: refusing exec with {} CLONE_VM sibling(s) sharing address space (cr3=0x{:x})",
+            share_count - 1,
+            current_memory_space
         );
         return Err(SyscallError::EBUSY);
     }
@@ -3546,19 +3566,30 @@ fn sys_exec(
     //
     // After switching CR3, any error must restore the old address space
     // and free the new one. This guard ensures automatic rollback.
+    // R118-I1 FIX: ExecSpaceGuard now tracks new_user_space so that KPTI user
+    // PML4 frames are freed on rollback (previously leaked on exec failure).
     struct ExecSpaceGuard {
         old_space: usize,
+        old_user_space: usize,
         new_space: usize,
+        new_user_space: usize,
         committed: bool,
     }
 
     impl ExecSpaceGuard {
-        fn new(old_space: usize, new_space: usize) -> Self {
+        fn new(old_space: usize, old_user_space: usize, new_space: usize) -> Self {
             Self {
                 old_space,
+                old_user_space,
                 new_space,
+                new_user_space: 0,
                 committed: false,
             }
+        }
+
+        /// R118-I1 FIX: Track KPTI user PML4 for rollback cleanup.
+        fn set_new_user_space(&mut self, user_space: usize) {
+            self.new_user_space = user_space;
         }
 
         /// Mark the exec as successful, preventing rollback on drop
@@ -3571,7 +3602,12 @@ fn sys_exec(
         fn drop(&mut self) {
             if !self.committed {
                 // Rollback: restore old address space and free new one
-                crate::process::activate_memory_space(self.old_space);
+                crate::process::activate_memory_space(self.old_space, Some(self.old_user_space));
+                // R118-I1 FIX: Free KPTI user PML4 before kernel PML4
+                // (user PML4 contains shared sub-table pointers)
+                if self.new_user_space != 0 {
+                    crate::fork::free_kpti_user_pml4(self.new_user_space);
+                }
                 crate::process::free_address_space(self.new_space);
             }
         }
@@ -3580,11 +3616,12 @@ fn sys_exec(
     // Create the guard before switching CR3
     let mut space_guard = ExecSpaceGuard::new(
         old_memory_space,
+        old_user_memory_space,
         new_memory_space,
     );
 
-    // 切换到新地址空间
-    activate_memory_space(new_memory_space);
+    // 切换到新地址空间 (KPTI user PML4 not yet created — pass 0)
+    activate_memory_space(new_memory_space, Some(0));
 
     // 加载 ELF 映像
     // S-7 fix: Let the guard handle rollback on error
@@ -3790,6 +3827,8 @@ fn sys_exec(
     } else {
         0
     };
+    // R118-I1 FIX: Register user PML4 with guard so rollback frees it.
+    space_guard.set_new_user_space(new_user_memory_space);
 
     // Final RSP points to argc (lowest address in the buffer)
     let final_rsp = buf_base as u64;
@@ -3889,13 +3928,14 @@ fn sys_exec(
     // This must be called after all error-prone operations are complete.
     space_guard.commit();
 
-    // H.3 KPTI: Re-synchronize per-CPU KPTI CR3 pair now that the PCB has been
-    // updated with the new user_memory_space.  activate_memory_space() ran before
-    // the user PML4 existed (it was created in Phase 4 after ELF loading), so the
-    // per-CPU state was installed as "single" context.  This call re-reads the
-    // current CR3, discovers the user PML4 via lookup_user_memory_space(), and
-    // pushes the correct (user_cr3, kernel_cr3) pair to the GS-addressable fields.
-    crate::process::sync_kpti_cr3();
+    // R118-6 FIX: Update per-CPU KPTI CR3 pair now that the user PML4 exists.
+    //
+    // The initial activate_memory_space() ran before Phase 4 and installed a
+    // single-root context (user PML4 wasn't created yet).  Now that the user
+    // PML4 is committed to the PCB, re-invoke with the correct user_memory_space
+    // to install the dual-root KPTI context.  This replaces the previous
+    // sync_kpti_cr3() call that scanned PROCESS_TABLE.
+    activate_memory_space(new_memory_space, Some(new_user_memory_space));
 
     // 释放旧地址空间
     // H.3 KPTI: Free old user PML4 before old kernel PML4 (shared sub-tables).

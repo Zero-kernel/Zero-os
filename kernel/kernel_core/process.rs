@@ -2169,14 +2169,14 @@ pub fn has_no_new_privs() -> bool {
 /// kernel CR3, returning its `user_memory_space` (0 if KPTI is not active for that
 /// process, or if no match is found).
 ///
-/// This is called from `activate_memory_space()` under interrupts-disabled context
-/// to determine whether to install a dual KPTI context.
+/// R118-6 FIX: This function is now only used by `sync_kpti_cr3()` as a recovery
+/// path when the caller updates `user_memory_space` in the PCB without changing CR3.
+/// The scheduler hot path passes `user_memory_space` directly to
+/// `activate_memory_space()`, avoiding the O(n) scan + Mutex acquisition.
 ///
 /// # Performance
 ///
-/// Linear scan of MAX_PID slots. Since this runs only on context switch (not hot
-/// path), the cost is acceptable. A future optimization could cache the mapping
-/// in the scheduler or pass user_memory_space directly through the context switch.
+/// Linear scan of MAX_PID slots — intentionally kept out of the scheduler hot path.
 fn lookup_user_memory_space(kernel_memory_space: usize) -> usize {
     let table = PROCESS_TABLE.lock();
     for slot in table.iter() {
@@ -2195,14 +2195,24 @@ fn lookup_user_memory_space(kernel_memory_space: usize) -> usize {
 /// 切换到进程的页表。memory_space 为 0 时使用引导时的页表（内核共享页表）。
 /// 调用 Cr3::write 会刷新 TLB，确保新地址空间立即生效。
 ///
+/// # R118-6 FIX: Direct user_memory_space parameter
+///
+/// The optional `user_memory_space` parameter eliminates the need for
+/// `lookup_user_memory_space()` in the scheduler hot path.  Callers that know
+/// the user PML4 (context switch, sys_exec) pass it directly; callers that
+/// don't care (boot CR3, test code) pass `None`.
+///
 /// # Arguments
 /// * `memory_space` - 进程的 PML4 物理地址，0 表示使用引导页表
+/// * `user_memory_space` - H.3 KPTI user PML4 physical address.
+///   `Some(phys)` installs a dual KPTI context; `None` skips KPTI update
+///   unless CR3 actually changes (in which case single-root is installed).
 ///
 /// # Safety
 /// 这个函数会修改 CR3 寄存器，调用者必须确保：
 /// - memory_space 指向有效的 PML4 页表
 /// - 内核代码和数据在新旧页表中都有正确映射
-pub fn activate_memory_space(memory_space: usize) {
+pub fn activate_memory_space(memory_space: usize, user_memory_space: Option<usize>) {
     let (boot_frame, boot_flags) = *BOOT_CR3;
     let (current_frame, _) = Cr3::read();
 
@@ -2217,33 +2227,37 @@ pub fn activate_memory_space(memory_space: usize) {
         )
     };
 
+    let target_cr3_phys = target_frame.start_address().as_u64();
+    let need_cr3_switch = target_frame != current_frame;
+    // Update KPTI state when: (a) CR3 is changing, or (b) caller explicitly
+    // provides a user_memory_space (e.g., sys_exec re-sync after Phase 4).
+    let should_update_kpti = need_cr3_switch || user_memory_space.is_some();
+
+    // R118-6 safety net: When KPTI is globally enabled, context-switching to a
+    // user address space (memory_space != 0) without an explicit user_memory_space
+    // is likely a caller bug. Debug-assert to catch missed call sites early.
+    #[cfg(debug_assertions)]
+    if memory_space != 0 && user_memory_space.is_none() && security::is_kpti_enabled() {
+        klog!(Warn,
+            "activate_memory_space: KPTI enabled but user_memory_space=None for cr3=0x{:x} — KPTI will be single-root for this switch",
+            memory_space
+        );
+    }
+
     // 只有当目标页表与当前不同时才切换（避免不必要的 TLB 刷新）
-    if target_frame != current_frame {
+    if need_cr3_switch {
         unsafe { Cr3::write(target_frame, target_flags) };
+    }
 
-        let target_cr3_phys = target_frame.start_address().as_u64();
+    // H.3 KPTI: Keep per-CPU KPTI context in sync with the active address space.
+    //
+    // R118-6 FIX: Callers now pass user_memory_space directly, eliminating
+    // the O(n) PROCESS_TABLE scan under Mutex inside without_interrupts.
+    // This removes the NMI deadlock risk and improves context switch latency.
+    if should_update_kpti {
+        let user_cr3 = user_memory_space.unwrap_or(0);
 
-        // H.3 KPTI: Keep per-CPU KPTI context in sync with the loaded CR3.
-        //
-        // install_kpti_context uses a per-CPU seqlock and must run with
-        // interrupts disabled (its debug_assert enforces this). The scheduler
-        // calls activate_memory_space with interrupts already disabled (cli in
-        // switch_context), but sys_exec also calls it with interrupts enabled,
-        // so we wrap in without_interrupts for safety.
-        //
-        // When KPTI dual-root support is active (user_memory_space != 0),
-        // install the dual context so the syscall assembly's GS-relative CR3
-        // switch activates. Otherwise, use a single context (zero-overhead
-        // skip via the cmp/je pattern in syscall_entry_stub).
         x86_64::instructions::interrupts::without_interrupts(|| {
-            // Look up the process to check for a KPTI user CR3.
-            // This is a brief lock acquisition under interrupts-disabled context.
-            let user_cr3 = if memory_space != 0 {
-                lookup_user_memory_space(memory_space)
-            } else {
-                0
-            };
-
             let kpti_ctx = if user_cr3 != 0 {
                 security::KptiContext::dual(user_cr3 as u64, target_cr3_phys, 0)
             } else {
@@ -2261,7 +2275,9 @@ pub fn activate_memory_space(memory_space: usize) {
             };
             notify_kpti_cr3_update(user_cr3_val, target_cr3_phys);
         });
+    }
 
+    if need_cr3_switch {
         // R68 Architecture Improvement: Update per-address-space TLB tracking.
         //
         // This allows TLB shootdown to target only CPUs that might have TLB entries
@@ -2290,11 +2306,16 @@ pub fn activate_memory_space(memory_space: usize) {
 /// and pushes the (user_cr3, kernel_cr3) pair to the per-CPU GS-addressable fields
 /// used by the syscall assembly trampoline.
 pub fn sync_kpti_cr3() {
-    let (current_frame, _) = Cr3::read();
-    let current_cr3_phys = current_frame.start_address().as_u64();
-    let memory_space = current_cr3_phys as usize;
-
+    // R118-7 FIX: CR3 read moved inside without_interrupts to prevent TOCTOU.
+    //
+    // Previously, Cr3::read() was outside the interrupt-disabled section.
+    // A timer IRQ between the read and the lookup could trigger a context switch,
+    // changing CR3 to a different process's page table. The lookup would then
+    // find the wrong (or no) user_memory_space, installing a stale KPTI context.
     x86_64::instructions::interrupts::without_interrupts(|| {
+        let (current_frame, _) = Cr3::read();
+        let current_cr3_phys = current_frame.start_address().as_u64();
+        let memory_space = current_cr3_phys as usize;
         let user_cr3 = if memory_space != 0 {
             lookup_user_memory_space(memory_space)
         } else {
@@ -2470,8 +2491,7 @@ pub fn terminate_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
     // The zombie's user page tables may be freed by a concurrent reaper on
     // another CPU. Switching to BOOT_CR3 ensures no stale TLB entries reference
     // freed page table frames.
-    activate_memory_space(0);
-
+    activate_memory_space(0, Some(0));
     // Give the scheduler a chance to context-switch to another task.
     // force_reschedule() may temporarily re-enable interrupts internally
     // (spinlock acquisition), but we are now on safe boot CR3.

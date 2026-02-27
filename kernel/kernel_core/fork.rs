@@ -1162,6 +1162,27 @@ pub fn create_kpti_user_pml4(
         zero_table(user_pml4_frame);
     }
 
+    // R118-5 FIX: Allocate a dedicated PDPT for the entry island (PML4[511]).
+    //
+    // Instead of copying the kernel's full PML4[511] (which maps 512 GiB),
+    // we create a fresh PDPT and copy only the top 4 GiB (PDPT[508..=511]).
+    // This limits speculative Meltdown-style exposure from 512 GiB to 4 GiB,
+    // covering only the regions actually needed by the trampoline:
+    //   - Kernel text/data (.text at 0xffffffff80100000)
+    //   - Per-CPU syscall metadata (SyscallPerCpu)
+    //   - IDT/GDT/TSS and scratch stacks
+    let entry_island_pdpt_frame = match frame_alloc.allocate_frame() {
+        Some(f) => f,
+        None => {
+            // Roll back: free the PML4 frame that was already allocated above.
+            frame_alloc.deallocate_frame(user_pml4_frame);
+            return Err(ForkError::MemoryAllocationFailed);
+        }
+    };
+    unsafe {
+        zero_table(entry_island_pdpt_frame);
+    }
+
     let kernel_pml4_frame: PhysFrame<Size4KiB> =
         PhysFrame::containing_address(PhysAddr::new(kernel_pml4_phys as u64));
 
@@ -1191,18 +1212,35 @@ pub fn create_kpti_user_pml4(
 
         // ── Map entry island (PML4[511]) ──
         //
-        // Copies the kernel's PML4[511] entry, which covers the high-half direct
-        // mapping region containing kernel text (.text at 0xffffffff80100000),
-        // per-CPU data (SYSCALL_PERCPU), scratch stacks, IDT, GDT, and TSS.
+        // R118-5 FIX: Instead of copying the kernel's PML4[511] verbatim (512 GiB),
+        // point to a dedicated PDPT that only maps the top 4 GiB (PDPT[508..=511]).
+        // This contains:
+        //   - Kernel text (.text at 0xffffffff80100000 → PDPT[510])
+        //   - Per-CPU data, IDT, GDT, TSS, scratch stacks (PDPT[510..=511])
+        //   - Kernel stacks (PDPT[508..=511] range depending on layout)
         //
-        // Defense-in-depth: strip USER_ACCESSIBLE to ensure ring-3 code cannot
-        // access these pages even if Meltdown-class speculative reads are possible.
-        user_pml4[ENTRY_ISLAND_INDEX] = kernel_pml4[ENTRY_ISLAND_INDEX].clone();
-        if !user_pml4[ENTRY_ISLAND_INDEX].is_unused() {
-            let addr = user_pml4[ENTRY_ISLAND_INDEX].addr();
-            let mut flags = user_pml4[ENTRY_ISLAND_INDEX].flags();
-            flags.remove(PageTableFlags::USER_ACCESSIBLE);
-            user_pml4[ENTRY_ISLAND_INDEX].set_addr(addr, flags);
+        // All entries are supervisor-only (USER_ACCESSIBLE removed at both PML4
+        // and PDPT levels) to prevent normal Ring 3 access and limit Meltdown-style
+        // speculative exposure to 4 GiB instead of 512 GiB.
+        if !kernel_pml4[ENTRY_ISLAND_INDEX].is_unused() {
+            let mut island_flags = kernel_pml4[ENTRY_ISLAND_INDEX].flags();
+            island_flags.remove(PageTableFlags::USER_ACCESSIBLE);
+            user_pml4[ENTRY_ISLAND_INDEX].set_frame(entry_island_pdpt_frame, island_flags);
+
+            let kernel_pdpt = phys_to_virt_table(kernel_pml4[ENTRY_ISLAND_INDEX].addr());
+            let island_pdpt = phys_to_virt_table(entry_island_pdpt_frame.start_address());
+
+            // Copy only PDPT[508..=511] (top 4 GiB) from kernel's PDPT.
+            // PDPT[0..508] remain absent (not present) in the user PDPT.
+            for i in 508..512 {
+                island_pdpt[i] = kernel_pdpt[i].clone();
+                if !island_pdpt[i].is_unused() {
+                    let addr = island_pdpt[i].addr();
+                    let mut flags = island_pdpt[i].flags();
+                    flags.remove(PageTableFlags::USER_ACCESSIBLE);
+                    island_pdpt[i].set_addr(addr, flags);
+                }
+            }
         }
     }
 
@@ -1212,9 +1250,10 @@ pub fn create_kpti_user_pml4(
 
 /// H.3 KPTI: Free a user PML4 root created by `create_kpti_user_pml4()`.
 ///
-/// Only deallocates the root PML4 frame. User-half entries (PML4[0..255]) are
-/// shared pointers into the kernel PML4's sub-tables and MUST NOT be freed here
-/// (they are freed when `free_address_space()` is called on the kernel PML4).
+/// Deallocates the root PML4 frame and its dedicated entry-island PDPT frame.
+/// User-half entries (PML4[0..255]) are shared pointers into the kernel PML4's
+/// sub-tables and MUST NOT be freed here (they are freed when
+/// `free_address_space()` is called on the kernel PML4).
 ///
 /// # Safety
 ///
@@ -1227,6 +1266,19 @@ pub fn free_kpti_user_pml4(user_memory_space: usize) {
     let mut frame_alloc = FrameAllocator::new();
     let root_frame: PhysFrame<Size4KiB> =
         PhysFrame::containing_address(PhysAddr::new(user_memory_space as u64));
+
+    // R118-5 FIX: Free the privately-owned entry-island PDPT frame (PML4[511]).
+    unsafe {
+        const ENTRY_ISLAND_INDEX: usize = 511;
+        let user_pml4 = phys_to_virt_table(root_frame.start_address());
+        if !user_pml4[ENTRY_ISLAND_INDEX].is_unused() {
+            let pdpt_phys = user_pml4[ENTRY_ISLAND_INDEX].addr();
+            user_pml4[ENTRY_ISLAND_INDEX].set_unused();
+            let pdpt_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(pdpt_phys);
+            frame_alloc.deallocate_frame(pdpt_frame);
+        }
+    }
+
     frame_alloc.deallocate_frame(root_frame);
 }
 

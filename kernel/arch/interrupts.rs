@@ -1272,7 +1272,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                 // the zombie's kernel stack, and freed user page tables remain
                 // in the TLB. Same safety rationale as terminate_self_and_halt().
                 x86_interrupts::disable();
-                kernel_core::process::activate_memory_space(0);
+                kernel_core::process::activate_memory_space(0, Some(0));
 
                 kernel_core::force_reschedule();
 

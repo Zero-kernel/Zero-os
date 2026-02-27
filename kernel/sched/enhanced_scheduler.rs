@@ -1344,10 +1344,13 @@ impl Scheduler {
             // R70-4 FIX: Copy context to per-CPU shadow buffer to prevent use-after-unlock.
             // The PCB lock is released at the end of the closure, but we use the shadow
             // buffer's stable pointer for enter_usermode/switch_context.
-            let (new_ctx_ptr, next_kstack_top, next_cs, next_fs_base, next_gs_base, next_wd_handle): (
+            // R118-6 FIX: Also extract user_memory_space to pass directly to
+            // activate_memory_space(), avoiding PROCESS_TABLE scan in the hot path.
+            let (new_ctx_ptr, next_kstack_top, next_cs, next_user_space, next_fs_base, next_gs_base, next_wd_handle): (
                 *const ArchContext,
                 u64,
                 u64,
+                usize,
                 u64,
                 u64,
                 Option<WatchdogHandle>,
@@ -1357,10 +1360,11 @@ impl Scheduler {
                 let ctx_ptr = shadow.store(&guard.context);
                 let kstack_top = guard.kernel_stack_top.as_u64();
                 let cs = guard.context.cs;
+                let user_space = guard.user_memory_space;
                 let fs_base = guard.fs_base;
                 let gs_base = guard.gs_base;
                 let wd_handle = guard.watchdog_handle;
-                (ctx_ptr, kstack_top, cs, fs_base, gs_base, wd_handle)
+                (ctx_ptr, kstack_top, cs, user_space, fs_base, gs_base, wd_handle)
             });
 
             // 判断下一个进程是否为用户态进程（Ring 3）
@@ -1406,7 +1410,7 @@ impl Scheduler {
                 heartbeat(handle, now_ms);
             }
 
-            process::activate_memory_space(next_space);
+            process::activate_memory_space(next_space, Some(next_user_space));
 
             // 执行上下文切换
             // 根据目标进程的特权级选择不同的切换方式：

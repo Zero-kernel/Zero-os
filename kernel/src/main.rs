@@ -567,6 +567,18 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         // activate_memory_space() can keep the syscall assembly's GS-relative
         // CR3 pair in sync during context switches.
         kernel_core::register_kpti_cr3_callback(arch::arch_set_kpti_cr3s);
+
+        // R118-3 FIX: Enable KPTI now that the arch-level CR3 updater is registered.
+        //
+        // This makes fork/exec create dual page table roots and activates CR3
+        // switching in syscall entry/exit and enter_usermode() IRETQ paths.
+        // All pre-requisite bugs (R118-2, R118-4, R118-5, R118-7) are fixed.
+        //
+        // KPTI is enabled unconditionally: all pre-Whiskey Lake Intel CPUs are
+        // vulnerable to Meltdown. A future refinement could check CPUID for
+        // IA32_ARCH_CAPABILITIES.RDCL_NO and skip enablement on safe CPUs.
+        security::kaslr::enable_kpti();
+
         klog_always!("      ✓ SYSCALL MSR configured");
         klog_always!("      ✓ Syscall frame callback registered");
         klog_always!("      ✓ KPTI CR3 callback registered");

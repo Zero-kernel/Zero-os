@@ -588,6 +588,26 @@ pub unsafe extern "C" fn enter_usermode(ctx: *const Context) -> ! {
         // CLI 确保 SWAPGS 与 IRETQ 之间不会被中断（否则中断处理器
         // 会看到用户态 GS 导致 per-CPU 数据访问错误）
         "cli",
+
+        // R118-2 FIX: Switch to user CR3 before returning to Ring 3 (KPTI).
+        //
+        // When KPTI dual page tables are active, kpti_user_cr3 != kpti_kernel_cr3.
+        // We must load the user CR3 before IRETQ to ensure Ring 3 code runs with
+        // the restricted user page table (no kernel mappings).
+        //
+        // GS still points to kernel per-CPU data at this point (SWAPGS hasn't
+        // happened yet), so we can safely access the GS-relative CR3 fields.
+        // Use the kpti_tmp scratch slot to avoid clobbering RDI (already restored).
+        "mov qword ptr gs:[{percpu_kpti_tmp}], rdx",
+        "mov rdx, qword ptr gs:[{percpu_kpti_user_cr3}]",
+        "test rdx, rdx",
+        "jz 4f",                       // Skip if zero (no KPTI)
+        "cmp rdx, qword ptr gs:[{percpu_kpti_kernel_cr3}]",
+        "je 4f",                       // Skip if same (KPTI not active for this process)
+        "mov cr3, rdx",
+        "4:",
+        "mov rdx, qword ptr gs:[{percpu_kpti_tmp}]",
+
         "swapgs",
         // 执行 IRETQ 进入用户态（IRETQ 会从栈帧恢复 RFLAGS.IF）
         "iretq",
@@ -603,6 +623,9 @@ pub unsafe extern "C" fn enter_usermode(ctx: *const Context) -> ! {
         fxoff = const FXSAVE_OFFSET,
         rflags_if = const RFLAGS_IF,
         rflags_user_mask = const RFLAGS_USER_MASK,
+        percpu_kpti_kernel_cr3 = const crate::syscall::PERCPU_KPTI_KERNEL_CR3_OFFSET,
+        percpu_kpti_user_cr3 = const crate::syscall::PERCPU_KPTI_USER_CR3_OFFSET,
+        percpu_kpti_tmp = const crate::syscall::PERCPU_KPTI_TMP_OFFSET,
         user_cs = const USER_CODE_SELECTOR,
         user_ss = const USER_DATA_SELECTOR,
     );
