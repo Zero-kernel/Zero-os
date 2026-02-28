@@ -12,21 +12,51 @@
 //! 3. The usercopy helper returns an error code (EFAULT semantics)
 //! 4. The syscall layer receives the error and returns EFAULT to userspace
 //!
-//! # Section Layout
+//! # Section Layout (PC-relative, PIE-compatible)
 //!
-//! The `.ex_table` section contains pairs of `(fault_ip, fixup_ip)` addresses.
-//! Each entry is 16 bytes (two u64 pointers) aligned to 16 bytes.
+//! Each `.ex_table` entry is 8 bytes: two signed 32-bit offsets.
+//! - `fault_ip_rel`: offset from the field's own address to the faulting instruction
+//! - `fixup_ip_rel`: offset from the field's own address to the fixup label
+//!
+//! Absolute addresses are recovered at runtime:
+//!   `absolute = &field as usize + field as isize`
+//!
+//! This PC-relative encoding avoids R_X86_64_64 relocations, making the
+//! exception table compatible with PIE/text-KASLR linking.
 
 use core::ptr;
 
-/// Exception table entry mapping a faulting instruction to its fixup.
+/// Exception table entry using PC-relative signed 32-bit offsets.
+///
+/// Each field stores the signed distance from its own address to the target.
+/// This avoids absolute addresses and is compatible with PIE linking.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ExceptionTableEntry {
-    /// Address of the instruction that may fault
-    pub fault_ip: usize,
-    /// Address to jump to when a fault occurs at fault_ip
-    pub fixup_ip: usize,
+    /// Signed offset from this field's address to the faulting instruction
+    pub fault_ip_rel: i32,
+    /// Signed offset from this field's address to the fixup label
+    pub fixup_ip_rel: i32,
+}
+
+impl ExceptionTableEntry {
+    /// Compute the absolute faulting instruction address.
+    ///
+    /// `absolute = &self.fault_ip_rel as usize + self.fault_ip_rel as isize`
+    #[inline]
+    unsafe fn fault_ip(&self) -> usize {
+        let base = ptr::addr_of!(self.fault_ip_rel) as usize;
+        base.wrapping_add(self.fault_ip_rel as isize as usize)
+    }
+
+    /// Compute the absolute fixup address.
+    ///
+    /// `absolute = &self.fixup_ip_rel as usize + self.fixup_ip_rel as isize`
+    #[inline]
+    unsafe fn fixup_ip(&self) -> usize {
+        let base = ptr::addr_of!(self.fixup_ip_rel) as usize;
+        base.wrapping_add(self.fixup_ip_rel as isize as usize)
+    }
 }
 
 extern "C" {
@@ -60,10 +90,11 @@ pub fn lookup(fault_ip: usize) -> Option<usize> {
     let count = (end as usize - start as usize) / core::mem::size_of::<ExceptionTableEntry>();
 
     for i in 0..count {
-        // SAFETY: `i` is within the exception table range
-        let entry = unsafe { ptr::read(start.add(i)) };
-        if entry.fault_ip == fault_ip {
-            return Some(entry.fixup_ip);
+        // SAFETY: `i` is within the exception table range; entry read is aligned (8-byte).
+        let entry = unsafe { &*start.add(i) };
+        let abs_fault = unsafe { entry.fault_ip() };
+        if abs_fault == fault_ip {
+            return Some(unsafe { entry.fixup_ip() });
         }
     }
 

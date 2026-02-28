@@ -175,8 +175,9 @@ static KERNEL_LAYOUT: Mutex<KernelLayout> = Mutex::new(KernelLayout::fixed());
 
 /// Partial KASLR feature status.
 ///
-/// When full text KASLR is unavailable (kernel compiled with `-C relocation-model=static`),
-/// Partial KASLR provides defense-in-depth by randomizing other kernel regions.
+/// Partial KASLR provides defense-in-depth by randomizing kernel regions
+/// other than the text/rodata/data image. It is useful both when text KASLR
+/// is unavailable and as an additional layer when text KASLR is enabled.
 #[derive(Debug, Clone, Copy)]
 pub struct PartialKaslrStatus {
     /// Heap base randomization via early RDRAND entropy
@@ -215,6 +216,20 @@ pub enum PartialKaslrFeature {
     KernelStacks,
     /// Userspace ASLR (mmap, stack, brk)
     UserspaceAslr,
+}
+
+/// Text (kernel image) KASLR status.
+///
+/// Reports whether the kernel image was loaded at a randomized physical/virtual
+/// address by the bootloader's `.rela.dyn` relocation engine.
+#[derive(Debug, Clone, Copy)]
+pub struct TextKaslrStatus {
+    /// True when the kernel image is slid by a non-zero offset.
+    pub enabled: bool,
+    /// Slide applied to the kernel image (bytes). 0 when disabled.
+    pub slide: u64,
+    /// Whether `slide` respects the 2 MiB granularity contract.
+    pub slide_aligned_2m: bool,
 }
 
 // ============================================================================
@@ -972,6 +987,21 @@ pub fn partial_kaslr_status() -> PartialKaslrStatus {
     }
 }
 
+/// Get text KASLR status (kernel image slide).
+///
+/// Returns the slide value passed by the bootloader via `BootInfo::kaslr_slide`.
+/// When non-zero, the kernel image was loaded at a randomized physical address
+/// and all absolute addresses were patched by the bootloader's `.rela.dyn`
+/// relocation engine.
+pub fn text_kaslr_status() -> TextKaslrStatus {
+    let slide = get_kernel_layout().kaslr_slide;
+    TextKaslrStatus {
+        enabled: slide != 0,
+        slide,
+        slide_aligned_2m: slide % KASLR_SLIDE_GRANULARITY == 0,
+    }
+}
+
 /// Enable a partial KASLR feature.
 ///
 /// # Arguments
@@ -1411,7 +1441,7 @@ pub fn init(boot_slide: Option<u64>) {
     #[cfg(debug_assertions)]
     {
         kprintln!(
-            "  KASLR: {} (slide: 0x{:x})",
+            "  Text KASLR: {} (slide: 0x{:x})",
             if layout.kaslr_slide != 0 {
                 "enabled"
             } else {
@@ -1422,7 +1452,7 @@ pub fn init(boot_slide: Option<u64>) {
     }
     #[cfg(not(debug_assertions))]
     klog_always!(
-        "  KASLR: {}",
+        "  Text KASLR: {}",
         if layout.kaslr_slide != 0 {
             "enabled"
         } else {

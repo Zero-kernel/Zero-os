@@ -18,7 +18,7 @@
 
 use alloc::string::ToString;
 use kernel_core::elf_loader::load_elf;
-use kernel_core::fork::create_fresh_address_space;
+use kernel_core::fork::{create_fresh_address_space, create_kpti_user_pml4, free_kpti_user_pml4};
 use kernel_core::process::{create_process, get_process, FxSaveArea, ProcessState};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{PageTable, PageTableFlags};
@@ -266,12 +266,13 @@ pub fn run_usermode_test() -> bool {
     };
 
     // Step 3: Switch to new address space and load ELF
-    klog!(Info, "[3/4] Loading ELF binary...");
+    klog!(Info, "[3/5] Loading ELF binary...");
 
     // Get reference to aligned ELF data
     let elf_data = user_elf();
 
-    // Switch to user address space for ELF loading
+    // Switch to user address space for ELF loading.
+    // user_memory_space is not yet available (created after ELF load), so pass None.
     kernel_core::process::activate_memory_space(memory_space, None);
 
     let load_result = match load_elf(elf_data) {
@@ -294,13 +295,44 @@ pub fn run_usermode_test() -> bool {
         }
     };
 
+    // Step 3.5: Create KPTI user PML4 if KPTI is enabled.
+    //
+    // This MUST happen AFTER load_elf() completes, because create_kpti_user_pml4()
+    // snapshots PML4[0..255] from the kernel PML4 — any user-space mappings created
+    // after this point would be invisible under the user CR3.
+    let user_memory_space = if security::is_kpti_enabled() {
+        klog!(Info, "[3.5/5] Creating KPTI user PML4...");
+        match create_kpti_user_pml4(memory_space) {
+            Ok((_user_pml4_frame, user_phys)) => {
+                // Re-sync per-CPU KPTI context with the newly created dual page table roots.
+                // CR3 hasn't changed, but the per-CPU GS-relative fields need to know
+                // about the user CR3 so that syscall entry/exit assembly switches correctly.
+                kernel_core::process::activate_memory_space(
+                    memory_space,
+                    Some(user_phys),
+                );
+                klog!(Info, "      ✓ KPTI user PML4 at phys 0x{:x}", user_phys);
+                user_phys
+            }
+            Err(e) => {
+                klog!(Error, "      ✗ Failed to create KPTI user PML4: {:?}", e);
+                kernel_core::process::activate_memory_space(saved_cr3, None);
+                return false;
+            }
+        }
+    } else {
+        0
+    };
+
     // Step 4: Update process PCB with loaded state
-    klog!(Info, "[4/4] Configuring process context...");
+    klog!(Info, "[4/5] Configuring process context...");
     if let Some(process) = get_process(pid) {
         let mut proc = process.lock();
 
-        // Set memory space
+        // Set memory space (kernel CR3 root)
         proc.memory_space = memory_space;
+        // Set KPTI user CR3 root (0 if KPTI disabled)
+        proc.user_memory_space = user_memory_space;
         proc.user_stack = Some(x86_64::VirtAddr::new(load_result.user_stack_top));
 
         // Set up context for Ring 3 execution
@@ -347,20 +379,25 @@ pub fn run_usermode_test() -> bool {
         klog!(Info, "        SS:    0x{:x} (Ring 3)", proc.context.ss);
     } else {
         klog!(Error, "      ✗ Failed to get process");
+        // Clean up KPTI user PML4 if it was created
+        if user_memory_space != 0 {
+            free_kpti_user_pml4(user_memory_space);
+        }
         kernel_core::process::activate_memory_space(saved_cr3, None);
         return false;
     }
 
-    // Add process to scheduler's ready queue
+    // Step 5: Add process to scheduler's ready queue
     if let Some(process) = get_process(pid) {
         sched::enhanced_scheduler::Scheduler::add_process(process);
-        klog!(Info, "      ✓ Process added to scheduler ready queue");
+        klog!(Info, "[5/5] Process added to scheduler ready queue");
     }
 
     // Restore kernel address space (scheduler will switch when running the process)
     kernel_core::process::activate_memory_space(saved_cr3, None);
 
     klog!(Info, "\n✓ Ring 3 test process ready!");
+    klog!(Info, "  KPTI: {}", if user_memory_space != 0 { "dual-root (exercised)" } else { "single-root" });
     klog!(Info, "  The process will execute when scheduled.");
     klog!(Info, "  Expected output: \"Hello from Ring 3!\" followed by PID\n");
 
@@ -373,10 +410,15 @@ pub fn run_usermode_test() -> bool {
 /// WARNING: This will not return if successful - the process exits via sys_exit.
 ///
 /// Use this only for debugging the Ring 3 transition itself.
+/// Supports KPTI dual page tables when KPTI is globally enabled.
 #[allow(dead_code)]
 pub unsafe fn test_direct_ring3_jump() -> ! {
     klog!(Info, "\n=== Direct Ring 3 Jump Test ===\n");
     klog!(Warn, "WARNING: This test will not return!\n");
+
+    // Save current CR3 for error paths
+    let (saved_cr3_frame, _) = Cr3::read();
+    let saved_cr3 = saved_cr3_frame.start_address().as_u64() as usize;
 
     // Create address space
     let (_pml4_frame, memory_space) =
@@ -386,7 +428,30 @@ pub unsafe fn test_direct_ring3_jump() -> ! {
     kernel_core::process::activate_memory_space(memory_space, None);
 
     // Load ELF
-    let load_result = load_elf(user_elf()).expect("Failed to load ELF");
+    let load_result = match load_elf(user_elf()) {
+        Ok(result) => result,
+        Err(e) => {
+            kernel_core::process::activate_memory_space(saved_cr3, None);
+            panic!("Failed to load ELF: {:?}", e);
+        }
+    };
+
+    // Create KPTI user PML4 after all user mappings are established
+    if security::is_kpti_enabled() {
+        match create_kpti_user_pml4(memory_space) {
+            Ok((_user_pml4_frame, user_phys)) => {
+                kernel_core::process::activate_memory_space(
+                    memory_space,
+                    Some(user_phys),
+                );
+                klog!(Info, "KPTI user PML4 created at phys 0x{:x}", user_phys);
+            }
+            Err(e) => {
+                kernel_core::process::activate_memory_space(saved_cr3, None);
+                panic!("Failed to create KPTI user PML4: {:?}", e);
+            }
+        }
+    }
 
     klog!(Info, "Jumping to Ring 3...");
     klog!(Info, "  Entry: 0x{:x}", load_result.entry);

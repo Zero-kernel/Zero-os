@@ -83,10 +83,12 @@ __zero_os_usercopy_get_u8:
     ret
     .size __zero_os_usercopy_get_u8, .-__zero_os_usercopy_get_u8
 
-    // Exception table entry for get_u8
+    // Exception table entry for get_u8 (PC-relative for PIE/KASLR compatibility)
+    // Each .long is a signed 32-bit offset from its own address to the target.
     .pushsection .ex_table,"a"
-    .balign 16
-    .quad .Lget_u8_access, .Lget_u8_fixup
+    .balign 8
+.Lex_get_u8_fault:  .long .Lget_u8_access - .Lex_get_u8_fault
+.Lex_get_u8_fixup:  .long .Lget_u8_fixup - .Lex_get_u8_fixup
     .popsection
 
     // Write one byte (sil) to user space [rdi]
@@ -103,10 +105,11 @@ __zero_os_usercopy_put_u8:
     ret
     .size __zero_os_usercopy_put_u8, .-__zero_os_usercopy_put_u8
 
-    // Exception table entry for put_u8
+    // Exception table entry for put_u8 (PC-relative for PIE/KASLR compatibility)
     .pushsection .ex_table,"a"
-    .balign 16
-    .quad .Lput_u8_access, .Lput_u8_fixup
+    .balign 8
+.Lex_put_u8_fault:  .long .Lput_u8_access - .Lex_put_u8_fault
+.Lex_put_u8_fixup:  .long .Lput_u8_fixup - .Lex_put_u8_fixup
     .popsection
 "#
 );

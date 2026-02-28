@@ -19,11 +19,11 @@ all: build
 build:
 	@echo "=== 构建 Bootloader (UEFI) ==="
 	cd bootloader && \
-	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr
 
 	@echo "=== 构建 Kernel (Bare Metal) ==="
 	cd kernel && \
-	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C relocation-model=static -C code-model=kernel -C panic=abort" \
+	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
 	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins
 
 	@echo "=== 准备 EFI ESP 目录 ==="
@@ -48,11 +48,11 @@ build-shell:
 
 	@echo "=== 构建 Bootloader (UEFI) ==="
 	cd bootloader && \
-	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr
 
 	@echo "=== 构建 Kernel (Bare Metal) with Shell ==="
 	cd kernel && \
-	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C relocation-model=static -C code-model=kernel -C panic=abort" \
+	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
 	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features shell
 
 	@echo "=== 准备 EFI ESP 目录 ==="
@@ -77,11 +77,11 @@ build-syscall-test:
 
 	@echo "=== 构建 Bootloader (UEFI) ==="
 	cd bootloader && \
-	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr
 
 	@echo "=== 构建 Kernel (Bare Metal) with Syscall Test ==="
 	cd kernel && \
-	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C relocation-model=static -C code-model=kernel -C panic=abort" \
+	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
 	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features syscall_test
 
 	@echo "=== 准备 EFI ESP 目录 ==="
@@ -112,11 +112,11 @@ build-musl-test:
 
 	@echo "=== 构建 Bootloader (UEFI) ==="
 	cd bootloader && \
-	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr
 
 	@echo "=== 构建 Kernel (Bare Metal) with Musl Test ==="
 	cd kernel && \
-	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C relocation-model=static -C code-model=kernel -C panic=abort" \
+	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
 	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features musl_test
 
 	@echo "=== 准备 EFI ESP 目录 ==="
@@ -149,11 +149,11 @@ build-clone-test:
 
 	@echo "=== 构建 Bootloader (UEFI) ==="
 	cd bootloader && \
-	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi
+	CARGO_TARGET_DIR=../bootloader-target cargo build --release --target x86_64-unknown-uefi --features kaslr
 
 	@echo "=== 构建 Kernel (Bare Metal) with Clone Test ==="
 	cd kernel && \
-	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C relocation-model=static -C code-model=kernel -C panic=abort" \
+	CARGO_TARGET_DIR=../kernel-target RUSTFLAGS="-C link-arg=-T$(KERNEL_LD) -C link-arg=-nostdlib -C link-arg=-static -C link-arg=-pie -C relocation-model=pie -C code-model=kernel -C panic=abort" \
 	cargo build --release --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins --features clone_test
 
 	@echo "=== 准备 EFI ESP 目录 ==="

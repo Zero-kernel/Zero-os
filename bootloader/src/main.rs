@@ -14,6 +14,7 @@ use uefi::table::cfg::{ACPI2_GUID, ACPI_GUID};
 use uefi::CStr16;
 use uefi::Identify;
 use xmas_elf::program::Type;
+use xmas_elf::sections::SectionData;
 use xmas_elf::ElfFile;
 
 // ============================================================================
@@ -22,6 +23,9 @@ use xmas_elf::ElfFile;
 
 /// Kernel load base physical address (matches kernel/security/kaslr.rs)
 const KERNEL_PHYS_BASE: u64 = 0x100000;
+/// Kernel virtual base address matching the linker script.
+/// Used to filter out non-kernel LOAD segments (e.g., `.rela.dyn` metadata at VA 0).
+const KERNEL_VIRT_BASE: u64 = 0xffffffff80000000;
 
 /// Maximum KASLR slide (512 MiB, within the 1GB high-half mapping)
 const KASLR_MAX_SLIDE: u64 = 512 * 1024 * 1024;
@@ -29,23 +33,137 @@ const KASLR_MAX_SLIDE: u64 = 512 * 1024 * 1024;
 /// KASLR slide granularity (2 MiB aligned for huge page compatibility)
 const KASLR_SLIDE_GRANULARITY: u64 = 2 * 1024 * 1024;
 
+/// ELF relocation type: R_X86_64_RELATIVE (base + addend)
+const R_X86_64_RELATIVE: u32 = 8;
+
+/// Apply `.rela.dyn` relocations to the loaded kernel image.
+///
+/// A static-PIE kernel emits only `R_X86_64_RELATIVE` relocations (no GOT/PLT
+/// symbol references). Each entry patches an absolute address in the loaded
+/// image: `*site = addend + load_bias`.
+///
+/// # Arguments
+///
+/// * `elf` — Parsed ELF file (still refers to the original in-memory buffer)
+/// * `kernel_min_vaddr` — Lowest virtual address among LOAD segments (link-time base)
+/// * `kernel_phys_base` — Physical address where the kernel image is loaded
+/// * `load_bias` — KASLR slide: the delta between the actual and linked load addresses
+///
+/// # Panics
+///
+/// Panics if:
+/// - `load_bias != 0` but the kernel has no `.rela.dyn` section
+/// - Any relocation type other than `R_X86_64_RELATIVE` is encountered
+/// - A relocation targets a VA below `kernel_min_vaddr`
+/// - A relocation target + 8 exceeds the kernel image bounds
+fn apply_rela_dyn_relocations(
+    elf: &ElfFile<'_>,
+    kernel_min_vaddr: u64,
+    kernel_size: u64,
+    kernel_phys_base: u64,
+    load_bias: u64,
+) {
+    let rela_dyn = match elf.find_section_by_name(".rela.dyn") {
+        Some(section) => section,
+        None => {
+            if load_bias != 0 {
+                panic!(
+                    "KASLR slide is 0x{:x} but kernel has no .rela.dyn section — \
+                     kernel must be compiled as PIE (-C relocation-model=pie) \
+                     and keep relocation sections in the linker script",
+                    load_bias
+                );
+            }
+            // No relocations and no slide — nothing to do
+            return;
+        }
+    };
+
+    let relas = match rela_dyn
+        .get_data(elf)
+        .expect("Failed to parse .rela.dyn section data")
+    {
+        SectionData::Rela64(relas) => relas,
+        _ => panic!(
+            "Unexpected .rela.dyn format (expected Rela64 for x86_64 kernel)"
+        ),
+    };
+
+    if relas.is_empty() {
+        return;
+    }
+
+    info!(
+        "Applying {} .rela.dyn relocations (load_bias=0x{:x})",
+        relas.len(),
+        load_bias
+    );
+
+    let mut applied = 0u64;
+    for rela in relas {
+        let rtype = rela.get_type();
+        if rtype != R_X86_64_RELATIVE {
+            panic!(
+                "Unsupported relocation type {} at offset 0x{:x} — \
+                 static-PIE kernel should only emit R_X86_64_RELATIVE (type 8)",
+                rtype,
+                rela.get_offset()
+            );
+        }
+
+        // R_X86_64_RELATIVE must have symbol index 0
+        if rela.get_symbol_table_index() != 0 {
+            panic!(
+                "R_X86_64_RELATIVE at offset 0x{:x} has unexpected symbol index {} — \
+                 expected 0 for base-relative relocations",
+                rela.get_offset(),
+                rela.get_symbol_table_index()
+            );
+        }
+
+        let reloc_va = rela.get_offset();
+        if reloc_va < kernel_min_vaddr {
+            panic!(
+                "Relocation target VA 0x{:x} is below kernel base VA 0x{:x}",
+                reloc_va, kernel_min_vaddr
+            );
+        }
+        let offset_in_image = reloc_va - kernel_min_vaddr;
+        // Each relocation writes a u64 (8 bytes); ensure the write stays within
+        // the allocated kernel image to prevent out-of-bounds memory corruption.
+        if offset_in_image + 8 > kernel_size {
+            panic!(
+                "Relocation at VA 0x{:x} (offset 0x{:x}) + 8 exceeds kernel image size 0x{:x}",
+                reloc_va, offset_in_image, kernel_size
+            );
+        }
+
+        // Translate the virtual address to the physical address in the loaded image
+        let site_phys = kernel_phys_base + offset_in_image;
+
+        // R_X86_64_RELATIVE: *site = addend + load_bias
+        // addend is the link-time absolute VA; adding load_bias shifts it to the slid VA
+        let value = rela.get_addend().wrapping_add(load_bias);
+
+        unsafe {
+            core::ptr::write_unaligned(site_phys as *mut u64, value);
+        }
+        applied += 1;
+    }
+
+    info!("  {} relocations applied successfully", applied);
+}
+
 /// Generate a random KASLR slide using RDRAND
 ///
-/// Returns 0 if RDRAND is unavailable or fails
+/// Returns 0 when the `kaslr` feature is disabled, if RDRAND is unavailable,
+/// or if RDRAND fails.
 ///
-/// # Note (R39-7)
-///
-/// KASLR is currently disabled because the kernel is not compiled as
-/// position-independent code (PIE). The kernel has absolute addresses
-/// that don't work when relocated. To enable KASLR, the kernel must be:
-/// 1. Compiled with -C relocation-model=pie
-/// 2. Have relocation information in the ELF
-/// 3. Have the bootloader apply relocations at load time
-///
-/// The infrastructure is in place for future PIE kernel support.
+/// When non-zero, the bootloader will:
+/// - Load the kernel at `KERNEL_PHYS_BASE + slide` (2 MiB aligned)
+/// - Apply `.rela.dyn` `R_X86_64_RELATIVE` relocations with the slide as load bias
+/// - Jump to `e_entry + slide`
 fn generate_kaslr_slide() -> u64 {
-    // R39-7: KASLR disabled - kernel is not PIE
-    // TODO: Enable once kernel is built as PIE with relocation support
     #[cfg(feature = "kaslr")]
     {
         let max_slots = KASLR_MAX_SLIDE / KASLR_SLIDE_GRANULARITY;
@@ -298,6 +416,12 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     continue;
                 }
                 let virt_addr = program_header.virtual_addr();
+                // Skip non-kernel LOAD segments (e.g., .rela.dyn metadata at VA 0
+                // emitted by PIE linking). Only kernel segments reside in the
+                // high-half virtual range.
+                if virt_addr < KERNEL_VIRT_BASE {
+                    continue;
+                }
                 let mem_size = program_header.mem_size();
 
                 if virt_addr < min_addr {
@@ -309,43 +433,59 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             }
 
             // 分配一块连续的内存来容纳整个内核
-            // A.4 KASLR: Generate slide value for future PIE support, but always
-            // allocate at fixed address since page tables assume fixed mapping.
-            // When kaslr feature is enabled AND kernel is compiled as PIE:
-            // - generate_kaslr_slide() returns random 2MB-aligned value
-            // - Bootloader applies ELF relocations
-            // - Page tables are set up with slide offset
-            // Until then, slide is always 0 and kernel loads at fixed address.
-            let kaslr_slide = generate_kaslr_slide();
-            let kernel_phys_base = KERNEL_PHYS_BASE; // Always fixed until PIE support
+            //
+            // Text KASLR: The kernel is compiled as a static PIE with
+            // `-C relocation-model=pie`. The bootloader:
+            //   1. Generates a 2 MiB-aligned random slide (0 when feature disabled)
+            //   2. Attempts to allocate at KERNEL_PHYS_BASE + slide
+            //   3. Falls back to KERNEL_PHYS_BASE (slide=0) on allocation failure
+            //   4. Loads LOAD segments into the allocated region
+            //   5. Applies .rela.dyn R_X86_64_RELATIVE relocations with slide as load_bias
+            //   6. Jumps to entry_point + slide
             let kernel_size = (max_addr - min_addr) as usize;
             let pages = (kernel_size + 0xFFF) / 0x1000;
+
+            let mut kaslr_slide = generate_kaslr_slide();
+            let mut kernel_phys_base = KERNEL_PHYS_BASE + kaslr_slide;
 
             info!(
                 "Allocating {} pages ({} bytes) for kernel at 0x{:x} (KASLR slide=0x{:x})",
                 pages, kernel_size, kernel_phys_base, kaslr_slide
             );
 
-            // Allocate at fixed address (KASLR address randomization requires PIE)
-            let result = boot_services.allocate_pages(
-                AllocateType::Address(kernel_phys_base),
-                MemoryType::LOADER_DATA,
-                pages,
-            );
-
-            let actual_phys_base = match result {
-                Ok(_) => kernel_phys_base,
-                Err(status) => {
-                    panic!(
-                        "FATAL: Cannot allocate kernel memory at 0x{:x}: {:?}. \
-                        Page table mappings require kernel at this fixed address. \
-                        Ensure no UEFI runtime or reserved regions overlap.",
-                        kernel_phys_base, status
-                    );
+            // Try to allocate at the slid address; fall back to fixed base on failure.
+            // UEFI firmware or reserved regions may overlap the slid range.
+            let actual_phys_base = loop {
+                match boot_services.allocate_pages(
+                    AllocateType::Address(kernel_phys_base),
+                    MemoryType::LOADER_DATA,
+                    pages,
+                ) {
+                    Ok(_) => break kernel_phys_base,
+                    Err(status) => {
+                        if kaslr_slide == 0 {
+                            panic!(
+                                "FATAL: Cannot allocate kernel memory at 0x{:x}: {:?}. \
+                                 Page table mappings require kernel within the 1 GiB high-half \
+                                 identity region. Ensure no UEFI runtime or reserved regions overlap.",
+                                kernel_phys_base, status
+                            );
+                        }
+                        // Slid allocation failed — fall back to deterministic base
+                        info!(
+                            "KASLR allocation at 0x{:x} failed ({:?}) — falling back to fixed base 0x{:x}",
+                            kernel_phys_base, status, KERNEL_PHYS_BASE
+                        );
+                        kaslr_slide = 0;
+                        kernel_phys_base = KERNEL_PHYS_BASE;
+                    }
                 }
             };
 
-            info!("Kernel memory allocated at 0x{:x}", actual_phys_base);
+            info!(
+                "Kernel memory allocated at 0x{:x} (final slide=0x{:x})",
+                actual_phys_base, kaslr_slide
+            );
 
             // 清零整块内存
             unsafe {
@@ -359,6 +499,10 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 }
 
                 let virt_addr = program_header.virtual_addr();
+                // Skip non-kernel LOAD segments (e.g., .rela.dyn metadata at VA 0)
+                if virt_addr < KERNEL_VIRT_BASE {
+                    continue;
+                }
                 let mem_size = program_header.mem_size();
                 let file_size = program_header.file_size();
                 let file_offset = program_header.offset();
@@ -410,8 +554,11 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 );
             }
 
-            // 链接脚本现在将入口点设置为 0xffffffff80100000
-            // 这对应物理地址 0x100000，通过页表映射正确
+            // Text KASLR: Apply PIE relocations so absolute addresses in the
+            // kernel image point to the correct (slid) virtual addresses.
+            // This is a no-op when kaslr_slide == 0 and no .rela.dyn section exists.
+            apply_rela_dyn_relocations(&elf, min_addr, kernel_size as u64, actual_phys_base, kaslr_slide);
+
             // R39-7 FIX: Apply KASLR slide to entry point
             let adjusted_entry = entry_point + kaslr_slide;
             info!(
@@ -501,15 +648,11 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         // 由于使用2MB大页，必须从2MB边界开始，所以实际映射：
         // 虚拟 0xffffffff80000000 → 物理 0x0
         //
-        // A.4 KASLR NOTE: True KASLR requires Position Independent Executable (PIE)
-        // compilation. The current kernel uses absolute addresses that cannot be
-        // relocated. The kaslr_slide value is calculated and passed to the kernel
-        // for informational purposes, but physical memory layout is not randomized.
-        //
-        // To enable true KASLR, the kernel must be:
-        // 1. Compiled with -C relocation-model=pie
-        // 2. Have relocation sections (.rela.dyn) in the ELF
-        // 3. Bootloader must apply ELF relocations at load time
+        // Text KASLR: With a PIE kernel, the physical load base is
+        // KERNEL_PHYS_BASE + kaslr_slide. The 1 GiB high-half mapping
+        // (virtual 0xffffffff80000000 → physical 0x0) covers the entire
+        // first GB, so the slid kernel is still accessible. NX marking
+        // tracks the actual kernel physical extent.
         //
         // The high-half mapping MUST remain at virtual→physical offset 0xffffffff80000000→0
         // because PHYSICAL_MEMORY_OFFSET is used throughout the kernel for phys_to_virt().
@@ -519,10 +662,14 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         //   只有包含内核的条目设为可执行，其他设为 NX
         //   由于 2MB 粒度太粗，无法正确分离代码和数据
         //   暂时保持 RWX，由内核启动后通过 enforce_nx_for_kernel() 拆分为 4KB 页
-        let kernel_phys_start = KERNEL_PHYS_BASE; // A.4: Fixed at 0x100000 until PIE is implemented
+        let kernel_phys_start = KERNEL_PHYS_BASE + kaslr_slide;
         let kernel_phys_end = kernel_phys_start + (kernel_size as u64);
         let start_pd_idx = (kernel_phys_start / 0x200000) as usize;
-        let end_pd_idx = ((kernel_phys_end + 0x1FFFFF) / 0x200000) as usize; // Round up
+        // Last PD entry that actually contains kernel bytes (inclusive).
+        // saturating_sub(1) handles the edge case where kernel_phys_end is
+        // exactly on a 2 MiB boundary — without it the ceil formula would
+        // mark one extra 2 MiB page as executable.
+        let end_pd_idx = (kernel_phys_end.saturating_sub(1) / 0x200000) as usize;
 
         for i in 0..512usize {
             let phys_addr = PhysAddr::new((i as u64) * 0x200000);
