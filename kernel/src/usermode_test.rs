@@ -24,6 +24,16 @@ use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{PageTable, PageTableFlags};
 
 /// Debug: Dump page table entries for a virtual address
+///
+/// # R119-5 FIX
+///
+/// This function prints CR3 and page-table physical addresses which could
+/// leak kernel memory layout information. Gated behind `debug_assertions`
+/// for consistency with the kernel-side KASLR address redaction pattern
+/// (kaslr.rs:1400-1490). In release builds with Balanced/Secure profiles,
+/// `klog!(Info, ...)` is already suppressed, but gating the entire function
+/// behind `debug_assertions` provides defense-in-depth.
+#[cfg(debug_assertions)]
 fn dump_page_table_for_addr(addr: u64) {
     klog!(Info, "\n[DEBUG] Page table dump for 0x{:x}:", addr);
 
@@ -280,10 +290,14 @@ pub fn run_usermode_test() -> bool {
             klog!(Info, "      ✓ ELF loaded at entry 0x{:x}", result.entry);
             klog!(Info, "      ✓ User stack top at 0x{:x}", result.user_stack_top);
 
-            // Debug: Dump page table entries for the entry point and stack
-            dump_page_table_for_addr(result.entry);
-            // Dump stack page (one page below stack top)
-            dump_page_table_for_addr(result.user_stack_top - 0x1000);
+            // R119-5 FIX: Page table dumps print physical addresses; debug-only.
+            #[cfg(debug_assertions)]
+            {
+                // Debug: Dump page table entries for the entry point and stack
+                dump_page_table_for_addr(result.entry);
+                // Dump stack page (one page below stack top)
+                dump_page_table_for_addr(result.user_stack_top - 0x1000);
+            }
 
             result
         }

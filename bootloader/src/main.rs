@@ -93,11 +93,16 @@ fn apply_rela_dyn_relocations(
         return;
     }
 
+    // R119-1 FIX: Gate load_bias value behind debug_assertions to prevent KASLR
+    // slide leak to serial console observers. The relocation count is safe to log.
+    #[cfg(debug_assertions)]
     info!(
         "Applying {} .rela.dyn relocations (load_bias=0x{:x})",
         relas.len(),
         load_bias
     );
+    #[cfg(not(debug_assertions))]
+    info!("Applying {} .rela.dyn relocations", relas.len());
 
     let mut applied = 0u64;
     for rela in relas {
@@ -171,10 +176,39 @@ fn generate_kaslr_slide() -> u64 {
             return 0;
         }
 
+        // R119-2 FIX: Check CPUID.01H:ECX[30] for RDRAND support before executing
+        // the instruction. Without this check, RDRAND triggers #UD (Invalid Opcode)
+        // on pre-Ivy Bridge Intel or pre-Excavator AMD CPUs. CPUID clobbers EAX,
+        // EBX, ECX, EDX; we save/restore RBX via push/pop since LLVM may use it as
+        // a frame pointer or callee-saved register in the surrounding function.
+        // NOTE: push/pop touches the stack so we must NOT use options(nostack).
+        let rdrand_available: bool = {
+            let ecx: u32;
+            unsafe {
+                core::arch::asm!(
+                    "push rbx",
+                    "mov eax, 1",
+                    "xor ecx, ecx",   // ECX=0 (sub-leaf 0) for CPUID leaf 1
+                    "cpuid",
+                    "pop rbx",
+                    lateout("eax") _,
+                    lateout("ecx") ecx,
+                    lateout("edx") _,
+                    // No `nomem` or `nostack` — push/pop uses both stack and memory.
+                );
+            }
+            (ecx & (1 << 30)) != 0
+        };
+
+        if !rdrand_available {
+            // RDRAND not supported — graceful degradation to slide=0 (no KASLR)
+            return 0;
+        }
+
         let mut val: u64 = 0;
         let success: u8;
 
-        // Use RDRAND instruction to get random value
+        // Use RDRAND instruction to get random value (CPUID check passed above)
         unsafe {
             core::arch::asm!(
                 "rdrand {val}",
@@ -448,9 +482,16 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             let mut kaslr_slide = generate_kaslr_slide();
             let mut kernel_phys_base = KERNEL_PHYS_BASE + kaslr_slide;
 
+            // R119-1 FIX: Gate physical addresses and KASLR slide behind debug_assertions
+            #[cfg(debug_assertions)]
             info!(
                 "Allocating {} pages ({} bytes) for kernel at 0x{:x} (KASLR slide=0x{:x})",
                 pages, kernel_size, kernel_phys_base, kaslr_slide
+            );
+            #[cfg(not(debug_assertions))]
+            info!(
+                "Allocating {} pages ({} bytes) for kernel",
+                pages, kernel_size
             );
 
             // Try to allocate at the slid address; fall back to fixed base on failure.
@@ -472,9 +513,16 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                             );
                         }
                         // Slid allocation failed — fall back to deterministic base
+                        // R119-1 FIX: Gate addresses behind debug_assertions
+                        #[cfg(debug_assertions)]
                         info!(
                             "KASLR allocation at 0x{:x} failed ({:?}) — falling back to fixed base 0x{:x}",
                             kernel_phys_base, status, KERNEL_PHYS_BASE
+                        );
+                        #[cfg(not(debug_assertions))]
+                        info!(
+                            "KASLR allocation failed ({:?}) — falling back to fixed base",
+                            status
                         );
                         kaslr_slide = 0;
                         kernel_phys_base = KERNEL_PHYS_BASE;
@@ -482,9 +530,15 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 }
             };
 
+            // R119-1 FIX: Gate allocated address and slide behind debug_assertions
+            #[cfg(debug_assertions)]
             info!(
                 "Kernel memory allocated at 0x{:x} (final slide=0x{:x})",
                 actual_phys_base, kaslr_slide
+            );
+            #[cfg(not(debug_assertions))]
+            info!("Kernel memory allocated (KASLR {})",
+                if kaslr_slide != 0 { "active" } else { "inactive" }
             );
 
             // 清零整块内存
@@ -538,13 +592,23 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     }
                 }
 
+                // R119-1 FIX: Physical addresses reveal KASLR slide; gate behind debug_assertions.
+                // Virtual addresses are link-time public and safe to log.
+                #[cfg(debug_assertions)]
                 info!(
                     "Loaded segment: virt=0x{:x}, phys=0x{:x}, filesz=0x{:x}, memsz=0x{:x}",
                     virt_addr, phys_addr, file_size, mem_size
                 );
+                #[cfg(not(debug_assertions))]
+                info!(
+                    "Loaded segment: virt=0x{:x}, filesz=0x{:x}, memsz=0x{:x}",
+                    virt_addr, file_size, mem_size
+                );
             }
 
-            // 验证内核代码已加载到物理地址
+            // R119-1 FIX: Verification dump reveals physical load address; gate behind
+            // debug_assertions. In release, just do a volatile read to confirm accessibility.
+            #[cfg(debug_assertions)]
             unsafe {
                 let kernel_start = actual_phys_base as *const u8;
                 let first_bytes = core::slice::from_raw_parts(kernel_start, 16);
@@ -552,6 +616,12 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     "First 16 bytes at phys 0x{:x}: {:x?}",
                     actual_phys_base, first_bytes
                 );
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                let kernel_start = actual_phys_base as *const u8;
+                let _ = unsafe { core::ptr::read_volatile(kernel_start) };
+                info!("Kernel image load verified");
             }
 
             // Text KASLR: Apply PIE relocations so absolute addresses in the
@@ -561,9 +631,16 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
             // R39-7 FIX: Apply KASLR slide to entry point
             let adjusted_entry = entry_point + kaslr_slide;
+            // R119-1 FIX: Entry point and slide values reveal the kernel memory layout;
+            // gate behind debug_assertions to match kernel-side redaction pattern.
+            #[cfg(debug_assertions)]
             info!(
                 "Using ELF entry point: 0x{:x} (slide applied: 0x{:x}, final: 0x{:x})",
                 entry_point, kaslr_slide, adjusted_entry
+            );
+            #[cfg(not(debug_assertions))]
+            info!("ELF entry point resolved (KASLR {})",
+                if kaslr_slide != 0 { "applied" } else { "inactive" }
             );
             (adjusted_entry, kaslr_slide, kernel_size) // R39-7: Return entry, slide, and size
         };

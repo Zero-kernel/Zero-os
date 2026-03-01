@@ -63,9 +63,14 @@ SECTIONS {
      * it is only read from the ELF file by the bootloader before jumping
      * to the kernel entry point.
      *
-     * Address 0 is a non-loadable marker; the section header's sh_offset
-     * still points to valid data in the ELF file on disk. */
-    .rela.dyn 0 : {
+     * R119-3 FIX: Use (INFO) output section type to prevent the linker from
+     * creating a PT_LOAD program header for this section. Previously, the
+     * bare `0` address caused a spurious PT_LOAD at VirtAddr 0x0 which
+     * confused external ELF analysis tools. The section header's sh_offset
+     * still points to valid data in the ELF file on disk — the bootloader
+     * accesses it via section headers (find_section_by_name), not program
+     * headers. */
+    .rela.dyn 0 (INFO) : {
         KEEP(*(.rela.dyn))
         KEEP(*(.rela.dyn.*))
     }

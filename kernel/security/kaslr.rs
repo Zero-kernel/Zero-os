@@ -436,6 +436,15 @@ impl KernelLayout {
     /// phys_base is now also adjusted by the slide value to match
     /// the actual kernel load address.
     ///
+    /// # R119-4 FIX
+    ///
+    /// `virt_base` is now always `KERNEL_VIRT_BASE` regardless of slide.
+    /// The high-half page table mapping is fixed at `0xffffffff80000000 -> 0x0`
+    /// and does NOT change with KASLR. The slide only affects where WITHIN
+    /// the mapped region the kernel image physically resides. Using a slid
+    /// `virt_base` would cause `virt_to_phys()` to return incorrect physical
+    /// addresses.
+    ///
     /// # Note
     ///
     /// This is a const fn using placeholder values. Runtime heap address
@@ -443,7 +452,7 @@ impl KernelLayout {
     #[allow(dead_code)]
     pub const fn with_slide(slide: u64) -> Self {
         Self {
-            virt_base: KERNEL_VIRT_BASE + slide,
+            virt_base: KERNEL_VIRT_BASE, // R119-4 FIX: Never add slide to virt_base
             phys_base: KERNEL_PHYS_BASE + slide, // R39-7 FIX: Include slide in physical base
             kaslr_slide: slide,
             text_start: KERNEL_VIRT_BASE + KERNEL_ENTRY_OFFSET + slide,
@@ -474,10 +483,18 @@ impl KernelLayout {
     }
 
     /// Convert a virtual address to physical (for high-half kernel addresses)
+    ///
+    /// # R119-4 FIX
+    ///
+    /// Uses the fixed `PHYSICAL_MEMORY_OFFSET` constant directly rather than
+    /// `self.virt_base` / `self.phys_base`. The bootloader's high-half page table
+    /// mapping is always `0xffffffff80000000 -> 0x0` regardless of KASLR slide,
+    /// so `phys = virt - 0xffffffff80000000` is the correct translation for all
+    /// high-half virtual addresses.
     #[inline]
     pub fn virt_to_phys(&self, virt: u64) -> Option<u64> {
-        if virt >= self.virt_base {
-            Some(virt - self.virt_base + self.phys_base)
+        if virt >= PHYSICAL_MEMORY_OFFSET {
+            Some(virt - PHYSICAL_MEMORY_OFFSET)
         } else {
             None
         }
@@ -545,7 +562,7 @@ fn build_kernel_layout_from_linker() -> KernelLayout {
     let heap_size = mm::memory::heap_size() as u64;
 
     KernelLayout {
-        virt_base: KERNEL_VIRT_BASE + runtime_slide,
+        virt_base: KERNEL_VIRT_BASE, // R119-4 FIX: Never add slide; mapping is fixed
         phys_base: KERNEL_PHYS_BASE + runtime_slide, // R39-7 FIX: Include slide in physical base
         kaslr_slide: runtime_slide,
         text_start: text_start_addr,
@@ -1519,7 +1536,9 @@ mod tests {
     fn test_kernel_layout_with_slide() {
         let slide = 0x200000; // 2 MiB slide
         let layout = KernelLayout::with_slide(slide);
-        assert_eq!(layout.virt_base, KERNEL_VIRT_BASE + slide);
+        // R119-4 FIX: virt_base is always KERNEL_VIRT_BASE regardless of slide
+        assert_eq!(layout.virt_base, KERNEL_VIRT_BASE);
+        assert_eq!(layout.phys_base, KERNEL_PHYS_BASE + slide);
         assert_eq!(layout.kaslr_slide, slide);
         assert!(layout.has_kaslr());
     }
@@ -1529,7 +1548,8 @@ mod tests {
         let layout = KernelLayout::fixed();
         let virt = KERNEL_VIRT_BASE + 0x1000;
         let phys = layout.virt_to_phys(virt);
-        assert_eq!(phys, Some(KERNEL_PHYS_BASE + 0x1000));
+        // R119-4 FIX: phys = virt - PHYSICAL_MEMORY_OFFSET (the mapping is 0xffffffff80000000 -> 0x0)
+        assert_eq!(phys, Some(0x1000));
     }
 
     #[test]
