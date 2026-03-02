@@ -433,6 +433,13 @@ lazy_static! {
         // IPI handlers (high vectors)
         idt[ipi::IPI_VECTOR_RESCHEDULE].set_handler_fn(reschedule_ipi_handler);
         idt[ipi::IPI_VECTOR_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_ipi_handler);
+        // R120-3 FIX: Register panic IPI handler (vector 0xFD, moved from 0xFF)
+        idt[ipi::IPI_VECTOR_PANIC].set_handler_fn(panic_ipi_handler);
+
+        // R120-3 FIX: LAPIC Spurious Interrupt Vector (SIVR = 0xFF).
+        // Per Intel SDM Vol. 3A Section 10.9, spurious interrupts must NOT
+        // receive EOI. This handler is intentionally a no-op.
+        idt[0xFF].set_handler_fn(spurious_interrupt_handler);
 
         idt
     };
@@ -1600,4 +1607,64 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStack
 
     // R69-3 FIX: Mark leaving IRQ context
     current_cpu().irq_exit();
+}
+
+/// R120-3 FIX: Panic IPI Handler (vector 0xFD)
+///
+/// Called when this CPU receives a panic broadcast from another CPU.
+/// This handler:
+/// 1. Clears SMAP if active (CLAC)
+/// 2. Sends LAPIC EOI to acknowledge the IPI
+/// 3. Disables interrupts and enters a permanent halt loop
+///
+/// The originating CPU's panic handler broadcasts this IPI to stop all
+/// other CPUs from executing further, preventing concurrent access to
+/// shared data structures during panic state collection.
+///
+/// # Safety
+///
+/// - Must be called with interrupts disabled (x86-interrupt calling convention)
+/// - Uses LAPIC EOI (not PIC) since this is an IPI
+/// - After EOI, disables interrupts permanently and halts
+extern "x86-interrupt" fn panic_ipi_handler(_stack_frame: InterruptStackFrame) {
+    // S-6 fix: Immediately restore SMAP protection
+    clac_if_smap();
+
+    // Send LAPIC EOI before halting — must acknowledge the IPI to prevent
+    // the LAPIC from blocking further interrupts on other vectors.
+    unsafe {
+        apic::lapic_eoi();
+    }
+
+    // Permanently halt this CPU. Disable interrupts to prevent any further
+    // execution after entering the halt loop.
+    x86_interrupts::disable();
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+/// R120-3 FIX: LAPIC Spurious Interrupt Handler (vector 0xFF)
+///
+/// Vector 0xFF is configured as the LAPIC Spurious Interrupt Vector Register
+/// (SIVR). The LAPIC generates spurious interrupts when:
+/// - An edge-triggered interrupt is retracted before delivery
+/// - During APIC reinitialization or certain hardware glitches
+///
+/// Per Intel SDM Vol. 3A, Section 10.9: "A software handler for the spurious
+/// interrupt should return without issuing an EOI."
+///
+/// This handler intentionally does NOT send EOI.
+///
+/// # Safety
+///
+/// - Must be called with interrupts disabled (x86-interrupt calling convention)
+/// - Must NOT send EOI per Intel SDM specification
+extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // S-6 fix: Immediately restore SMAP protection
+    clac_if_smap();
+
+    // Intentionally no EOI — spurious interrupts must not be acknowledged.
+    // Per Intel SDM Vol. 3A Section 10.9, the ISR bit is NOT set for
+    // spurious interrupts, so an EOI would clear the wrong bit.
 }

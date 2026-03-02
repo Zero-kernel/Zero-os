@@ -26,6 +26,10 @@
 
 use core::ptr;
 
+/// Kernel high-half virtual address base (0xFFFFFFFF80000000).
+/// Used for defense-in-depth validation of computed exception table addresses.
+const KERNEL_VIRT_BASE: u64 = 0xffffffff80000000;
+
 /// Exception table entry using PC-relative signed 32-bit offsets.
 ///
 /// Each field stores the signed distance from its own address to the target.
@@ -43,19 +47,35 @@ impl ExceptionTableEntry {
     /// Compute the absolute faulting instruction address.
     ///
     /// `absolute = &self.fault_ip_rel as usize + self.fault_ip_rel as isize`
+    /// R120-5 FIX: Added debug_assert to validate the computed address falls
+    /// within kernel space (>= KERNEL_VIRT_BASE). This is a defense-in-depth
+    /// check — the linker guarantees valid entries, but this catches corruption.
     #[inline]
     unsafe fn fault_ip(&self) -> usize {
         let base = ptr::addr_of!(self.fault_ip_rel) as usize;
-        base.wrapping_add(self.fault_ip_rel as isize as usize)
+        let addr = base.wrapping_add(self.fault_ip_rel as isize as usize);
+        debug_assert!(
+            addr as u64 >= KERNEL_VIRT_BASE,
+            "exception table fault_ip {:#x} outside kernel space",
+            addr
+        );
+        addr
     }
 
     /// Compute the absolute fixup address.
     ///
     /// `absolute = &self.fixup_ip_rel as usize + self.fixup_ip_rel as isize`
+    /// R120-5 FIX: Added debug_assert for kernel-space address validation.
     #[inline]
     unsafe fn fixup_ip(&self) -> usize {
         let base = ptr::addr_of!(self.fixup_ip_rel) as usize;
-        base.wrapping_add(self.fixup_ip_rel as isize as usize)
+        let addr = base.wrapping_add(self.fixup_ip_rel as isize as usize);
+        debug_assert!(
+            addr as u64 >= KERNEL_VIRT_BASE,
+            "exception table fixup_ip {:#x} outside kernel space",
+            addr
+        );
+        addr
     }
 }
 

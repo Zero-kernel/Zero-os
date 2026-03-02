@@ -67,11 +67,13 @@ fn apply_rela_dyn_relocations(
         Some(section) => section,
         None => {
             if load_bias != 0 {
+                // R120-4 FIX: Do not include the KASLR slide value in the panic
+                // string — it would be captured by UEFI firmware logs, serial
+                // console, or BMC/IPMI history, leaking the slide in release builds.
                 panic!(
-                    "KASLR slide is 0x{:x} but kernel has no .rela.dyn section — \
+                    "KASLR slide is non-zero but kernel has no .rela.dyn section — \
                      kernel must be compiled as PIE (-C relocation-model=pie) \
-                     and keep relocation sections in the linker script",
-                    load_bias
+                     and keep relocation sections in the linker script"
                 );
             }
             // No relocations and no slide — nothing to do
@@ -461,8 +463,13 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 if virt_addr < min_addr {
                     min_addr = virt_addr;
                 }
-                if virt_addr + mem_size > max_addr {
-                    max_addr = virt_addr + mem_size;
+                // R120-1 FIX: Use checked arithmetic to detect crafted ELF
+                // headers with wrapping virt_addr + mem_size values.
+                let end_addr = virt_addr
+                    .checked_add(mem_size)
+                    .expect("ELF LOAD segment virt_addr + mem_size overflow");
+                if end_addr > max_addr {
+                    max_addr = end_addr;
                 }
             }
 
@@ -476,8 +483,20 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             //   4. Loads LOAD segments into the allocated region
             //   5. Applies .rela.dyn R_X86_64_RELATIVE relocations with slide as load_bias
             //   6. Jumps to entry_point + slide
-            let kernel_size = (max_addr - min_addr) as usize;
-            let pages = (kernel_size + 0xFFF) / 0x1000;
+            // R120-1 FIX: Use checked subtraction to detect empty LOAD segment set
+            // (where no valid high-half segments were found).
+            let kernel_size = max_addr
+                .checked_sub(min_addr)
+                .expect("ELF LOAD: max_addr < min_addr (no valid kernel segments)") as usize;
+            // R120-1 FIX: Use checked arithmetic for page computation to prevent
+            // wrapping on crafted ELF headers with absurd segment sizes.
+            let pages = kernel_size
+                .checked_add(0xFFF)
+                .expect("ELF kernel size + page alignment overflow")
+                / 0x1000;
+            let alloc_bytes = pages
+                .checked_mul(0x1000)
+                .expect("Kernel allocation pages * 0x1000 overflow");
 
             let mut kaslr_slide = generate_kaslr_slide();
             let mut kernel_phys_base = KERNEL_PHYS_BASE + kaslr_slide;
@@ -541,9 +560,12 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 if kaslr_slide != 0 { "active" } else { "inactive" }
             );
 
-            // 清零整块内存
+            // R120-1 FIX: Zero the entire page-aligned allocation (alloc_bytes),
+            // not just kernel_size. This ensures the tail bytes (up to 4095) in
+            // the last page are zeroed, preventing stale UEFI memory from being
+            // mapped into the kernel's high-half virtual address range.
             unsafe {
-                core::ptr::write_bytes(actual_phys_base as *mut u8, 0, kernel_size);
+                core::ptr::write_bytes(actual_phys_base as *mut u8, 0, alloc_bytes);
             }
 
             // 加载所有程序段到物理地址 0x100000

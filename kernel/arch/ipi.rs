@@ -8,11 +8,14 @@
 //!
 //! | Vector | Type | Purpose |
 //! |--------|------|---------|
+//! | 0xFA | PROFILE | Profiling interrupt for sampling |
 //! | 0xFB | RESCHEDULE | Request CPU to run scheduler |
 //! | 0xFC | HALT | Stop CPU (for shutdown/panic) |
-//! | 0xFD | PROFILE | Profiling interrupt for sampling |
+//! | 0xFD | PANIC | Panic broadcast to all CPUs |
 //! | 0xFE | TLB_SHOOTDOWN | Cross-CPU TLB invalidation |
-//! | 0xFF | PANIC | Panic broadcast to all CPUs |
+//!
+//! Note: Vector 0xFF is reserved for the LAPIC Spurious Interrupt Vector
+//! Register (SIVR) and must NOT be used for any IPI.
 //!
 //! # Usage
 //!
@@ -59,7 +62,10 @@ pub const IPI_VECTOR_HALT: u8 = 0xFC;
 ///
 /// Used by the profiler to sample CPU state. The target CPU should
 /// record its current RIP and stack trace.
-pub const IPI_VECTOR_PROFILE: u8 = 0xFD;
+///
+/// R120-3 FIX: Moved from 0xFD to 0xFA to free 0xFD for PANIC (which
+/// was previously 0xFF, conflicting with the LAPIC SIVR spurious vector).
+pub const IPI_VECTOR_PROFILE: u8 = 0xFA;
 
 /// IPI vector for TLB shootdown
 ///
@@ -71,7 +77,12 @@ pub const IPI_VECTOR_TLB_SHOOTDOWN: u8 = 0xFE;
 ///
 /// Sent when a CPU panics to notify all other CPUs. Target CPUs should
 /// stop normal execution, save state, and wait in a safe halt loop.
-pub const IPI_VECTOR_PANIC: u8 = 0xFF;
+///
+/// R120-3 FIX: Moved from 0xFF to 0xFD. Vector 0xFF is reserved for
+/// the LAPIC SIVR (spurious interrupt vector) and must not be shared
+/// with any IPI — the CPU cannot distinguish a spurious interrupt from
+/// an IPI on the same vector, and spurious interrupts must not receive EOI.
+pub const IPI_VECTOR_PANIC: u8 = 0xFD;
 
 // ============================================================================
 // IPI Type Enum
