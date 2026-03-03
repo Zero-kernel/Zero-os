@@ -25,11 +25,13 @@
 //! - Linux netfilter/iptables conceptual model
 //! - RFC 5765: Security threats and solutions for connections states
 
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use spin::{Once, RwLock};
+use spin::RwLock;
 
 use crate::conntrack::CtDecision;
 use crate::ipv4::{Ipv4Addr, Ipv4Proto};
@@ -386,6 +388,8 @@ impl FirewallRuleBuilder {
 /// Packet metadata presented to the firewall for evaluation.
 #[derive(Debug, Clone, Copy)]
 pub struct FirewallPacket {
+    /// R121-1 FIX: Network namespace ID for per-namespace rule isolation.
+    pub net_ns_id: u64,
     pub src_ip: Ipv4Addr,
     pub dst_ip: Ipv4Addr,
     pub proto: Ipv4Proto,
@@ -604,20 +608,77 @@ fn default_rules() -> Vec<FirewallRule> {
 }
 
 // ============================================================================
-// Global Instance
+// Per-Namespace Instances (R121-1 FIX)
 // ============================================================================
 
-static FIREWALL_TABLE: Once<FirewallTable> = Once::new();
+/// R121-1 FIX: Per-namespace firewall tables replace the former global singleton.
+///
+/// The map is bounded by live namespace count (max `MAX_NET_NS_COUNT` = 1024
+/// concurrent namespaces). Entries are removed by `firewall_remove_ns()` when
+/// a `NetNamespace` is dropped, so the map size tracks live namespaces, not
+/// cumulative namespace IDs. Each namespace gets its own rule set, ensuring
+/// that DROP/ALLOW rules in one namespace do not affect other namespaces.
+static FIREWALL_TABLES: RwLock<BTreeMap<u64, Arc<FirewallTable>>> =
+    RwLock::new(BTreeMap::new());
 
-/// Get the global firewall table.
+/// Get (and lazily initialize) the firewall table for a specific network namespace.
+///
+/// # R121-1 FIX: Per-namespace firewall isolation
+///
+/// Each network namespace gets its own `FirewallTable` instance, initialized
+/// with the default deny policy and `default_rules()`. Rules in namespace A
+/// do not affect packet filtering in namespace B.
+///
+/// The Arc is cloned so callers can evaluate rules without holding the global
+/// map lock, avoiding contention in the packet processing hot path.
+pub fn firewall_table_for_ns(ns_id: u64) -> Arc<FirewallTable> {
+    // Fast path: read lock for existing entry
+    {
+        let guard = FIREWALL_TABLES.read();
+        if let Some(table) = guard.get(&ns_id) {
+            return Arc::clone(table);
+        }
+    }
+
+    // Slow path: write lock for lazy initialization (double-checked)
+    let mut guard = FIREWALL_TABLES.write();
+    if let Some(table) = guard.get(&ns_id) {
+        return Arc::clone(table);
+    }
+
+    let table = Arc::new(FirewallTable::new_with_rules(
+        FirewallAction::Drop,
+        default_rules(),
+    ));
+    guard.insert(ns_id, Arc::clone(&table));
+    table
+}
+
+/// Get the root-namespace (namespace 0) firewall table.
 ///
 /// # R94-12 FIX: Default Deny Policy
 ///
 /// Uses `FirewallAction::Drop` as the default policy. All traffic not matching
 /// an explicit ACCEPT rule will be dropped. This is fail-closed security design.
-pub fn firewall_table() -> &'static FirewallTable {
-    FIREWALL_TABLE
-        .call_once(|| FirewallTable::new_with_rules(FirewallAction::Drop, default_rules()))
+pub fn firewall_table() -> Arc<FirewallTable> {
+    firewall_table_for_ns(0)
+}
+
+/// R121-1 FIX (Codex review): Remove the firewall table for a destroyed namespace.
+///
+/// Must be called when a network namespace is destroyed to prevent unbounded
+/// growth of `FIREWALL_TABLES`. Namespace IDs are monotonically allocated,
+/// so without cleanup the map would grow proportionally to cumulative namespace
+/// create/destroy events, not just concurrent namespaces.
+///
+/// Safe to call for non-existent or already-removed namespace IDs (no-op).
+pub fn firewall_remove_ns(ns_id: u64) {
+    // Never remove the root namespace (namespace 0).
+    if ns_id == 0 {
+        return;
+    }
+    let mut guard = FIREWALL_TABLES.write();
+    guard.remove(&ns_id);
 }
 
 // ============================================================================

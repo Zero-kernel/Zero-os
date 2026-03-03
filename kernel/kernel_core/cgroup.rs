@@ -1540,8 +1540,16 @@ pub fn migrate_task(
 
     // Attach to target (rollback on failure)
     if let Err(e) = to.attach_task(task) {
-        // Rollback: re-attach to source
-        let _ = from.attach_task(task);
+        // R121-7 FIX: Log rollback failures instead of silently ignoring them.
+        // If rollback fails (e.g., from's pids.max was filled by a concurrent
+        // attach), the task becomes permanently untracked — a resource accounting
+        // leak that could bypass pids.max limits.
+        if let Err(rollback_err) = from.attach_task(task) {
+            klog_always!(
+                "SECURITY: cgroup migrate rollback failed for task {}: source={} target={} err={:?}",
+                task, from_id, to_id, rollback_err
+            );
+        }
         return Err(e);
     }
 

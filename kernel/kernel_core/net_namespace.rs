@@ -445,6 +445,9 @@ pub fn move_device(
 impl Drop for NetNamespace {
     fn drop(&mut self) {
         if self.level > 0 {
+            // R121-1 FIX: Clean up per-namespace firewall table to prevent
+            // unbounded growth of the global FIREWALL_TABLES map.
+            net::firewall::firewall_remove_ns(self.id.0);
             NET_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
         }
     }

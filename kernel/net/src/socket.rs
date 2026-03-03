@@ -373,12 +373,17 @@ static CHALLENGE_ACK_WINDOW_START: AtomicU64 = AtomicU64::new(0);
 /// challenge ACKs. This consumes CPU and bandwidth, and can be used as a
 /// reflection/amplification attack vector.
 fn allow_challenge_ack(now_ms: u64) -> bool {
-    // Check if we need to reset the window
+    // R121-6 FIX: Use compare_exchange on window start so only one CPU
+    // wins the reset race. Without CAS, multiple CPUs can simultaneously
+    // observe the window as expired and all refill tokens to the full limit.
     let window_start = CHALLENGE_ACK_WINDOW_START.load(Ordering::Relaxed);
     if window_start == 0 || now_ms.saturating_sub(window_start) >= CHALLENGE_ACK_WINDOW_MS {
-        // New window - reset tokens and update start time
-        CHALLENGE_ACK_WINDOW_START.store(now_ms, Ordering::Relaxed);
-        CHALLENGE_ACK_TOKENS.store(CHALLENGE_ACK_LIMIT, Ordering::Relaxed);
+        if CHALLENGE_ACK_WINDOW_START
+            .compare_exchange(window_start, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            CHALLENGE_ACK_TOKENS.store(CHALLENGE_ACK_LIMIT, Ordering::Relaxed);
+        }
     }
 
     // Try to consume a token using CAS loop
@@ -424,10 +429,16 @@ static RST_WINDOW_START: AtomicU64 = AtomicU64::new(0);
 /// R63-4 FIX: Implements token bucket rate limiting for RST packets
 /// to prevent amplification attacks.
 fn allow_rst(now_ms: u64) -> bool {
+    // R121-6 FIX: Use compare_exchange on window start so only one CPU
+    // wins the reset race, preventing concurrent token refill on SMP.
     let window_start = RST_WINDOW_START.load(Ordering::Relaxed);
     if window_start == 0 || now_ms.saturating_sub(window_start) >= RST_RATE_WINDOW_MS {
-        RST_WINDOW_START.store(now_ms, Ordering::Relaxed);
-        RST_TOKENS.store(RST_RATE_LIMIT, Ordering::Relaxed);
+        if RST_WINDOW_START
+            .compare_exchange(window_start, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            RST_TOKENS.store(RST_RATE_LIMIT, Ordering::Relaxed);
+        }
     }
 
     let mut tokens = RST_TOKENS.load(Ordering::Relaxed);
@@ -813,6 +824,10 @@ impl TcpListenState {
             return false;
         }
 
+        // R121-3 FIX: Mark this socket as counted so cleanup_tcp_connection()
+        // only decrements for sockets that actually incremented the counter.
+        sock.counted_in_active.store(true, Ordering::Release);
+
         self.accept_queue.push_back(sock);
         true
     }
@@ -909,6 +924,12 @@ pub struct SocketState {
     waiters: WaitQueue,
     /// Socket closed flag
     closed: AtomicBool,
+    /// R121-3 FIX: Whether this socket was counted in GLOBAL_ACTIVE_CONN_COUNT.
+    ///
+    /// Set to `true` when `try_inc_active_conn()` succeeds in `queue_accept()`.
+    /// Checked in `cleanup_tcp_connection()` to avoid decrementing the counter
+    /// for client-initiated connections that were never counted.
+    counted_in_active: AtomicBool,
     /// Bytes received counter
     rx_bytes: AtomicU64,
     /// Bytes sent counter
@@ -961,6 +982,7 @@ impl SocketState {
             rx_queue: Mutex::new(VecDeque::new()),
             waiters: WaitQueue::new(),
             closed: AtomicBool::new(false),
+            counted_in_active: AtomicBool::new(false),
             rx_bytes: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             rx_datagrams: AtomicU64::new(0),
@@ -2890,13 +2912,15 @@ impl SocketTable {
                             dec_half_open();
                         }
                     }
-                    // Collect established-but-not-accepted queue children
+                    // Collect established-but-not-accepted queue children.
+                    // R121-3 FIX (Codex review): Do NOT decrement the active connection
+                    // counter here. These children will be processed by
+                    // cleanup_tcp_connection() below, which decrements iff
+                    // counted_in_active is true. Decrementing here as well would
+                    // cause a double-decrement for accept-queue sockets.
                     while let Some(child) = listen_state.accept_queue.pop_front() {
                         child.mark_closed();
                         children_to_cleanup.push(child);
-
-                        // R74-5 FIX: Decrement active connection counter when cleaning up accept queue
-                        dec_active_conn();
                     }
                     // Wake any blocked accept() to return ECONNABORTED
                     listen_state.accept_waiters.close();
@@ -2930,8 +2954,13 @@ impl SocketTable {
                 ) {
                     let key = tcp_map_key_from_parts(sock.net_ns_id, Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
                     if self.tcp_conns.lock().remove(&key).is_some() {
-                        // R74-5 FIX: Decrement active connection counter when removing connection
-                        dec_active_conn();
+                        // R121-3 FIX (Codex review): Only decrement if this socket
+                        // was counted via try_inc_active_conn() in queue_accept().
+                        // Client-initiated connections (sys_connect) are never
+                        // counted, so decrementing them would drift the counter low.
+                        if sock.counted_in_active.load(Ordering::Acquire) {
+                            dec_active_conn();
+                        }
                     }
                 }
             }
@@ -6181,17 +6210,14 @@ impl SocketTable {
         ) {
             let key = tcp_map_key_from_parts(sock.net_ns_id, Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
             if self.tcp_conns.lock().remove(&key).is_some() {
-                // R74-5 Enhancement: Decrement active connection counter when removing.
-                //
-                // Note: This decrements for ALL connections, but try_inc_active_conn()
-                // is only called for accepted (server-side) connections via queue_accept().
-                // This is safe because dec_active_conn() uses saturating_sub(), so the
-                // counter won't underflow. However, client-initiated connections (via
-                // sys_connect) should also call try_inc_active_conn() for full consistency.
-                //
-                // TODO: Track whether each socket was counted in the active counter
-                // (e.g., via a flag in SocketState) for precise accounting.
-                dec_active_conn();
+                // R121-3 FIX: Only decrement the global active connection counter
+                // if this socket was previously counted via try_inc_active_conn()
+                // in queue_accept(). Client-initiated connections (sys_connect)
+                // are never counted, so decrementing them would artificially lower
+                // the counter and weaken connection-flood DoS protection.
+                if sock.counted_in_active.load(Ordering::Acquire) {
+                    dec_active_conn();
+                }
             }
         }
 

@@ -1327,7 +1327,14 @@ fn register_loaded_patch(p: &LoadedPatch) -> Result<u64, Errno> {
             klog!(Info, "livepatch: loaded id={} deps={}", id, p.meta.dep_count);
             #[cfg(debug_assertions)]
             klog!(Info, "livepatch: loaded id={} target={:#x} handler={:#x}", id, p.target, p.handler);
+            // R121-5 FIX: Redact kernel addresses from audit channel in release
+            // builds to prevent KASLR slide recovery via CAP_AUDIT_READ.
+            // Audit event is still emitted (preserving audit chain integrity)
+            // but with zeroed address fields.
+            #[cfg(debug_assertions)]
             emit_livepatch_audit(0, id, p.target as u64, [p.handler as u64, p.meta.dep_count as u64, 0]);
+            #[cfg(not(debug_assertions))]
+            emit_livepatch_audit(0, id, 0, [0, p.meta.dep_count as u64, 0]);
             return Ok(id);
         }
     }
@@ -1401,7 +1408,11 @@ pub fn kpatch_enable(id: u64) -> Result<(), Errno> {
             klog!(Info, "livepatch: enabled id={}", id);
             #[cfg(debug_assertions)]
             klog!(Info, "livepatch: enabled id={} target={:#x}", id, target);
+            // R121-5 FIX: Redact kernel addresses in release builds.
+            #[cfg(debug_assertions)]
             emit_livepatch_audit(1, id, target as u64, [0, 0, 0]);
+            #[cfg(not(debug_assertions))]
+            emit_livepatch_audit(1, id, 0, [0, 0, 0]);
             Ok(())
         }
         Err(e) => {
@@ -1463,7 +1474,11 @@ pub fn kpatch_disable(id: u64) -> Result<(), Errno> {
             klog!(Info, "livepatch: disabled id={}", id);
             #[cfg(debug_assertions)]
             klog!(Info, "livepatch: disabled id={} target={:#x}", id, target);
+            // R121-5 FIX: Redact kernel addresses in release builds.
+            #[cfg(debug_assertions)]
             emit_livepatch_audit(2, id, target as u64, [0, 0, 0]);
+            #[cfg(not(debug_assertions))]
+            emit_livepatch_audit(2, id, 0, [0, 0, 0]);
             Ok(())
         }
         Err(e) => {
@@ -1590,7 +1605,11 @@ pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
     klog!(Info, "livepatch: unloaded id={}", id);
     #[cfg(debug_assertions)]
     klog!(Info, "livepatch: unloaded id={} target={:#x}", id, target_addr);
+    // R121-5 FIX: Redact kernel addresses in release builds.
+    #[cfg(debug_assertions)]
     emit_livepatch_audit(3, id, target_addr as u64, [0, 0, 0]);
+    #[cfg(not(debug_assertions))]
+    emit_livepatch_audit(3, id, 0, [0, 0, 0]);
     Ok(())
 }
 

@@ -2708,7 +2708,12 @@ fn sys_clone(
             parent.memory_space,
             parent.user_memory_space, // H.3 KPTI
             parent.tgid,
-            parent.mmap_regions.clone(),
+            // R121-4 FIX: Strip pending-map/unmap flags from mmap_regions
+            // when cloning for fork. The child's address space is COW-forked
+            // with pages already mapped, so pending flags are not applicable.
+            parent.mmap_regions.iter()
+                .map(|(&base, &len_with_flags)| (base, mmap_region_len(len_with_flags)))
+                .collect(),
             parent.next_mmap_addr,
             parent.brk_start,
             parent.brk,
@@ -5324,6 +5329,23 @@ fn page_align_up(addr: usize) -> usize {
     (addr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
+// R121-4 FIX: mmap_regions encodes transient state in the low bits of the
+// stored length.  All committed lengths are page-aligned (4 KiB), so the
+// low 12 bits are available for flags.
+//
+// PENDING_MAP   — address range is reserved, page table mapping in progress
+// PENDING_UNMAP — region marked for removal, page table unmap in progress
+const MMAP_REGION_FLAG_MASK: usize = 0xfff;
+const MMAP_REGION_FLAG_PENDING_MAP: usize = 1 << 0;
+const MMAP_REGION_FLAG_PENDING_UNMAP: usize = 1 << 1;
+
+/// Extract the actual page-aligned length from an mmap_regions entry,
+/// stripping any in-flight state flags.
+#[inline]
+pub(crate) fn mmap_region_len(len_with_flags: usize) -> usize {
+    len_with_flags & !MMAP_REGION_FLAG_MASK
+}
+
 /// sys_brk - 改变数据段大小（堆管理）
 ///
 /// # Arguments
@@ -5386,8 +5408,8 @@ fn sys_brk(addr: usize) -> SyscallResult {
         let grow_size = new_top - old_top;
 
         // 检查与 mmap 区域冲突
-        for (&region_base, &region_len) in proc.mmap_regions.iter() {
-            let region_end = region_base.saturating_add(region_len);
+        for (&region_base, &region_len_with_flags) in proc.mmap_regions.iter() {
+            let region_end = region_base.saturating_add(mmap_region_len(region_len_with_flags));
             if old_top < region_end && new_top > region_base {
                 // 有重叠，返回旧值
                 return Ok(old_brk);
@@ -5586,70 +5608,94 @@ fn sys_mmap(
         page_flags |= PageTableFlags::NO_EXECUTE;
     }
 
-    // R65-9 FIX: Hold process lock across address selection, page ops, and PCB commit
-    // This prevents race conditions where concurrent mmap calls select overlapping addresses
-    // or concurrent mmap/munmap calls corrupt page table state.
-    let mut proc = process.lock();
-
-    // 选择起始虚拟地址（使用 checked_add 防止溢出）
-    // R65-11 FIX: Ensure auto-selected address is at least MMAP_MIN_ADDR
-    let base = if addr == 0 {
-        let candidate = proc
-            .next_mmap_addr
-            .checked_add(0xfff)
-            .ok_or(SyscallError::EINVAL)?
-            & !0xfff;
-        // Ensure we don't auto-select addresses below MMAP_MIN_ADDR
-        if candidate < crate::usercopy::MMAP_MIN_ADDR {
-            crate::usercopy::MMAP_MIN_ADDR
-        } else {
-            candidate
-        }
-    } else {
-        addr
-    };
-
-    // 检查地址对齐
-    if base & 0xfff != 0 {
-        return Err(SyscallError::EINVAL);
-    }
-
-    // R65-11 FIX: Reject mappings below MMAP_MIN_ADDR to prevent NULL dereference exploitation
-    // A kernel NULL pointer bug could be exploited if user space can map page 0 with controlled content.
-    // 64KB is the Linux default (vm.mmap_min_addr).
-    if base < crate::usercopy::MMAP_MIN_ADDR {
-        return Err(SyscallError::EPERM);
-    }
-
-    // 计算结束地址并检查用户空间边界
-    let end = base
-        .checked_add(length_aligned)
-        .ok_or(SyscallError::EFAULT)?;
-
-    if end > USER_SPACE_TOP {
-        return Err(SyscallError::EFAULT);
-    }
-
-    // 检查与现有映射的重叠
-    for (&region_base, &region_len) in proc.mmap_regions.iter() {
-        let region_end = region_base
-            .checked_add(region_len)
-            .ok_or(SyscallError::EFAULT)?;
-        if base < region_end && end > region_base {
-            return Err(SyscallError::EINVAL);
-        }
-    }
-
+    // R121-4 FIX (was R65-9): Three-phase mmap to respect documented lock
+    // ordering (PT_LOCK before Process::inner in lock_ordering.rs) while still
+    // preventing address-space races.
+    //
+    // Phase 1 (Process lock): select/validate address, reserve in mmap_regions
+    //   with a PENDING_MAP flag so concurrent mmap/munmap see it as occupied.
+    // Phase 2 (no Process lock): charge cgroup, then perform PT operations via
+    //   with_current_manager() which acquires PT_LOCK.
+    // Phase 3 (Process lock): commit (clear pending flag), or rollback on failure.
     let update_next = addr == 0;
 
+    let (base, end, cgroup_id, old_next_mmap_addr) = {
+        let mut proc = process.lock();
+
+        // 选择起始虚拟地址（使用 checked_add 防止溢出）
+        // R65-11 FIX: Ensure auto-selected address is at least MMAP_MIN_ADDR
+        let base = if addr == 0 {
+            let candidate = proc
+                .next_mmap_addr
+                .checked_add(0xfff)
+                .ok_or(SyscallError::EINVAL)?
+                & !0xfff;
+            // Ensure we don't auto-select addresses below MMAP_MIN_ADDR
+            if candidate < crate::usercopy::MMAP_MIN_ADDR {
+                crate::usercopy::MMAP_MIN_ADDR
+            } else {
+                candidate
+            }
+        } else {
+            addr
+        };
+
+        // 检查地址对齐
+        if base & 0xfff != 0 {
+            return Err(SyscallError::EINVAL);
+        }
+
+        // R65-11 FIX: Reject mappings below MMAP_MIN_ADDR to prevent NULL dereference exploitation
+        if base < crate::usercopy::MMAP_MIN_ADDR {
+            return Err(SyscallError::EPERM);
+        }
+
+        // 计算结束地址并检查用户空间边界
+        let end = base
+            .checked_add(length_aligned)
+            .ok_or(SyscallError::EFAULT)?;
+
+        if end > USER_SPACE_TOP {
+            return Err(SyscallError::EFAULT);
+        }
+
+        // 检查与现有映射的重叠（pending entries also count as occupied）
+        for (&region_base, &region_len_with_flags) in proc.mmap_regions.iter() {
+            let region_len = mmap_region_len(region_len_with_flags);
+            let region_end = region_base
+                .checked_add(region_len)
+                .ok_or(SyscallError::EFAULT)?;
+            if base < region_end && end > region_base {
+                return Err(SyscallError::EINVAL);
+            }
+        }
+
+        // Reserve the region in the PCB with PENDING_MAP flag before dropping
+        // the process lock. This prevents concurrent mmap from selecting an
+        // overlapping address while PT operations are in progress.
+        proc.mmap_regions
+            .insert(base, length_aligned | MMAP_REGION_FLAG_PENDING_MAP);
+
+        // Advance next_mmap_addr early so concurrent auto-mmaps don't collide.
+        let old_next_mmap_addr = proc.next_mmap_addr;
+        if update_next && proc.next_mmap_addr < end {
+            proc.next_mmap_addr = end;
+        }
+
+        let cgroup_id = proc.cgroup_id;
+        (base, end, cgroup_id, old_next_mmap_addr)
+    }; // Process lock dropped here — Phase 1 complete
+
     // F.2 Cgroup: Atomically charge memory AFTER all validation passes.
-    // Uses CAS-based try_charge_memory() to close the TOCTOU race between limit
-    // check and usage update. By charging only after validation, early errors
-    // (unaligned address, below MMAP_MIN_ADDR, user-space overflow, overlap)
-    // don't leak phantom usage that could exhaust memory quota.
-    let cgroup_id = proc.cgroup_id;
-    cgroup::try_charge_memory(cgroup_id, length_aligned as u64)
-        .map_err(|_| SyscallError::ENOMEM)?;
+    if cgroup::try_charge_memory(cgroup_id, length_aligned as u64).is_err() {
+        // Rollback Phase 1 reservation on cgroup charge failure.
+        let mut proc = process.lock();
+        proc.mmap_regions.remove(&base);
+        if update_next && proc.next_mmap_addr == end {
+            proc.next_mmap_addr = old_next_mmap_addr;
+        }
+        return Err(SyscallError::ENOMEM);
+    }
 
     // 使用基于当前 CR3 的页表管理器进行映射
     // 使用 tracked vector 记录已映射的页，确保失败时完整回滚，避免帧泄漏
@@ -5709,25 +5755,30 @@ fn sys_mmap(
         })
     };
 
-    // F.2 Cgroup: If mapping fails, rollback the memory charge to maintain
-    // correct accounting. Without this, a failed mmap would leave phantom
-    // usage that blocks future allocations.
+    // F.2 Cgroup: If mapping fails, rollback the memory charge and Phase 1
+    // reservation to maintain correct accounting.
     if let Err(e) = map_result {
         cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
+        let mut proc = process.lock();
+        proc.mmap_regions.remove(&base);
+        if update_next && proc.next_mmap_addr == end {
+            proc.next_mmap_addr = old_next_mmap_addr;
+        }
         return Err(e);
     }
 
-    // 记录映射到进程 PCB（锁仍持有，R65-9 FIX）
-    proc.mmap_regions.insert(base, length_aligned);
-    if update_next {
-        proc.next_mmap_addr = end;
-    } else if proc.next_mmap_addr < end {
-        proc.next_mmap_addr = end;
+    // Phase 3: Commit the reservation by clearing the PENDING_MAP flag.
+    // The entry transitions from (length | PENDING_MAP) to plain length.
+    {
+        let mut proc = process.lock();
+        proc.mmap_regions.insert(base, length_aligned);
+        if proc.next_mmap_addr < end {
+            proc.next_mmap_addr = end;
+        }
     }
 
     // Note: Memory is already atomically charged via try_charge_memory() above.
     // R77-2 FIX: No separate accounting call needed - charge/uncharge model is complete.
-    drop(proc); // Explicitly drop the lock
 
     // R102-10 FIX: Gate address-revealing log behind debug_assertions to prevent
     // userspace ASLR bypass via kernel log output.
@@ -5763,25 +5814,47 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     // 对齐到页边界（使用 checked_add 防止整数溢出）
     let length_aligned = length.checked_add(0xfff).ok_or(SyscallError::EINVAL)? & !0xfff;
 
-    // R65-9 FIX: Hold process lock across validation, unmapping, and PCB update
-    // This prevents race conditions where concurrent munmap calls double-free pages
-    let mut proc = process.lock();
+    // R121-4 FIX (was R65-9): Three-phase munmap to respect documented lock
+    // ordering while preventing concurrent munmap double-free.
+    //
+    // Phase 1 (Process lock): validate region, mark as PENDING_UNMAP so
+    //   concurrent mmap/munmap can't race the PT operations.
+    // Phase 2 (no Process lock): perform PT unmap via with_current_manager().
+    // Phase 3 (Process lock): remove PCB record and uncharge cgroup.
+    let (recorded_length, cgroup_id) = {
+        let mut proc = process.lock();
 
-    // 检查该区域是否在进程的 mmap 记录中
-    let recorded_length = *proc.mmap_regions.get(&addr).ok_or(SyscallError::EINVAL)?;
+        // 检查该区域是否在进程的 mmap 记录中
+        let recorded_len_with_flags = *proc.mmap_regions.get(&addr).ok_or(SyscallError::EINVAL)?;
 
-    // 验证长度匹配
-    if recorded_length != length_aligned {
-        return Err(SyscallError::EINVAL);
-    }
-
-    // R30-3 FIX: Call LSM hook for munmap operations
-    // This ensures memory unmapping is subject to policy and audit
-    if let Some(ctx) = lsm::ProcessCtx::from_current() {
-        if lsm::hook_memory_munmap(&ctx, addr as u64, length_aligned as u64).is_err() {
-            return Err(SyscallError::EPERM);
+        // Reject if another operation is already in progress on this region.
+        if (recorded_len_with_flags
+            & (MMAP_REGION_FLAG_PENDING_MAP | MMAP_REGION_FLAG_PENDING_UNMAP))
+            != 0
+        {
+            return Err(SyscallError::EBUSY);
         }
-    }
+
+        let recorded_length = mmap_region_len(recorded_len_with_flags);
+
+        // 验证长度匹配
+        if recorded_length != length_aligned {
+            return Err(SyscallError::EINVAL);
+        }
+
+        // R30-3 FIX: Call LSM hook for munmap operations
+        if let Some(ctx) = lsm::ProcessCtx::from_current() {
+            if lsm::hook_memory_munmap(&ctx, addr as u64, length_aligned as u64).is_err() {
+                return Err(SyscallError::EPERM);
+            }
+        }
+
+        // Mark as pending-unmap so concurrent mmap/munmap can't race the PT ops.
+        proc.mmap_regions
+            .insert(addr, recorded_length | MMAP_REGION_FLAG_PENDING_UNMAP);
+
+        (recorded_length, proc.cgroup_id)
+    }; // Process lock dropped here — Phase 1 complete
 
     // 使用基于当前 CR3 的页表管理器进行取消映射
     // R23-3 fix: 使用两阶段方法 - 先收集帧、做 TLB shootdown、再释放
@@ -5828,16 +5901,20 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         })
     };
 
-    unmap_result?;
+    if let Err(e) = unmap_result {
+        // Roll back the PENDING_UNMAP marker so the region remains usable.
+        let mut proc = process.lock();
+        proc.mmap_regions.insert(addr, recorded_length);
+        return Err(e);
+    }
 
-    // 从进程 PCB 中移除映射记录（锁仍持有，R65-9 FIX）
-    proc.mmap_regions.remove(&addr);
+    // Phase 3: Remove the PCB record now that PT operations completed successfully.
+    {
+        let mut proc = process.lock();
+        proc.mmap_regions.remove(&addr);
+    }
 
     // F.2 Cgroup: Atomically uncharge memory after successful munmap.
-    // Uses the specific region size for accurate accounting rather than
-    // recalculating total usage from scratch.
-    let cgroup_id = proc.cgroup_id;
-    drop(proc); // Explicitly drop the lock
     cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
 
     // R102-10 FIX: Gate address-revealing log behind debug_assertions.

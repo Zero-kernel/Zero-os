@@ -47,7 +47,7 @@ use crate::device::TxError;
 use crate::ethernet::{
     build_ethernet_frame, parse_ethernet, EthAddr, EthHeader, ETHERTYPE_ARP, ETHERTYPE_IPV4,
 };
-use crate::firewall::{firewall_table, FirewallAction, FirewallPacket, FirewallVerdict};
+use crate::firewall::{firewall_table_for_ns, FirewallAction, FirewallPacket, FirewallVerdict};
 use crate::fragment::{
     cleanup_expired_fragments, process_fragment as reassemble_fragment, FragmentDropReason,
 };
@@ -486,8 +486,9 @@ fn process_udp(
     #[cfg(not(feature = "conntrack"))]
     let ct_result: Option<crate::conntrack::CtUpdateResult> = None;
 
-    // Firewall: Evaluate packet against rule table
+    // R121-1 FIX: Evaluate packet against per-namespace firewall rule table.
     let fw_packet = FirewallPacket {
+        net_ns_id: net_ns_id.0,
         src_ip: ip_hdr.src,
         dst_ip: ip_hdr.dst,
         proto: Ipv4Proto::Udp,
@@ -495,7 +496,8 @@ fn process_udp(
         dst_port: Some(header.dst_port),
         ct_state: ct_result.as_ref().map(|r| r.decision),
     };
-    let fw_verdict = firewall_table().evaluate(&fw_packet);
+    let fw_table = firewall_table_for_ns(net_ns_id.0);
+    let fw_verdict = fw_table.evaluate(&fw_packet);
     if let Some(result) =
         apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, payload, now_ms)
     {
@@ -566,8 +568,9 @@ fn process_icmp(
     #[cfg(not(feature = "conntrack"))]
     let ct_result: Option<crate::conntrack::CtUpdateResult> = None;
 
-    // Firewall: Evaluate ICMP packet against rule table
+    // R121-1 FIX: Evaluate ICMP packet against per-namespace firewall rule table.
     let fw_packet = FirewallPacket {
+        net_ns_id: net_ns_id.0,
         src_ip: ip_hdr.src,
         dst_ip: ip_hdr.dst,
         proto: Ipv4Proto::Icmp,
@@ -575,7 +578,8 @@ fn process_icmp(
         dst_port: None,
         ct_state: ct_result.as_ref().map(|r| r.decision),
     };
-    let fw_verdict = firewall_table().evaluate(&fw_packet);
+    let fw_table = firewall_table_for_ns(net_ns_id.0);
+    let fw_verdict = fw_table.evaluate(&fw_packet);
     if let Some(result) =
         apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, packet, now_ms)
     {
@@ -714,8 +718,9 @@ fn process_tcp(
     #[cfg(not(feature = "conntrack"))]
     let ct_result: Option<crate::conntrack::CtUpdateResult> = None;
 
-    // Firewall: Evaluate packet against rule table
+    // R121-1 FIX: Evaluate TCP packet against per-namespace firewall rule table.
     let fw_packet = FirewallPacket {
+        net_ns_id: net_ns_id.0,
         src_ip: ip_hdr.src,
         dst_ip: ip_hdr.dst,
         proto: Ipv4Proto::Tcp,
@@ -723,7 +728,8 @@ fn process_tcp(
         dst_port: Some(tcp_hdr.dst_port),
         ct_state: ct_result.as_ref().map(|r| r.decision),
     };
-    let fw_verdict = firewall_table().evaluate(&fw_packet);
+    let fw_table = firewall_table_for_ns(net_ns_id.0);
+    let fw_verdict = fw_table.evaluate(&fw_packet);
     if let Some(result) =
         apply_firewall_verdict(&fw_verdict, &fw_packet, ip_hdr, eth_hdr, payload, now_ms)
     {

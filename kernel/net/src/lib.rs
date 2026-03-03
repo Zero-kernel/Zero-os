@@ -72,9 +72,9 @@ pub use ethernet::{
     ETHERTYPE_IPV4,
 };
 pub use firewall::{
-    firewall_table, log_match, CtStateMask, FirewallAction, FirewallPacket, FirewallRule,
-    FirewallRuleBuilder, FirewallStats, FirewallStatsSnapshot, FirewallTable, FirewallVerdict,
-    IpCidrMatch, PortRange,
+    firewall_remove_ns, firewall_table, firewall_table_for_ns, log_match, CtStateMask,
+    FirewallAction, FirewallPacket, FirewallRule, FirewallRuleBuilder, FirewallStats,
+    FirewallStatsSnapshot, FirewallTable, FirewallVerdict, IpCidrMatch, PortRange,
 };
 pub use fragment::{
     cleanup_expired_fragments, fragment_cache, process_fragment, FragmentCache, FragmentDropReason,

@@ -335,8 +335,13 @@ fn fork_inner(
         child.robust_list_head = 0;
         child.robust_list_len = 0;
 
-        // 复制 mmap 区域记录
-        child.mmap_regions = parent.mmap_regions.clone();
+        // R121-4 FIX (Codex review): Strip pending-map/unmap flags when cloning
+        // mmap_regions into the child. If fork() races with an in-progress sys_mmap
+        // or sys_munmap, the child would inherit PENDING_* flags and hit spurious
+        // EBUSY errors or stale reservations.
+        child.mmap_regions = parent.mmap_regions.iter()
+            .map(|(&base, &len_with_flags)| (base, crate::syscall::mmap_region_len(len_with_flags)))
+            .collect();
         child.next_mmap_addr = parent.next_mmap_addr;
 
         child.context.rax = 0; // 子进程返回值 0

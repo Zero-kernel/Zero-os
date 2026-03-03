@@ -879,6 +879,7 @@ impl NetworkLoopbackTest {
         // Test that the firewall can evaluate packets
         // Create a test packet structure
         let test_pkt = firewall::FirewallPacket {
+            net_ns_id: 0,
             src_ip: Ipv4Addr([10, 0, 0, 2]),
             dst_ip: Ipv4Addr([10, 0, 0, 1]),
             src_port: Some(12345),

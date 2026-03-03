@@ -1347,7 +1347,9 @@ fn generate_maps(pid: u32) -> String {
                 truncated = true;
                 break;
             }
-            let end = start + size;
+            // R121-4 FIX: Strip pending-map/unmap flags from the stored length.
+            // Page-aligned lengths use bits [12..] so mask off low 12 bits.
+            let end = start.saturating_add(size & !0xfff);
             // Format: start-end perms offset dev:inode pathname
             let line = format!(
                 "{:016x}-{:016x} rw-p 00000000 00:00 0    [anon]\n",
