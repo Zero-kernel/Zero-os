@@ -2442,7 +2442,9 @@ fn sys_fork() -> SyscallResult {
             // F.2: Map ForkError to appropriate syscall error
             use crate::fork::ForkError;
             match e {
-                ForkError::CgroupPidsLimitExceeded => Err(SyscallError::EAGAIN),
+                ForkError::CgroupPidsLimitExceeded | ForkError::MmapTransientState => {
+                    Err(SyscallError::EAGAIN)
+                }
                 _ => Err(SyscallError::ENOMEM),
             }
         }
@@ -2813,7 +2815,17 @@ fn sys_clone(
                     }
                 }
             }
-            Err(_) => return Err(SyscallError::ENOMEM),
+            Err(e) => {
+                // R122-1 FIX: Map MmapTransientState to EAGAIN (retriable)
+                // to keep behavior consistent with the sys_fork() path.
+                use crate::fork::ForkError;
+                return Err(match e {
+                    ForkError::CgroupPidsLimitExceeded | ForkError::MmapTransientState => {
+                        SyscallError::EAGAIN
+                    }
+                    _ => SyscallError::ENOMEM,
+                });
+            }
         }
     };
 
@@ -5335,7 +5347,8 @@ fn page_align_up(addr: usize) -> usize {
 //
 // PENDING_MAP   — address range is reserved, page table mapping in progress
 // PENDING_UNMAP — region marked for removal, page table unmap in progress
-const MMAP_REGION_FLAG_MASK: usize = 0xfff;
+// R122-1: Made pub(crate) so fork.rs can check for transient state.
+pub(crate) const MMAP_REGION_FLAG_MASK: usize = 0xfff;
 const MMAP_REGION_FLAG_PENDING_MAP: usize = 1 << 0;
 const MMAP_REGION_FLAG_PENDING_UNMAP: usize = 1 << 1;
 

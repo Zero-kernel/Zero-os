@@ -48,6 +48,9 @@ pub enum ForkError {
     ProcessCreationFailed,
     /// F.2: Cgroup pids.max limit exceeded
     CgroupPidsLimitExceeded,
+    /// R122-1 FIX: mmap_regions contains in-flight PENDING_MAP/PENDING_UNMAP entries;
+    /// fork must be retried after the concurrent mmap/munmap completes.
+    MmapTransientState,
 }
 
 /// 执行fork系统调用
@@ -155,6 +158,29 @@ fn fork_inner(
     child_pid: ProcessId,
     parent_root: usize,
 ) -> Result<ProcessId, ForkError> {
+    // R122-1 FIX: Reject fork() while any mmap/munmap operation is in-flight.
+    //
+    // The three-phase mmap/munmap protocol (R121-4) encodes transient state in
+    // the low 12 bits of each mmap_regions entry (PENDING_MAP / PENDING_UNMAP).
+    // Committed entries always store page-aligned lengths (low 12 bits = 0).
+    //
+    // If a sibling thread (CLONE_VM) is between Phase 1 (reserve with PENDING
+    // flag) and Phase 3 (commit by clearing flag), copying the entry into the
+    // child — even after stripping the flag — produces an inconsistent child
+    // address space: the region record says "mapped" but the page table may be
+    // partially populated (PENDING_MAP) or partially torn down (PENDING_UNMAP).
+    //
+    // Returning MmapTransientState (mapped to EAGAIN) lets userspace retry.
+    // This is fail-closed: any non-zero low bits block fork, covering future
+    // transient flags as well.
+    if parent
+        .mmap_regions
+        .values()
+        .any(|&len_with_flags| len_with_flags & crate::syscall::MMAP_REGION_FLAG_MASK != 0)
+    {
+        return Err(ForkError::MmapTransientState);
+    }
+
     if let Some(child_process) = get_process(child_pid) {
         let mut child = child_process.lock();
 
@@ -335,10 +361,9 @@ fn fork_inner(
         child.robust_list_head = 0;
         child.robust_list_len = 0;
 
-        // R121-4 FIX (Codex review): Strip pending-map/unmap flags when cloning
-        // mmap_regions into the child. If fork() races with an in-progress sys_mmap
-        // or sys_munmap, the child would inherit PENDING_* flags and hit spurious
-        // EBUSY errors or stale reservations.
+        // R122-1 FIX: Transient PENDING_* entries are rejected at fork_inner()
+        // entry above. Defensively strip low-bit flags when cloning committed
+        // regions into the child, ensuring the child always sees clean lengths.
         child.mmap_regions = parent.mmap_regions.iter()
             .map(|(&base, &len_with_flags)| (base, crate::syscall::mmap_region_len(len_with_flags)))
             .collect();
