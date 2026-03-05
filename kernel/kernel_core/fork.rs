@@ -176,7 +176,7 @@ fn fork_inner(
     if parent
         .mmap_regions
         .values()
-        .any(|&len_with_flags| len_with_flags & crate::syscall::MMAP_REGION_FLAG_MASK != 0)
+        .any(|&len_with_flags| len_with_flags & crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK != 0)
     {
         return Err(ForkError::MmapTransientState);
     }
@@ -362,10 +362,15 @@ fn fork_inner(
         child.robust_list_len = 0;
 
         // R122-1 FIX: Transient PENDING_* entries are rejected at fork_inner()
-        // entry above. Defensively strip low-bit flags when cloning committed
-        // regions into the child, ensuring the child always sees clean lengths.
-        child.mmap_regions = parent.mmap_regions.iter()
-            .map(|(&base, &len_with_flags)| (base, crate::syscall::mmap_region_len(len_with_flags)))
+        // entry above. Strip only transient in-flight flags when cloning committed
+        // regions into the child, preserving persistent per-region flags (e.g.
+        // PROT_NONE) so the child inherits correct region metadata.
+        child.mmap_regions = parent
+            .mmap_regions
+            .iter()
+            .map(|(&base, &len_with_flags)| {
+                (base, len_with_flags & !crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK)
+            })
             .collect();
         child.next_mmap_addr = parent.next_mmap_addr;
 

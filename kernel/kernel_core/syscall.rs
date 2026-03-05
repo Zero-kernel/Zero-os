@@ -2680,6 +2680,9 @@ fn sys_clone(
         parent_brk,
         parent_name,
         parent_priority,
+        parent_cgroup_id,     // R123-2 FIX: for cgroup attachment after create_process
+        parent_cpuset_id,     // R123-2 FIX: for cpuset inheritance
+        parent_allowed_cpus,  // R123-2 FIX: for cpuset CPU mask inheritance
         _parent_context,
         parent_user_stack,
         parent_fs_base,
@@ -2710,17 +2713,21 @@ fn sys_clone(
             parent.memory_space,
             parent.user_memory_space, // H.3 KPTI
             parent.tgid,
-            // R121-4 FIX: Strip pending-map/unmap flags from mmap_regions
-            // when cloning for fork. The child's address space is COW-forked
-            // with pages already mapped, so pending flags are not applicable.
+            // R121-4 FIX: Strip only transient pending-map/unmap flags from
+            // mmap_regions when snapshotting for clone. Preserve committed
+            // per-region flags (e.g. PROT_NONE) so the child inherits
+            // correct region metadata.
             parent.mmap_regions.iter()
-                .map(|(&base, &len_with_flags)| (base, mmap_region_len(len_with_flags)))
+                .map(|(&base, &len_with_flags)| (base, len_with_flags & !MMAP_REGION_FLAG_TRANSIENT_MASK))
                 .collect(),
             parent.next_mmap_addr,
             parent.brk_start,
             parent.brk,
             parent.name.clone(),
             parent.priority,
+            parent.cgroup_id,     // R123-2 FIX
+            parent.cpuset_id,     // R123-2 FIX
+            parent.allowed_cpus,  // R123-2 FIX
             parent.context,
             parent.user_stack,
             parent.fs_base,
@@ -3116,6 +3123,12 @@ fn sys_clone(
             child.user_memory_space = parent_user_memory_space;
 
             // 共享地址空间时复制相关元数据
+            //
+            // R123-3 (short-term): CLONE_VM shares page tables (CR3) but currently
+            // snapshots mmap_regions/next_mmap_addr/brk into each task. Concurrent
+            // mmap/munmap from different threads can diverge until we introduce a
+            // shared MmState per address space (D3-ARC-MM-SHARED). This is a known
+            // architectural limitation carried as design finding D3-ARC-MM-SHARED.
             child.mmap_regions = parent_mmap;
             child.next_mmap_addr = parent_next_mmap;
             child.brk_start = parent_brk_start;
@@ -3403,14 +3416,56 @@ fn sys_clone(
     // Must be BEFORE user memory writes and scheduler notification
     enforce_lsm_task_fork(parent_pid, child_pid)?;
 
+    // R123-2 FIX: Propagate cgroup + cpuset membership for sys_clone tasks.
+    //
+    // create_process() initializes cgroup_id=0 (root). Without explicit
+    // attachment, CLONE_THREAD tasks bypass pids.max, memory.max, and cpu.max
+    // — a container escape via resource exhaustion. The fork path (fork.rs:73-148)
+    // handles this correctly; this brings sys_clone to parity.
+    //
+    // Must be AFTER enforce_lsm_task_fork() because that helper uses
+    // cleanup_unscheduled_process() which skips cgroup/cpuset teardown.
+    // We attach here so rollback paths below can detach symmetrically.
+    if !crate::cgroup::check_fork_allowed(parent_cgroup_id) {
+        if let Some(parent) = get_process(parent_pid) {
+            parent.lock().children.retain(|&p| p != child_pid);
+        }
+        cleanup_unscheduled_process(child_pid);
+        return Err(SyscallError::EAGAIN);
+    }
+
+    {
+        let mut child = child_arc.lock();
+        child.cgroup_id = parent_cgroup_id;
+        child.cpuset_id = parent_cpuset_id;
+        child.allowed_cpus = parent_allowed_cpus;
+    }
+
+    if let Some(cgroup) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+        if cgroup.attach_task(child_pid as u64).is_err() {
+            if let Some(parent) = get_process(parent_pid) {
+                parent.lock().children.retain(|&p| p != child_pid);
+            }
+            cleanup_unscheduled_process(child_pid);
+            return Err(SyscallError::EAGAIN);
+        }
+    }
+
+    // E.5 Cpuset: update task count after successful cgroup attach.
+    crate::process::notify_cpuset_task_joined(parent_cpuset_id);
+
     // 写入 parent_tid (F.1: use parent's view of child's PID)
     if flags & CLONE_PARENT_SETTID != 0 {
         let tid_bytes = (parent_view_pid as i32).to_ne_bytes();
         if let Err(e) = copy_to_user(parent_tid as *mut u8, &tid_bytes) {
             // R104-3 FIX: Clean up child process on copy_to_user failure to prevent
             // PID / kernel-stack / address-space leak.
-            // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process
-            // to avoid cgroup/cpuset/IPC detach on never-joined subsystems.
+            // R123-2 FIX: Child is now attached to cgroup + cpuset; roll back
+            // those subsystems before cleanup_unscheduled_process().
+            if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+                let _ = cg.detach_task(child_pid as u64);
+            }
+            crate::process::notify_cpuset_task_left(parent_cpuset_id);
             if let Some(parent) = get_process(parent_pid) {
                 parent.lock().children.retain(|&p| p != child_pid);
             }
@@ -3429,8 +3484,12 @@ fn sys_clone(
         let tid_bytes = (child_view_pid as i32).to_ne_bytes();
         if let Err(e) = copy_to_user(child_tid as *mut u8, &tid_bytes) {
             // R104-3 FIX: Clean up child process on copy_to_user failure.
-            // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process
-            // to avoid cgroup/cpuset/IPC detach on never-joined subsystems.
+            // R123-2 FIX: Child is now attached to cgroup + cpuset; roll back
+            // those subsystems before cleanup_unscheduled_process().
+            if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+                let _ = cg.detach_task(child_pid as u64);
+            }
+            crate::process::notify_cpuset_task_left(parent_cpuset_id);
             if let Some(parent) = get_process(parent_pid) {
                 parent.lock().children.retain(|&p| p != child_pid);
             }
@@ -5342,15 +5401,27 @@ fn page_align_up(addr: usize) -> usize {
 }
 
 // R121-4 FIX: mmap_regions encodes transient state in the low bits of the
-// stored length.  All committed lengths are page-aligned (4 KiB), so the
+// stored length. All committed lengths are page-aligned (4 KiB), so the
 // low 12 bits are available for flags.
 //
-// PENDING_MAP   — address range is reserved, page table mapping in progress
-// PENDING_UNMAP — region marked for removal, page table unmap in progress
+// Transient (in-flight) flags — cleared when operation completes:
+//   PENDING_MAP   — address range reserved, page table mapping in progress
+//   PENDING_UNMAP — region marked for removal, page table unmap in progress
+//
+// Persistent (committed) flags — survive into committed entry:
+//   PROT_NONE — pure address reservation, no physical frames allocated/charged
+//
 // R122-1: Made pub(crate) so fork.rs can check for transient state.
 pub(crate) const MMAP_REGION_FLAG_MASK: usize = 0xfff;
 const MMAP_REGION_FLAG_PENDING_MAP: usize = 1 << 0;
 const MMAP_REGION_FLAG_PENDING_UNMAP: usize = 1 << 1;
+// R123-1 FIX: Committed flag indicating PROT_NONE reservation (no frames/charge).
+const MMAP_REGION_FLAG_PROT_NONE: usize = 1 << 2;
+
+/// Mask of transient in-flight flags. Only these are stripped on fork/clone;
+/// persistent committed flags (e.g. PROT_NONE) are preserved.
+pub(crate) const MMAP_REGION_FLAG_TRANSIENT_MASK: usize =
+    MMAP_REGION_FLAG_PENDING_MAP | MMAP_REGION_FLAG_PENDING_UNMAP;
 
 /// Extract the actual page-aligned length from an mmap_regions entry,
 /// stripping any in-flight state flags.
@@ -5603,9 +5674,11 @@ fn sys_mmap(
     // 对齐到页边界（使用 checked_add 防止整数溢出）
     let length_aligned = length.checked_add(0xfff).ok_or(SyscallError::EINVAL)? & !0xfff;
 
+    let is_prot_none = prot == PROT_NONE;
+
     // R32-SC-1 FIX: PROT_NONE (prot=0) should create non-present mapping
     // that faults on access (guard page behavior). Mirror sys_mprotect.
-    let mut page_flags = if prot == 0 {
+    let mut page_flags = if is_prot_none {
         PageTableFlags::empty()
     } else {
         PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE
@@ -5698,6 +5771,29 @@ fn sys_mmap(
         let cgroup_id = proc.cgroup_id;
         (base, end, cgroup_id, old_next_mmap_addr)
     }; // Process lock dropped here — Phase 1 complete
+
+    // R123-1 FIX: PROT_NONE is a pure address reservation per POSIX semantics.
+    // No physical frames are allocated and no cgroup memory is charged until
+    // protections are elevated (e.g. via mprotect) and a page fault triggers
+    // demand allocation. The mmap_regions entry is committed with the
+    // PROT_NONE flag so munmap/exit know not to uncharge or free frames.
+    if is_prot_none {
+        {
+            let mut proc = process.lock();
+            proc.mmap_regions
+                .insert(base, length_aligned | MMAP_REGION_FLAG_PROT_NONE);
+            if proc.next_mmap_addr < end {
+                proc.next_mmap_addr = end;
+            }
+        }
+
+        kprintln!(
+            "sys_mmap: pid={}, reserved {} bytes at 0x{:x} (PROT_NONE, no frames)",
+            pid, length_aligned, base
+        );
+
+        return Ok(base);
+    }
 
     // F.2 Cgroup: Atomically charge memory AFTER all validation passes.
     if cgroup::try_charge_memory(cgroup_id, length_aligned as u64).is_err() {
@@ -5834,21 +5930,21 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     //   concurrent mmap/munmap can't race the PT operations.
     // Phase 2 (no Process lock): perform PT unmap via with_current_manager().
     // Phase 3 (Process lock): remove PCB record and uncharge cgroup.
-    let (recorded_length, cgroup_id) = {
+    let (recorded_length, committed_flags, cgroup_id) = {
         let mut proc = process.lock();
 
         // 检查该区域是否在进程的 mmap 记录中
         let recorded_len_with_flags = *proc.mmap_regions.get(&addr).ok_or(SyscallError::EINVAL)?;
 
         // Reject if another operation is already in progress on this region.
-        if (recorded_len_with_flags
-            & (MMAP_REGION_FLAG_PENDING_MAP | MMAP_REGION_FLAG_PENDING_UNMAP))
-            != 0
-        {
+        if (recorded_len_with_flags & MMAP_REGION_FLAG_TRANSIENT_MASK) != 0 {
             return Err(SyscallError::EBUSY);
         }
 
         let recorded_length = mmap_region_len(recorded_len_with_flags);
+        // R123-1 FIX: Capture committed per-region flags (e.g. PROT_NONE) so
+        // we can skip cgroup uncharge for regions that were never charged.
+        let committed_flags = recorded_len_with_flags & MMAP_REGION_FLAG_MASK;
 
         // 验证长度匹配
         if recorded_length != length_aligned {
@@ -5863,10 +5959,11 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         }
 
         // Mark as pending-unmap so concurrent mmap/munmap can't race the PT ops.
+        // Preserve committed per-region flags (e.g. PROT_NONE) through the operation.
         proc.mmap_regions
-            .insert(addr, recorded_length | MMAP_REGION_FLAG_PENDING_UNMAP);
+            .insert(addr, recorded_length | committed_flags | MMAP_REGION_FLAG_PENDING_UNMAP);
 
-        (recorded_length, proc.cgroup_id)
+        (recorded_length, committed_flags, proc.cgroup_id)
     }; // Process lock dropped here — Phase 1 complete
 
     // 使用基于当前 CR3 的页表管理器进行取消映射
@@ -5916,8 +6013,9 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
 
     if let Err(e) = unmap_result {
         // Roll back the PENDING_UNMAP marker so the region remains usable.
+        // Preserve committed per-region flags (e.g. PROT_NONE).
         let mut proc = process.lock();
-        proc.mmap_regions.insert(addr, recorded_length);
+        proc.mmap_regions.insert(addr, recorded_length | committed_flags);
         return Err(e);
     }
 
@@ -5928,7 +6026,11 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     }
 
     // F.2 Cgroup: Atomically uncharge memory after successful munmap.
-    cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
+    // R123-1 FIX: PROT_NONE reservations never allocated frames or charged
+    // cgroup memory, so skip uncharge to maintain correct accounting.
+    if (committed_flags & MMAP_REGION_FLAG_PROT_NONE) == 0 {
+        cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
+    }
 
     // R102-10 FIX: Gate address-revealing log behind debug_assertions.
     kprintln!(

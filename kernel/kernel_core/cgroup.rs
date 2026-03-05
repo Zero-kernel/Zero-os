@@ -1091,6 +1091,20 @@ impl CgroupNode {
     /// Uses fetch_update CAS to atomically check-and-increment pids counters,
     /// preventing concurrent attach bypassing pids.max limits.
     pub fn attach_task(&self, task: TaskId) -> Result<(), CgroupError> {
+        self.attach_task_impl(task, true)
+    }
+
+    /// Attaches a task to this cgroup, bypassing pids.max enforcement.
+    ///
+    /// R123-4 FIX: Used exclusively for rollback paths (e.g. `migrate_task`)
+    /// where a failed migration must re-attach the task to its source cgroup.
+    /// Without this, a concurrent attach filling pids.max between detach and
+    /// rollback would leave the task permanently unattached (INV-CG-03 violation).
+    fn force_attach_task(&self, task: TaskId) -> Result<(), CgroupError> {
+        self.attach_task_impl(task, false)
+    }
+
+    fn attach_task_impl(&self, task: TaskId, enforce_pids_max: bool) -> Result<(), CgroupError> {
         // R77-1 FIX: Block attaches once deletion has started.
         // This prevents the race where a thread holds an old Arc<CgroupNode>
         // and attempts to attach after delete_cgroup() has checked emptiness
@@ -1122,8 +1136,8 @@ impl CgroupNode {
             cursor = p.parent();
         }
 
-        // Snapshot limits (only if PIDs controller enabled)
-        let self_limit = if self.controllers.contains(CgroupControllers::PIDS) {
+        // Snapshot limits (only if PIDs controller enabled AND enforcement requested)
+        let self_limit = if enforce_pids_max && self.controllers.contains(CgroupControllers::PIDS) {
             self.limits.lock().pids_max
         } else {
             None
@@ -1131,7 +1145,7 @@ impl CgroupNode {
         let ancestor_limits: alloc::vec::Vec<Option<u64>> = ancestors
             .iter()
             .map(|a| {
-                if a.controllers.contains(CgroupControllers::PIDS) {
+                if enforce_pids_max && a.controllers.contains(CgroupControllers::PIDS) {
                     a.limits.lock().pids_max
                 } else {
                     None
@@ -1540,11 +1554,11 @@ pub fn migrate_task(
 
     // Attach to target (rollback on failure)
     if let Err(e) = to.attach_task(task) {
-        // R121-7 FIX: Log rollback failures instead of silently ignoring them.
-        // If rollback fails (e.g., from's pids.max was filled by a concurrent
-        // attach), the task becomes permanently untracked — a resource accounting
-        // leak that could bypass pids.max limits.
-        if let Err(rollback_err) = from.attach_task(task) {
+        // R123-4 FIX: Rollback must not fail due to pids.max. force_attach_task()
+        // bypasses pids.max enforcement so a failed migration never orphans the
+        // task (INV-CG-03). The pids counter may temporarily exceed pids.max, but
+        // this is bounded and self-correcting (next task exit decrements it).
+        if let Err(rollback_err) = from.force_attach_task(task) {
             klog_always!(
                 "SECURITY: cgroup migrate rollback failed for task {}: source={} target={} err={:?}",
                 task, from_id, to_id, rollback_err

@@ -3130,7 +3130,13 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
 /// * `keep_address_space` - R24-1 fix: 如果为 true，不释放地址空间（其他线程仍在使用）
 fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
     let region_count = proc.mmap_regions.len();
-    let total_size: usize = proc.mmap_regions.values().sum();
+    // R123-5 FIX: Mask low-bit flags (PENDING/PROT_NONE) before summing,
+    // so diagnostic logs reflect actual region lengths, not inflated values.
+    let total_size: usize = proc
+        .mmap_regions
+        .values()
+        .map(|&v| crate::syscall::mmap_region_len(v))
+        .sum();
 
     // 释放 per-process 内核栈
     if proc.kernel_stack.as_u64() != 0 {
@@ -3323,11 +3329,31 @@ unsafe fn free_page_table_level(
 
     for idx in idx_range {
         let entry = &mut table[idx];
-        if entry.is_unused() || !entry.flags().contains(PageTableFlags::PRESENT) {
+        if entry.is_unused() {
             continue;
         }
 
+        let flags = entry.flags();
         let entry_phys = entry.addr();
+
+        // R123-1 defense-in-depth: Reclaim leaf frames referenced by non-present
+        // PTEs. A buggy PROT_NONE mmap path could install non-present leaf entries
+        // that still encode a physical frame address. Older code skipped all
+        // non-PRESENT entries, leaking those frames permanently. At level 1 (PT),
+        // if the PTE is non-present but encodes a non-zero physical address, free
+        // the frame. At higher levels, skip non-present entries (intermediate page
+        // table structures are always present when valid).
+        if level == 1 && !flags.contains(PageTableFlags::PRESENT) {
+            if entry_phys.as_u64() != 0 {
+                free_leaf_frame(entry_phys, frame_alloc);
+                entry.set_unused();
+            }
+            continue;
+        }
+
+        if !flags.contains(PageTableFlags::PRESENT) {
+            continue;
+        }
 
         // 检查是否是大页 (2MB 或 1GB)
         //
@@ -3340,7 +3366,7 @@ unsafe fn free_page_table_level(
         // Note: Buddy allocator only tracks 4KB frames. For huge pages, we
         // release the base frame which may not fully reclaim the memory.
         // Future improvement: Extend buddy allocator for multi-page frees.
-        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        if flags.contains(PageTableFlags::HUGE_PAGE) {
             // Release the huge page physical memory to prevent leak
             let huge_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(entry_phys);
             frame_alloc.deallocate_frame(huge_frame);
@@ -3482,7 +3508,13 @@ pub fn oom_snapshot() -> Vec<mm::OomProcessInfo> {
             }
 
             // 计算 RSS（简化实现：使用 mmap 区域大小估算）
-            let rss_pages = (proc.mmap_regions.values().sum::<usize>() / 4096) as u64;
+            // R123-5 FIX: Mask low-bit flags before summing for accurate RSS.
+            let rss_pages = (proc
+                .mmap_regions
+                .values()
+                .map(|&v| crate::syscall::mmap_region_len(v))
+                .sum::<usize>()
+                / 4096) as u64;
 
             // R39-3 FIX: 使用共享凭证获取 uid/gid
             let creds = proc.credentials.read();
