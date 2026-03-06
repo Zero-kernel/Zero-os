@@ -85,6 +85,10 @@ pub struct ElfLoadResult {
     /// 这是 brk(0) 的初始返回值，也是 brk_start 的初始值。
     /// 计算为所有 PT_LOAD 段中 (vaddr + memsz) 的最大值，向上对齐到页边界。
     pub brk_start: usize,
+    /// R125-1 FIX: Total bytes charged to the process's cgroup during ELF
+    /// loading (segments + stack, page-aligned).  The caller uses this to
+    /// roll back cgroup accounting if exec fails after load_elf() succeeds.
+    pub charged_bytes: u64,
 }
 
 /// 为当前进程地址空间加载 ELF 映像
@@ -124,6 +128,11 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
     // 追踪所有段的最高地址，用于计算 brk_start
     let mut highest_segment_end: usize = 0;
 
+    // R125-1 FIX: Accumulate total cgroup-charged bytes across all segments
+    // and the user stack.  Returned in ElfLoadResult so the caller can
+    // uncharge on exec rollback (ExecSpaceGuard::drop).
+    let mut charged_bytes: u64 = 0;
+
     // 加载所有 PT_LOAD 段
     for ph in elf.program_iter() {
         if ph.get_type() == Ok(PhType::Load) {
@@ -137,20 +146,26 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
                 }
             }
 
-            if let Err(e) = load_segment_tracked(&elf, &ph, &mut all_mappings, cgroup_id) {
-                // 回滚所有已成功映射的段
-                rollback_all_mappings(&mut all_mappings, cgroup_id);
-                return Err(e);
-            }
+            let seg_charged = match load_segment_tracked(&elf, &ph, &mut all_mappings, cgroup_id) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    rollback_all_mappings(&mut all_mappings, cgroup_id);
+                    return Err(e);
+                }
+            };
+            charged_bytes = charged_bytes.saturating_add(seg_charged);
         }
     }
 
     // 分配用户栈
-    if let Err(e) = allocate_user_stack_tracked(&mut all_mappings, cgroup_id) {
-        // 回滚所有已加载的段
-        rollback_all_mappings(&mut all_mappings, cgroup_id);
-        return Err(e);
-    }
+    let stack_charged = match allocate_user_stack_tracked(&mut all_mappings, cgroup_id) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            rollback_all_mappings(&mut all_mappings, cgroup_id);
+            return Err(e);
+        }
+    };
+    charged_bytes = charged_bytes.saturating_add(stack_charged);
 
     // 计算 brk_start：段末尾向上对齐到页边界
     let brk_start = (highest_segment_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -205,6 +220,7 @@ pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
         entry: elf.header.pt2.entry_point(),
         user_stack_top: initial_rsp,
         brk_start,
+        charged_bytes,
     })
 }
 
@@ -253,13 +269,15 @@ fn validate_elf_header(elf: &ElfFile) -> Result<(), ElfLoadError> {
 ///
 /// # Returns
 ///
-/// 成功返回 Ok(())，失败时调用方负责使用 tracked 进行全局回滚
+/// 成功返回 Ok(charged_bytes)，失败时调用方负责使用 tracked 进行全局回滚。
+/// R125-1 FIX: Returns the number of bytes charged to the cgroup for this
+/// segment so the caller can accumulate the total for exec rollback.
 fn load_segment_tracked(
     elf: &ElfFile,
     ph: &xmas_elf::program::ProgramHeader,
     tracked: &mut Vec<MappedEntry>,
     cgroup_id: cgroup::CgroupId,
-) -> Result<(), ElfLoadError> {
+) -> Result<u64, ElfLoadError> {
     let vaddr = ph.virtual_addr() as usize;
     let memsz = ph.mem_size() as usize;
     let filesz = ph.file_size() as usize;
@@ -267,7 +285,7 @@ fn load_segment_tracked(
 
     // 跳过大小为 0 的段
     if memsz == 0 {
-        return Ok(());
+        return Ok(0);
     }
 
     // R93-18 FIX: Reject malformed ELF with p_filesz > p_memsz.
@@ -423,7 +441,7 @@ fn load_segment_tracked(
         src_off += len;
     }
 
-    Ok(())
+    Ok(charge_bytes)
 }
 
 /// Z-10 fix: 分配用户栈并追踪映射，便于失败时全局回滚
@@ -435,11 +453,13 @@ fn load_segment_tracked(
 ///
 /// # Returns
 ///
-/// 成功返回 Ok(())，失败时调用方负责使用 tracked 进行全局回滚
+/// 成功返回 Ok(charged_bytes)，失败时调用方负责使用 tracked 进行全局回滚。
+/// R125-1 FIX: Returns the number of bytes charged to the cgroup for the
+/// stack so the caller can accumulate the total for exec rollback.
 fn allocate_user_stack_tracked(
     tracked: &mut Vec<MappedEntry>,
     cgroup_id: cgroup::CgroupId,
-) -> Result<(), ElfLoadError> {
+) -> Result<u64, ElfLoadError> {
     let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
     // 【修复】多分配一页，确保 USER_STACK_TOP 所在的页也被映射
     // musl libc 启动时会向上扫描栈查找 auxv 等数据结构
@@ -527,7 +547,7 @@ fn allocate_user_stack_tracked(
         }
     }
 
-    Ok(())
+    Ok(charge_bytes)
 }
 
 /// Z-10 fix: 回滚所有已追踪的映射（段 + 栈）

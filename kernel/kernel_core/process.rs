@@ -268,11 +268,15 @@ pub fn allocate_kernel_stack(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), Ker
                 .ok_or(KernelStackError::AllocationFailed)?
                 .start_address();
 
-            // 内核栈页标志：可写、不可执行、全局（跨 CR3 有效）
+            // R128-1 FIX: 内核栈页标志：可写、不可执行。
+            // 不使用 GLOBAL 标志：per-process 内核栈在 PID 回收时会被解映射并重新分配。
+            // GLOBAL TLB 条目跨 CR3 切换持久化，且现有 TLB shootdown 路径
+            // (invpcid_all_nonglobal / flush_all_local) 不刷新 GLOBAL 条目。
+            // 移除 GLOBAL 可确保 CR3 切换自动清除 stale 条目，
+            // 消除 PID 回收后 stale GLOBAL TLB 导致的内核栈 UAF 风险。
             let flags = PageTableFlags::PRESENT
                 | PageTableFlags::WRITABLE
-                | PageTableFlags::NO_EXECUTE
-                | PageTableFlags::GLOBAL;
+                | PageTableFlags::NO_EXECUTE;
 
             // 映射栈页（守护页不映射，自动触发页错误）
             let stack_size = (KSTACK_PAGES as u64 * PAGE_SIZE) as usize;
@@ -3172,6 +3176,20 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
                 crate::cgroup::uncharge_memory(cgroup_id, len);
             }
         }
+
+        // R127-3 FIX: Uncharge brk heap allocations from cgroup as well.
+        // sys_brk() charges via try_charge_memory() on growth, but exit/exec
+        // only uncharged mmap_regions — brk heap bytes remained permanently
+        // charged, leaking cgroup memory_current on every process exit.
+        let heap_bytes = {
+            const PAGE_SIZE: usize = 0x1000;
+            let brk_aligned = (proc.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let brk_start_aligned = (proc.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            brk_aligned.saturating_sub(brk_start_aligned) as u64
+        };
+        if heap_bytes > 0 {
+            crate::cgroup::uncharge_memory(cgroup_id, heap_bytes);
+        }
     }
 
     // 清理 mmap 区域跟踪
@@ -3290,17 +3308,31 @@ pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
     // a quiescent state.
     crate::rcu::call_rcu(move || {
         let stack_base = VirtAddr::new(stack_base_u64);
+        let stack_size = (KSTACK_PAGES as u64 * PAGE_SIZE) as usize;
         let mut frame_alloc = FrameAllocator::new();
 
         unsafe {
             page_table::with_current_manager(VirtAddr::new(0), |mgr| {
+                // R128-1 FIX: 3-phase unmap pattern (matches sys_munmap/sys_brk shrink).
+                // Phase 1: Unmap pages and collect frames — do not deallocate yet.
+                let mut frames_to_free = Vec::new();
                 for i in 0..KSTACK_PAGES {
                     let addr = stack_base + (i as u64 * PAGE_SIZE);
                     let page = Page::containing_address(addr);
 
                     if let Ok(frame) = mgr.unmap_page(page) {
-                        frame_alloc.deallocate_frame(frame);
+                        frames_to_free.push(frame);
                     }
+                }
+
+                // Phase 2: Cross-CPU TLB shootdown.
+                // Even without GLOBAL flag, defense-in-depth ensures no stale
+                // entries remain on any CPU before frames are freed.
+                mm::flush_current_as_range(stack_base, stack_size);
+
+                // Phase 3: Deallocate physical frames (TLB now clear on all CPUs).
+                for frame in frames_to_free {
+                    frame_alloc.deallocate_frame(frame);
                 }
             });
         }

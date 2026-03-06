@@ -673,8 +673,17 @@ impl Vfs {
                     return Err(FsError::NotDir);
                 }
 
-                // Check execute/search permission on directory before traversing
-                if idx < components.len() - 1 || components.len() == 1 {
+                // R128-2 FIX: Check execute/search permission on EVERY directory before traversing.
+                //
+                // POSIX requires execute (search) permission on each directory component in the
+                // path. The previous condition `(idx < len-1 || len==1)` skipped the execute
+                // check on the parent directory of the final path component for multi-component
+                // paths. For `/restricted_dir/file.txt` (components=["restricted_dir","file.txt"],
+                // len=2), at idx=1 (processing file.txt): `1 < 1` is false, `2 == 1` is false,
+                // so the execute permission check on `restricted_dir` (the current directory at
+                // that iteration) was bypassed. This allowed accessing files inside directories
+                // without execute permission by specifying the filename directly.
+                {
                     let dir_stat = current.stat()?;
                     if !check_access_permission(&dir_stat, false, false, true) {
                         return Err(FsError::PermDenied);

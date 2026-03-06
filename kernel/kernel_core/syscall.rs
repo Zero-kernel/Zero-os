@@ -3649,6 +3649,10 @@ fn sys_exec(
         old_user_space: usize,
         new_space: usize,
         new_user_space: usize,
+        /// R125-1 FIX: Cgroup to uncharge on rollback.
+        cgroup_id: cgroup::CgroupId,
+        /// R125-1 FIX: Total bytes charged by load_elf() (segments + stack).
+        charged_bytes: u64,
         committed: bool,
     }
 
@@ -3659,6 +3663,8 @@ fn sys_exec(
                 old_user_space,
                 new_space,
                 new_user_space: 0,
+                cgroup_id: 0,
+                charged_bytes: 0,
                 committed: false,
             }
         }
@@ -3666,6 +3672,13 @@ fn sys_exec(
         /// R118-I1 FIX: Track KPTI user PML4 for rollback cleanup.
         fn set_new_user_space(&mut self, user_space: usize) {
             self.new_user_space = user_space;
+        }
+
+        /// R125-1 FIX: Record cgroup charges made by load_elf() so that
+        /// drop() can uncharge them if exec fails after load_elf() succeeds.
+        fn set_cgroup_charge(&mut self, cgroup_id: cgroup::CgroupId, charged_bytes: u64) {
+            self.cgroup_id = cgroup_id;
+            self.charged_bytes = charged_bytes;
         }
 
         /// Mark the exec as successful, preventing rollback on drop
@@ -3685,6 +3698,14 @@ fn sys_exec(
                     crate::fork::free_kpti_user_pml4(self.new_user_space);
                 }
                 crate::process::free_address_space(self.new_space);
+                // R125-1 FIX: Uncharge cgroup memory that load_elf() charged
+                // for the new image's segments and stack.  Without this,
+                // exec failure after successful load_elf() permanently
+                // inflates memory_current (container DoS under memory
+                // pressure).
+                if self.charged_bytes > 0 {
+                    cgroup::uncharge_memory(self.cgroup_id, self.charged_bytes);
+                }
             }
         }
     }
@@ -3705,6 +3726,15 @@ fn sys_exec(
         klog!(Error, "sys_exec: ELF load failed: {:?}", e);
         SyscallError::ENOEXEC
     })?;
+
+    // R125-1 FIX: Record cgroup charges from load_elf() in the guard.  If
+    // any subsequent step (copy_to_user, KPTI PML4 creation, etc.) fails,
+    // ExecSpaceGuard::drop() will uncharge these bytes, preventing permanent
+    // inflation of cgroup memory_current on exec rollback.
+    {
+        let cgroup_id = process.lock().cgroup_id;
+        space_guard.set_cgroup_charge(cgroup_id, load_result.charged_bytes);
+    }
 
     // =========================================================================
     // 构建符合 System V AMD64 ABI 的用户栈布局：
@@ -3967,6 +3997,15 @@ fn sys_exec(
                 if len > 0 {
                     cgroup::uncharge_memory(cgroup_id, len);
                 }
+            }
+
+            // R127-3 FIX: Uncharge brk heap from the old image before resetting
+            // brk_start/brk. Without this, the old image's heap charges remain
+            // permanently in the cgroup, leaking memory_current across every exec.
+            let heap_bytes =
+                page_align_up(proc.brk).saturating_sub(page_align_up(proc.brk_start)) as u64;
+            if heap_bytes > 0 {
+                cgroup::uncharge_memory(cgroup_id, heap_bytes);
             }
         }
 
@@ -5555,10 +5594,25 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     let frame = match frame_alloc.allocate_frame() {
                         Some(f) => f,
                         None => {
-                            // Rollback: unmap all pages we mapped in this call
+                            // R127-2 FIX: 3-phase rollback pattern —
+                            // 1) unmap pages and collect frames
+                            // 2) cross-CPU TLB shootdown
+                            // 3) deallocate frames after TLB is flushed
+                            // Without step 2, CLONE_VM siblings on other CPUs may
+                            // retain stale TLB entries pointing to freed frames.
+                            let mut frames_to_free = Vec::new();
                             for &rollback_page in mapped_pages.iter().rev() {
                                 if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
-                                    frame_alloc.deallocate_frame(freed_frame);
+                                    frames_to_free.push(freed_frame);
+                                }
+                            }
+                            if !frames_to_free.is_empty() {
+                                mm::flush_current_as_range(
+                                    VirtAddr::new(old_top as u64),
+                                    grow_size,
+                                );
+                                for frame in frames_to_free {
+                                    frame_alloc.deallocate_frame(frame);
                                 }
                             }
                             return Err(SyscallError::ENOMEM);
@@ -5576,10 +5630,21 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     {
                         // Free the frame we just allocated
                         frame_alloc.deallocate_frame(frame);
-                        // Rollback: unmap all pages we mapped in this call
+                        // R127-2 FIX: 3-phase rollback — collect frames, TLB
+                        // shootdown, then deallocate.
+                        let mut frames_to_free = Vec::new();
                         for &rollback_page in mapped_pages.iter().rev() {
                             if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
-                                frame_alloc.deallocate_frame(freed_frame);
+                                frames_to_free.push(freed_frame);
+                            }
+                        }
+                        if !frames_to_free.is_empty() {
+                            mm::flush_current_as_range(
+                                VirtAddr::new(old_top as u64),
+                                grow_size,
+                            );
+                            for frame in frames_to_free {
+                                frame_alloc.deallocate_frame(frame);
                             }
                         }
                         return Err(SyscallError::ENOMEM);
@@ -5610,19 +5675,42 @@ fn sys_brk(addr: usize) -> SyscallResult {
         // 释放锁后进行解映射操作
         drop(proc);
 
-        // 解映射页面
+        // R126-1 FIX: 3-phase unmap matching sys_munmap() pattern for COW safety
         unsafe {
             with_current_manager(VirtAddr::new(0), |manager| {
                 let mut frame_alloc = FrameAllocator::new();
+                let mut frames_to_free = Vec::new();
 
+                // 阶段 1: 取消映射并收集需要释放的帧（检查 COW 引用计数）
                 for offset in (0..shrink_size).step_by(PAGE_SIZE) {
                     let vaddr = VirtAddr::new((new_top + offset) as u64);
                     let page = Page::containing_address(vaddr);
 
-                    // 解映射并释放帧
                     if let Ok(frame) = manager.unmap_page(page) {
-                        frame_alloc.deallocate_frame(frame);
+                        let phys_addr = frame.start_address().as_u64() as usize;
+
+                        // R126-1 FIX: 检查是否为 COW 共享页
+                        // 如果有引用计数，递减；只有当引用计数为 0 时才释放
+                        let should_free = if PAGE_REF_COUNT.get(phys_addr) > 0 {
+                            PAGE_REF_COUNT.decrement(phys_addr) == 0
+                        } else {
+                            // 没有引用计数记录，说明不是 COW 页，可以直接释放
+                            true
+                        };
+
+                        if should_free {
+                            frames_to_free.push(frame);
+                        }
                     }
+                }
+
+                // 阶段 2: TLB shootdown
+                // 在释放物理帧之前，确保所有 CPU 都已清除 stale TLB 条目
+                mm::flush_current_as_range(VirtAddr::new(new_top as u64), shrink_size);
+
+                // 阶段 3: 释放物理帧（此时 TLB 已清除，安全释放）
+                for frame in frames_to_free {
+                    frame_alloc.deallocate_frame(frame);
                 }
             });
         }
@@ -5845,14 +5933,23 @@ fn sys_mmap(
                 let frame = match frame_alloc.allocate_frame() {
                     Some(f) => f,
                     None => {
-                        // 回滚：释放所有已映射的页和帧
-                        // 只有在 unmap 成功时才释放帧，避免 UAF
+                        // R127-2 FIX: 3-phase rollback — collect frames, TLB
+                        // shootdown, then deallocate. Without cross-CPU TLB flush,
+                        // CLONE_VM siblings retain stale TLB entries to freed frames.
+                        let flush_len = mapped.len() * 0x1000;
+                        let mut frames_to_free = vec::Vec::new();
                         for (cleanup_page, cleanup_frame) in mapped.drain(..) {
                             if manager.unmap_page(cleanup_page).is_ok() {
-                                frame_alloc.deallocate_frame(cleanup_frame);
+                                frames_to_free.push(cleanup_frame);
                             }
                             // unmap 失败时不释放帧，因为映射可能仍然存在
                             // 这会导致帧泄漏，但比 UAF 更安全
+                        }
+                        if !frames_to_free.is_empty() {
+                            mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
+                            for frame in frames_to_free {
+                                frame_alloc.deallocate_frame(frame);
+                            }
                         }
                         return Err(SyscallError::ENOMEM);
                     }
@@ -5867,13 +5964,21 @@ fn sys_mmap(
                 if let Err(_) = manager.map_page(page, frame, page_flags, &mut frame_alloc) {
                     // 释放当前分配但未映射的帧
                     frame_alloc.deallocate_frame(frame);
-                    // 回滚：释放所有已映射的页和帧
-                    // 只有在 unmap 成功时才释放帧，避免 UAF
+                    // R127-2 FIX: 3-phase rollback — collect frames, TLB
+                    // shootdown, then deallocate.
+                    let flush_len = mapped.len() * 0x1000;
+                    let mut frames_to_free = vec::Vec::new();
                     for (cleanup_page, cleanup_frame) in mapped.drain(..) {
                         if manager.unmap_page(cleanup_page).is_ok() {
-                            frame_alloc.deallocate_frame(cleanup_frame);
+                            frames_to_free.push(cleanup_frame);
                         }
                         // unmap 失败时不释放帧，因为映射可能仍然存在
+                    }
+                    if !frames_to_free.is_empty() {
+                        mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
+                        for frame in frames_to_free {
+                            frame_alloc.deallocate_frame(frame);
+                        }
                     }
                     return Err(SyscallError::ENOMEM);
                 }
@@ -6136,11 +6241,28 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
         with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
             for offset in (0..len_aligned).step_by(0x1000) {
                 let page_addr = addr + offset;
-                let page = Page::containing_address(VirtAddr::new(page_addr as u64));
+                let vaddr = VirtAddr::new(page_addr as u64);
+                let page = Page::containing_address(vaddr);
+
+                // R127-1 FIX: Preserve COW semantics. If the page is COW-shared
+                // (BIT_9 set by fork), we must NOT make it WRITABLE via mprotect.
+                // Instead, preserve the COW marker and keep the page read-only so
+                // that the first write triggers the COW fault handler for proper
+                // resolution (new frame allocation + copy).
+                // Without this check, mprotect(PROT_WRITE) on a COW page would
+                // strip BIT_9 and set WRITABLE, allowing direct writes to the
+                // shared physical frame — a COW isolation break.
+                let mut new_flags = flags;
+                if let Some((_phys, current_flags)) = manager.translate_with_flags(vaddr) {
+                    if current_flags.contains(PageTableFlags::BIT_9) {
+                        new_flags.insert(PageTableFlags::BIT_9);
+                        new_flags.remove(PageTableFlags::WRITABLE);
+                    }
+                }
 
                 // 尝试更新页的保护属性
                 // 如果页不存在，跳过（mprotect 只修改已存在的映射）
-                if let Err(e) = manager.update_flags(page, flags) {
+                if let Err(e) = manager.update_flags(page, new_flags) {
                     // 忽略页不存在的错误，这是正常的
                     // 其他错误则返回
                     if !matches!(e, mm::page_table::UpdateFlagsError::PageNotMapped) {
