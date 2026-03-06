@@ -1640,6 +1640,12 @@ fn vfs_truncate_callback(fd: i32, length: u64) -> Result<(), SyscallError> {
         .downcast_ref::<FileHandle>()
         .ok_or(SyscallError::ENOSYS)?;
 
+    // R129-1 FIX: POSIX requires ftruncate fd to be open for writing.
+    // Without this check, open(O_RDONLY) + ftruncate() bypasses DAC write permission.
+    if !file_handle.flags.is_writable() {
+        return Err(SyscallError::EINVAL);
+    }
+
     // R26-5 FIX: MAC gate for truncate operations
     // LSM policy can block file truncation
     if let Some(task) = LsmProcessCtx::from_current() {
