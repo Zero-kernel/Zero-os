@@ -3949,6 +3949,27 @@ fn sys_exec(
         proc.context.r14 = 0;
         proc.context.r15 = 0;
 
+        // R124-1 FIX: Uncharge the old image's cgroup memory before clearing
+        // mmap_regions. exec() replaces the entire userspace image; the old
+        // regions' cgroup charges must be released or memory_current leaks
+        // monotonically across every execve(), eventually blocking all
+        // allocations in the cgroup (container DoS).
+        //
+        // Skip PROT_NONE reservations: never allocated frames or charged
+        // memory (R123-1 invariant INV-MM-PROT-NONE).
+        {
+            let cgroup_id = proc.cgroup_id;
+            for (&_base, &len_with_flags) in proc.mmap_regions.iter() {
+                if (len_with_flags & MMAP_REGION_FLAG_PROT_NONE) != 0 {
+                    continue;
+                }
+                let len = mmap_region_len(len_with_flags) as u64;
+                if len > 0 {
+                    cgroup::uncharge_memory(cgroup_id, len);
+                }
+            }
+        }
+
         proc.mmap_regions.clear();
         // H.2 Partial KASLR: Re-randomize mmap base on exec for ASLR
         proc.next_mmap_addr = security::randomized_mmap_base(0x4000_0000);
@@ -5416,7 +5437,8 @@ pub(crate) const MMAP_REGION_FLAG_MASK: usize = 0xfff;
 const MMAP_REGION_FLAG_PENDING_MAP: usize = 1 << 0;
 const MMAP_REGION_FLAG_PENDING_UNMAP: usize = 1 << 1;
 // R123-1 FIX: Committed flag indicating PROT_NONE reservation (no frames/charge).
-const MMAP_REGION_FLAG_PROT_NONE: usize = 1 << 2;
+// R124-1 FIX: Made pub(crate) so process exit/exec cleanup can skip uncharge for PROT_NONE.
+pub(crate) const MMAP_REGION_FLAG_PROT_NONE: usize = 1 << 2;
 
 /// Mask of transient in-flight flags. Only these are stripped on fork/clone;
 /// persistent committed flags (e.g. PROT_NONE) are preserved.

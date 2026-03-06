@@ -3145,6 +3145,35 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
         proc.kernel_stack_top = VirtAddr::new(0);
     }
 
+    // R124-1 FIX: Uncharge cgroup memory for all charged mmap regions BEFORE
+    // clearing the bookkeeping. Without this, process exit permanently leaks
+    // cgroup memory_current, eventually blocking all allocations in the cgroup
+    // (user-triggerable container DoS).
+    //
+    // Guard conditions:
+    //   - !keep_address_space: When the address space is shared by threads
+    //     (CLONE_VM), the charges remain valid for surviving threads; only
+    //     the last thread to exit (keep_address_space == false) uncharges.
+    //   - proc.memory_space != 0: Clone error paths zero memory_space before
+    //     calling cleanup_unscheduled_process(). Those children inherited a
+    //     snapshot of the parent's mmap_regions but never owned the charges;
+    //     uncharging here would corrupt the parent's cgroup accounting.
+    //
+    // Skip PROT_NONE reservations: they never allocated physical frames or
+    // charged cgroup memory (R123-1 invariant INV-MM-PROT-NONE).
+    if !keep_address_space && proc.memory_space != 0 {
+        let cgroup_id = proc.cgroup_id;
+        for (&_base, &len_with_flags) in proc.mmap_regions.iter() {
+            if (len_with_flags & crate::syscall::MMAP_REGION_FLAG_PROT_NONE) != 0 {
+                continue;
+            }
+            let len = crate::syscall::mmap_region_len(len_with_flags) as u64;
+            if len > 0 {
+                crate::cgroup::uncharge_memory(cgroup_id, len);
+            }
+        }
+    }
+
     // 清理 mmap 区域跟踪
     proc.mmap_regions.clear();
 
