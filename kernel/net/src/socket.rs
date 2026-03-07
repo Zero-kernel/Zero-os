@@ -3264,9 +3264,12 @@ impl SocketTable {
             }
         }
         // cleanup_tcp_connection: removes from tcp_conns + dec_active_conn.
+        // R129-2: If the victim was mark_closed(), cleanup_tcp_connection now also
+        // removes from sockets map and calls dec_ns_count. The is_some() guard below
+        // ensures we only decrement if cleanup_tcp_connection didn't already do it.
         self.cleanup_tcp_connection(&victim);
-        // Remove from sockets map + decrement namespace quota (mirrors
-        // the sweep_time_wait cleanup path in run_tcp_timers).
+        // Remove from sockets map + decrement namespace quota (fallback for
+        // victims not yet mark_closed when cleanup_tcp_connection ran).
         if self.sockets.write().remove(&victim.id).is_some() {
             self.dec_ns_count(victim.net_ns_id);
         }
@@ -3892,11 +3895,11 @@ impl SocketTable {
                             if !listener.push_accept_ready(child.clone()) {
                                 // Accept queue became full between check and push
                                 child.mark_closed();
+                                // R129-2 FIX: cleanup_tcp_connection now handles dec_ns_count
+                                // when removing from sockets map. The explicit dec_ns_count
+                                // (R77-4) that was here is no longer needed and would cause
+                                // a double-decrement.
                                 self.cleanup_tcp_connection(&child);
-                                // R77-4 FIX: Rollback namespace quota on failure.
-                                // cleanup_tcp_connection doesn't decrement quota, so we must
-                                // do it here to maintain accounting integrity.
-                                self.dec_ns_count(listener.net_ns_id);
                                 return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                             }
 
@@ -6156,11 +6159,21 @@ impl SocketTable {
             ids_to_remove.push(child.id);
         }
 
+        // R129-2 FIX: Mirror the non-blocking sweep path (run_tcp_timers) and
+        // decrement per-namespace socket count when actually removing sockets.
+        // For sockets already removed by cleanup_tcp_connection (mark_closed path),
+        // remove() returns None and dec_ns_count is not called (no double-decrement).
+        let mut ns_ids_to_decrement: Vec<NamespaceId> = Vec::new();
         if !ids_to_remove.is_empty() {
             let mut sockets = self.sockets.write();
             for id in ids_to_remove {
-                sockets.remove(&id);
+                if let Some(sock) = sockets.remove(&id) {
+                    ns_ids_to_decrement.push(sock.net_ns_id);
+                }
             }
+        }
+        for ns_id in ns_ids_to_decrement {
+            self.dec_ns_count(ns_id);
         }
 
         for (dst_ip, seg) in fin_retransmit {
@@ -6243,8 +6256,16 @@ impl SocketTable {
         // remove it from the sockets map to complete cleanup and prevent leak.
         // This handles the case where close() kept the socket registered for
         // FIN/ACK handling and the TCP state machine has now completed.
+        // R129-2 FIX: When removing from sockets map, also decrement per-namespace
+        // socket count. This fixes a leak where SynReceived sockets aborted via
+        // invalid ACK or accept-queue-full had try_inc_ns_count() called at
+        // creation but dec_ns_count() was never called on abort. The is_some()
+        // guard prevents double-decrement when close_socket() or sweep_time_wait
+        // already removed the socket from the map.
         if sock.is_closed() {
-            self.sockets.write().remove(&sock.id);
+            if self.sockets.write().remove(&sock.id).is_some() {
+                self.dec_ns_count(sock.net_ns_id);
+            }
         }
     }
 

@@ -17,6 +17,7 @@ Cargo.lock
 *.log
 kernel-security-audit-fix.skill
 kernel-security-audit.skill
+kernel-next-phase.skill
 core
 
 !README.md
