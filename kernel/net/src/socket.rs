@@ -3370,7 +3370,21 @@ impl SocketTable {
                         return Some(challenge_ack);
                     }
 
-                    if old_state == TcpState::SynSent || old_state == TcpState::Established {
+                    // R130-4 FIX: Extend RST cleanup to all synchronized states.
+                    // RFC 793 §3.4 requires a valid RST in any synchronized state
+                    // to immediately close the connection. Previously only SynSent
+                    // and Established triggered cleanup; closing-state RSTs were
+                    // silently ignored, leaving sockets until timer sweep.
+                    if matches!(
+                        old_state,
+                        TcpState::SynSent
+                            | TcpState::Established
+                            | TcpState::FinWait1
+                            | TcpState::FinWait2
+                            | TcpState::CloseWait
+                            | TcpState::Closing
+                            | TcpState::LastAck
+                    ) {
                         tcp_state.control.state = TcpState::Closed;
                         drop(guard);
 

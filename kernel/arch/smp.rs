@@ -1111,8 +1111,11 @@ fn alloc_ap_stack() -> u64 {
         }
 
         if attempt > 0 {
-            klog!(Warn, "[SMP] AP stack allocation attempt {} got high frame 0x{:x}, retrying...",
-                     attempt + 1, phys);
+            // R130-5 FIX: Gate physical address behind kprintln! (debug-only)
+            // to comply with kptr-safety policy. The raw physical frame address
+            // leaks physical memory layout in release builds.
+            kprintln!("[SMP] AP stack allocation attempt {} got high frame, retrying...",
+                     attempt + 1);
         }
     }
 

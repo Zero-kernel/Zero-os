@@ -346,12 +346,21 @@ impl OpenFlags {
 
     /// Check if readable
     pub fn is_readable(&self) -> bool {
+        // R130-6 FIX: O_PATH fds are path-only references — no read/write
+        // operations allowed (only fstat, close, dup per POSIX).
+        if self.is_path() {
+            return false;
+        }
         let mode = self.0 & Self::O_ACCMODE;
         mode == Self::O_RDONLY || mode == Self::O_RDWR
     }
 
     /// Check if writable
     pub fn is_writable(&self) -> bool {
+        // R130-6 FIX: O_PATH fds are path-only references — no write allowed.
+        if self.is_path() {
+            return false;
+        }
         let mode = self.0 & Self::O_ACCMODE;
         mode == Self::O_WRONLY || mode == Self::O_RDWR
     }

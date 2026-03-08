@@ -703,6 +703,73 @@ impl Domain {
     }
 }
 
+/// R130-3 FIX: Release page table tree memory when a Domain is dropped.
+///
+/// Without this, all page table frames allocated for IOMMU domains are
+/// permanently leaked because `DOMAINS` only grows and Domain had no destructor.
+/// This walks the page table hierarchy and returns each intermediate/leaf frame
+/// to the buddy allocator.
+impl Drop for Domain {
+    fn drop(&mut self) {
+        // Only PageTable domains allocate page table frames.
+        if self.domain_type != DomainType::PageTable {
+            return;
+        }
+
+        let root_phys = self.page_table_root.load(Ordering::Acquire);
+        if root_phys == 0 {
+            return; // Lazily allocated but never used.
+        }
+
+        // Hold page_table_lock to prevent concurrent mapping operations
+        // (shouldn't happen during drop, but defense-in-depth).
+        let _pt_guard = self.page_table_lock.lock();
+
+        let levels: usize = if self.address_width >= 48 { 4 } else { 3 };
+
+        // Recursively free all page table frames in the tree.
+        // SAFETY: We hold page_table_lock and are the sole owner during drop.
+        unsafe {
+            Self::free_page_table_tree(root_phys, levels);
+        }
+    }
+}
+
+impl Domain {
+    /// Recursively walk and free all page table frames in the hierarchy.
+    ///
+    /// # Safety
+    /// - `page_table_lock` must be held
+    /// - `table_phys` must point to a valid page table frame within direct map
+    unsafe fn free_page_table_tree(table_phys: u64, level: usize) {
+        if table_phys == 0 || table_phys >= MAX_DIRECT_MAP_PHYS {
+            return;
+        }
+
+        // For non-leaf levels, recurse into child tables before freeing this one.
+        if level > 1 {
+            let table = Self::table_from_phys(table_phys);
+            for idx in 0..512 {
+                let entry = table.entry(idx);
+                if !entry.is_present() {
+                    continue;
+                }
+                // Skip superpage entries (2MB/1GB mappings) — they don't point
+                // to child page tables, just large physical regions.
+                if entry.raw() & SL_PTE_SUPERPAGE != 0 {
+                    continue;
+                }
+                Self::free_page_table_tree(entry.addr(), level - 1);
+            }
+        }
+
+        // Free this page table frame back to the buddy allocator.
+        if let Ok(frame) = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(table_phys)) {
+            buddy_allocator::free_physical_pages(frame, 1);
+        }
+    }
+}
+
 // ============================================================================
 // Second-Level Page Table Structures
 // ============================================================================

@@ -816,6 +816,13 @@ const MAX_ARG_STRLEN: usize = 4096;
 /// 1MB 上限足够大多数场景，同时保护内核免受资源耗尽攻击。
 const MAX_RW_SIZE: usize = 1 * 1024 * 1024;
 
+/// R130-1 FIX: Maximum number of mmap regions per process.
+///
+/// Bounds the per-process `mmap_regions` BTreeMap to prevent unbounded kernel
+/// heap growth from unprivileged syscalls (e.g., millions of PROT_NONE mmaps).
+/// Matches Linux's default `/proc/sys/vm/max_map_count` (65536).
+const MAX_MAP_COUNT: usize = 65536;
+
 /// 系统调用号定义（参考Linux系统调用表）
 #[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5372,9 +5379,16 @@ fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
-    // 从 fd_table 获取文件描述符
-    let proc = process.lock();
-    let file_ops = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+    // R130-2 FIX: Extract file descriptor and release process lock before
+    // calling VFS callback. Holding the process lock across the VFS callback
+    // creates a lock ordering inversion risk (process lock -> procfs ->
+    // PROCESS_TABLE vs. signal delivery PROCESS_TABLE -> process lock).
+    // Follows the same pattern as vfs_readdir_callback and vfs_truncate_callback.
+    let file_ops = {
+        let proc = process.lock();
+        proc.get_fd(fd).ok_or(SyscallError::EBADF)?.clone_box()
+    };
+    // Process lock released here — safe for VFS operations
 
     // 获取 lseek 回调函数
     let lseek_fn = {
@@ -5853,6 +5867,13 @@ fn sys_mmap(
 
         if end > USER_SPACE_TOP {
             return Err(SyscallError::EFAULT);
+        }
+
+        // R130-1 FIX: Bound mmap_regions to prevent kernel heap exhaustion DoS.
+        // Without this check, unlimited PROT_NONE (or normal) mmaps can grow
+        // the BTreeMap until alloc_error_handler panics the kernel.
+        if proc.mmap_regions.len() >= MAX_MAP_COUNT {
+            return Err(SyscallError::ENOMEM);
         }
 
         // 检查与现有映射的重叠（pending entries also count as occupied）
@@ -7416,6 +7437,17 @@ fn sys_access(path: *const u8, mode: i32) -> SyscallResult {
     // F_OK(0) - 仅检查文件是否存在
     if mode == 0 {
         return Ok(0);
+    }
+
+    // R130-7 FIX: Invoke LSM MAC hook before DAC permission check.
+    // Without this, a MAC-denied file that is DAC-accessible can be probed
+    // via access() without MAC intervention — inconsistent with enforcement
+    // at real operations (open, read, write, unlink).
+    if let Some(proc_ctx) = lsm_current_process_ctx() {
+        let access_mask = (mode as u32) & 0x7; // R_OK=4, W_OK=2, X_OK=1
+        if let Err(err) = lsm::hook_file_permission(&proc_ctx, stat.ino, access_mask) {
+            return Err(lsm_error_to_syscall(err));
+        }
     }
 
     // 获取当前进程凭证
