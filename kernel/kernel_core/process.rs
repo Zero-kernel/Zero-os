@@ -3156,12 +3156,24 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
     //
     // Guard conditions:
     //   - !keep_address_space: When the address space is shared by threads
-    //     (CLONE_VM), the charges remain valid for surviving threads; only
-    //     the last thread to exit (keep_address_space == false) uncharges.
+    //     (CLONE_VM), only the last thread to exit (keep_address_space=false)
+    //     performs uncharge. This prevents double-uncharge of inherited entries.
     //   - proc.memory_space != 0: Clone error paths zero memory_space before
     //     calling cleanup_unscheduled_process(). Those children inherited a
     //     snapshot of the parent's mmap_regions but never owned the charges;
     //     uncharging here would corrupt the parent's cgroup accounting.
+    //
+    // R131-6 KNOWN LIMITATION: CLONE_VM threads get a *snapshot* of
+    // mmap_regions at clone time (R123-3), not a shared reference. When a
+    // non-last CLONE_VM thread performs mmap() and then exits with
+    // keep_address_space=true, the charge for that mmap leaks because the
+    // last-exit thread's snapshot does not contain the entry. Unconditionally
+    // uncharging all entries would cause double-uncharge of inherited snapshot
+    // entries. A full fix requires shared MmState per address space
+    // (D2-RES-CGROUP-CLONE / D3-ARC-MM-SHARED). Impact is bounded: only
+    // CLONE_VM threads that independently mmap and exit before the last thread
+    // are affected. Standard pthread_create + pthread_exit patterns do not
+    // trigger this because pthreads rarely do independent mmap.
     //
     // Skip PROT_NONE reservations: they never allocated physical frames or
     // charged cgroup memory (R123-1 invariant INV-MM-PROT-NONE).

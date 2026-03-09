@@ -775,7 +775,10 @@ pub fn start_aps() -> usize {
     let cr4 = read_cr4();
     let efer = read_efer();
 
-    klog!(Info,
+    // R131-8 FIX: Use kprintln! (debug-only) instead of klog! (release-active)
+    // to prevent leaking BSP CR3 physical address in release builds.
+    // CR3 reveals the kernel page table root — critical for KASLR bypass.
+    kprintln!(
         "[SMP] BSP CR3=0x{:x} CR4=0x{:x} EFER=0x{:x}",
         cr3_phys,
         cr4,
@@ -1271,7 +1274,9 @@ pub(crate) unsafe fn find_rsdp() -> Option<(u64, u64)> {
         if let Some(result) = validate_rsdp_at(rsdp_phys) {
             return Some(result);
         }
-        klog!(Warn,
+        // R131-8 FIX: Use kprintln! (debug-only) instead of klog! (release-active)
+        // to prevent leaking RSDP physical address in release builds.
+        kprintln!(
             "[SMP] Bootloader RSDP at 0x{:x} invalid, trying BIOS scan",
             rsdp_phys
         );

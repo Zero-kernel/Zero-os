@@ -5341,8 +5341,16 @@ fn sys_fstat(fd: i32, statbuf: *mut VfsStat) -> SyscallResult {
         // R41-1 FIX: 查询 fd 对象获取真实元数据
         let pid = current_pid().ok_or(SyscallError::ESRCH)?;
         let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
-        let proc = process.lock();
-        let fd_obj = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+        // R131-4 FIX: Release process lock before calling VFS stat() callback.
+        // Holding the process lock across inode.stat() creates a lock ordering
+        // inversion risk: process lock → procfs → PROCESS_TABLE (reverse of
+        // normal signal delivery path: PROCESS_TABLE → process lock).
+        // Same clone_box() pattern as R130-2 sys_lseek fix.
+        let fd_obj = {
+            let proc = process.lock();
+            proc.get_fd(fd).ok_or(SyscallError::EBADF)?.clone_box()
+        };
+        // Process lock released here — safe for VFS/procfs operations
         fd_obj.stat()?
     };
 
@@ -5541,11 +5549,12 @@ fn sys_brk(addr: usize) -> SyscallResult {
     // F.2 Cgroup: Cache cgroup_id for memory accounting
     let cgroup_id = proc.cgroup_id;
 
-    // R29-3 FIX: Call LSM hook for brk operations
-    if let Some(ctx) = lsm::ProcessCtx::from_current() {
-        if lsm::hook_memory_brk(&ctx, addr as u64).is_err() {
-            return Err(SyscallError::EPERM);
-        }
+    // R131-1 FIX: Use lsm_process_ctx_from() instead of ProcessCtx::from_current()
+    // to avoid deadlock. from_current() calls current_credentials() which re-acquires
+    // the same Process mutex we already hold → deterministic self-deadlock.
+    let ctx = lsm_process_ctx_from(&proc);
+    if lsm::hook_memory_brk(&ctx, addr as u64).is_err() {
+        return Err(SyscallError::EPERM);
     }
 
     // 拒绝缩小到 brk_start 以下
@@ -6099,11 +6108,12 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
             return Err(SyscallError::EINVAL);
         }
 
-        // R30-3 FIX: Call LSM hook for munmap operations
-        if let Some(ctx) = lsm::ProcessCtx::from_current() {
-            if lsm::hook_memory_munmap(&ctx, addr as u64, length_aligned as u64).is_err() {
-                return Err(SyscallError::EPERM);
-            }
+        // R131-2 FIX: Use lsm_process_ctx_from() instead of ProcessCtx::from_current()
+        // to avoid deadlock. from_current() calls current_credentials() which re-acquires
+        // the same Process mutex we already hold → deterministic self-deadlock.
+        let ctx = lsm_process_ctx_from(&proc);
+        if lsm::hook_memory_munmap(&ctx, addr as u64, length_aligned as u64).is_err() {
+            return Err(SyscallError::EPERM);
         }
 
         // Mark as pending-unmap so concurrent mmap/munmap can't race the PT ops.
@@ -7434,20 +7444,23 @@ fn sys_access(path: *const u8, mode: i32) -> SyscallResult {
     let stat_fn = VFS_STAT_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
     let stat = stat_fn(path_str)?;
 
-    // F_OK(0) - 仅检查文件是否存在
-    if mode == 0 {
-        return Ok(0);
-    }
-
     // R130-7 FIX: Invoke LSM MAC hook before DAC permission check.
     // Without this, a MAC-denied file that is DAC-accessible can be probed
     // via access() without MAC intervention — inconsistent with enforcement
     // at real operations (open, read, write, unlink).
+    // R131-7 FIX: LSM hook is now checked for ALL modes including F_OK (mode==0).
+    // Previously, F_OK returned early before reaching this hook, allowing
+    // file existence probes to bypass MAC policy.
     if let Some(proc_ctx) = lsm_current_process_ctx() {
         let access_mask = (mode as u32) & 0x7; // R_OK=4, W_OK=2, X_OK=1
         if let Err(err) = lsm::hook_file_permission(&proc_ctx, stat.ino, access_mask) {
             return Err(lsm_error_to_syscall(err));
         }
+    }
+
+    // F_OK(0) - 仅检查文件是否存在 (after LSM check)
+    if mode == 0 {
+        return Ok(0);
     }
 
     // 获取当前进程凭证

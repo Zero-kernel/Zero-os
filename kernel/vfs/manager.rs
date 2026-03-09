@@ -1535,6 +1535,16 @@ fn vfs_readdir_callback(fd: i32, max_bytes: usize) -> Result<alloc::vec::Vec<ker
             .downcast_ref::<FileHandle>()
             .ok_or(SyscallError::ENOTDIR)?;
 
+        // R131-5 FIX: Reject O_PATH fds. POSIX specifies that O_PATH file descriptors
+        // are path-only references that only support fstat/close/dup — not read/write/
+        // getdents64. Without this check, open(dir, O_PATH) bypasses DAC because
+        // is_readable()/is_writable() both return false for O_PATH, making
+        // check_access_permission() pass with no checks. An unprivileged process
+        // could enumerate any directory's contents.
+        if file_handle.flags.is_path() {
+            return Err(SyscallError::EBADF);
+        }
+
         if !file_handle.inode.is_dir() {
             return Err(SyscallError::ENOTDIR);
         }
@@ -1648,10 +1658,15 @@ fn vfs_truncate_callback(fd: i32, length: u64) -> Result<(), SyscallError> {
 
     // R26-5 FIX: MAC gate for truncate operations
     // LSM policy can block file truncation
-    if let Some(task) = LsmProcessCtx::from_current() {
-        let stat = file_handle.inode.stat().map_err(fs_error_to_syscall)?;
-        lsm::hook_file_truncate(&task, stat.ino, length).map_err(|_| SyscallError::EPERM)?;
-    }
+    // R131-3 FIX: Build LSM context directly from the locked Process struct instead of
+    // calling from_current(). from_current() triggers current_credentials() which
+    // re-acquires the same Process mutex → deterministic self-deadlock.
+    let task = {
+        let creds = proc.credentials.read();
+        LsmProcessCtx::new(proc.pid, proc.tgid, creds.uid, creds.gid, creds.euid, creds.egid)
+    };
+    let stat = file_handle.inode.stat().map_err(fs_error_to_syscall)?;
+    lsm::hook_file_truncate(&task, stat.ino, length).map_err(|_| SyscallError::EPERM)?;
 
     file_handle
         .inode

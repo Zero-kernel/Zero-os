@@ -533,10 +533,12 @@ impl Domain {
         // Build leaf entry flags:
         // - PRESENT: Entry is valid
         // - WRITE: If write permission requested
-        // - EXECUTE: Allow device instruction fetches (some devices need this)
         // R80-4 FIX: Don't set ACCESSED/DIRTY - they are reserved on some VT-d hardware
         // Hardware that supports A/D tracking will update these automatically
-        let mut flags = SlPteFlags::PRESENT | SlPteFlags::EXECUTE;
+        // R131-9 FIX: Don't grant EXECUTE by default. DMA devices rarely need instruction
+        // fetch capability. Granting EXECUTE unconditionally violates least-privilege.
+        // If a specific device needs execute permission, it should request it explicitly.
+        let mut flags = SlPteFlags::PRESENT;
         if write {
             flags |= SlPteFlags::WRITE;
         }
