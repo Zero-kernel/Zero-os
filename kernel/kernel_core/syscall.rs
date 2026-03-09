@@ -8184,19 +8184,34 @@ fn resolve_socket(
 ) -> Result<(cap::CapEntry, alloc::sync::Arc<net::SocketState>), SyscallError> {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
-    let proc = process.lock();
 
-    // Lookup capability entry
-    let entry = proc
-        .cap_table
-        .lookup(cap_id)
-        .map_err(cap_error_to_syscall)?;
+    // R132-1 FIX: Extract capability entry and net namespace ID under the process lock,
+    // then drop the lock before any external lookups. Previously, current_net_ns_id()
+    // was called while holding process.lock(), which re-acquired the same non-reentrant
+    // Process mutex via PROCESS_TABLE → slot.lock() → deterministic self-deadlock on
+    // every socket operation (bind, listen, accept, connect, sendto, recvfrom, shutdown).
+    let (entry, caller_ns_id) = {
+        let proc = process.lock();
 
-    // Verify it's a socket with matching ID
-    match &entry.object {
-        cap::CapObject::Socket(ref h) if h.socket_id == socket_id => {}
-        _ => return Err(SyscallError::ENOTSOCK),
-    }
+        // Lookup capability entry
+        let entry = proc
+            .cap_table
+            .lookup(cap_id)
+            .map_err(cap_error_to_syscall)?;
+
+        // Verify it's a socket with matching ID
+        match &entry.object {
+            cap::CapObject::Socket(ref h) if h.socket_id == socket_id => {}
+            _ => return Err(SyscallError::ENOTSOCK),
+        }
+
+        // Read net_ns ID directly from the locked Process struct instead of calling
+        // current_net_ns_id() which would re-enter PROCESS_TABLE and deadlock.
+        let ns_id = proc.net_ns.id();
+
+        (entry, ns_id)
+    };
+    // Process lock released — safe for external lookups
 
     // Get socket state from socket_table
     let sock = net::socket_table()
@@ -8207,7 +8222,6 @@ fn resolve_socket(
     // A process that has entered a different network namespace (via clone/setns)
     // must not be able to use sockets from its previous namespace.
     // This prevents container escape via inherited socket capabilities.
-    let caller_ns_id = current_net_ns_id().ok_or(SyscallError::ESRCH)?;
     if sock.net_ns_id != caller_ns_id {
         // Socket belongs to a different namespace - deny access
         return Err(SyscallError::EACCES);

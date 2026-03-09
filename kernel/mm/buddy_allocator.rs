@@ -385,7 +385,9 @@ pub fn init_buddy_allocator(base_addr: PhysAddr, size: usize) {
     *BUDDY_ALLOCATOR.lock() = Some(allocator);
 
     klog_always!("Buddy allocator initialized:");
-    klog!(Info, "  Base address: 0x{:x}", base_addr);
+    // R132-3 FIX: Use kprintln! (debug-only) to avoid leaking physical memory base
+    // address in release builds. Same kptr-safety policy as R130-5 and R131-8.
+    kprintln!("  Base address: 0x{:x}", base_addr);
     klog_always!("  Size: {} MB", size / (1024 * 1024));
     klog_always!("  Total pages: {}", size / PAGE_SIZE);
 }

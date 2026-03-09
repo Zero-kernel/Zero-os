@@ -1640,36 +1640,50 @@ fn vfs_truncate_callback(fd: i32, length: u64) -> Result<(), SyscallError> {
 
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
-    let proc = proc_arc.lock();
 
-    let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+    // R132-2 FIX: Clone inode Arc and build LSM context under the process lock,
+    // then drop the lock before VFS inode callbacks. Previously, inode.stat() and
+    // inode.truncate() were called while holding proc_arc.lock(). For procfs inodes,
+    // these callbacks may access PROCESS_TABLE, creating a lock ordering inversion:
+    //   vfs_truncate path: Process lock → inode.stat()/truncate() → PROCESS_TABLE
+    //   Normal path:       PROCESS_TABLE → Process lock (signal delivery, get_process)
+    // Same pattern as R131-4 (sys_fstat) and R130-2 (sys_lseek), both now fixed.
+    let (inode, task) = {
+        let proc = proc_arc.lock();
 
-    // Downcast to FileHandle
-    let file_handle = handle
-        .as_any()
-        .downcast_ref::<FileHandle>()
-        .ok_or(SyscallError::ENOSYS)?;
+        let handle = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
 
-    // R129-1 FIX: POSIX requires ftruncate fd to be open for writing.
-    // Without this check, open(O_RDONLY) + ftruncate() bypasses DAC write permission.
-    if !file_handle.flags.is_writable() {
-        return Err(SyscallError::EINVAL);
-    }
+        // Downcast to FileHandle
+        let file_handle = handle
+            .as_any()
+            .downcast_ref::<FileHandle>()
+            .ok_or(SyscallError::ENOSYS)?;
 
-    // R26-5 FIX: MAC gate for truncate operations
-    // LSM policy can block file truncation
-    // R131-3 FIX: Build LSM context directly from the locked Process struct instead of
-    // calling from_current(). from_current() triggers current_credentials() which
-    // re-acquires the same Process mutex → deterministic self-deadlock.
-    let task = {
-        let creds = proc.credentials.read();
-        LsmProcessCtx::new(proc.pid, proc.tgid, creds.uid, creds.gid, creds.euid, creds.egid)
+        // R129-1 FIX: POSIX requires ftruncate fd to be open for writing.
+        // Without this check, open(O_RDONLY) + ftruncate() bypasses DAC write permission.
+        if !file_handle.flags.is_writable() {
+            return Err(SyscallError::EINVAL);
+        }
+
+        // Clone inode Arc so we can use it after dropping the process lock
+        let inode = file_handle.inode.clone();
+
+        // R26-5 FIX: MAC gate for truncate operations
+        // LSM policy can block file truncation
+        // R131-3 FIX: Build LSM context directly from the locked Process struct instead of
+        // calling from_current(). from_current() triggers current_credentials() which
+        // re-acquires the same Process mutex → deterministic self-deadlock.
+        let task = {
+            let creds = proc.credentials.read();
+            LsmProcessCtx::new(proc.pid, proc.tgid, creds.uid, creds.gid, creds.euid, creds.egid)
+        };
+
+        (inode, task)
     };
-    let stat = file_handle.inode.stat().map_err(fs_error_to_syscall)?;
+    // Process lock released — safe for VFS/procfs inode operations
+
+    let stat = inode.stat().map_err(fs_error_to_syscall)?;
     lsm::hook_file_truncate(&task, stat.ino, length).map_err(|_| SyscallError::EPERM)?;
 
-    file_handle
-        .inode
-        .truncate(length)
-        .map_err(fs_error_to_syscall)
+    inode.truncate(length).map_err(fs_error_to_syscall)
 }
