@@ -48,7 +48,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once, RwLock};
 
 use cap::{CapId, NamespaceId};
@@ -331,6 +331,19 @@ impl Default for WaitQueue {
 /// new datagrams are dropped (not an error - normal network behavior).
 const MAX_RX_QUEUE: usize = 64;
 
+/// R132-4 FIX: Maximum aggregate UDP payload bytes queued across all sockets.
+///
+/// Prevents memory exhaustion when many UDP sockets each buffer large datagrams.
+/// 16 MiB is a conservative cap: enough for normal traffic (~250 full-size
+/// datagrams) but prevents unbounded kernel heap growth from UDP flooding.
+const MAX_GLOBAL_UDP_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+
+/// R132-4 FIX: Global accounting of UDP payload bytes currently queued.
+///
+/// Incremented atomically in `enqueue_rx()`, decremented in `pop_rx()` and
+/// `SocketState::drop()` (for unread datagrams still queued at socket close).
+static GLOBAL_UDP_QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
 /// Privileged port boundary (ports below this require special permissions).
 const PRIVILEGED_PORT_LIMIT: u16 = 1024;
 
@@ -558,6 +571,36 @@ fn dec_active_conn() {
     let _ = GLOBAL_ACTIVE_CONN_COUNT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         Some(v.saturating_sub(1))
     });
+}
+
+// ============================================================================
+// R132-5 FIX: SYN Cookie Observability Counters
+// ============================================================================
+
+/// Total SYN cookies generated (SYN-ACKs sent with stateless cookie ISN).
+static SYN_COOKIES_GENERATED: AtomicU64 = AtomicU64::new(0);
+
+/// Total SYN cookies validated successfully (completed handshakes).
+static SYN_COOKIES_VALIDATED: AtomicU64 = AtomicU64::new(0);
+
+/// Total SYN cookies rejected (invalid MAC, expired, or malformed).
+static SYN_COOKIES_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of SYN cookie observability counters.
+#[derive(Debug, Clone, Copy)]
+pub struct SynCookieCounters {
+    pub generated: u64,
+    pub validated: u64,
+    pub rejected: u64,
+}
+
+/// Get current SYN cookie observability counters (for procfs/stats export).
+pub fn syn_cookie_counters() -> SynCookieCounters {
+    SynCookieCounters {
+        generated: SYN_COOKIES_GENERATED.load(Ordering::Relaxed),
+        validated: SYN_COOKIES_VALIDATED.load(Ordering::Relaxed),
+        rejected: SYN_COOKIES_REJECTED.load(Ordering::Relaxed),
+    }
 }
 
 // ============================================================================
@@ -1191,11 +1234,13 @@ impl SocketState {
     /// Enqueue a received datagram.
     ///
     /// Returns `true` if the datagram was queued, `false` if dropped
-    /// (queue full or socket closed).
+    /// (queue full, global byte cap exceeded, or socket closed).
     fn enqueue_rx(&self, pkt: PendingDatagram) -> bool {
         if self.is_closed() {
             return false;
         }
+
+        let pkt_len = pkt.data.len();
 
         let mut queue = self.rx_queue.lock();
         if queue.len() >= MAX_RX_QUEUE {
@@ -1203,8 +1248,25 @@ impl SocketState {
             return false;
         }
 
+        // R132-4 FIX: Enforce global UDP queued bytes cap via atomic CAS loop.
+        // Prevents aggregate memory exhaustion across all UDP sockets.
+        if GLOBAL_UDP_QUEUED_BYTES
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                let new_total = current.saturating_add(pkt_len);
+                if new_total <= MAX_GLOBAL_UDP_QUEUED_BYTES {
+                    Some(new_total)
+                } else {
+                    None
+                }
+            })
+            .is_err()
+        {
+            self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
         self.rx_bytes
-            .fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
+            .fetch_add(pkt_len as u64, Ordering::Relaxed);
         self.rx_datagrams.fetch_add(1, Ordering::Relaxed);
         queue.push_back(pkt);
         drop(queue);
@@ -1214,8 +1276,14 @@ impl SocketState {
     }
 
     /// Pop the next received datagram from the queue.
+    ///
+    /// R132-4 FIX: Decrements GLOBAL_UDP_QUEUED_BYTES on dequeue.
     fn pop_rx(&self) -> Option<PendingDatagram> {
-        self.rx_queue.lock().pop_front()
+        let pkt = self.rx_queue.lock().pop_front();
+        if let Some(ref pkt) = pkt {
+            GLOBAL_UDP_QUEUED_BYTES.fetch_sub(pkt.data.len(), Ordering::Relaxed);
+        }
+        pkt
     }
 
     /// Get socket statistics.
@@ -1227,6 +1295,22 @@ impl SocketState {
             tx_datagrams: self.tx_datagrams.load(Ordering::Relaxed),
             rx_dropped: self.rx_dropped.load(Ordering::Relaxed),
             rx_queue_len: self.rx_queue.lock().len(),
+        }
+    }
+}
+
+/// R132-4 FIX: Release global UDP queued byte accounting when a socket is
+/// dropped with unread datagrams still in its rx_queue.
+impl Drop for SocketState {
+    fn drop(&mut self) {
+        let queued_bytes: usize = self
+            .rx_queue
+            .get_mut()
+            .iter()
+            .map(|pkt| pkt.data.len())
+            .sum();
+        if queued_bytes > 0 {
+            GLOBAL_UDP_QUEUED_BYTES.fetch_sub(queued_bytes, Ordering::Relaxed);
         }
     }
 }
@@ -2757,8 +2841,10 @@ impl SocketTable {
             received_at: now_ticks,
         };
 
-        // Enqueue (enqueue_rx may still drop if race condition)
-        sock.enqueue_rx(pkt)
+        // Enqueue (enqueue_rx may drop due to race, global cap, or queue full —
+        // regardless, a bound socket exists so report "listener found").
+        let _ = sock.enqueue_rx(pkt);
+        true
     }
 
     /// Close a socket, initiating TCP graceful shutdown if needed.
@@ -3459,6 +3545,7 @@ impl SocketTable {
                                 || listen_state.syn_queue.len() >= listen_state.syn_backlog
                             {
                                 // Generate SYN cookie ISN (encodes 4-tuple, time, MSS)
+                                SYN_COOKIES_GENERATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
                                 let cookie_iss = generate_syn_cookie_isn(
                                     now_ms,
                                     dst_ip,
@@ -3683,6 +3770,7 @@ impl SocketTable {
                             self.dec_ns_count(listener.net_ns_id);
 
                             // Fall back to stateless SYN cookie SYN-ACK
+                            SYN_COOKIES_GENERATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
                             let cookie_iss = generate_syn_cookie_isn(
                                 now_ms,
                                 dst_ip,
@@ -3757,6 +3845,7 @@ impl SocketTable {
                             src_ip,
                             header.src_port,
                         ) {
+                            SYN_COOKIES_VALIDATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
                             // Security: Final ACK must exactly acknowledge our SYN (ISS + 1)
                             // This prevents attacks with forged ACK numbers that could
                             // corrupt send-window accounting
@@ -3922,6 +4011,8 @@ impl SocketTable {
 
                             // No response needed - connection is established
                             return None;
+                        } else {
+                            SYN_COOKIES_REJECTED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
                         }
                     }
                 }
