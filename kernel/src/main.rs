@@ -29,7 +29,7 @@ extern crate klog;
 
 // A.3 Audit capability gate imports
 use cap::CapRights;
-use kernel_core::process::{current_credentials, with_current_cap_table};
+use kernel_core::process::{current_credentials, current_is_host_root, with_current_cap_table};
 // G.1 Observability: Counter integration for allocation failures
 use trace::counters::{increment_counter, TraceCounter};
 
@@ -807,13 +807,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                     return Err(audit::AuditError::AccessDenied);
                 }
 
-                // After boot: Allow root users
-                if let Some(ref c) = creds {
-                    if c.euid == 0 {
-                        return Ok(());
-                    }
+                // R133-1 FIX: Use host-mapped root check for host-global gate
+                if current_is_host_root() {
+                    return Ok(());
                 }
-                // Allow processes with CAP_AUDIT_READ capability
                 if let Some(has_cap) =
                     with_current_cap_table(|table| table.has_rights(CapRights::AUDIT_READ))
                 {
@@ -840,11 +837,9 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                     return Err(audit::AuditError::AccessDenied);
                 }
 
-                // After boot: Allow root users
-                if let Some(ref c) = creds {
-                    if c.euid == 0 {
-                        return Ok(());
-                    }
+                // R133-1 FIX: Use host-mapped root check for host-global gate
+                if current_is_host_root() {
+                    return Ok(());
                 }
                 // Allow processes with CAP_AUDIT_WRITE capability
                 if let Some(has_cap) =
@@ -938,11 +933,9 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         if creds.is_none() {
             return !BOOT_PHASE_COMPLETE.load(core::sync::atomic::Ordering::Acquire);
         }
-        // After boot: Allow root users
-        if let Some(ref c) = creds {
-            if c.euid == 0 {
-                return true;
-            }
+        // R133-1 FIX: Use host-mapped root check for host-global gate
+        if current_is_host_root() {
+            return true;
         }
         // Allow processes with CAP_TRACE_READ capability
         if let Some(has_cap) =

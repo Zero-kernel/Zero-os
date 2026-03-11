@@ -1235,12 +1235,17 @@ impl SocketState {
     ///
     /// Returns `true` if the datagram was queued, `false` if dropped
     /// (queue full, global byte cap exceeded, or socket closed).
-    fn enqueue_rx(&self, pkt: PendingDatagram) -> bool {
+    ///
+    /// R133-2 FIX: Accept raw parameters instead of pre-allocated PendingDatagram.
+    /// The payload is only copied (to_vec) after per-socket queue depth and
+    /// global byte cap checks pass, preventing allocation/copy churn DoS under
+    /// UDP flood conditions when the cap is saturated.
+    fn enqueue_rx(&self, src_ip: Ipv4Addr, src_port: u16, data: &[u8], received_at: u64) -> bool {
         if self.is_closed() {
             return false;
         }
 
-        let pkt_len = pkt.data.len();
+        let pkt_len = data.len();
 
         let mut queue = self.rx_queue.lock();
         if queue.len() >= MAX_RX_QUEUE {
@@ -1264,6 +1269,14 @@ impl SocketState {
             self.rx_dropped.fetch_add(1, Ordering::Relaxed);
             return false;
         }
+
+        // R133-2 FIX: Only allocate/copy the payload after all cap checks pass.
+        let pkt = PendingDatagram {
+            src_ip,
+            src_port,
+            data: data.to_vec(),
+            received_at,
+        };
 
         self.rx_bytes
             .fetch_add(pkt_len as u64, Ordering::Relaxed);
@@ -2823,27 +2836,12 @@ impl SocketTable {
             }
         }
 
-        // R47-4 FIX: Check queue capacity BEFORE copying
-        // This prevents memory exhaustion from large datagrams
-        {
-            let queue = sock.rx_queue.lock();
-            if queue.len() >= MAX_RX_QUEUE {
-                sock.rx_dropped.fetch_add(1, Ordering::Relaxed);
-                return true; // Socket exists but queue full - don't report no listener
-            }
-        }
-
-        // Now safe to allocate memory for the datagram (LSM approved, queue has space)
-        let pkt = PendingDatagram {
-            src_ip,
-            src_port,
-            data: data.to_vec(),
-            received_at: now_ticks,
-        };
-
-        // Enqueue (enqueue_rx may drop due to race, global cap, or queue full —
-        // regardless, a bound socket exists so report "listener found").
-        let _ = sock.enqueue_rx(pkt);
+        // R133-2 FIX: Removed pre-allocation of data.to_vec() before cap checks.
+        // enqueue_rx now performs queue depth and global byte cap checks BEFORE
+        // allocating/copying the attacker-controlled payload.
+        // Regardless of the enqueue outcome, a bound socket exists so report
+        // "listener found".
+        let _ = sock.enqueue_rx(src_ip, src_port, data, now_ticks);
         true
     }
 
@@ -4298,7 +4296,8 @@ impl SocketTable {
                         data_received = true;
                     } else if seq_gt(header.seq_num, tcp_state.control.rcv_nxt) {
                         // Out-of-order: buffer in OOO queue and send SACK-bearing ACK
-                        tcp_state.control.ooo_insert(header.seq_num, payload);
+                        // R133-3 FIX: Pass FIN flag to preserve it during OOO buffering.
+                        tcp_state.control.ooo_insert(header.seq_num, payload, is_fin);
 
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let sack_ack = Self::build_sack_ack(
@@ -4530,7 +4529,8 @@ impl SocketTable {
                         ));
                         data_received = true;
                     } else if seq_gt(header.seq_num, tcp_state.control.rcv_nxt) {
-                        tcp_state.control.ooo_insert(header.seq_num, payload);
+                        // R133-3 FIX: Pass FIN flag to preserve it during OOO buffering.
+                        tcp_state.control.ooo_insert(header.seq_num, payload, is_fin);
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let sack_ack = Self::build_sack_ack(
                             &tcp_state.control,
@@ -4742,7 +4742,8 @@ impl SocketTable {
                         ));
                         data_received = true;
                     } else if seq_gt(header.seq_num, tcp_state.control.rcv_nxt) {
-                        tcp_state.control.ooo_insert(header.seq_num, payload);
+                        // R133-3 FIX: Pass FIN flag to preserve it during OOO buffering.
+                        tcp_state.control.ooo_insert(header.seq_num, payload, is_fin);
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let sack_ack = Self::build_sack_ack(
                             &tcp_state.control,

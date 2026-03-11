@@ -889,6 +889,9 @@ pub struct OooSegment {
     pub seq: u32,
     /// Contiguous received data
     pub data: Vec<u8>,
+    /// R133-3 FIX: True if this segment carries a FIN at the end of the data.
+    /// FIN occupies one sequence number after the data payload.
+    pub fin: bool,
 }
 
 impl TcpControlBlock {
@@ -1048,8 +1051,8 @@ impl TcpControlBlock {
     ///
     /// Returns the byte length of the final merged segment that was inserted.
     /// This may exceed the input `data.len()` if existing segments were merged.
-    pub fn ooo_insert(&mut self, seq: u32, data: &[u8]) -> u32 {
-        if data.is_empty() {
+    pub fn ooo_insert(&mut self, seq: u32, data: &[u8], fin: bool) -> u32 {
+        if data.is_empty() && !fin {
             return 0;
         }
 
@@ -1064,15 +1067,17 @@ impl TcpControlBlock {
 
         // Trim payload to the remaining window budget so a single large
         // OOO segment cannot overshoot the advertised receive window.
-        let data = if (data.len() as u32) > available {
-            &data[..available as usize]
+        // R133-3 FIX: If we trim, drop FIN because it is beyond the retained bytes.
+        let (data, fin) = if (data.len() as u32) > available {
+            (&data[..available as usize], false)
         } else {
-            data
+            (data, fin)
         };
 
         let mut new_seg = OooSegment {
             seq,
             data: data.to_vec(),
+            fin,
         };
 
         // Track bytes absorbed from existing segments during merges so we can
@@ -1124,6 +1129,9 @@ impl TcpControlBlock {
                 new_seg = OooSegment {
                     seq: merged_start,
                     data: merged_data,
+                    // R133-3 FIX: Preserve FIN from whichever segment covers the tail.
+                    fin: (removed.fin && rm_end == merged_end)
+                        || (new_seg.fin && cur_end == merged_end),
                 };
                 // Don't increment i; check same position again for cascading merges
             } else {
@@ -1183,6 +1191,32 @@ impl TcpControlBlock {
                 self.ooo_bytes = self
                     .ooo_bytes
                     .saturating_sub(removed.data.len() as u32);
+
+                // R133-3 FIX: Process FIN received in OOO segment.
+                // FIN occupies one sequence number after the data payload.
+                let removed_end = removed.seq.wrapping_add(removed.data.len() as u32);
+                if removed.fin && removed_end == self.rcv_nxt {
+                    self.fin_received = true;
+                    self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+
+                    // Trigger state transition for passive close.
+                    self.state = match self.state {
+                        TcpState::Established => TcpState::CloseWait,
+                        TcpState::FinWait1 => TcpState::Closing,
+                        TcpState::FinWait2 => TcpState::TimeWait,
+                        other => other,
+                    };
+
+                    // No data is valid after FIN. Clear remaining OOO segments
+                    // to prevent attacker-injected data beyond FIN from being
+                    // delivered after the connection is logically closed.
+                    while let Some(stale) = self.ooo_queue.pop_front() {
+                        self.ooo_bytes = self
+                            .ooo_bytes
+                            .saturating_sub(stale.data.len() as u32);
+                    }
+                    break;
+                }
             } else {
                 // Gap — stop draining
                 break;

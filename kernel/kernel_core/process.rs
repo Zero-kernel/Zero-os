@@ -1801,6 +1801,41 @@ pub fn current_euid() -> Option<u32> {
     current_credentials().map(|c| c.euid)
 }
 
+/// R133-1 FIX: 获取当前进程的 host 级有效用户ID（映射后的 euid）。
+///
+/// User namespace 内的 euid 是命名空间相对的。该函数将当前进程的
+/// namespace euid 通过 UserNamespace::map_uid_from_ns() 转换为 host UID。
+/// 对于 root namespace 进程，map_uid_from_ns 返回 identity（input == output）。
+///
+/// 如果 UID 未映射，返回 OVERFLOW_UID (65534) 以确保 fail-closed。
+pub fn current_host_euid() -> Option<u32> {
+    const OVERFLOW_UID: u32 = 65534;
+
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let proc = slot.as_ref()?.lock();
+
+    let ns_euid = proc.credentials.read().euid;
+    let user_ns = proc.user_ns.clone();
+    // Drop locks before calling into user_ns to avoid holding PROCESS_TABLE
+    // across the uid_map read lock.
+    drop(proc);
+    drop(table);
+
+    Some(user_ns.map_uid_from_ns(ns_euid).unwrap_or(OVERFLOW_UID))
+}
+
+/// R133-1 FIX: 判断当前进程是否为 host root（host-mapped euid == 0）。
+///
+/// Host-global privilege gates (audit, FIPS, trace, cgroup governance,
+/// network device moves) MUST use this function instead of checking
+/// `euid == 0`, which only proves namespace-level root.
+#[inline]
+pub fn current_is_host_root() -> bool {
+    current_host_euid() == Some(0)
+}
+
 /// 获取当前进程的有效组ID
 pub fn current_egid() -> Option<u32> {
     current_credentials().map(|c| c.egid)

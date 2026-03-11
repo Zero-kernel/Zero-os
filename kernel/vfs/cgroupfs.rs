@@ -605,8 +605,9 @@ impl CgroupCtrlInode {
         }
 
         // P1-3: Determine caller identity and delegation status.
+        // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
         let euid = current_euid().ok_or(FsError::PermDenied)?;
-        let is_root = euid == 0;
+        let is_root = kernel_core::current_is_host_root();
         let cgroup = cgroup::lookup_cgroup(self.cgroup_id).ok_or(FsError::NotFound)?;
         let is_delegate = !is_root && cgroup.is_delegated_to(euid);
 

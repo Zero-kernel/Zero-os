@@ -415,10 +415,9 @@ pub fn move_device(
     let has_cap_admin =
         crate::process::with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN))
             .unwrap_or(false);
-    // CODEX REVIEW FIX: Use unwrap_or(false) instead of unwrap_or(true) to prevent
-    // permission bypass when current_euid() fails (e.g., no process context).
-    // Fail-closed: if we can't determine euid, assume non-root.
-    let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
+    // R133-1 FIX: Host-global gates must check host-mapped identity.
+    // Fail-closed: if we can't determine host identity, assume non-root.
+    let is_root = crate::current_is_host_root();
     if !is_root && !has_cap_admin {
         return Err(NetNsError::PermissionDenied);
     }

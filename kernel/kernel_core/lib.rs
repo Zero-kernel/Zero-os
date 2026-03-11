@@ -47,6 +47,8 @@ pub use process::{
     current_credentials,
     current_egid,
     current_euid,
+    current_host_euid,      // R133-1: host-mapped euid for privilege gates
+    current_is_host_root,   // R133-1: host root check for global gates
     current_ipc_ns,      // F.1: IPC namespace
     current_ipc_ns_id,   // R75-2: IPC namespace ID for partitioning
     current_mount_ns,    // F.1: Mount namespace
@@ -243,13 +245,11 @@ pub fn init() {
     scheduler_hook::register_timer_callback(syscall::check_socket_timeouts);
 
     // R26-4 FIX: Register audit snapshot authorizer
-    // Allow root (euid == 0) or processes with CAP_AUDIT_READ capability
+    // R133-1 FIX: Use host-mapped root check for host-global gate
     audit::register_snapshot_authorizer(|| {
-        // First check: root always allowed
-        if let Some(creds) = current_credentials() {
-            if creds.euid == 0 {
-                return Ok(());
-            }
+        // First check: host root always allowed
+        if current_is_host_root() {
+            return Ok(());
         }
 
         // Second check: CAP_AUDIT_READ capability

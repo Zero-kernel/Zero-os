@@ -2708,6 +2708,8 @@ fn sys_clone(
         parent_net_ns_for_children,  // F.1: Network namespace for children
         parent_user_ns,              // F.1: User namespace
         parent_user_ns_for_children, // F.1: User namespace for children
+        parent_fd_table_snapshot,    // R133-5 FIX: fd_table snapshot under parent lock
+        parent_cap_table_clone,      // R133-5 FIX: cap_table clone under parent lock
     ) = {
         let mut parent = parent_arc.lock();
         // 始终从 MSR 同步 fs_base 到 PCB
@@ -2716,6 +2718,31 @@ fn sys_clone(
         if current_fs_base != 0 {
             parent.fs_base = current_fs_base;
         }
+
+        // R133-5 FIX: Snapshot fd_table and cap_table under the parent lock
+        // to avoid child→parent lock order inversion later. Previously,
+        // the child lock block re-acquired parent.lock() for CLONE_FILES
+        // and cap_table cloning, violating the parent→child lock order
+        // used in enforce_lsm_task_fork().
+        let fd_snapshot: Vec<(i32, crate::process::FileDescriptor)> =
+            if flags & CLONE_FILES != 0 {
+                parent
+                    .fd_table
+                    .iter()
+                    .map(|(&fd, desc)| (fd, desc.clone_box()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        let cap_clone = if flags & CLONE_THREAD != 0 {
+            // Thread: share parent's cap_table (via Arc)
+            parent.cap_table.clone()
+        } else {
+            // R25-8 FIX: Non-thread cases must inherit and filter CLOFORK entries
+            Arc::new(parent.cap_table.clone_for_fork())
+        };
+
         (
             parent.memory_space,
             parent.user_memory_space, // H.3 KPTI
@@ -2753,6 +2780,8 @@ fn sys_clone(
             parent.net_ns_for_children.clone(),  // F.1: Network namespace for children
             parent.user_ns.clone(),              // F.1: User namespace
             parent.user_ns_for_children.clone(), // F.1: User namespace for children
+            fd_snapshot,                         // R133-5 FIX: fd_table snapshot
+            cap_clone,                           // R133-5 FIX: cap_table clone
         )
     };
 
@@ -3284,30 +3313,17 @@ fn sys_clone(
         child.seccomp_state = parent_seccomp_state;
         child.pledge_state = parent_pledge_state;
 
-        // 复制文件描述符表（CLONE_FILES 时理论上应共享，但当前架构暂用克隆）
+        // R133-5 FIX: Use pre-captured fd_table snapshot instead of re-acquiring
+        // parent lock (which would create child→parent lock order inversion).
         if flags & CLONE_FILES != 0 {
-            let parent = parent_arc.lock();
-            for (&fd, desc) in parent.fd_table.iter() {
-                child.fd_table.insert(fd, desc.clone_box());
+            for (fd, desc) in parent_fd_table_snapshot {
+                child.fd_table.insert(fd, desc);
             }
         }
 
-        // 克隆能力表（CLONE_THREAD 时共享，否则克隆并过滤 CLOFORK）
-        //
-        // 对于线程（CLONE_THREAD），共享父进程的能力表（通过 Arc）
-        // 对于进程（无 CLONE_THREAD），使用 clone_for_fork() 过滤 CLOFORK 条目
-        //
-        // 注意：与 fd_table 不同，cap_table 使用 Arc 包装，天然支持共享
-        if flags & CLONE_THREAD != 0 {
-            // 线程：共享父进程的能力表
-            let parent = parent_arc.lock();
-            child.cap_table = parent.cap_table.clone();
-        } else {
-            // R25-8 FIX: 非线程情况（包括CLONE_FILES和默认进程语义）
-            // 都必须继承能力表并过滤 CLOFORK 条目
-            let parent = parent_arc.lock();
-            child.cap_table = Arc::new(parent.cap_table.clone_for_fork());
-        }
+        // R133-5 FIX: Use pre-captured cap_table clone instead of re-acquiring
+        // parent lock. See snapshot above (under parent lock block).
+        child.cap_table = parent_cap_table_clone;
 
         // F.1 Mount Namespace: Assign mount namespace to child
         //
@@ -3963,9 +3979,10 @@ fn sys_exec(
         proc.context.rsp = final_rsp;
         proc.context.rbp = final_rsp;
 
-        // 用户态段选择子（Ring 3）
-        proc.context.cs = 0x1B;
-        proc.context.ss = 0x23;
+        // R133-6 FIX: Correct user CS/SS selectors (Ring 3)
+        // USER_CS = 0x23, USER_SS = 0x1B (previously swapped)
+        proc.context.cs = 0x23;
+        proc.context.ss = 0x1B;
         proc.context.rflags = 0x202;
 
         // System V AMD64 调用约定：RDI = argc, RSI = argv
@@ -9188,11 +9205,12 @@ fn is_cgroup_delegated_to_caller(cgroup_id: u64) -> bool {
 fn sys_cgroup_create(parent_id: u64, controllers: u32) -> Result<usize, SyscallError> {
     // R93-17 FIX: Capability-based access control for cgroup creation
     // P1-3: Also allow delegated owners of the parent cgroup
-    let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+    // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
+    let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
     let has_cap_admin =
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
 
-    if !has_cap_admin && creds.euid != 0 && !is_cgroup_delegated_to_caller(parent_id) {
+    if !has_cap_admin && !crate::current_is_host_root() && !is_cgroup_delegated_to_caller(parent_id) {
         return Err(SyscallError::EPERM);
     }
 
@@ -9230,11 +9248,12 @@ fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
     // R93-17 FIX: Capability-based access control for cgroup destruction
     // P1-3: Also allow delegated owners (delegation checked on the cgroup itself,
     // since delegation inherits from ancestors)
-    let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+    // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
+    let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
     let has_cap_admin =
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
 
-    if !has_cap_admin && creds.euid != 0 && !is_cgroup_delegated_to_caller(cgroup_id) {
+    if !has_cap_admin && !crate::current_is_host_root() && !is_cgroup_delegated_to_caller(cgroup_id) {
         return Err(SyscallError::EPERM);
     }
 
@@ -9264,12 +9283,13 @@ fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
 /// children, set limits (bounded by ancestor ceilings), and migrate owned tasks
 /// within the cgroup and its descendants. Pass `uid = u64::MAX` to revoke.
 fn sys_cgroup_delegate(cgroup_id: u64, uid: u64) -> Result<usize, SyscallError> {
-    let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+    let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
     let has_cap_admin =
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
 
-    // P1-3: Allow root, CAP_SYS_ADMIN, or delegated subtree managers.
-    let authorized = creds.euid == 0
+    // P1-3: Allow host root, CAP_SYS_ADMIN, or delegated subtree managers.
+    // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
+    let authorized = crate::current_is_host_root()
         || has_cap_admin
         || is_cgroup_delegated_to_caller(cgroup_id);
 
@@ -9367,8 +9387,9 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     };
 
     // R93-5 FIX: Require CAP_SYS_ADMIN or root to attach to cgroups
-    let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
-    let is_root = creds.euid == 0;
+    // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
+    let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+    let is_root = crate::current_is_host_root();
 
     if !is_root {
         // P1-3: Delegated owners of the target cgroup may attach without
@@ -9458,12 +9479,14 @@ const CGROUP_LIMIT_IO_MAX_IOPS: u32 = 7;
 fn sys_cgroup_set_limit(cgroup_id: u64, limit_type: u32, value: u64) -> Result<usize, SyscallError> {
     // R93-17 FIX: Capability-based access control for setting limits
     // P1-3: Delegated owners may set limits bounded by parent ceilings
-    let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+    // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
+    let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
     let has_cap_admin =
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let is_host_root = crate::current_is_host_root();
 
-    let is_delegated = !has_cap_admin && creds.euid != 0 && is_cgroup_delegated_to_caller(cgroup_id);
-    if !has_cap_admin && creds.euid != 0 && !is_delegated {
+    let is_delegated = !has_cap_admin && !is_host_root && is_cgroup_delegated_to_caller(cgroup_id);
+    if !has_cap_admin && !is_host_root && !is_delegated {
         return Err(SyscallError::EPERM);
     }
 
@@ -9553,10 +9576,11 @@ fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usiz
     }
 
     // P1-3: Stats access should respect delegation boundaries.
-    let creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
+    // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
+    let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
     let has_cap_admin =
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
-    if creds.euid != 0 && !has_cap_admin && !is_cgroup_delegated_to_caller(cgroup_id) {
+    if !crate::current_is_host_root() && !has_cap_admin && !is_cgroup_delegated_to_caller(cgroup_id) {
         return Err(SyscallError::EPERM);
     }
 
@@ -9675,8 +9699,9 @@ fn sys_compliance_status(buf: *mut ComplianceStatusBuf) -> Result<usize, Syscall
 ///   - EIO: FIPS self-test failed
 fn sys_fips_enable() -> Result<usize, SyscallError> {
     // Check privilege: require root or CAP_ADMIN capability
-    let creds = crate::current_credentials().ok_or(SyscallError::ESRCH)?;
-    if creds.euid != 0 {
+    // R133-1 FIX: Use host-mapped root check for host-global FIPS gate.
+    let _creds = crate::current_credentials().ok_or(SyscallError::ESRCH)?;
+    if !crate::current_is_host_root() {
         // Check for CAP_ADMIN capability (system administration rights)
         let has_cap = with_current_cap_table(|table| table.has_rights(cap::CapRights::ADMIN));
         if has_cap != Some(true) {
@@ -9822,8 +9847,9 @@ fn sys_audit_export(
     use crate::usercopy::copy_to_user_safe;
 
     // Check privilege: require root or CAP_AUDIT_READ.
+    // R133-1 FIX: Use host-mapped root check for host-global audit gate.
     let creds = crate::current_credentials().ok_or(SyscallError::ESRCH)?;
-    let caller_is_root = creds.euid == 0;
+    let caller_is_root = crate::current_is_host_root();
     if !caller_is_root {
         let has_cap = with_current_cap_table(|table| table.has_rights(cap::CapRights::AUDIT_READ));
         if has_cap != Some(true) {

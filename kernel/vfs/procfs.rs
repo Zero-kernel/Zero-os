@@ -1124,20 +1124,39 @@ fn process_exists(pid: u32) -> bool {
 /// List all PIDs
 ///
 /// R29-1 FIX: Now returns actual PIDs from the process table
+/// R133-4 FIX: Filter by calling process's PID namespace for container isolation.
+/// A process only sees PIDs that are visible from its owning PID namespace.
 fn list_pids() -> Vec<u32> {
     let table = PROCESS_TABLE.lock();
+
+    // R133-4 FIX: Determine the caller's owning PID namespace.
+    let caller_ns = process::current_pid()
+        .and_then(|pid| table.get(pid))
+        .and_then(|slot| slot.as_ref())
+        .and_then(|proc_arc| {
+            let p = proc_arc.lock();
+            kernel_core::owning_namespace(&p.pid_ns_chain)
+        });
+
     table
         .iter()
         .enumerate()
         .skip(1) // PID 0 is reserved
         .filter_map(|(pid, slot)| {
-            slot.as_ref().and_then(|proc| {
-                let state = proc.lock().state;
-                if matches!(state, ProcessState::Zombie | ProcessState::Terminated) {
-                    None
-                } else {
-                    Some(pid as u32)
+            slot.as_ref().and_then(|proc_arc| {
+                let p = proc_arc.lock();
+                if matches!(p.state, ProcessState::Zombie | ProcessState::Terminated) {
+                    return None;
                 }
+
+                // R133-4 FIX: Only include PIDs visible in caller's namespace.
+                if let Some(ref ns) = caller_ns {
+                    if !kernel_core::is_visible_in_namespace(ns, &p.pid_ns_chain) {
+                        return None;
+                    }
+                }
+
+                Some(pid as u32)
             })
         })
         .collect()

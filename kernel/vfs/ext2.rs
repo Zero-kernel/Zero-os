@@ -63,6 +63,8 @@ pub const EXT2_FT_REG_FILE: u8 = 1;
 pub const EXT2_FT_DIR: u8 = 2;
 pub const EXT2_FT_CHRDEV: u8 = 3;
 pub const EXT2_FT_BLKDEV: u8 = 4;
+pub const EXT2_FT_FIFO: u8 = 5;   // R133-7 FIX
+pub const EXT2_FT_SOCK: u8 = 6;   // R133-7 FIX
 pub const EXT2_FT_SYMLINK: u8 = 7;
 
 /// Inode flags
@@ -1349,12 +1351,17 @@ impl Inode for Ext2Inode {
                     let name = String::from_utf8_lossy(name_bytes).into_owned();
 
                     let file_type = match head.file_type {
+                        0 => FileType::Regular, // EXT2_FT_UNKNOWN: filetype feature absent
                         EXT2_FT_REG_FILE => FileType::Regular,
                         EXT2_FT_DIR => FileType::Directory,
                         EXT2_FT_SYMLINK => FileType::Symlink,
                         EXT2_FT_CHRDEV => FileType::CharDevice,
                         EXT2_FT_BLKDEV => FileType::BlockDevice,
-                        _ => FileType::Regular,
+                        // R133-7 FIX: Map FIFO/SOCK to correct FileType variants
+                        // instead of silently defaulting to Regular.
+                        EXT2_FT_FIFO => FileType::Fifo,
+                        EXT2_FT_SOCK => FileType::Socket,
+                        _ => return Err(FsError::Invalid),
                     };
 
                     return Ok(Some((
