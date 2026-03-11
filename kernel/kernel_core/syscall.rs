@@ -7005,13 +7005,10 @@ fn can_set_affinity(target_pid: ProcessId) -> Result<bool, SyscallError> {
         return Ok(true);
     }
 
-    // Check if caller is root
-    if let Some(proc_arc) = get_process(caller) {
-        let proc = proc_arc.lock();
-        let creds = proc.credentials.read();
-        if creds.euid == 0 {
-            return Ok(true);
-        }
+    // R134-4 FIX: Use host-mapped root check instead of namespace euid==0.
+    // Namespace root must not be able to modify CPU affinity of host processes.
+    if crate::current_is_host_root() {
+        return Ok(true);
     }
 
     Ok(false)
@@ -8440,11 +8437,12 @@ fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
     let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
 
     // R49-3 FIX: Compute privileged port binding permission
-    // Can bind to privileged ports if: root (euid == 0) OR has NET_BIND_SERVICE capability
+    // R134-3 FIX: Use host-mapped root check instead of namespace euid==0.
+    // Namespace root must NOT be able to bind privileged ports on the host network.
     let has_net_bind_cap =
         with_current_cap_table(|table| table.has_rights(cap::CapRights::NET_BIND_SERVICE))
             .unwrap_or(false);
-    let can_bind_privileged = ctx.euid == 0 || has_net_bind_cap;
+    let can_bind_privileged = crate::current_is_host_root() || has_net_bind_cap;
 
     // Early check for privileged port access
     const PRIVILEGED_PORT_LIMIT: u16 = 1024;
@@ -8504,10 +8502,11 @@ fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
     let ctx = lsm_current_process_ctx().ok_or(SyscallError::ESRCH)?;
 
     // Compute privileged-port permission for auto-bind
+    // R134-3 FIX: Use host-mapped root check instead of namespace euid==0.
     let has_net_bind_cap =
         with_current_cap_table(|table| table.has_rights(cap::CapRights::NET_BIND_SERVICE))
             .unwrap_or(false);
-    let can_bind_privileged = ctx.euid == 0 || has_net_bind_cap;
+    let can_bind_privileged = crate::current_is_host_root() || has_net_bind_cap;
 
     net::socket_table()
         .listen(&socket, &ctx, cap_id, backlog as u32, can_bind_privileged)
@@ -9173,10 +9172,14 @@ pub struct CgroupStatsBuf {
     pub io_throttle_events: u64,
 }
 
-/// P1-3: Returns `true` if the current process's euid is a delegated owner
-/// of `cgroup_id` (or any ancestor in the delegation chain).
+/// P1-3: Returns `true` if the current process's host-mapped euid is a
+/// delegated owner of `cgroup_id` (or any ancestor in the delegation chain).
+///
+/// R134-2 FIX: Use host-mapped euid for delegation identity matching.
+/// Namespace-relative euid can collide across user namespaces, allowing
+/// an attacker to assume another namespace's delegation identity.
 fn is_cgroup_delegated_to_caller(cgroup_id: u64) -> bool {
-    let euid = match crate::process::current_euid() {
+    let euid = match crate::process::current_host_euid() {
         Some(uid) => uid,
         None => return false,
     };

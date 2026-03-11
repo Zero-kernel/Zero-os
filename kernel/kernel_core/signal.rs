@@ -315,10 +315,13 @@ fn send_signal_inner(
                 let target_uid = process_arc.lock().credentials.read().uid;
 
                 // POSIX 权限检查：
-                // 1. Root (euid == 0) 可以发信号给任何进程
+                // 1. Host root (host-mapped euid == 0) 可以发信号给任何进程
                 // 2. sender.uid == target.uid
                 // 3. sender.euid == target.uid
-                let has_permission = sender_creds.euid == 0
+                // R134-7 FIX: Use host-mapped root check for defense-in-depth.
+                // sys_kill already performs namespace-aware check, but this
+                // hardens the inner function against future callers.
+                let has_permission = crate::current_is_host_root()
                     || sender_creds.uid == target_uid
                     || sender_creds.euid == target_uid;
 

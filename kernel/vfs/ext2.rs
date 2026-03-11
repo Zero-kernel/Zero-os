@@ -1351,7 +1351,24 @@ impl Inode for Ext2Inode {
                     let name = String::from_utf8_lossy(name_bytes).into_owned();
 
                     let file_type = match head.file_type {
-                        0 => FileType::Regular, // EXT2_FT_UNKNOWN: filetype feature absent
+                        // R134-6 FIX: EXT2_FT_UNKNOWN — fall back to inode mode
+                        // when the filetype feature is absent.  Without this,
+                        // legacy ext2 images report everything as Regular.
+                        0 => {
+                            match fs.read_inode_raw(head.inode) {
+                                Ok(raw_inode) => match raw_inode.mode & EXT2_S_IFMT {
+                                    EXT2_S_IFREG => FileType::Regular,
+                                    EXT2_S_IFDIR => FileType::Directory,
+                                    EXT2_S_IFLNK => FileType::Symlink,
+                                    0x2000 => FileType::CharDevice,  // S_IFCHR
+                                    0x6000 => FileType::BlockDevice,  // S_IFBLK
+                                    0x1000 => FileType::Fifo,         // S_IFIFO
+                                    0xC000 => FileType::Socket,       // S_IFSOCK
+                                    _ => FileType::Regular,
+                                },
+                                Err(_) => FileType::Regular,
+                            }
+                        }
                         EXT2_FT_REG_FILE => FileType::Regular,
                         EXT2_FT_DIR => FileType::Directory,
                         EXT2_FT_SYMLINK => FileType::Symlink,

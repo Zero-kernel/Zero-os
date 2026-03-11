@@ -124,6 +124,14 @@ impl ProcRootInode {
                 // Try to parse as PID
                 if let Ok(pid) = name.parse::<u32>() {
                     if process_exists(pid) {
+                        // R134-1 FIX: Enforce PID namespace visibility for direct
+                        // /proc/<pid> lookups.  R133-4 only fixed list_pids()
+                        // (directory listing); the lookup path was unprotected,
+                        // allowing container root to read host process info via
+                        // /proc/<global_pid>/maps etc.
+                        if !is_pid_visible_in_caller_ns(pid) {
+                            return Err(FsError::NotFound);
+                        }
                         // R31-1 FIX: Check access permission before returning PID directory
                         if !can_access_pid(pid) {
                             return Err(FsError::PermDenied);
@@ -1073,11 +1081,48 @@ fn get_current_creds() -> (u32, u32) {
     }
 }
 
+/// R134-1 FIX: Check whether `pid` is visible from the caller's PID namespace.
+///
+/// A process is visible if it belongs to the caller's owning namespace or any
+/// descendant namespace.  When the caller has no PID namespace (kernel context),
+/// all processes are visible (global view).
+///
+/// Returns `false` (invisible) when `pid` is outside the caller's namespace
+/// subtree, preventing cross-namespace information disclosure via direct
+/// `/proc/<global_pid>` lookups.
+fn is_pid_visible_in_caller_ns(pid: u32) -> bool {
+    let table = PROCESS_TABLE.lock();
+
+    // Determine the caller's owning PID namespace.
+    let caller_ns = process::current_pid()
+        .and_then(|cur_pid| table.get(cur_pid))
+        .and_then(|slot| slot.as_ref())
+        .and_then(|proc_arc| {
+            let p = proc_arc.lock();
+            kernel_core::owning_namespace(&p.pid_ns_chain)
+        });
+
+    // Kernel context (no namespace): global visibility.
+    let ns = match caller_ns {
+        Some(ns) => ns,
+        None => return true,
+    };
+
+    // Check target process visibility in the caller's namespace.
+    match table.get(pid as usize) {
+        Some(Some(proc_arc)) => {
+            let p = proc_arc.lock();
+            kernel_core::is_visible_in_namespace(&ns, &p.pid_ns_chain)
+        }
+        _ => false,
+    }
+}
+
 /// R31-1 FIX: Access control for /proc/[pid] entries.
 ///
 /// Allow access if any of the following conditions are met:
 /// - Accessing own process (self)
-/// - Caller is root (uid 0)
+/// - Caller is root (euid 0)
 /// - Caller has same owner UID as target process
 ///
 /// R37-6 FIX: Removed same-GID check. Allowing same-GID access is a security
@@ -1093,9 +1138,11 @@ fn can_access_pid(pid: u32) -> bool {
             return true;
         }
     }
-    // Root can access all processes
+    // R134-1 FIX: Root check must use euid, not uid, matching POSIX semantics.
+    // A process with euid==0 (via setuid) should have root-level /proc access.
     let (cur_uid, _cur_gid) = get_current_creds();
-    if cur_uid == 0 {
+    let cur_euid = kernel_core::current_euid().unwrap_or(u32::MAX);
+    if cur_euid == 0 {
         return true;
     }
     // R37-6 FIX: Only same UID can access; same GID is NOT sufficient

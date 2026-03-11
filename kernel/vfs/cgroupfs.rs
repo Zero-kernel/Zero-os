@@ -606,7 +606,9 @@ impl CgroupCtrlInode {
 
         // P1-3: Determine caller identity and delegation status.
         // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
-        let euid = current_euid().ok_or(FsError::PermDenied)?;
+        // R134-2 FIX: Use host-mapped euid for delegation identity matching.
+        // Namespace-relative euid can collide across user namespaces.
+        let euid = kernel_core::current_host_euid().ok_or(FsError::PermDenied)?;
         let is_root = kernel_core::current_is_host_root();
         let cgroup = cgroup::lookup_cgroup(self.cgroup_id).ok_or(FsError::NotFound)?;
         let is_delegate = !is_root && cgroup.is_delegated_to(euid);
@@ -852,11 +854,6 @@ impl Inode for CgroupCtrlInode {
 // Helper Functions
 // ============================================================================
 
-/// Returns the effective UID of the current process, if available.
-fn current_euid() -> Option<u32> {
-    kernel_core::current_credentials().map(|c| c.euid)
-}
-
 /// P1-3: Resolve the effective owner UID for a cgroup inode.
 ///
 /// Walks the ancestor chain to find the nearest delegation point.
@@ -879,16 +876,22 @@ fn effective_owner(cgroup_id: CgroupId) -> u32 {
     0
 }
 
-/// P1-3: Check if current process is root OR owns the delegated subtree
+/// P1-3: Check if current process is host root OR owns the delegated subtree
 /// containing `cgroup_id`.
+///
+/// R134-2 FIX: Use host-mapped root check and host-mapped euid for delegation
+/// identity. Namespace euid==0 is not equivalent to host root.
 fn is_privileged_or_delegate(cgroup_id: CgroupId) -> bool {
-    match current_euid() {
-        Some(0) => true,
-        Some(uid) => cgroup::lookup_cgroup(cgroup_id)
-            .map(|cg| cg.is_delegated_to(uid))
-            .unwrap_or(false),
-        None => false,
+    if kernel_core::current_is_host_root() {
+        return true;
     }
+    let euid = match kernel_core::current_host_euid() {
+        Some(uid) => uid,
+        None => return false,
+    };
+    cgroup::lookup_cgroup(cgroup_id)
+        .map(|cg| cg.is_delegated_to(euid))
+        .unwrap_or(false)
 }
 
 /// P1-3: Apply a resource limit to a cgroup, enforcing delegation boundaries.

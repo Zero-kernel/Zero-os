@@ -1086,31 +1086,52 @@ impl TcpControlBlock {
         let mut removed_bytes = 0u32;
 
         // Merge with any overlapping/adjacent existing segments
+        //
+        // R134-5 FIX: Model FIN as occupying one sequence number in sequence
+        // space.  Endpoints used for overlap detection and FIN preservation
+        // include the +1 for FIN; data buffer sizing uses data-only endpoints.
         let mut i = 0;
         while i < self.ooo_queue.len() {
             let existing = &self.ooo_queue[i];
-            let ex_end = existing.seq.wrapping_add(existing.data.len() as u32);
+            let ex_data_end = existing.seq.wrapping_add(existing.data.len() as u32);
+            let ex_seq_end = ex_data_end.wrapping_add(if existing.fin { 1 } else { 0 });
 
             // Recompute the running end of new_seg after each merge iteration
             // to avoid using a stale value that misses cascading overlaps.
-            let new_seg_end = new_seg.seq.wrapping_add(new_seg.data.len() as u32);
+            let ns_data_end = new_seg.seq.wrapping_add(new_seg.data.len() as u32);
+            let ns_seq_end = ns_data_end.wrapping_add(if new_seg.fin { 1 } else { 0 });
 
             // Check if new segment overlaps or is adjacent to existing
             // Two ranges [a, b) and [c, d) overlap or touch if a <= d && c <= b
-            if seq_le(new_seg.seq, ex_end) && seq_le(existing.seq, new_seg_end) {
+            // Use sequence-space endpoints (including FIN) for adjacency detection.
+            if seq_le(new_seg.seq, ex_seq_end) && seq_le(existing.seq, ns_seq_end) {
                 // Merge: remove existing, extend new_seg to cover both
                 let removed = self.ooo_queue.remove(i).unwrap();
                 removed_bytes = removed_bytes.saturating_add(removed.data.len() as u32);
-                let rm_end = removed.seq.wrapping_add(removed.data.len() as u32);
+                let rm_data_end = removed.seq.wrapping_add(removed.data.len() as u32);
+                let rm_seq_end = rm_data_end.wrapping_add(if removed.fin { 1 } else { 0 });
 
                 let merged_start = if seq_le(removed.seq, new_seg.seq) {
                     removed.seq
                 } else {
                     new_seg.seq
                 };
-                let cur_end = new_seg.seq.wrapping_add(new_seg.data.len() as u32);
-                let merged_end = if seq_ge(rm_end, cur_end) { rm_end } else { cur_end };
-                let merged_len = merged_end.wrapping_sub(merged_start) as usize;
+                let cur_data_end = new_seg.seq.wrapping_add(new_seg.data.len() as u32);
+                let cur_seq_end = cur_data_end.wrapping_add(if new_seg.fin { 1 } else { 0 });
+
+                // Sequence-space end (including FIN) for FIN preservation logic.
+                let merged_seq_end = if seq_ge(rm_seq_end, cur_seq_end) {
+                    rm_seq_end
+                } else {
+                    cur_seq_end
+                };
+                // Data-only end for buffer sizing (FIN occupies 0 bytes in buffer).
+                let merged_data_end = if seq_ge(rm_data_end, cur_data_end) {
+                    rm_data_end
+                } else {
+                    cur_data_end
+                };
+                let merged_len = merged_data_end.wrapping_sub(merged_start) as usize;
 
                 let mut merged_data = vec![0u8; merged_len];
 
@@ -1126,12 +1147,17 @@ impl TcpControlBlock {
                 merged_data[ns_off..ns_off + ns_len]
                     .copy_from_slice(&new_seg.data[..ns_len]);
 
+                // R134-5 FIX: Preserve FIN from whichever segment covers the
+                // tail of the merged sequence range. A FIN-carrying segment
+                // "covers the tail" when its sequence-space endpoint reaches
+                // the merged sequence-space endpoint.
+                let merged_fin = (removed.fin && rm_seq_end == merged_seq_end)
+                    || (new_seg.fin && cur_seq_end == merged_seq_end);
+
                 new_seg = OooSegment {
                     seq: merged_start,
                     data: merged_data,
-                    // R133-3 FIX: Preserve FIN from whichever segment covers the tail.
-                    fin: (removed.fin && rm_end == merged_end)
-                        || (new_seg.fin && cur_end == merged_end),
+                    fin: merged_fin,
                 };
                 // Don't increment i; check same position again for cascading merges
             } else {
