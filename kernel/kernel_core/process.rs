@@ -1841,6 +1841,31 @@ pub fn current_egid() -> Option<u32> {
     current_credentials().map(|c| c.egid)
 }
 
+/// R135-1 FIX: 获取当前进程的 host 级有效组ID（映射后的 egid）。
+///
+/// User namespace 内的 egid 是命名空间相对的。该函数将当前进程的
+/// namespace egid 通过 UserNamespace::map_gid_from_ns() 转换为 host GID。
+/// 对于 root namespace 进程，map_gid_from_ns 返回 identity（input == output）。
+///
+/// 如果 GID 未映射，返回 OVERFLOW_GID (65534) 以确保 fail-closed。
+pub fn current_host_egid() -> Option<u32> {
+    const OVERFLOW_GID: u32 = 65534;
+
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let proc = slot.as_ref()?.lock();
+
+    let ns_egid = proc.credentials.read().egid;
+    let user_ns = proc.user_ns.clone();
+    // Drop locks before calling into user_ns to avoid holding PROCESS_TABLE
+    // across the gid_map read lock.
+    drop(proc);
+    drop(table);
+
+    Some(user_ns.map_gid_from_ns(ns_egid).unwrap_or(OVERFLOW_GID))
+}
+
 /// F.1: 获取当前进程的挂载命名空间
 ///
 /// Returns the current process's mount namespace, used by VFS for
@@ -1919,6 +1944,40 @@ pub fn current_supplementary_groups() -> Option<Vec<u32>> {
     let proc = slot.as_ref()?.lock();
     let groups = proc.credentials.read().supplementary_groups.clone();
     Some(groups)
+}
+
+/// R135-1 FIX: 获取当前进程的 host 级附属组列表（映射后的 supplementary groups）。
+///
+/// 将当前进程的 namespace supplementary groups 通过
+/// UserNamespace::map_gid_from_ns() 转换为 host GID 列表。
+/// 对于 root namespace 进程，该映射为 identity（input == output）。
+///
+/// 未映射的 GID 将被替换为 OVERFLOW_GID (65534) 以确保 fail-closed。
+pub fn current_host_supplementary_groups() -> Option<Vec<u32>> {
+    const OVERFLOW_GID: u32 = 65534;
+
+    let pid = current_pid()?;
+    let table = PROCESS_TABLE.lock();
+    let slot = table.get(pid)?;
+    let proc = slot.as_ref()?.lock();
+
+    let ns_groups = proc.credentials.read().supplementary_groups.clone();
+    let user_ns = proc.user_ns.clone();
+    // Drop locks before calling into user_ns to avoid holding PROCESS_TABLE
+    // across the gid_map read lock.
+    drop(proc);
+    drop(table);
+
+    let mut host_groups: Vec<u32> = ns_groups
+        .into_iter()
+        .map(|g| user_ns.map_gid_from_ns(g).unwrap_or(OVERFLOW_GID))
+        .collect();
+
+    // Keep the list normalized for fast membership checks.
+    host_groups.sort_unstable();
+    host_groups.dedup();
+
+    Some(host_groups)
 }
 
 /// Maximum number of supplementary groups per process

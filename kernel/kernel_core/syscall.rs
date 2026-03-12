@@ -4737,7 +4737,9 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
     // R83-2 FIX: Fail-closed - if euid cannot be determined, deny access
     // Previously used unwrap_or(true) which would grant root access on None
-    let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
+    // R135-3 FIX: Use host-mapped root check. Namespace root must NOT be
+    // able to join arbitrary mount namespaces.
+    let is_root = crate::current_is_host_root();
     if !is_root && !has_cap_admin {
         kprintln!("[sys_setns] Permission denied: requires CAP_SYS_ADMIN or root");
         return Err(SyscallError::EPERM);
@@ -7479,9 +7481,11 @@ fn sys_access(path: *const u8, mode: i32) -> SyscallResult {
 
     // 获取当前进程凭证
     // R93-4 FIX: Fail-closed - return ESRCH if credentials unavailable (was unwrap_or(0))
-    let euid = crate::current_euid().ok_or(SyscallError::ESRCH)?;
-    let egid = crate::current_egid().ok_or(SyscallError::ESRCH)?;
-    let sup_groups = crate::current_supplementary_groups().unwrap_or_default();
+    // R135-1 FIX: Use host-mapped credentials for DAC checks in sys_access.
+    // Namespace euid/egid must NOT be compared against host inode UIDs/GIDs.
+    let euid = crate::current_host_euid().ok_or(SyscallError::ESRCH)?;
+    let egid = crate::current_host_egid().ok_or(SyscallError::ESRCH)?;
+    let sup_groups = crate::current_host_supplementary_groups().unwrap_or_default();
 
     // root用户拥有所有权限
     if euid == 0 {

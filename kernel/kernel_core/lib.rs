@@ -47,7 +47,9 @@ pub use process::{
     current_credentials,
     current_egid,
     current_euid,
+    current_host_egid,      // R135-1: host-mapped egid for DAC
     current_host_euid,      // R133-1: host-mapped euid for privilege gates
+    current_host_supplementary_groups, // R135-1: host-mapped supplementary groups for DAC
     current_is_host_root,   // R133-1: host root check for global gates
     current_ipc_ns,      // F.1: IPC namespace
     current_ipc_ns_id,   // R75-2: IPC namespace ID for partitioning

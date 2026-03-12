@@ -22,8 +22,9 @@ use alloc::vec::Vec;
 use block::BlockDevice;
 use cap::NamespaceId;
 use kernel_core::{
-    current_egid, current_euid, current_mount_ns, current_supplementary_groups, current_umask,
-    FileDescriptor, FileOps, MountNamespace, SyscallError, VfsStat, ROOT_MNT_NAMESPACE,
+    current_host_egid, current_host_euid, current_host_supplementary_groups,
+    current_is_host_root, current_mount_ns, current_umask, FileDescriptor, FileOps,
+    MountNamespace, SyscallError, VfsStat, ROOT_MNT_NAMESPACE,
 };
 use spin::RwLock;
 
@@ -66,12 +67,21 @@ fn check_access_permission(
     need_write: bool,
     need_exec: bool,
 ) -> bool {
-    // Get current process credentials (default to root if no process context)
-    let euid = current_euid().unwrap_or(0);
-    let egid = current_egid().unwrap_or(0);
-    let supplementary = current_supplementary_groups().unwrap_or_default();
+    // R135-1 FIX: Use host-mapped credentials for DAC checks.
+    // Namespace-relative euid/egid must NOT be used because host-stored inode
+    // UIDs/GIDs are in the host ID space. Without host mapping, user namespace
+    // root (ns-euid==0) bypasses ALL permission checks on host inodes.
+    //
+    // If there is no process context (e.g. early boot / kernel init), allow
+    // access — matches the previous "default to root" behavior.
+    let euid = match current_host_euid() {
+        Some(v) => v,
+        None => return true,
+    };
+    let egid = current_host_egid().unwrap_or(65534);
+    let supplementary = current_host_supplementary_groups().unwrap_or_default();
 
-    // Root (euid 0) bypasses all permission checks
+    // Host root (host-mapped euid == 0) bypasses all permission checks
     if euid == 0 {
         return true;
     }
@@ -138,10 +148,11 @@ fn apply_umask(perm: u16) -> u16 {
 /// Sanitized permission bits
 #[inline]
 fn strip_suid_sgid_if_needed(perm: u16, is_dir: bool) -> u16 {
-    let euid = current_euid().unwrap_or(0);
-
-    if euid == 0 {
-        // Root can create setuid/setgid files
+    // R135-1 FIX: Use host-mapped root check instead of namespace euid.
+    // Namespace root must NOT be able to create setuid/setgid files on the
+    // host filesystem.
+    if current_is_host_root() {
+        // Host root can create setuid/setgid files
         return perm;
     }
 
@@ -403,13 +414,11 @@ impl Vfs {
     /// - setuid 二进制文件劫持
     /// - 数据泄露或完整性破坏
     pub fn mount(&self, path: &str, fs: Arc<dyn FileSystem>) -> Result<(), FsError> {
-        // X-4 安全修复：只有 root 可以执行 mount
-        // current_euid() 返回 None 表示内核初始化阶段（允许）
-        // 返回 Some(uid) 时需要检查是否为 root
-        if let Some(euid) = current_euid() {
-            if euid != 0 {
-                return Err(FsError::PermDenied);
-            }
+        // R135-2 FIX: Only host root can execute mount. Namespace root must NOT
+        // be able to mount filesystems on the host.
+        // current_host_euid() returns None during kernel init (allowed).
+        if current_host_euid().is_some() && !current_is_host_root() {
+            return Err(FsError::PermDenied);
         }
 
         let path = normalize_path(path)?;
@@ -470,11 +479,10 @@ impl Vfs {
     /// Umount 操作仅限 root 用户（euid == 0）。
     /// 未授权的 umount 可能导致 DoS（卸载关键文件系统）。
     pub fn umount(&self, path: &str) -> Result<(), FsError> {
-        // X-4 安全修复：只有 root 可以执行 umount
-        if let Some(euid) = current_euid() {
-            if euid != 0 {
-                return Err(FsError::PermDenied);
-            }
+        // R135-2 FIX: Only host root can execute umount. Namespace root must NOT
+        // be able to unmount host filesystems.
+        if current_host_euid().is_some() && !current_is_host_root() {
+            return Err(FsError::PermDenied);
         }
 
         let path = normalize_path(path)?;
@@ -1076,8 +1084,9 @@ impl Vfs {
         // Enforce sticky-bit semantics on the current (revalidated) entry:
         // If parent directory has sticky bit set, only root, directory owner,
         // or file owner may delete the file
+        // R135-1 FIX: Use host-mapped euid for sticky bit check.
         if latest_parent_stat.mode.perm & 0o1000 != 0 {
-            let euid = current_euid().unwrap_or(0);
+            let euid = current_host_euid().unwrap_or(0);
             if euid != 0 && euid != current_stat.uid && euid != latest_parent_stat.uid {
                 return Err(FsError::PermDenied);
             }

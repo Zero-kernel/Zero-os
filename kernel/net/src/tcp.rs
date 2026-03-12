@@ -1109,7 +1109,6 @@ impl TcpControlBlock {
                 let removed = self.ooo_queue.remove(i).unwrap();
                 removed_bytes = removed_bytes.saturating_add(removed.data.len() as u32);
                 let rm_data_end = removed.seq.wrapping_add(removed.data.len() as u32);
-                let rm_seq_end = rm_data_end.wrapping_add(if removed.fin { 1 } else { 0 });
 
                 let merged_start = if seq_le(removed.seq, new_seg.seq) {
                     removed.seq
@@ -1117,14 +1116,7 @@ impl TcpControlBlock {
                     new_seg.seq
                 };
                 let cur_data_end = new_seg.seq.wrapping_add(new_seg.data.len() as u32);
-                let cur_seq_end = cur_data_end.wrapping_add(if new_seg.fin { 1 } else { 0 });
 
-                // Sequence-space end (including FIN) for FIN preservation logic.
-                let merged_seq_end = if seq_ge(rm_seq_end, cur_seq_end) {
-                    rm_seq_end
-                } else {
-                    cur_seq_end
-                };
                 // Data-only end for buffer sizing (FIN occupies 0 bytes in buffer).
                 let merged_data_end = if seq_ge(rm_data_end, cur_data_end) {
                     rm_data_end
@@ -1147,12 +1139,16 @@ impl TcpControlBlock {
                 merged_data[ns_off..ns_off + ns_len]
                     .copy_from_slice(&new_seg.data[..ns_len]);
 
-                // R134-5 FIX: Preserve FIN from whichever segment covers the
-                // tail of the merged sequence range. A FIN-carrying segment
-                // "covers the tail" when its sequence-space endpoint reaches
-                // the merged sequence-space endpoint.
-                let merged_fin = (removed.fin && rm_seq_end == merged_seq_end)
-                    || (new_seg.fin && cur_seq_end == merged_seq_end);
+                // R135-4 FIX: Preserve FIN if EITHER segment carries it.
+                // TCP FIN means "no more data after this point in the stream".
+                // The previous logic required a FIN-carrying segment's seq_end
+                // to reach merged_seq_end, which fails when a FIN-only segment
+                // (data_len=0, fin=true) is merged with a following data segment:
+                // the FIN-only seg's seq_end (seq+1) doesn't reach the data
+                // segment's further extent, so FIN was silently dropped.
+                // Since no legitimate data can follow a FIN in the same stream
+                // direction, OR-merging is the correct semantic.
+                let merged_fin = removed.fin || new_seg.fin;
 
                 new_seg = OooSegment {
                     seq: merged_start,
