@@ -419,37 +419,41 @@ lint-fetch-add:
 		echo "OK: No unguarded fetch_add(1 in core/VFS/namespace paths."; \
 	fi
 
-# R113-1 / P3-6 / H.0.3: Catch unannotated struct-to-bytes copies in syscall paths.
+# R113-1 / P3-6 / H.0.1-3: Catch unannotated struct-to-bytes copies at the
+# kernel-userspace boundary.
 # Any from_raw_parts, copy_nonoverlapping, or transmute on #[repr(C)] structs
-# at the kernel-userspace boundary MUST carry a lint-repr-c-copy annotation
-# documenting why the struct is padding-safe (or be replaced with a zeroed-buffer copy).
+# MUST carry a lint-repr-c-copy annotation documenting why the copy is
+# padding-safe (or be replaced with a zeroed-buffer copy).
+# H.0.1-3: Expanded scan scope from syscall.rs-only to all boundary files.
 lint-repr-c-copy:
 	@echo "=== Lint: checking for unannotated repr(C) struct copies ==="
-	@HITS=$$(grep -n 'from_raw_parts\|copy_nonoverlapping\|mem::transmute' \
-		kernel/kernel_core/syscall.rs \
-		| grep -v '^\s*//' \
-		| grep -v '//.*from_raw_parts\|//.*copy_nonoverlapping\|//.*transmute' \
-		| grep -v 'as_mut_ptr() as \*mut u8, total' \
-	) ; \
+	@FILES="kernel/kernel_core/syscall.rs kernel/kernel_core/usercopy.rs kernel/audit/lib.rs"; \
 	FAIL=""; \
-	for line in $$HITS; do \
-		LINENO_PART=$$(echo "$$line" | cut -d: -f1); \
-		if [ -n "$$LINENO_PART" ] && [ "$$LINENO_PART" -eq "$$LINENO_PART" ] 2>/dev/null; then \
-			PREV=$$(sed -n "$$((LINENO_PART-3)),$$((LINENO_PART-1))p" kernel/kernel_core/syscall.rs); \
-			if ! echo "$$PREV" | grep -q 'lint-repr-c-copy: allow'; then \
-				echo "  syscall.rs:$$line"; \
-				FAIL="1"; \
+	for FILE in $$FILES; do \
+		HITS=$$(grep -n 'from_raw_parts\|copy_nonoverlapping\|mem::transmute' $$FILE \
+			| grep -v '^\s*//' \
+			| grep -v '//.*from_raw_parts\|//.*copy_nonoverlapping\|//.*transmute' \
+			| grep -v 'as_mut_ptr() as \*mut u8, total' \
+		) ; \
+		for line in $$HITS; do \
+			LINENO_PART=$$(echo "$$line" | cut -d: -f1); \
+			if [ -n "$$LINENO_PART" ] && [ "$$LINENO_PART" -eq "$$LINENO_PART" ] 2>/dev/null; then \
+				PREV=$$(sed -n "$$((LINENO_PART-3)),$$((LINENO_PART-1))p" $$FILE); \
+				if ! echo "$$PREV" | grep -q 'lint-repr-c-copy: allow'; then \
+					echo "  $$FILE:$$LINENO_PART"; \
+					FAIL="1"; \
+				fi; \
 			fi; \
-		fi; \
+		done; \
 	done; \
 	if [ -n "$$FAIL" ]; then \
 		echo ""; \
-		echo "ERROR: Unannotated struct-to-bytes copy found in syscall.rs."; \
+		echo "ERROR: Unannotated struct-to-bytes copy found."; \
 		echo "Add '// lint-repr-c-copy: allow (<reason>)' within 2 lines above each site."; \
 		echo "Or use a zeroed-buffer copy pattern (see copy_vfs_stat_to_user)."; \
 		exit 1; \
 	else \
-		echo "OK: All repr(C) struct copies in syscall.rs are annotated."; \
+		echo "OK: All repr(C) struct copies in audited files are annotated."; \
 	fi
 
 # Unified lint target: runs all CI lint checks.

@@ -1286,6 +1286,7 @@ pub fn copy_from_user<T: Copy>(dst: &mut T, src: UserPtr<T>) -> Result<(), Userc
     }
 
     // SAFETY: dst is a valid kernel reference, size matches T
+    // lint-repr-c-copy: allow (generic typed usercopy; user→kernel direction, no kernel info leak)
     let dst_bytes = unsafe { core::slice::from_raw_parts_mut(dst as *mut T as *mut u8, size) };
 
     copy_from_user_safe(dst_bytes, src.as_ptr() as *const u8).map_err(|_| UsercopyError)
@@ -1318,6 +1319,7 @@ pub fn copy_to_user<T: Copy>(dst: UserPtr<T>, src: &T) -> Result<(), UsercopyErr
     }
 
     // SAFETY: src is a valid kernel reference, size matches T
+    // lint-repr-c-copy: allow (generic typed usercopy; callers must ensure T has no uninitialized padding for kernel→user)
     let src_bytes = unsafe { core::slice::from_raw_parts(src as *const T as *const u8, size) };
 
     copy_to_user_safe(dst.as_mut_ptr() as *mut u8, src_bytes).map_err(|_| UsercopyError)

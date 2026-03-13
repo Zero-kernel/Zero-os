@@ -111,6 +111,9 @@ struct UserSeccompInsn {
     arg2: u64,
 }
 
+// H.0.1-3: Compile-time ABI size assertion.
+const _: [(); 32] = [(); core::mem::size_of::<UserSeccompInsn>()];
+
 /// User-space seccomp program header
 /// Describes the filter to be installed
 #[repr(C)]
@@ -123,6 +126,9 @@ struct UserSeccompProg {
     /// Pointer to instruction array
     filter: u64, // Using u64 instead of *const for safe Copy
 }
+
+// H.0.1-3: Compile-time ABI size assertion.
+const _: [(); 16] = [(); core::mem::size_of::<UserSeccompProg>()];
 
 // ============================================================================
 // Linux ABI struct definitions for new syscalls
@@ -146,6 +152,9 @@ struct OpenHow {
     resolve: u64,
 }
 
+// H.0.1-3: Compile-time ABI size assertion.
+const _: [(); 24] = [(); core::mem::size_of::<OpenHow>()];
+
 /// struct timeval (Linux ABI)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -154,6 +163,9 @@ struct TimeVal {
     tv_usec: i64,
 }
 
+// H.0.1-3: Compile-time ABI size assertion.
+const _: [(); 16] = [(); core::mem::size_of::<TimeVal>()];
+
 /// struct timespec (Linux ABI)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -161,6 +173,9 @@ struct TimeSpec {
     tv_sec: i64,
     tv_nsec: i64,
 }
+
+// H.0.1-3: Compile-time ABI size assertion.
+const _: [(); 16] = [(); core::mem::size_of::<TimeSpec>()];
 
 /// struct utsname (Linux ABI, fixed-size strings)
 #[repr(C)]
@@ -185,6 +200,9 @@ impl Default for UtsName {
     }
 }
 
+// H.0.1-3: Compile-time ABI size assertion.
+const _: [(); 325] = [(); core::mem::size_of::<UtsName>()];
+
 /// Linux dirent64 layout for getdents64 syscall
 #[repr(C)]
 struct LinuxDirent64 {
@@ -194,6 +212,9 @@ struct LinuxDirent64 {
     d_type: u8,
     // followed by name bytes + '\0'
 }
+
+// H.0.1-3: Compile-time ABI size assertion (includes 5 bytes tail padding).
+const _: [(); 24] = [(); core::mem::size_of::<LinuxDirent64>()];
 
 // ============================================================================
 // Socket ABI (Linux x86_64)
@@ -225,6 +246,9 @@ struct SockAddrIn {
     /// Padding to 16 bytes (Linux ABI)
     sin_zero: [u8; 8],
 }
+
+// H.0.1-3: Compile-time ABI size assertion.
+const _: [(); 16] = [(); core::mem::size_of::<SockAddrIn>()];
 
 impl SockAddrIn {
     /// Create from Ipv4Addr and port (host byte order).
@@ -1150,6 +1174,9 @@ pub struct VfsStat {
     pub ctime_sec: i64,
     pub ctime_nsec: i64,
 }
+
+// H.0.1-3: Compile-time ABI size assertion (112 = 2 implicit 4-byte padding gaps).
+const _: [(); 112] = [(); core::mem::size_of::<VfsStat>()];
 
 lazy_static::lazy_static! {
     /// 管道创建回调
@@ -5032,6 +5059,9 @@ struct Iovec {
     /// 缓冲区长度
     iov_len: usize,
 }
+
+// H.0.1-3: Compile-time ABI size assertion.
+const _: [(); 16] = [(); core::mem::size_of::<Iovec>()];
 
 /// writev 最大 iovec 数量
 const IOV_MAX: usize = 1024;
@@ -9176,6 +9206,46 @@ pub struct CgroupStatsBuf {
     pub io_throttle_events: u64,
 }
 
+// H.0.1-3: Compile-time ABI size assertion (104 bytes, no implicit padding).
+const _: [(); 104] = [(); core::mem::size_of::<CgroupStatsBuf>()];
+
+/// H.0.1-3: Copy CgroupStatsBuf to userspace via a zeroed byte buffer so that
+/// any padding bytes (explicit `_padding` field) are guaranteed zero, preventing
+/// kernel memory disclosure. Mirrors the VfsStat pattern (R113-1).
+#[inline]
+fn copy_cgroup_stats_to_user(
+    user_dst: *mut CgroupStatsBuf,
+    stats: &CgroupStatsBuf,
+) -> Result<(), SyscallError> {
+    let mut buf = [0u8; mem::size_of::<CgroupStatsBuf>()];
+
+    macro_rules! put {
+        ($field:ident) => {
+            let off = mem::offset_of!(CgroupStatsBuf, $field);
+            let bytes = stats.$field.to_ne_bytes();
+            buf[off..off + bytes.len()].copy_from_slice(&bytes);
+        };
+    }
+
+    put!(id);
+    put!(depth);
+    put!(controllers);
+    put!(nr_tasks);
+    put!(cpu_time_ns);
+    put!(memory_current);
+    put!(memory_events_high);
+    put!(memory_events_max);
+    put!(pids_events_max);
+    // `_padding` intentionally left as zeroes in the buffer.
+    put!(io_read_bytes);
+    put!(io_write_bytes);
+    put!(io_read_ios);
+    put!(io_write_ios);
+    put!(io_throttle_events);
+
+    copy_to_user(user_dst as *mut u8, &buf)
+}
+
 /// P1-3: Returns `true` if the current process's host-mapped euid is a
 /// delegated owner of `cgroup_id` (or any ancestor in the delegation chain).
 ///
@@ -9571,8 +9641,6 @@ fn sys_cgroup_set_limit(cgroup_id: u64, limit_type: u32, value: u64) -> Result<u
 /// * On success: 0
 /// * On error: Negative errno
 fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usize, SyscallError> {
-    use crate::usercopy::copy_to_user_safe;
-
     // Validate user pointer
     if buf.is_null() {
         return Err(SyscallError::EFAULT);
@@ -9613,17 +9681,8 @@ fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usiz
         io_throttle_events: stats.io_throttle_events,
     };
 
-    // Copy to userspace
-    // P1-6 FIX: Removed redundant outer UserAccessGuard — copy_to_user_safe
-    // creates its own guard internally.
-    // lint-repr-c-copy: allow (explicit _padding:u32 initialized to 0; no implicit gaps)
-    unsafe {
-        let result_bytes: [u8; core::mem::size_of::<CgroupStatsBuf>()] =
-            core::mem::transmute(result);
-        if copy_to_user_safe(buf as *mut u8, &result_bytes).is_err() {
-            return Err(SyscallError::EFAULT);
-        }
-    }
+    // H.0.1-3: Copy via zeroed byte buffer so padding bytes are guaranteed zero.
+    copy_cgroup_stats_to_user(buf, &result)?;
 
     Ok(0)
 }
@@ -9648,6 +9707,25 @@ pub struct ComplianceStatusBuf {
     _padding: [u8; 5],
 }
 
+// H.0.1-3: Compile-time ABI size assertion (8 bytes, alignment 1, no implicit padding).
+const _: [(); 8] = [(); core::mem::size_of::<ComplianceStatusBuf>()];
+
+/// H.0.1-3: Copy ComplianceStatusBuf to userspace via a zeroed byte buffer.
+/// All fields are u8 (alignment 1, no implicit gaps), but explicit _padding
+/// is guaranteed zero by the zeroed buffer pattern for defense-in-depth.
+#[inline]
+fn copy_compliance_status_to_user(
+    user_dst: *mut ComplianceStatusBuf,
+    status: &ComplianceStatusBuf,
+) -> Result<(), SyscallError> {
+    let mut buf = [0u8; mem::size_of::<ComplianceStatusBuf>()];
+    buf[mem::offset_of!(ComplianceStatusBuf, profile)] = status.profile;
+    buf[mem::offset_of!(ComplianceStatusBuf, profile_locked)] = status.profile_locked;
+    buf[mem::offset_of!(ComplianceStatusBuf, fips_state)] = status.fips_state;
+    // `_padding` intentionally left as zeroes in the buffer.
+    copy_to_user(user_dst as *mut u8, &buf)
+}
+
 /// sys_compliance_status - Get current compliance status
 ///
 /// # Arguments
@@ -9657,8 +9735,6 @@ pub struct ComplianceStatusBuf {
 /// * On success: 0
 /// * On error: Negative errno (EFAULT if pointer invalid)
 fn sys_compliance_status(buf: *mut ComplianceStatusBuf) -> Result<usize, SyscallError> {
-    use crate::usercopy::copy_to_user_safe;
-
     // Validate user pointer
     if buf.is_null() {
         return Err(SyscallError::EFAULT);
@@ -9678,17 +9754,8 @@ fn sys_compliance_status(buf: *mut ComplianceStatusBuf) -> Result<usize, Syscall
         _padding: [0; 5],
     };
 
-    // Copy to userspace
-    // P1-6 FIX: Removed redundant outer UserAccessGuard — copy_to_user_safe
-    // creates its own guard internally.
-    // lint-repr-c-copy: allow (explicit _padding:[u8;5] initialized to [0;5]; alignment=1, no implicit gaps)
-    unsafe {
-        let result_bytes: [u8; core::mem::size_of::<ComplianceStatusBuf>()] =
-            core::mem::transmute(result);
-        if copy_to_user_safe(buf as *mut u8, &result_bytes).is_err() {
-            return Err(SyscallError::EFAULT);
-        }
-    }
+    // H.0.1-3: Copy via zeroed byte buffer so padding bytes are guaranteed zero.
+    copy_compliance_status_to_user(buf, &result)?;
 
     Ok(0)
 }
