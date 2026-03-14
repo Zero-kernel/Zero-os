@@ -533,6 +533,32 @@ pub struct Process {
     /// mmap 区域跟踪 (起始地址 -> 长度)
     pub mmap_regions: BTreeMap<usize, usize>,
 
+    /// R131-6 FIX: Per-task cgroup memory bytes independently charged via
+    /// sys_mmap / sys_brk since this task was created or cloned.
+    ///
+    /// CLONE_VM snapshots mmap_regions at clone time (R123-3), so a non-last
+    /// task's independent charges are invisible to the last-exit task's
+    /// snapshot.  This counter lets non-last tasks uncharge their own
+    /// independent charges on exit (keep_address_space=true) without
+    /// double-uncharging inherited snapshot entries.
+    ///
+    /// Invariant: uses saturating arithmetic — never underflows.
+    pub vm_charged_bytes: u64,
+
+    /// R137-1 FIX: Cgroup memory bytes charged by the ELF loader for PT_LOAD
+    /// segments and the initial user stack.
+    ///
+    /// `load_elf()` charges cgroup memory via `try_charge_memory()` but these
+    /// charges are not tracked in `mmap_regions`, `brk`, or `vm_charged_bytes`.
+    /// Without explicit tracking, exit and subsequent exec never uncharge them,
+    /// causing `memory_current` to leak ~2-8 MB per exec+exit cycle.
+    ///
+    /// Set on successful exec commit; uncharged on process exit (last-exit in
+    /// CLONE_VM group) and on subsequent exec (before loading the new image).
+    /// CLONE_VM children inherit this value via the clone snapshot so that
+    /// whichever task is last-exit can perform the uncharge.
+    pub elf_charged_bytes: u64,
+
     /// 下一个自动分配的 mmap 起始地址
     pub next_mmap_addr: usize,
 
@@ -774,6 +800,8 @@ impl Process {
             memory_space: 0,
             user_memory_space: 0,
             mmap_regions: BTreeMap::new(),
+            vm_charged_bytes: 0,
+            elf_charged_bytes: 0,
             next_mmap_addr: security::randomized_mmap_base(DEFAULT_MMAP_BASE),
             fd_table: BTreeMap::new(),
             cloexec_fds: BTreeSet::new(),
@@ -1638,10 +1666,20 @@ pub fn thread_group_size(tgid: ProcessId) -> usize {
         .count()
 }
 
-/// R37-1 FIX: Count live tasks sharing the same address space (CLONE_VM siblings).
+/// R37-1 FIX: Count tasks sharing the same address space (CLONE_VM siblings).
 ///
 /// Returns 0 if no valid memory_space is set.
-/// Used to detect CLONE_VM processes for seccomp TSYNC enforcement.
+///
+/// R136-1 FIX: Counts all non-Terminated tasks, **including Zombie**.
+/// This kernel defers page-table teardown to `cleanup_zombie()`, so a Zombie
+/// process retains its `memory_space` reference until reaped. Excluding zombies
+/// allowed `sys_exec()` to see `share_count == 1` and free the old CR3 while an
+/// unreaped CLONE_VM zombie still held a reference — causing a double-free when
+/// `cleanup_zombie()` later freed the same address space.
+///
+/// Note: `non_thread_group_vm_share_count()` (used for seccomp TSYNC) still
+/// excludes zombies because TSYNC only cares about live tasks that can execute
+/// seccomp filters.
 pub fn address_space_share_count(memory_space: usize) -> usize {
     if memory_space == 0 {
         return 0;
@@ -1652,9 +1690,7 @@ pub fn address_space_share_count(memory_space: usize) -> usize {
         .filter(|slot| {
             if let Some(p) = slot {
                 let p = p.lock();
-                p.memory_space == memory_space
-                    && p.state != ProcessState::Zombie
-                    && p.state != ProcessState::Terminated
+                p.memory_space == memory_space && p.state != ProcessState::Terminated
             } else {
                 false
             }
@@ -3018,8 +3054,14 @@ pub fn cleanup_zombie(pid: ProcessId) {
         if !is_zombie {
             None
         } else {
-            // Phase 1b: Check if other processes share this address space
-            // (must be done under PROCESS_TABLE lock since we iterate the table)
+            // Phase 1b: Check if other processes still reference this address space.
+            //
+            // R136-1 FIX: Zombies are intentionally INCLUDED here (only Terminated
+            // excluded). A Zombie retains `memory_space` until reaped, so we must
+            // keep the address space alive if any other Zombie (or live process)
+            // still references it. This is consistent with the updated
+            // `address_space_share_count()` which also counts zombies.
+            // (Must be done under PROCESS_TABLE lock since we iterate the table.)
             let keep_address_space = if memory_space == 0 {
                 false
             } else {
@@ -3257,17 +3299,13 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
     //     snapshot of the parent's mmap_regions but never owned the charges;
     //     uncharging here would corrupt the parent's cgroup accounting.
     //
-    // R131-6 KNOWN LIMITATION: CLONE_VM threads get a *snapshot* of
-    // mmap_regions at clone time (R123-3), not a shared reference. When a
-    // non-last CLONE_VM thread performs mmap() and then exits with
-    // keep_address_space=true, the charge for that mmap leaks because the
-    // last-exit thread's snapshot does not contain the entry. Unconditionally
-    // uncharging all entries would cause double-uncharge of inherited snapshot
-    // entries. A full fix requires shared MmState per address space
-    // (D2-RES-CGROUP-CLONE / D3-ARC-MM-SHARED). Impact is bounded: only
-    // CLONE_VM threads that independently mmap and exit before the last thread
-    // are affected. Standard pthread_create + pthread_exit patterns do not
-    // trigger this because pthreads rarely do independent mmap.
+    // R131-6 FIX: CLONE_VM snapshots mmap_regions at clone time (R123-3).
+    // A non-last task can independently charge cgroup memory via mmap()/brk(),
+    // then exit with keep_address_space=true.  Those charges would not appear
+    // in the last-exit task's snapshot and would otherwise leak permanently.
+    // Uncharging the full snapshot would double-uncharge inherited mappings,
+    // so non-last tasks instead uncharge only their own independent charges
+    // tracked in vm_charged_bytes.
     //
     // Skip PROT_NONE reservations: they never allocated physical frames or
     // charged cgroup memory (R123-1 invariant INV-MM-PROT-NONE).
@@ -3295,6 +3333,25 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
         };
         if heap_bytes > 0 {
             crate::cgroup::uncharge_memory(cgroup_id, heap_bytes);
+        }
+
+        // R137-1 FIX: Uncharge ELF loader allocations (PT_LOAD segments + user stack).
+        // load_elf() charges cgroup memory that is not tracked in mmap_regions or brk,
+        // so without this explicit uncharge, memory_current leaks ~2-8 MB per exec+exit.
+        let elf_bytes = proc.elf_charged_bytes;
+        if elf_bytes > 0 {
+            crate::cgroup::uncharge_memory(cgroup_id, elf_bytes);
+            proc.elf_charged_bytes = 0;
+        }
+    } else if keep_address_space && proc.memory_space != 0 {
+        // R131-6 FIX: Non-last CLONE_VM task — uncharge only the bytes this
+        // task independently charged via sys_mmap/sys_brk after being cloned.
+        // This prevents permanent cgroup memory_current leaks without risking
+        // double-uncharge of inherited snapshot entries.
+        let charged = proc.vm_charged_bytes;
+        if charged > 0 {
+            crate::cgroup::uncharge_memory(proc.cgroup_id, charged);
+            proc.vm_charged_bytes = 0;
         }
     }
 

@@ -2712,6 +2712,7 @@ fn sys_clone(
         parent_next_mmap,
         parent_brk_start,
         parent_brk,
+        parent_elf_charged_bytes,
         parent_name,
         parent_priority,
         parent_cgroup_id,     // R123-2 FIX: for cgroup attachment after create_process
@@ -2784,6 +2785,7 @@ fn sys_clone(
             parent.next_mmap_addr,
             parent.brk_start,
             parent.brk,
+            parent.elf_charged_bytes,
             parent.name.clone(),
             parent.priority,
             parent.cgroup_id,     // R123-2 FIX
@@ -3196,6 +3198,9 @@ fn sys_clone(
             child.next_mmap_addr = parent_next_mmap;
             child.brk_start = parent_brk_start;
             child.brk = parent_brk;
+            // R137-1 FIX: Inherit ELF loader charges so the last-exit task
+            // (keep_address_space=false) can uncharge them in free_process_resources.
+            child.elf_charged_bytes = parent_elf_charged_bytes;
         }
 
         // 从当前 syscall 帧构建子进程上下文
@@ -3626,8 +3631,10 @@ fn sys_exec(
     // but shares the same memory_space.  If exec freed the old page tables,
     // that CLONE_VM sibling would still reference the freed CR3 → UAF.
     //
-    // address_space_share_count() counts ALL live processes with the same
-    // memory_space, regardless of tgid.
+    // R136-1 FIX: address_space_share_count() now counts ALL non-Terminated
+    // processes (including Zombies) that share the same memory_space. A Zombie
+    // retains its memory_space reference until reaped by cleanup_zombie(), so
+    // it must be counted to prevent double-free of CR3 page tables.
     let share_count = address_space_share_count(current_memory_space);
     if share_count > 1 {
         kprintln!(
@@ -4058,8 +4065,26 @@ fn sys_exec(
             if heap_bytes > 0 {
                 cgroup::uncharge_memory(cgroup_id, heap_bytes);
             }
+
+            // R137-1 FIX: Uncharge the old image's ELF loader charges (PT_LOAD
+            // segments + user stack). These bytes were charged by load_elf() and
+            // are not represented in mmap_regions or brk bookkeeping.
+            let elf_bytes = proc.elf_charged_bytes;
+            if elf_bytes > 0 {
+                cgroup::uncharge_memory(cgroup_id, elf_bytes);
+            }
         }
 
+        // R131-6 FIX: Reset per-task charge counter — the old image's charges
+        // were fully uncharged above; new ELF image starts with a clean slate.
+        proc.vm_charged_bytes = 0;
+        // R137-1 FIX: Record the new ELF image's cgroup charges (segments + stack)
+        // so that process exit and subsequent exec can uncharge them. The old
+        // image's elf_charged_bytes were already uncharged above alongside
+        // mmap_regions and brk. Safe to set before space_guard.commit() because
+        // no fallible operations remain between lock release and commit(); if the
+        // guard were to roll back, it uncharges via its own charged_bytes field.
+        proc.elf_charged_bytes = load_result.charged_bytes;
         proc.mmap_regions.clear();
         // H.2 Partial KASLR: Re-randomize mmap base on exec for ASLR
         proc.next_mmap_addr = security::randomized_mmap_base(0x4000_0000);
@@ -5738,6 +5763,10 @@ fn sys_brk(addr: usize) -> SyscallResult {
         // 更新进程 brk
         let mut proc = process.lock();
         proc.brk = addr;
+        // R131-6 FIX: Track brk growth in per-task charge counter.
+        proc.vm_charged_bytes = proc
+            .vm_charged_bytes
+            .saturating_add(grow_size as u64);
         Ok(addr)
     }
     // 堆收缩
@@ -5790,6 +5819,10 @@ fn sys_brk(addr: usize) -> SyscallResult {
         // 更新进程 brk 并释放内存计费
         let mut proc = process.lock();
         proc.brk = addr;
+        // R131-6 FIX: Track brk shrink in per-task charge counter.
+        proc.vm_charged_bytes = proc
+            .vm_charged_bytes
+            .saturating_sub(shrink_size as u64);
         drop(proc);
 
         // F.2 Cgroup: Uncharge memory after successful heap shrink
@@ -6087,6 +6120,11 @@ fn sys_mmap(
     {
         let mut proc = process.lock();
         proc.mmap_regions.insert(base, length_aligned);
+        // R131-6 FIX: Track this task's independent cgroup charge so non-last
+        // CLONE_VM tasks can uncharge on exit (keep_address_space=true).
+        proc.vm_charged_bytes = proc
+            .vm_charged_bytes
+            .saturating_add(length_aligned as u64);
         if proc.next_mmap_addr < end {
             proc.next_mmap_addr = end;
         }
@@ -6230,6 +6268,14 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     {
         let mut proc = process.lock();
         proc.mmap_regions.remove(&addr);
+        // R131-6 FIX: Decrement per-task charge tracker so non-last CLONE_VM
+        // exit does not over-uncharge.  Saturating: inherited regions may have
+        // been munmapped before the task accumulated any independent charges.
+        if (committed_flags & MMAP_REGION_FLAG_PROT_NONE) == 0 {
+            proc.vm_charged_bytes = proc
+                .vm_charged_bytes
+                .saturating_sub(recorded_length as u64);
+        }
     }
 
     // F.2 Cgroup: Atomically uncharge memory after successful munmap.

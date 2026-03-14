@@ -147,6 +147,68 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
                 return Err(ForkError::CgroupPidsLimitExceeded);
             }
         }
+
+        // R138-1 FIX: Worst-case COW cgroup memory charging.
+        //
+        // COW fork shares physical frames but gives the child a full copy of
+        // mmap_regions, brk, and elf_charged_bytes.  On child exit (or exec),
+        // free_process_resources() / sys_exec() uncharges ALL of those bytes.
+        // If the child was never charged for them, the parent's charges get
+        // uncharged twice — driving memory_current below true physical usage
+        // and allowing subsequent allocations to bypass memory.max.
+        //
+        // Fix: charge the child's cgroup for the full inherited virtual
+        // footprint at fork time.  This is conservative (counts COW-shared
+        // pages for both parent and child) but is fail-closed: the uncharge
+        // on exit exactly cancels the charge here, keeping memory_current
+        // accurate for every process independently.
+        //
+        // Locking note: fork_inner() copies mmap_regions, brk, and
+        // elf_charged_bytes verbatim from parent to child.  Rather than
+        // re-locking the child (which would nest parent→child locks and
+        // widen the critical section), we compute the inherited footprint
+        // directly from the already-held parent snapshot.
+        let fork_charge_bytes: u64 = {
+            let mut bytes: u64 = 0;
+
+            // Sum non-PROT_NONE mmap regions (inherited verbatim from parent)
+            for (&_base, &len_with_flags) in parent.mmap_regions.iter() {
+                if (len_with_flags & crate::syscall::MMAP_REGION_FLAG_PROT_NONE) != 0 {
+                    continue;
+                }
+                let len = crate::syscall::mmap_region_len(len_with_flags) as u64;
+                bytes = bytes.saturating_add(len);
+            }
+
+            // Brk heap (inherited verbatim from parent)
+            let heap_bytes = {
+                const PAGE_SIZE: usize = 0x1000;
+                let brk_aligned = (parent.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                let brk_start_aligned =
+                    (parent.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                brk_aligned.saturating_sub(brk_start_aligned) as u64
+            };
+            bytes = bytes.saturating_add(heap_bytes);
+
+            // ELF loader charges (inherited verbatim from parent)
+            bytes = bytes.saturating_add(parent.elf_charged_bytes);
+
+            bytes
+        };
+
+        if fork_charge_bytes > 0
+            && crate::cgroup::try_charge_memory(parent_cgroup_id, fork_charge_bytes).is_err()
+        {
+            // Cgroup memory.max would be exceeded — roll back the entire fork.
+            parent.children.retain(|&pid| pid != child_pid);
+            if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+                let _ = cg.detach_task(child_pid as u64);
+            }
+            crate::process::notify_cpuset_task_left(parent_cpuset_id);
+            drop(parent);
+            cleanup_partial_child(child_pid);
+            return Err(ForkError::MemoryAllocationFailed);
+        }
     }
 
     result
@@ -324,6 +386,12 @@ fn fork_inner(
         // 复制堆管理状态
         child.brk_start = parent.brk_start;
         child.brk = parent.brk;
+
+        // R138-1 FIX: Inherit parent's ELF loader charges so the child's cgroup
+        // accounting is complete under worst-case COW semantics.  The actual
+        // cgroup charge for the child's full inherited footprint (mmap_regions +
+        // brk + elf_charged_bytes) happens in sys_fork() after fork_inner returns.
+        child.elf_charged_bytes = parent.elf_charged_bytes;
 
         // 复制 TLS 状态（FS/GS base）
         child.fs_base = parent.fs_base;

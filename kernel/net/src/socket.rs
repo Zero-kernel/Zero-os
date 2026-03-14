@@ -470,8 +470,63 @@ fn allow_rst(now_ms: u64) -> bool {
 }
 
 // ============================================================================
+// SYN Cookie SYN-ACK Rate Limiting (R137-2 FIX)
+// ============================================================================
+
+/// Maximum SYN-cookie SYN-ACK packets per window period.
+///
+/// R137-2 FIX: SYN cookies generate stateless SYN-ACK responses. Without a
+/// global rate limit, spoofed SYN floods cause the server to reflect SYN-ACKs
+/// to victims (low amplification ~1.2x but still undesirable). 200/sec is
+/// generous enough for legitimate handshakes under load while capping
+/// reflection bandwidth.
+const SYNACK_COOKIE_RATE_LIMIT: u32 = 200;
+
+/// SYN-cookie SYN-ACK rate limiting window in milliseconds.
+const SYNACK_COOKIE_RATE_WINDOW_MS: u64 = 1000;
+
+/// Token bucket for SYN-cookie SYN-ACK rate limiting.
+static SYNACK_COOKIE_TOKENS: AtomicU32 = AtomicU32::new(SYNACK_COOKIE_RATE_LIMIT);
+
+/// Window start time for SYN-cookie SYN-ACK rate limiter.
+static SYNACK_COOKIE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
+
+/// Check if a SYN-cookie SYN-ACK can be sent (rate limiter).
+///
+/// R137-2 FIX: Token bucket rate limiting for stateless SYN-cookie SYN-ACK
+/// responses to reduce spoofed-source reflection amplification.
+fn allow_syn_cookie_ack(now_ms: u64) -> bool {
+    // Use compare_exchange on window start so only one CPU wins the reset
+    // race, preventing concurrent token refill on SMP (same as allow_rst).
+    let window_start = SYNACK_COOKIE_WINDOW_START.load(Ordering::Relaxed);
+    if window_start == 0 || now_ms.saturating_sub(window_start) >= SYNACK_COOKIE_RATE_WINDOW_MS {
+        if SYNACK_COOKIE_WINDOW_START
+            .compare_exchange(window_start, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            SYNACK_COOKIE_TOKENS.store(SYNACK_COOKIE_RATE_LIMIT, Ordering::Relaxed);
+        }
+    }
+
+    let mut tokens = SYNACK_COOKIE_TOKENS.load(Ordering::Relaxed);
+    while tokens > 0 {
+        match SYNACK_COOKIE_TOKENS.compare_exchange_weak(
+            tokens,
+            tokens - 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(current) => tokens = current,
+        }
+    }
+    false
+}
+
+// ============================================================================
 // R74-5 FIX: Global TCP Connection Counters
 // ============================================================================
+
 
 /// Global counter for half-open (SYN_RECEIVED) TCP connections.
 ///
@@ -3542,6 +3597,12 @@ impl SocketTable {
                             if force_syn_cookie
                                 || listen_state.syn_queue.len() >= listen_state.syn_backlog
                             {
+                                // R137-2 FIX: Rate limit stateless SYN-cookie SYN-ACK
+                                // generation to reduce spoofed-source reflection.
+                                if !allow_syn_cookie_ack(now_ms) {
+                                    return None;
+                                }
+
                                 // Generate SYN cookie ISN (encodes 4-tuple, time, MSS)
                                 SYN_COOKIES_GENERATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
                                 let cookie_iss = generate_syn_cookie_isn(
@@ -3768,6 +3829,10 @@ impl SocketTable {
                             self.dec_ns_count(listener.net_ns_id);
 
                             // Fall back to stateless SYN cookie SYN-ACK
+                            // R137-2 FIX: Rate limit fallback SYN-cookie path as well.
+                            if !allow_syn_cookie_ack(now_ms) {
+                                return None;
+                            }
                             SYN_COOKIES_GENERATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
                             let cookie_iss = generate_syn_cookie_isn(
                                 now_ms,
