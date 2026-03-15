@@ -533,14 +533,15 @@ pub struct Process {
     /// mmap 区域跟踪 (起始地址 -> 长度)
     pub mmap_regions: BTreeMap<usize, usize>,
 
-    /// R131-6 FIX: Per-task cgroup memory bytes independently charged via
+    /// R131-6: Per-task cgroup memory bytes independently charged via
     /// sys_mmap / sys_brk since this task was created or cloned.
     ///
-    /// CLONE_VM snapshots mmap_regions at clone time (R123-3), so a non-last
-    /// task's independent charges are invisible to the last-exit task's
-    /// snapshot.  This counter lets non-last tasks uncharge their own
-    /// independent charges on exit (keep_address_space=true) without
-    /// double-uncharging inherited snapshot entries.
+    /// R139-1 FIX: Do NOT uncharge these bytes on non-last CLONE_VM exit.
+    /// When `keep_address_space=true`, the backing pages remain mapped in the
+    /// shared page tables; uncharging would undercount cgroup `memory_current`
+    /// and enable `memory.max` bypass. We intentionally prefer safe over-
+    /// counting (leaked charges) over under-counting. The field is still
+    /// cleared on exit for bookkeeping cleanup.
     ///
     /// Invariant: uses saturating arithmetic — never underflows.
     pub vm_charged_bytes: u64,
@@ -3299,13 +3300,14 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
     //     snapshot of the parent's mmap_regions but never owned the charges;
     //     uncharging here would corrupt the parent's cgroup accounting.
     //
-    // R131-6 FIX: CLONE_VM snapshots mmap_regions at clone time (R123-3).
-    // A non-last task can independently charge cgroup memory via mmap()/brk(),
-    // then exit with keep_address_space=true.  Those charges would not appear
-    // in the last-exit task's snapshot and would otherwise leak permanently.
-    // Uncharging the full snapshot would double-uncharge inherited mappings,
-    // so non-last tasks instead uncharge only their own independent charges
-    // tracked in vm_charged_bytes.
+    // R139-1 FIX: CLONE_VM snapshots mmap_regions at clone time (R123-3).
+    // Non-last tasks may have `vm_charged_bytes` from mmap()/brk(), but when
+    // keep_address_space=true the shared page tables (and their backing
+    // physical pages) remain alive. Do NOT uncharge vm_charged_bytes on
+    // non-last CLONE_VM exit: it would drop cgroup memory_current without
+    // freeing physical memory, enabling memory.max bypass via accounting
+    // undercount. Prefer safe over-counting (possible leaked charges) over
+    // under-counting.
     //
     // Skip PROT_NONE reservations: they never allocated physical frames or
     // charged cgroup memory (R123-1 invariant INV-MM-PROT-NONE).
@@ -3344,15 +3346,12 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
             proc.elf_charged_bytes = 0;
         }
     } else if keep_address_space && proc.memory_space != 0 {
-        // R131-6 FIX: Non-last CLONE_VM task — uncharge only the bytes this
-        // task independently charged via sys_mmap/sys_brk after being cloned.
-        // This prevents permanent cgroup memory_current leaks without risking
-        // double-uncharge of inherited snapshot entries.
-        let charged = proc.vm_charged_bytes;
-        if charged > 0 {
-            crate::cgroup::uncharge_memory(proc.cgroup_id, charged);
-            proc.vm_charged_bytes = 0;
-        }
+        // R139-1 FIX: Non-last CLONE_VM exit keeps the shared address space.
+        // The pages backing vm_charged_bytes remain mapped in the shared page
+        // tables, so uncharging here would undercount cgroup memory_current
+        // and enable memory.max bypass. Keep the cgroup charge (safe over-
+        // counting) and only clear the per-task counter for cleanup.
+        proc.vm_charged_bytes = 0;
     }
 
     // 清理 mmap 区域跟踪

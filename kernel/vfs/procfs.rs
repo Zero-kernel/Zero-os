@@ -1122,7 +1122,7 @@ fn is_pid_visible_in_caller_ns(pid: u32) -> bool {
 ///
 /// Allow access if any of the following conditions are met:
 /// - Accessing own process (self)
-/// - Caller is root (euid 0)
+/// - Caller is host root (host euid 0)
 /// - Caller has same owner UID as target process
 ///
 /// R37-6 FIX: Removed same-GID check. Allowing same-GID access is a security
@@ -1140,9 +1140,11 @@ fn can_access_pid(pid: u32) -> bool {
     }
     // R134-1 FIX: Root check must use euid, not uid, matching POSIX semantics.
     // A process with euid==0 (via setuid) should have root-level /proc access.
+    // R139-2 FIX: Use host-mapped euid for the root bypass. Namespace root
+    // (ns-euid==0) must not get host-wide /proc access — same class as R135-1.
     let (cur_uid, _cur_gid) = get_current_creds();
-    let cur_euid = kernel_core::current_euid().unwrap_or(u32::MAX);
-    if cur_euid == 0 {
+    let cur_host_euid = kernel_core::current_host_euid().unwrap_or(u32::MAX);
+    if cur_host_euid == 0 {
         return true;
     }
     // R37-6 FIX: Only same UID can access; same GID is NOT sufficient
