@@ -349,7 +349,8 @@ fn process_ipv4(
     // R48-6 + R60: Process fragments through reassembly cache with anti-DoS limits
     let final_payload = if ip_hdr.is_fragment() {
         stats.inc_fragments_rx();
-        match reassemble_fragment(&ip_hdr, payload, now_ms) {
+        // R140-4 FIX: Pass net_ns_id to isolate fragment reassembly per namespace.
+        match reassemble_fragment(net_ns_id.raw(), &ip_hdr, payload, now_ms) {
             Ok(Some(reassembled)) => {
                 // Reassembly complete - use the reassembled payload
                 stats.inc_fragments_reassembled();

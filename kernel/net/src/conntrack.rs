@@ -35,6 +35,11 @@ use crate::ipv4::Ipv4Addr;
 /// Maximum entries in the conntrack table
 pub const CT_MAX_ENTRIES: usize = 65536;
 
+/// R140-9 FIX: Maximum entries per network namespace.
+/// Prevents a single namespace from monopolizing the global conntrack table.
+/// Set to 1/4 of global limit as a fair-share heuristic.
+const CT_MAX_ENTRIES_PER_NS: usize = 16384;
+
 /// TCP timeout values (milliseconds)
 pub const CT_TCP_TIMEOUT_SYN_SENT_MS: u64 = 60_000;
 pub const CT_TCP_TIMEOUT_SYN_RECV_MS: u64 = 60_000;
@@ -485,6 +490,8 @@ impl Ord for LruIndexEntry {
 pub struct ConntrackTable {
     /// Entry storage (BTreeMap for stable iteration during sweep)
     entries: RwLock<BTreeMap<FlowKey, Mutex<ConntrackEntry>>>,
+    /// R140-9 FIX: Per-namespace entry counts for fair quota enforcement.
+    ns_entry_counts: Mutex<BTreeMap<u64, usize>>,
     /// R65-3 FIX: Min-heap (via Reverse) for O(log n) LRU eviction
     lru_index: Mutex<BinaryHeap<Reverse<LruIndexEntry>>>,
     /// R65-3 FIX: Monotonic generation counter for LRU heap validation
@@ -498,6 +505,7 @@ impl ConntrackTable {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(BTreeMap::new()),
+            ns_entry_counts: Mutex::new(BTreeMap::new()),
             lru_index: Mutex::new(BinaryHeap::new()),
             lru_clock: AtomicU64::new(0),
             stats: ConntrackStats::new(),
@@ -751,6 +759,22 @@ impl ConntrackTable {
             }
         }
 
+        // R140-9 FIX: Enforce per-namespace conntrack entry limit.
+        // Prevents a single network namespace from monopolizing the global table.
+        {
+            let ns_counts = self.ns_entry_counts.lock();
+            let ns_count = ns_counts.get(&key.net_ns_id).copied().unwrap_or(0);
+            if ns_count >= CT_MAX_ENTRIES_PER_NS {
+                drop(ns_counts);
+                self.stats.insert_failed.fetch_add(1, Ordering::Relaxed);
+                return CtUpdateResult {
+                    decision: CtDecision::Invalid,
+                    state: CtProtoState::Other,
+                    dir,
+                };
+            }
+        }
+
         // R63-1 FIX: Pass initiator_dir to track the true connection initiator.
         // The first packet's direction (dir) is the initiator direction.
         let mut entry = ConntrackEntry::new(key, initial_state, now_ms, dir);
@@ -763,6 +787,11 @@ impl ConntrackTable {
         let last_seen_ms = entry.last_seen_ms;
 
         entries.insert(key, Mutex::new(entry));
+        // R140-9 FIX: Increment per-namespace entry count.
+        {
+            let mut ns_counts = self.ns_entry_counts.lock();
+            *ns_counts.entry(key.net_ns_id).or_insert(0) += 1;
+        }
         self.stats.entries_created.fetch_add(1, Ordering::Relaxed);
         self.stats.current_entries.fetch_add(1, Ordering::Relaxed);
 
@@ -867,6 +896,13 @@ impl ConntrackTable {
             {
                 CtDecision::Invalid
             }
+            // R140-2 FIX: Non-SYN packets (ACK, data) remaining in Close/TimeWait
+            // are also invalid.  The R95-2 fix blocked SYN tuple reuse but non-SYN
+            // packets in teardown states still fell through to Established, allowing
+            // post-RST traffic to bypass firewall DROP rules via the ESTABLISHED
+            // accept rule.
+            (TcpCtState::Close, TcpCtState::Close)
+            | (TcpCtState::TimeWait, TcpCtState::TimeWait) => CtDecision::Invalid,
             _ => CtDecision::Established,
         };
         (CtProtoState::Tcp(new_state), decision)
@@ -906,6 +942,8 @@ impl ConntrackTable {
         if entries.remove(key).is_some() {
             self.stats.entries_deleted.fetch_add(1, Ordering::Relaxed);
             self.stats.current_entries.fetch_sub(1, Ordering::Relaxed);
+            // R140-9 FIX: Decrement per-namespace entry count.
+            self.dec_ns_entry_count(key.net_ns_id);
             true
         } else {
             false
@@ -919,6 +957,17 @@ impl ConntrackTable {
     ///
     /// # Returns
     ///
+    /// R140-9 FIX: Decrement the per-namespace entry count for a removed entry.
+    fn dec_ns_entry_count(&self, ns_id: u64) {
+        let mut counts = self.ns_entry_counts.lock();
+        if let Some(c) = counts.get_mut(&ns_id) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                counts.remove(&ns_id);
+            }
+        }
+    }
+
     /// `true` if an entry was evicted, `false` if the table is empty.
     /// R65-3 FIX: Evict the least-recently-seen entry (LRU) in O(log n) using heap index.
     ///
@@ -945,6 +994,8 @@ impl ConntrackTable {
                 if entry.lru_gen == victim.generation && entry.last_seen_ms == victim.last_seen_ms {
                     drop(entry);
                     entries.remove(&victim.key);
+                    // R140-9 FIX: Decrement per-namespace entry count.
+                    self.dec_ns_entry_count(victim.key.net_ns_id);
                     self.stats.entries_deleted.fetch_add(1, Ordering::Relaxed);
                     self.stats.evictions.fetch_add(1, Ordering::Relaxed);
                     self.stats.current_entries.fetch_sub(1, Ordering::Relaxed);
@@ -989,6 +1040,8 @@ impl ConntrackTable {
                 // R65-4 FIX: Check if entry actually existed before counting
                 if entries.remove(key).is_some() {
                     actually_removed += 1;
+                    // R140-9 FIX: Decrement per-namespace entry count.
+                    self.dec_ns_entry_count(key.net_ns_id);
                 }
             }
             if actually_removed > 0 {

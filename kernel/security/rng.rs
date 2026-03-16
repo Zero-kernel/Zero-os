@@ -30,6 +30,8 @@ use core::hint::spin_loop;
 use lazy_static::lazy_static;
 use spin::Mutex;
 
+use crate::fips::{fips_state, FipsState};
+
 /// RNG errors
 #[derive(Debug, Clone, Copy)]
 pub enum RngError {
@@ -41,6 +43,8 @@ pub enum RngError {
     InsufficientEntropy,
     /// RNG not initialized
     NotInitialized,
+    /// R140-6 FIX: FIPS state is Failed/corrupted — all crypto blocked (fail-closed).
+    FipsBlocked,
     /// Reseed required (too many bytes generated without reseeding)
     ReseedRequired,
 }
@@ -140,6 +144,16 @@ pub fn is_ready() -> bool {
 /// entropy mix-in, so transient entropy failures will be retried on
 /// subsequent calls rather than silently continuing without reseeding.
 pub fn fill_random(out: &mut [u8]) -> Result<(), RngError> {
+    // R140-6 FIX: ChaCha20 is not FIPS 140-2/140-3 approved.
+    // Follow the kdump pattern (R93-15): check FIPS state before using ChaCha20.
+    //  - Enabled: fall back to direct hardware entropy (RDRAND/RDSEED)
+    //  - Failed:  fail closed — no crypto operations in indeterminate state
+    //  - Disabled: proceed normally with ChaCha20 CSPRNG
+    match fips_state() {
+        FipsState::Enabled => return fill_entropy(out),
+        FipsState::Failed => return Err(RngError::FipsBlocked),
+        FipsState::Disabled => {}
+    }
     for chunk in out.chunks_mut(RNG_FILL_CHUNK_SIZE) {
         let mut guard = GLOBAL_RNG.lock();
         let rng = guard.as_mut().ok_or(RngError::NotInitialized)?;
@@ -182,6 +196,13 @@ pub fn fill_random(out: &mut [u8]) -> Result<(), RngError> {
 /// we now fall back to direct hardware entropy. This ensures kdump can
 /// always get entropy for encryption, avoiding plaintext dumps.
 pub fn try_fill_random(out: &mut [u8]) -> Result<(), RngError> {
+    // R140-6 FIX: Same FIPS gate as fill_random().
+    match fips_state() {
+        FipsState::Enabled => return fill_entropy(out),
+        FipsState::Failed => return Err(RngError::FipsBlocked),
+        FipsState::Disabled => {}
+    }
+
     // First, try the CSPRNG if it's available without blocking.
     if let Some(mut guard) = GLOBAL_RNG.try_lock() {
         if let Some(rng) = guard.as_mut() {

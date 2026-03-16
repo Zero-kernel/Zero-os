@@ -44,6 +44,15 @@ use crate::process::FileOps;
 /// Maximum mount namespace nesting depth (Linux default is 32)
 pub const MAX_MNT_NS_LEVEL: u8 = 32;
 
+/// R140-3 FIX: Maximum number of mount namespaces allowed system-wide.
+/// Prevents DoS via unbounded flat fan-out namespace creation exhausting kernel
+/// heap (each namespace eagerly materializes a VFS mount table clone). Matches
+/// the limit used by PID/IPC/NET/USER namespaces.
+pub const MAX_MNT_NS_COUNT: u32 = 1024;
+
+/// R140-3 FIX: Current mount namespace count (root namespace starts at 1).
+static MNT_NS_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
 // ============================================================================
 // Mount Flags
 // ============================================================================
@@ -84,6 +93,8 @@ bitflags::bitflags! {
 pub enum MountNsError {
     /// Maximum namespace nesting depth exceeded
     MaxDepthExceeded,
+    /// R140-3 FIX: Maximum system-wide namespace count exceeded
+    MaxCountExceeded,
     /// Namespace is shutting down
     NamespaceShuttingDown,
     /// Mount point already exists at the specified path
@@ -146,9 +157,25 @@ impl MountNamespace {
             return Err(MountNsError::MaxDepthExceeded);
         }
 
+        // R140-3 FIX: Enforce system-wide mount namespace count limit.
+        // CAS loop: atomically increment count only if below MAX_MNT_NS_COUNT.
+        MNT_NS_COUNT
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                if count >= MAX_MNT_NS_COUNT {
+                    None // Reject — limit exceeded
+                } else {
+                    Some(count + 1)
+                }
+            })
+            .map_err(|_| MountNsError::MaxCountExceeded)?;
+
         let id = NEXT_MNT_NS_ID
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
-            .map_err(|_| MountNsError::NoMemory)?;
+            .map_err(|_| {
+                // R140-3 FIX: Rollback count increment on ID allocation failure.
+                MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
+                MountNsError::NoMemory
+            })?;
 
         let child = Arc::new(Self {
             id: NamespaceId::new(id),
@@ -195,6 +222,18 @@ impl MountNamespace {
         *self.root_path.write() = path;
     }
 
+}
+
+/// R140-3 FIX: Decrement mount namespace count when a namespace is dropped.
+/// This ensures the count stays accurate as namespaces are destroyed,
+/// allowing new namespaces to be created up to the MAX_MNT_NS_COUNT limit.
+impl Drop for MountNamespace {
+    fn drop(&mut self) {
+        // Don't decrement for root namespace (it's counted in the initial value)
+        if !self.is_root() {
+            MNT_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 impl core::fmt::Debug for MountNamespace {

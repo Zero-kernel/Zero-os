@@ -27,6 +27,10 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use security::SecurityConfig;
 use spin::Once;
 
+// R140-6 FIX: FipsState and fips_state() now live in security::fips so that
+// the RNG module can enforce FIPS policy without a circular dependency.
+pub use security::fips::{fips_state, FipsState};
+
 // ============================================================================
 // Hardening Profiles
 // ============================================================================
@@ -372,21 +376,6 @@ pub fn is_profile_locked() -> bool {
 // FIPS Mode
 // ============================================================================
 
-/// FIPS mode states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FipsState {
-    /// FIPS mode not enabled.
-    Disabled = 0,
-    /// FIPS mode enabled (sticky until reboot).
-    Enabled = 1,
-    /// FIPS mode enable failed (e.g., self-test failure).
-    Failed = 2,
-}
-
-/// Global FIPS mode flag (sticky once enabled).
-static FIPS_MODE: AtomicU8 = AtomicU8::new(FipsState::Disabled as u8);
-
 /// R93-1 FIX: Serialize FIPS enable attempts to avoid races between callers.
 static FIPS_ENABLING: AtomicBool = AtomicBool::new(false);
 
@@ -452,13 +441,13 @@ pub fn enable_fips_mode() -> Result<(), FipsError> {
 
     // Run self-tests (placeholder - real implementation would test crypto)
     if !run_fips_self_tests() {
-        FIPS_MODE.store(FipsState::Failed as u8, Ordering::Release);
+        security::fips::set_fips_state(FipsState::Failed);
         emit_fips_audit_event(false, "self-test failed");
         return Err(FipsError::SelfTestFailed);
     }
 
     // Enable FIPS mode (sticky)
-    FIPS_MODE.store(FipsState::Enabled as u8, Ordering::Release);
+    security::fips::set_fips_state(FipsState::Enabled);
     emit_fips_audit_event(true, "enabled");
 
     Ok(())
@@ -478,25 +467,6 @@ pub fn enable_fips_mode() -> Result<(), FipsError> {
 #[inline]
 pub fn is_fips_enabled() -> bool {
     fips_state() == FipsState::Enabled
-}
-
-/// Get the current FIPS state.
-///
-/// # R94-3 FIX: Fail-Closed on Corruption
-///
-/// Unknown/corrupted atomic values now return `Failed` instead of `Disabled`.
-/// Previously, a corrupted FIPS_MODE value (e.g., from bit-flip or memory corruption)
-/// would fall back to `Disabled`, effectively bypassing FIPS enforcement.
-/// Now, any indeterminate state is treated as a failure, blocking all non-FIPS
-/// algorithms and requiring explicit re-initialization.
-pub fn fips_state() -> FipsState {
-    match FIPS_MODE.load(Ordering::Acquire) {
-        0 => FipsState::Disabled,
-        1 => FipsState::Enabled,
-        2 => FipsState::Failed,
-        // R94-3 FIX: Fail-closed — corrupted value treated as failure, not disabled.
-        _ => FipsState::Failed,
-    }
 }
 
 /// Check if an algorithm is permitted under current FIPS policy.

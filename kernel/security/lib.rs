@@ -34,6 +34,7 @@ extern crate drivers;
 #[macro_use]
 extern crate klog;
 
+pub mod fips;
 pub mod kaslr;
 pub mod kptr;
 pub mod memory_hardening;

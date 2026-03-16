@@ -1699,6 +1699,76 @@ pub fn address_space_share_count(memory_space: usize) -> usize {
         .count()
 }
 
+/// R140-1 FIX: Synchronize mmap_regions removal across all tasks sharing the
+/// same address space (CLONE_VM siblings).
+///
+/// Under CLONE_VM, page tables are shared but `mmap_regions` is snapshotted
+/// per-task (D3-ARC-MM-SHARED design limitation). When one sibling munmaps a
+/// region and uncharges the cgroup, other siblings retain a stale record of
+/// the region. If the last sibling exits with this stale record, it will
+/// double-uncharge the cgroup (`memory_current` undercount → `memory.max`
+/// bypass).
+///
+/// This function removes the given base address from ALL tasks that share
+/// `memory_space`, preventing the stale-record double-uncharge.
+///
+/// Must be called AFTER the current task's mmap_regions removal AND before the
+/// cgroup uncharge (sync must complete before charge is released).
+///
+/// # Arguments
+///
+/// * `memory_space` - Physical address of the shared PML4 (CR3 value)
+/// * `addr` - Base address of the munmapped region to remove
+/// * `caller_pid` - PID of the caller (already handled, skip)
+pub fn sync_vm_siblings_remove_mmap(memory_space: usize, addr: usize, caller_pid: ProcessId) {
+    if memory_space == 0 {
+        return;
+    }
+    let table = PROCESS_TABLE.lock();
+    for (idx, slot) in table.iter().enumerate() {
+        if idx == caller_pid {
+            continue; // Already handled by caller
+        }
+        if let Some(proc_arc) = slot {
+            let mut proc = proc_arc.lock();
+            if proc.memory_space == memory_space && proc.state != ProcessState::Terminated {
+                proc.mmap_regions.remove(&addr);
+            }
+        }
+    }
+}
+
+/// R140-1 FIX: Synchronize brk value across all tasks sharing the same
+/// address space (CLONE_VM siblings).
+///
+/// Same rationale as `sync_vm_siblings_remove_mmap`: under CLONE_VM, `brk` is
+/// snapshotted per-task. If one sibling shrinks the heap and uncharges, other
+/// siblings retain a stale (higher) brk value. The last sibling to exit would
+/// uncharge based on the stale brk, causing cgroup `memory_current` undercount.
+///
+/// # Arguments
+///
+/// * `memory_space` - Physical address of the shared PML4
+/// * `new_brk` - New brk value to propagate
+/// * `caller_pid` - PID of the caller (already handled, skip)
+pub fn sync_vm_siblings_brk(memory_space: usize, new_brk: usize, caller_pid: ProcessId) {
+    if memory_space == 0 {
+        return;
+    }
+    let table = PROCESS_TABLE.lock();
+    for (idx, slot) in table.iter().enumerate() {
+        if idx == caller_pid {
+            continue;
+        }
+        if let Some(proc_arc) = slot {
+            let mut proc = proc_arc.lock();
+            if proc.memory_space == memory_space && proc.state != ProcessState::Terminated {
+                proc.brk = new_brk;
+            }
+        }
+    }
+}
+
 /// R37-1 FIX (Codex review): Count CLONE_VM siblings that are NOT in the same thread group.
 ///
 /// CLONE_THREAD siblings share memory_space AND have the same tgid - these can be TSYNC'd.

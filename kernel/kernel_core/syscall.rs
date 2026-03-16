@@ -5817,13 +5817,22 @@ fn sys_brk(addr: usize) -> SyscallResult {
         }
 
         // 更新进程 brk 并释放内存计费
-        let mut proc = process.lock();
-        proc.brk = addr;
-        // R131-6 FIX: Track brk shrink in per-task charge counter.
-        proc.vm_charged_bytes = proc
-            .vm_charged_bytes
-            .saturating_sub(shrink_size as u64);
-        drop(proc);
+        let memory_space = {
+            let mut proc = process.lock();
+            proc.brk = addr;
+            // R131-6 FIX: Track brk shrink in per-task charge counter.
+            proc.vm_charged_bytes = proc
+                .vm_charged_bytes
+                .saturating_sub(shrink_size as u64);
+            let ms = proc.memory_space;
+            drop(proc);
+            ms
+        };
+
+        // R140-1 FIX: Sync brk across CLONE_VM siblings. Without this, siblings
+        // retain stale (higher) brk values and the last-exit would double-uncharge
+        // the cgroup for the difference (memory_current undercount → memory.max bypass).
+        crate::process::sync_vm_siblings_brk(memory_space, addr, pid);
 
         // F.2 Cgroup: Uncharge memory after successful heap shrink
         cgroup::uncharge_memory(cgroup_id, shrink_size as u64);
@@ -6265,7 +6274,7 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     }
 
     // Phase 3: Remove the PCB record now that PT operations completed successfully.
-    {
+    let memory_space = {
         let mut proc = process.lock();
         proc.mmap_regions.remove(&addr);
         // R131-6 FIX: Decrement per-task charge tracker so non-last CLONE_VM
@@ -6276,7 +6285,14 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
                 .vm_charged_bytes
                 .saturating_sub(recorded_length as u64);
         }
-    }
+        proc.memory_space
+    };
+
+    // R140-1 FIX: Remove the stale mmap_regions entry from ALL CLONE_VM siblings.
+    // Without this, the last sibling to exit would iterate its stale mmap_regions,
+    // find this already-munmapped/uncharged region, and double-uncharge the cgroup
+    // (memory_current undercount → memory.max bypass).
+    crate::process::sync_vm_siblings_remove_mmap(memory_space, addr, pid);
 
     // F.2 Cgroup: Atomically uncharge memory after successful munmap.
     // R123-1 FIX: PROT_NONE reservations never allocated frames or charged
@@ -7325,6 +7341,8 @@ fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> SyscallResult {
     let mut tmp = vec![0u8; count];
     match rng::fill_random(&mut tmp) {
         Ok(()) => {}
+        // R140-6 FIX: FIPS state failed/corrupted — deny all crypto.
+        Err(rng::RngError::FipsBlocked) => return Err(SyscallError::EPERM),
         Err(rng::RngError::NotInitialized) => {
             // 懒初始化 CSPRNG；非阻塞模式遵循 Linux 语义返回 EAGAIN
             if flags & GRND_NONBLOCK != 0 {

@@ -1061,26 +1061,6 @@ fn get_current_pid() -> u32 {
     process::current_pid().unwrap_or(0) as u32
 }
 
-/// Get current process credentials (uid, gid)
-///
-/// R31-1 FIX: Returns (0, 0) if no current process (kernel context)
-fn get_current_creds() -> (u32, u32) {
-    let pid = process::current_pid().unwrap_or(0);
-    if pid == 0 {
-        return (0, 0);
-    }
-    let table = PROCESS_TABLE.lock();
-    match table.get(pid) {
-        Some(Some(proc)) => {
-            let p = proc.lock();
-            // R39-3 FIX: 使用共享凭证读取 uid/gid
-            let creds = p.credentials.read();
-            (creds.uid, creds.gid)
-        }
-        _ => (0, 0),
-    }
-}
-
 /// R134-1 FIX: Check whether `pid` is visible from the caller's PID namespace.
 ///
 /// A process is visible if it belongs to the caller's owning namespace or any
@@ -1123,7 +1103,7 @@ fn is_pid_visible_in_caller_ns(pid: u32) -> bool {
 /// Allow access if any of the following conditions are met:
 /// - Accessing own process (self)
 /// - Caller is host root (host euid 0)
-/// - Caller has same owner UID as target process
+/// - Caller has same owner UID as target process (host-mapped)
 ///
 /// R37-6 FIX: Removed same-GID check. Allowing same-GID access is a security
 /// vulnerability that lets group members snoop on each other's process info.
@@ -1132,9 +1112,10 @@ fn can_access_pid(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    let cur_pid = process::current_pid();
     // Self access is always allowed
-    if let Some(cur_pid) = process::current_pid() {
-        if cur_pid as u32 == pid {
+    if let Some(cp) = cur_pid {
+        if cp as u32 == pid {
             return true;
         }
     }
@@ -1142,14 +1123,23 @@ fn can_access_pid(pid: u32) -> bool {
     // A process with euid==0 (via setuid) should have root-level /proc access.
     // R139-2 FIX: Use host-mapped euid for the root bypass. Namespace root
     // (ns-euid==0) must not get host-wide /proc access — same class as R135-1.
-    let (cur_uid, _cur_gid) = get_current_creds();
     let cur_host_euid = kernel_core::current_host_euid().unwrap_or(u32::MAX);
     if cur_host_euid == 0 {
         return true;
     }
     // R37-6 FIX: Only same UID can access; same GID is NOT sufficient
-    let (owner_uid, _owner_gid) = get_process_owner(pid);
-    cur_uid == owner_uid
+    // R140-5 FIX: Use host-mapped UIDs for both caller and target to prevent
+    // cross-user-namespace collisions.  Two processes in different user namespaces
+    // can have the same numeric UID (e.g., both mapped to 1000) but correspond to
+    // completely different host users.
+    // Codex review: use Option-based comparison — if either UID is unmapped,
+    // deny access rather than risking a false match on OVERFLOW_UID.
+    let cur_host_uid = cur_pid.and_then(|cp| get_process_host_uid_opt(cp as u32));
+    let target_host_uid = get_process_host_uid_opt(pid);
+    match (cur_host_uid, target_host_uid) {
+        (Some(cur), Some(target)) => cur == target,
+        _ => false, // Unmapped UID on either side → deny
+    }
 }
 
 /// Check if a process exists
@@ -1231,6 +1221,37 @@ fn get_process_owner(pid: u32) -> (u32, u32) {
     }
 }
 
+/// R140-5 FIX: Map a process's UID through its user namespace to obtain the host UID.
+///
+/// Returns `None` if the process doesn't exist or the UID has no mapping in the
+/// user namespace.  Callers should treat `None` as "deny" rather than collapsing
+/// to a sentinel value (Codex review: prevents false match on OVERFLOW_UID).
+///
+/// Drops PROCESS_TABLE lock before calling into user_ns to avoid lock ordering issues
+/// (same pattern as current_host_euid() in process.rs:1918).
+fn get_process_host_uid_opt(pid: u32) -> Option<u32> {
+    if pid == 0 {
+        return None;
+    }
+
+    let table = PROCESS_TABLE.lock();
+    let (ns_uid, user_ns) = match table.get(pid as usize) {
+        Some(Some(proc)) => {
+            let p = proc.lock();
+            let ns_uid = p.credentials.read().uid;
+            let user_ns = p.user_ns.clone();
+            (ns_uid, user_ns)
+        }
+        _ => return None,
+    };
+
+    // Drop PROCESS_TABLE lock before mapping to avoid holding it across
+    // user_ns operations (follows established lock ordering pattern).
+    drop(table);
+
+    user_ns.map_uid_from_ns(ns_uid)
+}
+
 /// Get process command line
 ///
 /// R29-1 FIX: Now returns actual process name from PCB
@@ -1301,6 +1322,17 @@ fn generate_status(pid: u32) -> String {
     }
 
     let table = PROCESS_TABLE.lock();
+
+    // R140-7 FIX: Resolve the caller's owning PID namespace so that PIDs
+    // emitted in /proc/[pid]/status are namespace-local, not global kernel PIDs.
+    let caller_ns = process::current_pid()
+        .and_then(|cur_pid| table.get(cur_pid))
+        .and_then(|slot| slot.as_ref())
+        .and_then(|proc_arc| {
+            let p = proc_arc.lock();
+            kernel_core::owning_namespace(&p.pid_ns_chain)
+        });
+
     match table.get(pid as usize) {
         Some(Some(proc)) => {
             let p = proc.lock();
@@ -1316,6 +1348,20 @@ fn generate_status(pid: u32) -> String {
             };
             // R39-3 FIX: 使用共享凭证读取 uid/gid/euid/egid
             let creds = p.credentials.read();
+
+            // R140-7 FIX: Emit namespace-local PIDs as seen from the caller's
+            // owning PID namespace.  Cross-namespace parents are shown as 0.
+            let (ns_tgid, ns_pid, ns_ppid) = if let Some(ref ns) = caller_ns {
+                (
+                    kernel_core::pid_in_namespace(ns, p.tgid).unwrap_or(0),
+                    kernel_core::pid_in_namespace(ns, p.pid).unwrap_or(0),
+                    kernel_core::pid_in_namespace(ns, p.ppid).unwrap_or(0),
+                )
+            } else {
+                // Kernel context (no namespace): global view.
+                (p.tgid, p.pid, p.ppid)
+            };
+
             format!(
                 "Name:\t{}\n\
                  Umask:\t{:04o}\n\
@@ -1330,9 +1376,9 @@ fn generate_status(pid: u32) -> String {
                 p.umask,
                 state_char,
                 state_name,
-                p.tgid,
-                p.pid,
-                p.ppid,
+                ns_tgid,
+                ns_pid,
+                ns_ppid,
                 creds.uid,
                 creds.euid,
                 creds.uid,
@@ -1356,6 +1402,16 @@ fn generate_stat(pid: u32) -> String {
     }
 
     let table = PROCESS_TABLE.lock();
+
+    // R140-7 FIX: Resolve the caller's owning PID namespace for PID translation.
+    let caller_ns = process::current_pid()
+        .and_then(|cur_pid| table.get(cur_pid))
+        .and_then(|slot| slot.as_ref())
+        .and_then(|proc_arc| {
+            let p = proc_arc.lock();
+            kernel_core::owning_namespace(&p.pid_ns_chain)
+        });
+
     match table.get(pid as usize) {
         Some(Some(proc)) => {
             let p = proc.lock();
@@ -1368,15 +1424,26 @@ fn generate_stat(pid: u32) -> String {
                 ProcessState::Ready | ProcessState::Running => 'R',
                 ProcessState::Blocked | ProcessState::Sleeping => 'S',
             };
+
+            // R140-7 FIX: Emit namespace-local PIDs.
+            let (ns_pid, ns_ppid) = if let Some(ref ns) = caller_ns {
+                (
+                    kernel_core::pid_in_namespace(ns, p.pid).unwrap_or(0),
+                    kernel_core::pid_in_namespace(ns, p.ppid).unwrap_or(0),
+                )
+            } else {
+                (p.pid, p.ppid)
+            };
+
             // Minimal stat format: pid (comm) state ppid pgrp session tty_nr ...
             format!(
                 "{} ({}) {} {} {} {} 0 -1 0 0 0 0 0 0 0 0 {} 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-                p.pid,
+                ns_pid,
                 p.name,
                 state_char,
-                p.ppid,
-                p.pid, // pgrp = pid for now
-                p.pid, // session = pid for now
+                ns_ppid,
+                ns_pid, // pgrp = pid for now
+                ns_pid, // session = pid for now
                 p.priority,
             )
         }
@@ -1471,7 +1538,57 @@ fn generate_maps(pid: u32) -> String {
 /// Generate /proc/meminfo content
 ///
 /// Shows real memory statistics from the buddy allocator and page cache.
+/// R140-8 FIX: When the calling process is in a non-root cgroup with a
+/// configured memory.max, returns cgroup-relative totals instead of
+/// host-global physical memory stats.  This prevents namespaced containers
+/// from fingerprinting the host or detecting co-residency.
 fn generate_meminfo() -> String {
+    // R140-8 FIX: Virtualize for cgroup-limited containers.
+    if let Some(cgroup_id) = process::current_cgroup_id() {
+        if cgroup_id != 0 {
+            if let Some(cgroup) = kernel_core::cgroup::lookup_cgroup(cgroup_id) {
+                let limits = cgroup.limits();
+                if let Some(memory_max) = limits.memory_max {
+                    // Treat u64::MAX as "no limit" (Linux cgroup2 "max" semantics).
+                    if memory_max != u64::MAX {
+                        let snap = cgroup.get_stats();
+                        let memory_current = snap.memory_current;
+
+                        let total_kb = (memory_max / 1024) as usize;
+                        let used_kb = (memory_current / 1024) as usize;
+                        let free_kb = (memory_max.saturating_sub(memory_current) / 1024) as usize;
+
+                        return format!(
+                            "MemTotal:       {:8} kB\n\
+                             MemFree:        {:8} kB\n\
+                             MemAvailable:   {:8} kB\n\
+                             Buffers:        {:8} kB\n\
+                             Cached:         {:8} kB\n\
+                             SwapTotal:      {:8} kB\n\
+                             SwapFree:       {:8} kB\n\
+                             Active:         {:8} kB\n\
+                             Inactive:       {:8} kB\n\
+                             Dirty:          {:8} kB\n\
+                             KernelHeap:     {:8} kB\n",
+                            total_kb,
+                            free_kb,
+                            free_kb, // MemAvailable ~= MemFree in cgroup view
+                            0,       // Buffers: not tracked per-cgroup
+                            0,       // Cached: not tracked per-cgroup
+                            0,       // SwapTotal
+                            0,       // SwapFree
+                            used_kb, // Active ~= memory.current
+                            0,       // Inactive
+                            0,       // Dirty
+                            0,       // KernelHeap: host-global, not exposed
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Root cgroup or no memory limit: show host-global stats (original behavior).
     let mem_stats = FrameAllocator::new().stats();
     let cache_stats = PAGE_CACHE.stats();
 

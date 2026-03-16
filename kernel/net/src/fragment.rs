@@ -210,9 +210,15 @@ pub enum FragmentDropReason {
 /// Key to identify a fragment reassembly queue
 ///
 /// Per RFC 791, fragments are identified by (src, dst, protocol, identification).
+/// R140-4 FIX: Include net_ns_id so that fragment reassembly is isolated per
+/// network namespace.  Without this, overlapping private IP address spaces in
+/// different namespaces can cause cross-namespace fragment injection or DoS via
+/// global queue exhaustion.
 /// Ord is derived to allow direct use as BTreeMap key (avoiding lossy u64 packing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FragmentKey {
+    /// R140-4 FIX: Network namespace ID for cross-namespace isolation.
+    pub net_ns_id: u64,
     pub src: [u8; 4],
     pub dst: [u8; 4],
     pub protocol: u8,
@@ -220,9 +226,10 @@ pub struct FragmentKey {
 }
 
 impl FragmentKey {
-    /// Create key from IPv4 header
-    pub fn from_header(hdr: &Ipv4Header) -> Self {
+    /// Create key from IPv4 header within a specific network namespace.
+    pub fn from_header(net_ns_id: u64, hdr: &Ipv4Header) -> Self {
         Self {
+            net_ns_id,
             src: hdr.src.octets(),
             dst: hdr.dst.octets(),
             protocol: hdr.protocol,
@@ -586,6 +593,7 @@ impl FragmentCache {
     /// - Err(reason) if fragment was dropped
     pub fn process_fragment(
         &self,
+        net_ns_id: u64,
         header: &Ipv4Header,
         payload: &[u8],
         now_ms: u64,
@@ -594,7 +602,8 @@ impl FragmentCache {
             .fragments_received
             .fetch_add(1, Ordering::Relaxed);
 
-        let key = FragmentKey::from_header(header);
+        // R140-4 FIX: Include net_ns_id in key to isolate reassembly per namespace.
+        let key = FragmentKey::from_header(net_ns_id, header);
         let src_ip = key.src_ip();
 
         // Fragment offset is in 8-byte units
@@ -970,12 +979,14 @@ pub fn fragment_cache() -> &'static FragmentCache {
 /// Process an incoming IP fragment
 ///
 /// Convenience wrapper around fragment_cache().process_fragment()
+/// R140-4 FIX: Requires network namespace ID for per-namespace isolation.
 pub fn process_fragment(
+    net_ns_id: u64,
     header: &Ipv4Header,
     payload: &[u8],
     now_ms: u64,
 ) -> Result<Option<Vec<u8>>, FragmentDropReason> {
-    fragment_cache().process_fragment(header, payload, now_ms)
+    fragment_cache().process_fragment(net_ns_id, header, payload, now_ms)
 }
 
 /// Run fragment timeout cleanup
@@ -1015,7 +1026,9 @@ mod tests {
     #[test]
     fn test_fragment_key() {
         let hdr = make_header([10, 0, 0, 1], 0x1234, 0, true);
-        let key = FragmentKey::from_header(&hdr);
+        // R140-4 FIX: FragmentKey now includes net_ns_id
+        let key = FragmentKey::from_header(42, &hdr);
+        assert_eq!(key.net_ns_id, 42);
         assert_eq!(key.src, [10, 0, 0, 1]);
         assert_eq!(key.identification, 0x1234);
     }
@@ -1033,11 +1046,11 @@ mod tests {
         let hdr2 = make_header([10, 0, 0, 1], 0x1234, 2, false);
         let data2 = [2u8; 16]; // 16 bytes at offset 16
 
-        let result1 = cache.process_fragment(&hdr1, &data1, now);
+        let result1 = cache.process_fragment(1, &hdr1, &data1, now);
         assert!(result1.is_ok());
         assert!(result1.unwrap().is_none());
 
-        let result2 = cache.process_fragment(&hdr2, &data2, now);
+        let result2 = cache.process_fragment(1, &hdr2, &data2, now);
         assert!(result2.is_ok());
         let reassembled = result2.unwrap();
         assert!(reassembled.is_some());
@@ -1061,8 +1074,8 @@ mod tests {
         let hdr2 = make_header([10, 0, 0, 1], 0x5678, 1, true);
         let data2 = [2u8; 16];
 
-        let _ = cache.process_fragment(&hdr1, &data1, now);
-        let result2 = cache.process_fragment(&hdr2, &data2, now);
+        let _ = cache.process_fragment(1, &hdr1, &data1, now);
+        let result2 = cache.process_fragment(1, &hdr2, &data2, now);
 
         assert!(result2.is_err());
         assert_eq!(result2.unwrap_err(), FragmentDropReason::Overlap);
@@ -1077,7 +1090,7 @@ mod tests {
         let hdr = make_header([10, 0, 0, 1], 0x9ABC, 0, true);
         let data = [1u8; 4];
 
-        let result = cache.process_fragment(&hdr, &data, now);
+        let result = cache.process_fragment(1, &hdr, &data, now);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), FragmentDropReason::FirstTooSmall);
     }
