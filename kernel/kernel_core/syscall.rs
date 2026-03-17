@@ -5761,12 +5761,22 @@ fn sys_brk(addr: usize) -> SyscallResult {
         }
 
         // 更新进程 brk
-        let mut proc = process.lock();
-        proc.brk = addr;
-        // R131-6 FIX: Track brk growth in per-task charge counter.
-        proc.vm_charged_bytes = proc
-            .vm_charged_bytes
-            .saturating_add(grow_size as u64);
+        let memory_space = {
+            let mut proc = process.lock();
+            proc.brk = addr;
+            // R131-6 FIX: Track brk growth in per-task charge counter.
+            proc.vm_charged_bytes = proc
+                .vm_charged_bytes
+                .saturating_add(grow_size as u64);
+            proc.memory_space
+        };
+
+        // R141-1 FIX: Sync brk growth across CLONE_VM siblings. Without this,
+        // siblings retain a stale (lower) brk. If the last sibling to exit has
+        // the stale brk, it uncharges less than was charged → permanent
+        // memory_current inflation (cgroup DoS).
+        crate::process::sync_vm_siblings_brk(memory_space, addr, pid);
+
         Ok(addr)
     }
     // 堆收缩
@@ -6009,14 +6019,19 @@ fn sys_mmap(
     // demand allocation. The mmap_regions entry is committed with the
     // PROT_NONE flag so munmap/exit know not to uncharge or free frames.
     if is_prot_none {
-        {
+        let len_with_flags = length_aligned | MMAP_REGION_FLAG_PROT_NONE;
+        let memory_space = {
             let mut proc = process.lock();
-            proc.mmap_regions
-                .insert(base, length_aligned | MMAP_REGION_FLAG_PROT_NONE);
+            proc.mmap_regions.insert(base, len_with_flags);
             if proc.next_mmap_addr < end {
                 proc.next_mmap_addr = end;
             }
-        }
+            proc.memory_space
+        };
+
+        // R141-1 FIX: Propagate the PROT_NONE reservation to all CLONE_VM siblings
+        // so last-exit accounting and munmap are consistent across tasks.
+        crate::process::sync_vm_siblings_add_mmap(memory_space, base, len_with_flags, pid);
 
         kprintln!(
             "sys_mmap: pid={}, reserved {} bytes at 0x{:x} (PROT_NONE, no frames)",
@@ -6126,7 +6141,7 @@ fn sys_mmap(
 
     // Phase 3: Commit the reservation by clearing the PENDING_MAP flag.
     // The entry transitions from (length | PENDING_MAP) to plain length.
-    {
+    let memory_space = {
         let mut proc = process.lock();
         proc.mmap_regions.insert(base, length_aligned);
         // R131-6 FIX: Track this task's independent cgroup charge so non-last
@@ -6137,7 +6152,14 @@ fn sys_mmap(
         if proc.next_mmap_addr < end {
             proc.next_mmap_addr = end;
         }
-    }
+        proc.memory_space
+    };
+
+    // R141-1 FIX: Propagate the committed mmap entry to all CLONE_VM siblings.
+    // Without this, a sibling that exits last iterates its stale mmap_regions
+    // and cannot uncharge regions added by this task → permanent memory_current
+    // inflation (cgroup DoS).
+    crate::process::sync_vm_siblings_add_mmap(memory_space, base, length_aligned, pid);
 
     // Note: Memory is already atomically charged via try_charge_memory() above.
     // R77-2 FIX: No separate accounting call needed - charge/uncharge model is complete.
@@ -6233,7 +6255,22 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
             // 阶段 1: 取消映射并收集需要释放的帧
             for offset in (0..length_aligned).step_by(0x1000) {
                 let page = Page::containing_address(VirtAddr::new((addr + offset) as u64));
-                if let Ok(frame) = manager.unmap_page(page) {
+
+                // R141-9 FIX: Try normal unmap first. If the page is non-present
+                // (e.g. after mprotect(PROT_NONE)), fall back to reclaiming the
+                // frame from the raw PTE. Without this, frames referenced by
+                // non-present PTEs leak permanently while the cgroup is uncharged
+                // (memory.max bypass).
+                let frame_opt = match manager.unmap_page(page) {
+                    Ok(frame) => Some(frame),
+                    Err(mm::page_table::UnmapError::PageNotMapped) => {
+                        // PT_LOCK is held (we're inside with_current_manager).
+                        manager.take_nonpresent_leaf_frame(page)
+                    }
+                    Err(_) => None,
+                };
+
+                if let Some(frame) = frame_opt {
                     let phys_addr = frame.start_address().as_u64() as usize;
 
                     // 检查是否为 COW 共享页
@@ -7110,20 +7147,33 @@ fn can_set_affinity(target_pid: ProcessId) -> Result<bool, SyscallError> {
 
 /// Check whether the calling task may GET another task's CPU affinity.
 ///
-/// Per Linux semantics, sched_getaffinity is more permissive:
-/// - Target is self (always allowed)
-/// - Target is in same thread group (same tgid)
-/// - OR caller has CAP_SYS_NICE/root
+/// Per Linux semantics, sched_getaffinity is permissive (no EPERM for
+/// cross-UID reads). However, PID namespace isolation MUST be enforced:
+/// a container process must not be able to probe host processes by global PID.
 ///
-/// For now, we allow reading affinity of any process for simplicity,
-/// matching older Linux behavior. Stricter checks can be added later.
+/// R141-4 FIX: Added PID namespace visibility check. Processes not visible
+/// from the caller's namespace are treated as ESRCH.
 #[inline]
 fn can_get_affinity(target_pid: ProcessId) -> Result<bool, SyscallError> {
-    // Linux is permissive about reading affinity - allow for all processes
-    // This matches common Linux distributions' behavior
-    if get_process(target_pid).is_none() {
-        return Err(SyscallError::ESRCH);
+    let target_arc = get_process(target_pid).ok_or(SyscallError::ESRCH)?;
+
+    // R141-4 FIX: Enforce PID namespace visibility.
+    let caller_pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let caller_ns = {
+        let proc_arc = get_process(caller_pid).ok_or(SyscallError::ESRCH)?;
+        let proc = proc_arc.lock();
+        crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
+    };
+    if let Some(ns) = caller_ns {
+        let visible = {
+            let proc = target_arc.lock();
+            crate::pid_namespace::is_visible_in_namespace(&ns, &proc.pid_ns_chain)
+        };
+        if !visible {
+            return Err(SyscallError::ESRCH);
+        }
     }
+
     Ok(true)
 }
 
@@ -7184,9 +7234,24 @@ fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> Syscal
         return Err(SyscallError::EINVAL);
     }
 
-    // Resolve target PID
+    // R141-4 FIX: Resolve target PID through namespace translation.
+    // The user-provided pid is namespace-local; translate to global.
     let caller_pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let target_pid = if pid == 0 { caller_pid } else { pid as ProcessId };
+    let target_pid = if pid == 0 {
+        caller_pid
+    } else {
+        let caller_ns = {
+            let proc_arc = get_process(caller_pid).ok_or(SyscallError::ESRCH)?;
+            let proc = proc_arc.lock();
+            crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
+        };
+        if let Some(ns) = caller_ns {
+            crate::pid_namespace::resolve_pid_in_namespace(&ns, pid as ProcessId)
+                .ok_or(SyscallError::ESRCH)?
+        } else {
+            pid as ProcessId
+        }
+    };
 
     // Permission check (uses can_set_affinity which requires privilege for other processes)
     if !can_set_affinity(target_pid)? {
@@ -7262,11 +7327,25 @@ fn sys_sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> SyscallR
         return Err(SyscallError::EINVAL);
     }
 
-    // Resolve target PID
+    // R141-4 FIX: Resolve target PID through namespace translation.
     let caller_pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let target_pid = if pid == 0 { caller_pid } else { pid as ProcessId };
+    let target_pid = if pid == 0 {
+        caller_pid
+    } else {
+        let caller_ns = {
+            let proc_arc = get_process(caller_pid).ok_or(SyscallError::ESRCH)?;
+            let proc = proc_arc.lock();
+            crate::pid_namespace::owning_namespace(&proc.pid_ns_chain)
+        };
+        if let Some(ns) = caller_ns {
+            crate::pid_namespace::resolve_pid_in_namespace(&ns, pid as ProcessId)
+                .ok_or(SyscallError::ESRCH)?
+        } else {
+            pid as ProcessId
+        }
+    };
 
-    // Permission check (permissive - just verify process exists)
+    // Permission check (permissive - just verify process exists + namespace visibility)
     can_get_affinity(target_pid)?;
 
     // Get the affinity mask from PCB
@@ -7877,6 +7956,14 @@ fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
         return Err(SyscallError::EBADF);
     }
 
+    // R141-3 FIX: Reject newfd >= MAX_FD to prevent unbounded fd_table growth.
+    // allocate_fd() enforces MAX_FD for sys_dup/sys_open, but dup2 accepts an
+    // arbitrary newfd — without this gate a user can dup2(fd, 1_000_000) and
+    // grow the per-process BTreeMap in kernel heap without limit (local OOM DoS).
+    if newfd >= crate::process::MAX_FD {
+        return Err(SyscallError::EBADF);
+    }
+
     if oldfd == newfd {
         // 验证oldfd有效
         let pid = current_pid().ok_or(SyscallError::ESRCH)?;
@@ -7914,6 +8001,11 @@ fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
 
     if oldfd == newfd {
         return Err(SyscallError::EINVAL);
+    }
+
+    // R141-3 FIX: Reject newfd >= MAX_FD (same gate as sys_dup2 above).
+    if newfd >= crate::process::MAX_FD {
+        return Err(SyscallError::EBADF);
     }
 
     // 仅接受O_CLOEXEC标志

@@ -1769,6 +1769,54 @@ pub fn sync_vm_siblings_brk(memory_space: usize, new_brk: usize, caller_pid: Pro
     }
 }
 
+/// R141-1 FIX: Synchronize mmap_regions addition across all tasks sharing the
+/// same address space (CLONE_VM siblings).
+///
+/// Under CLONE_VM, page tables are shared but `mmap_regions` is snapshotted
+/// per-task (D3-ARC-MM-SHARED design limitation). When one sibling calls
+/// sys_mmap, the new region is only recorded in that task's bookkeeping.
+/// If a different sibling exits last, `free_process_resources()` iterates
+/// its stale `mmap_regions` that lack the new entry — the charge for that
+/// region is never uncharged → permanent `memory_current` inflation (DoS).
+///
+/// This function inserts the new entry into ALL tasks sharing `memory_space`
+/// and advances `next_mmap_addr` to prevent address collisions.
+///
+/// # Arguments
+///
+/// * `memory_space` - Physical address of the shared PML4 (CR3 value)
+/// * `addr` - Base address of the new mmap region
+/// * `len_with_flags` - Length | flags word to insert into mmap_regions
+/// * `caller_pid` - PID of the caller (already updated, skip)
+pub fn sync_vm_siblings_add_mmap(
+    memory_space: usize,
+    addr: usize,
+    len_with_flags: usize,
+    caller_pid: ProcessId,
+) {
+    if memory_space == 0 {
+        return;
+    }
+
+    let end = addr.saturating_add(crate::syscall::mmap_region_len(len_with_flags));
+
+    let table = PROCESS_TABLE.lock();
+    for (idx, slot) in table.iter().enumerate() {
+        if idx == caller_pid {
+            continue; // Already handled by caller
+        }
+        if let Some(proc_arc) = slot {
+            let mut proc = proc_arc.lock();
+            if proc.memory_space == memory_space && proc.state != ProcessState::Terminated {
+                proc.mmap_regions.insert(addr, len_with_flags);
+                if proc.next_mmap_addr < end {
+                    proc.next_mmap_addr = end;
+                }
+            }
+        }
+    }
+}
+
 /// R37-1 FIX (Codex review): Count CLONE_VM siblings that are NOT in the same thread group.
 ///
 /// CLONE_THREAD siblings share memory_space AND have the same tgid - these can be TSYNC'd.

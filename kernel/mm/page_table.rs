@@ -172,6 +172,80 @@ impl PageTableManager {
         Ok(frame)
     }
 
+    /// R141-9 FIX: Reclaim a physical frame referenced by a non-present leaf PTE.
+    ///
+    /// When `mprotect(PROT_NONE)` clears the PRESENT bit, the physical frame
+    /// address remains encoded in the PTE.  Standard `unmap_page()` returns
+    /// `PageNotMapped` for such entries, causing `sys_munmap` to silently skip
+    /// the frame — a memory leak that also breaks cgroup charge-balance.
+    ///
+    /// This method walks from the manager's existing PML4 reference (avoiding
+    /// a second `&mut` alias from re-reading CR3) and, if the leaf PTE is
+    /// non-present but contains a non-zero physical address, extracts the
+    /// frame, clears the PTE, and returns it.
+    ///
+    /// Must be called while PT_LOCK is held (i.e. inside `with_current_manager`).
+    pub fn take_nonpresent_leaf_frame(&mut self, page: Page) -> Option<PhysFrame> {
+        let addr = page.start_address();
+        let pml4_idx = usize::from(addr.p4_index());
+        let pdpt_idx = usize::from(addr.p3_index());
+        let pd_idx = usize::from(addr.p2_index());
+        let pt_idx = usize::from(addr.p1_index());
+
+        // Walk from the mapper's PML4 — no aliasing, no second CR3 read.
+        let pml4 = self.mapper.level_4_table_mut();
+
+        // PML4 → PDPT
+        let pml4e = &pml4[pml4_idx];
+        if !pml4e.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let pdpt: &mut PageTable =
+            unsafe { &mut *phys_to_virt(pml4e.addr()).as_mut_ptr() };
+
+        // PDPT → PD
+        let pdpte = &pdpt[pdpt_idx];
+        let pdpte_flags = pdpte.flags();
+        if !pdpte_flags.contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        if pdpte_flags.contains(PageTableFlags::HUGE_PAGE) {
+            return None; // 1GiB huge page — not a 4KiB leaf
+        }
+        let pd: &mut PageTable =
+            unsafe { &mut *phys_to_virt(pdpte.addr()).as_mut_ptr() };
+
+        // PD → PT
+        let pde = &pd[pd_idx];
+        let pde_flags = pde.flags();
+        if !pde_flags.contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        if pde_flags.contains(PageTableFlags::HUGE_PAGE) {
+            return None; // 2MiB huge page — not a 4KiB leaf
+        }
+        let pt: &mut PageTable =
+            unsafe { &mut *phys_to_virt(pde.addr()).as_mut_ptr() };
+
+        // Read leaf PTE
+        let pte = &mut pt[pt_idx];
+
+        // Only interested in non-present entries with a non-zero physical address.
+        if pte.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+
+        let phys = pte.addr();
+        if phys.as_u64() == 0 {
+            return None; // Truly empty — nothing to reclaim
+        }
+
+        // Reclaim: extract frame and clear PTE
+        let frame = PhysFrame::containing_address(phys);
+        pte.set_unused();
+        Some(frame)
+    }
+
     /// 转换虚拟地址到物理地址
     pub fn translate_addr(&self, addr: VirtAddr) -> Option<PhysAddr> {
         use x86_64::structures::paging::mapper::TranslateResult;

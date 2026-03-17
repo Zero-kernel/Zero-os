@@ -45,12 +45,26 @@ pub fn fips_state() -> FipsState {
 ///
 /// Enforces monotonic transitions: once Enabled or Failed, the state cannot
 /// be reverted to Disabled (Codex review: prevents accidental/malicious downgrade).
+///
+/// R141-6 FIX: Uses compare_exchange instead of separate load+store to
+/// eliminate a theoretical race where two concurrent callers both read
+/// Disabled and store different values. In practice, the compliance crate's
+/// FIPS_ENABLING spinlock serializes callers, but CAS is defense-in-depth.
+///
+/// Reject no-op Disabled→Disabled transitions (caller should only call this
+/// with Enabled or Failed).
 #[inline]
 pub fn set_fips_state(state: FipsState) {
-    let current = FIPS_MODE.load(Ordering::Acquire);
-    // Only allow: Disabled → Enabled, Disabled → Failed.
-    // Once Enabled or Failed, state is sticky.
-    if current == FipsState::Disabled as u8 {
-        FIPS_MODE.store(state as u8, Ordering::Release);
+    let desired = state as u8;
+    // Refuse Disabled → Disabled (no-op that could mask a bug).
+    if desired == FipsState::Disabled as u8 {
+        return;
     }
+    // CAS: only succeeds if current state is Disabled.
+    let _ = FIPS_MODE.compare_exchange(
+        FipsState::Disabled as u8,
+        desired,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
 }

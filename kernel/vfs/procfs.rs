@@ -122,23 +122,28 @@ impl ProcRootInode {
             "version" => Ok(Arc::new(ProcVersionInode { fs_id: self.fs_id })),
             _ => {
                 // Try to parse as PID
-                if let Ok(pid) = name.parse::<u32>() {
-                    if process_exists(pid) {
+                if let Ok(ns_pid) = name.parse::<u32>() {
+                    // R141-5 FIX: Interpret the parsed PID as namespace-local.
+                    // Translate to global PID so internal lookups work correctly.
+                    // Without namespace context, treat as global (kernel context).
+                    let global_pid = resolve_ns_pid_to_global(ns_pid).unwrap_or(ns_pid);
+
+                    if process_exists(global_pid) {
                         // R134-1 FIX: Enforce PID namespace visibility for direct
                         // /proc/<pid> lookups.  R133-4 only fixed list_pids()
                         // (directory listing); the lookup path was unprotected,
                         // allowing container root to read host process info via
                         // /proc/<global_pid>/maps etc.
-                        if !is_pid_visible_in_caller_ns(pid) {
+                        if !is_pid_visible_in_caller_ns(global_pid) {
                             return Err(FsError::NotFound);
                         }
                         // R31-1 FIX: Check access permission before returning PID directory
-                        if !can_access_pid(pid) {
+                        if !can_access_pid(global_pid) {
                             return Err(FsError::PermDenied);
                         }
                         return Ok(Arc::new(ProcPidDirInode {
                             fs_id: self.fs_id,
-                            pid,
+                            pid: global_pid,
                         }));
                     }
                 }
@@ -218,12 +223,19 @@ impl Inode for ProcRootInode {
         let pid_offset = offset - static_entries.len();
 
         if pid_offset < pids.len() {
-            let pid = pids[pid_offset];
+            let global_pid = pids[pid_offset];
+
+            // R141-5 FIX: Display namespace-local PID in directory names.
+            // Without this, directory entries show global kernel PIDs that
+            // don't match getpid() output in PID namespaces, breaking
+            // open("/proc/" + getpid() + "/status") inside containers.
+            let display_pid = caller_ns_local_pid(global_pid).unwrap_or(global_pid);
+
             return Ok(Some((
                 offset + 1,
                 DirEntry {
-                    name: format!("{}", pid),
-                    ino: 1000 + pid as u64,
+                    name: format!("{}", display_pid),
+                    ino: 1000 + global_pid as u64,
                     file_type: FileType::Directory,
                 },
             )));
@@ -253,6 +265,12 @@ impl ProcSelfSymlink {
             pid: self.target_pid,
         }
     }
+
+    /// R141-5 FIX: Return namespace-local PID for symlink display.
+    /// Internal operations still use `self.target_pid` (global).
+    fn display_pid(&self) -> u32 {
+        caller_ns_local_pid(self.target_pid).unwrap_or(self.target_pid)
+    }
 }
 
 impl Inode for ProcSelfSymlink {
@@ -265,7 +283,8 @@ impl Inode for ProcSelfSymlink {
     }
 
     fn stat(&self) -> Result<Stat, FsError> {
-        let target = format!("{}", self.target_pid);
+        // R141-5 FIX: Use namespace-local PID for symlink target display.
+        let target = format!("{}", self.display_pid());
         Ok(Stat {
             dev: self.fs_id,
             ino: 2,
@@ -288,8 +307,8 @@ impl Inode for ProcSelfSymlink {
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        // Return the symlink target
-        let target = format!("{}", self.target_pid);
+        // R141-5 FIX: Return namespace-local PID as symlink target.
+        let target = format!("{}", self.display_pid());
         let bytes = target.as_bytes();
         let len = buf.len().min(bytes.len());
         buf[..len].copy_from_slice(&bytes[..len]);
@@ -1096,6 +1115,47 @@ fn is_pid_visible_in_caller_ns(pid: u32) -> bool {
         }
         _ => false,
     }
+}
+
+/// R141-5 FIX: Translate a global PID to the namespace-local PID as seen by
+/// the current caller. Returns `None` if the caller has no PID namespace
+/// (kernel context) or the target is not visible.
+///
+/// Codex review: Drop PROCESS_TABLE lock before calling PID namespace methods
+/// to avoid holding it across their internal Mutex acquisitions.
+fn caller_ns_local_pid(global_pid: u32) -> Option<u32> {
+    let caller_ns = {
+        let table = PROCESS_TABLE.lock();
+        process::current_pid()
+            .and_then(|pid| table.get(pid))
+            .and_then(|slot| slot.as_ref())
+            .and_then(|proc_arc| {
+                let p = proc_arc.lock();
+                kernel_core::owning_namespace(&p.pid_ns_chain)
+            })
+    }?; // PROCESS_TABLE lock dropped here
+
+    kernel_core::pid_in_namespace(&caller_ns, global_pid as usize).map(|p| p as u32)
+}
+
+/// R141-5 FIX: Resolve a namespace-local PID (as entered by the user) to a
+/// global kernel PID. Returns `None` if the caller has no PID namespace
+/// (kernel context — use the value as-is).
+///
+/// Codex review: Drop PROCESS_TABLE lock before namespace translation.
+fn resolve_ns_pid_to_global(ns_pid: u32) -> Option<u32> {
+    let caller_ns = {
+        let table = PROCESS_TABLE.lock();
+        process::current_pid()
+            .and_then(|pid| table.get(pid))
+            .and_then(|slot| slot.as_ref())
+            .and_then(|proc_arc| {
+                let p = proc_arc.lock();
+                kernel_core::owning_namespace(&p.pid_ns_chain)
+            })
+    }?; // PROCESS_TABLE lock dropped here
+
+    kernel_core::resolve_pid_in_namespace(&caller_ns, ns_pid as usize).map(|p| p as u32)
 }
 
 /// R31-1 FIX: Access control for /proc/[pid] entries.

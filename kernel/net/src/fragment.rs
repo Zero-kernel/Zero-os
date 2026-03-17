@@ -569,8 +569,11 @@ impl FragmentQueue {
 pub struct FragmentCache {
     /// Active reassembly queues keyed by FragmentKey
     queues: Mutex<BTreeMap<FragmentKey, FragmentQueue>>,
-    /// Per-source queue counts
-    per_src_counts: Mutex<BTreeMap<u32, usize>>,
+    /// R141-2 FIX: Per-source queue counts, scoped by (net_ns_id, src_ip).
+    /// Previously keyed by src_ip alone; one namespace's fragment traffic
+    /// could exhaust the per-source budget for all namespaces sharing the
+    /// same source IP (cross-namespace DoS).
+    per_src_counts: Mutex<BTreeMap<(u64, u32), usize>>,
     /// Statistics
     stats: FragmentStats,
 }
@@ -605,6 +608,8 @@ impl FragmentCache {
         // R140-4 FIX: Include net_ns_id in key to isolate reassembly per namespace.
         let key = FragmentKey::from_header(net_ns_id, header);
         let src_ip = key.src_ip();
+        // R141-2 FIX: Namespace-scoped per-source key replaces bare src_ip.
+        let per_src_key = (key.net_ns_id, src_ip);
 
         // Fragment offset is in 8-byte units
         let offset = header.fragment_offset() * 8;
@@ -620,10 +625,10 @@ impl FragmentCache {
                 let frag_count = queue.received_frags as u32;
                 let byte_count = queue.received_bytes as u64;
                 queues.remove(&key);
-                if let Some(c) = per_src.get_mut(&src_ip) {
+                if let Some(c) = per_src.get_mut(&per_src_key) {
                     *c = c.saturating_sub(1);
                     if *c == 0 {
-                        per_src.remove(&src_ip);
+                        per_src.remove(&per_src_key);
                     }
                 }
                 self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
@@ -669,14 +674,15 @@ impl FragmentCache {
                     .map(|(&k, _)| k);
 
                 if let Some(evict_key) = oldest_key {
-                    let evict_src = evict_key.src_ip();
+                    // R141-2 FIX: Use namespace-scoped key for eviction path.
+                    let evict_per_src_key = (evict_key.net_ns_id, evict_key.src_ip());
                     if let Some(evicted) = queues.remove(&evict_key) {
                         let frag_count = evicted.received_frags as u32;
                         let byte_count = evicted.received_bytes as u64;
-                        if let Some(c) = per_src.get_mut(&evict_src) {
+                        if let Some(c) = per_src.get_mut(&evict_per_src_key) {
                             *c = c.saturating_sub(1);
                             if *c == 0 {
-                                per_src.remove(&evict_src);
+                                per_src.remove(&evict_per_src_key);
                             }
                         }
                         self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
@@ -712,7 +718,7 @@ impl FragmentCache {
             }
 
             // Check per-source limit
-            let src_count = per_src.get(&src_ip).copied().unwrap_or(0);
+            let src_count = per_src.get(&per_src_key).copied().unwrap_or(0);
             if src_count >= MAX_QUEUES_PER_SRC {
                 self.stats.queue_limit_drops.fetch_add(1, Ordering::Relaxed);
                 return Err(FragmentDropReason::PerSourceLimit);
@@ -721,7 +727,7 @@ impl FragmentCache {
             // Create new queue
             let new_queue = FragmentQueue::new(key, now_ms);
             queues.insert(key, new_queue);
-            *per_src.entry(src_ip).or_insert(0) += 1;
+            *per_src.entry(per_src_key).or_insert(0) += 1;
             self.stats.active_queues.fetch_add(1, Ordering::Relaxed);
             created_new_queue = true;
 
@@ -741,10 +747,10 @@ impl FragmentCache {
             // Codex review fix: Roll back queue creation on reservation failure
             if created_new_queue {
                 queues.remove(&key);
-                if let Some(count) = per_src.get_mut(&src_ip) {
+                if let Some(count) = per_src.get_mut(&per_src_key) {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
-                        per_src.remove(&src_ip);
+                        per_src.remove(&per_src_key);
                     }
                 }
                 self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
@@ -766,10 +772,10 @@ impl FragmentCache {
             // Codex review fix: Roll back queue creation on reservation failure
             if created_new_queue {
                 queues.remove(&key);
-                if let Some(count) = per_src.get_mut(&src_ip) {
+                if let Some(count) = per_src.get_mut(&per_src_key) {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
-                        per_src.remove(&src_ip);
+                        per_src.remove(&per_src_key);
                     }
                 }
                 self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
@@ -794,10 +800,10 @@ impl FragmentCache {
 
                     // Remove queue (queue reference is now invalid)
                     queues.remove(&key);
-                    if let Some(count) = per_src.get_mut(&src_ip) {
+                    if let Some(count) = per_src.get_mut(&per_src_key) {
                         *count = count.saturating_sub(1);
                         if *count == 0 {
-                            per_src.remove(&src_ip);
+                            per_src.remove(&per_src_key);
                         }
                     }
                     self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
@@ -828,10 +834,10 @@ impl FragmentCache {
                     let frag_count = queue.received_frags as u32;
                     let byte_count = queue.received_bytes as u64;
                     queues.remove(&key);
-                    if let Some(count) = per_src.get_mut(&src_ip) {
+                    if let Some(count) = per_src.get_mut(&per_src_key) {
                         *count = count.saturating_sub(1);
                         if *count == 0 {
-                            per_src.remove(&src_ip);
+                            per_src.remove(&per_src_key);
                         }
                     }
                     self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
@@ -855,10 +861,10 @@ impl FragmentCache {
                     let frag_count = queue.received_frags as u32;
                     let byte_count = queue.received_bytes as u64;
                     queues.remove(&key);
-                    if let Some(count) = per_src.get_mut(&src_ip) {
+                    if let Some(count) = per_src.get_mut(&per_src_key) {
                         *count = count.saturating_sub(1);
                         if *count == 0 {
-                            per_src.remove(&src_ip);
+                            per_src.remove(&per_src_key);
                         }
                     }
                     self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
@@ -881,10 +887,10 @@ impl FragmentCache {
                 // (e.g., FirstTooSmall, ZeroLength)
                 if created_new_queue && queue.received_frags == 0 {
                     queues.remove(&key);
-                    if let Some(count) = per_src.get_mut(&src_ip) {
+                    if let Some(count) = per_src.get_mut(&per_src_key) {
                         *count = count.saturating_sub(1);
                         if *count == 0 {
-                            per_src.remove(&src_ip);
+                            per_src.remove(&per_src_key);
                         }
                     }
                     self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
@@ -926,9 +932,10 @@ impl FragmentCache {
         for (&key, queue) in queues.iter() {
             if queue.is_expired(now_ms) {
                 // R62-2 FIX: Include byte count for cleanup
+                // R141-2 FIX: Use namespace-scoped per-source key.
                 expired_keys.push((
                     key,
-                    queue.key.src_ip(),
+                    (key.net_ns_id, queue.key.src_ip()),
                     queue.received_frags,
                     queue.received_bytes,
                 ));
@@ -937,12 +944,12 @@ impl FragmentCache {
 
         let count = expired_keys.len();
 
-        for (key, src_ip, frag_count, byte_count) in expired_keys {
+        for (key, per_src_key, frag_count, byte_count) in expired_keys {
             queues.remove(&key);
-            if let Some(c) = per_src.get_mut(&src_ip) {
+            if let Some(c) = per_src.get_mut(&per_src_key) {
                 *c = c.saturating_sub(1);
                 if *c == 0 {
-                    per_src.remove(&src_ip);
+                    per_src.remove(&per_src_key);
                 }
             }
             self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
