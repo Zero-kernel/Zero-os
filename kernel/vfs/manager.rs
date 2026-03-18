@@ -584,10 +584,28 @@ impl Vfs {
             return Err(FsError::Invalid);
         }
 
+        // R142-7 FIX: Component-boundary-aware path prefix check.
+        // Plain starts_with() matches "/proc" against "/process" because it
+        // compares bytes, not path components. This function verifies that the
+        // character after the prefix is '/' or end-of-string.
+        fn is_path_within(path: &str, anchor: &str) -> bool {
+            if anchor == "/" {
+                return path.starts_with('/');
+            }
+            let anchor = anchor.trim_end_matches('/');
+            if anchor.is_empty() {
+                return false;
+            }
+            if path == anchor {
+                return true;
+            }
+            path.starts_with(anchor) && path.as_bytes().get(anchor.len()) == Some(&b'/')
+        }
+
         'resolve: loop {
             // RESOLVE_BENEATH / RESOLVE_IN_ROOT: check path stays within anchor
             if (resolve_flags.beneath() || resolve_flags.in_root())
-                && !path_to_resolve.starts_with(&anchor_mount)
+                && !is_path_within(&path_to_resolve, &anchor_mount)
             {
                 return Err(FsError::CrossDev);
             }

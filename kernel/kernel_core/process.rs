@@ -1699,6 +1699,70 @@ pub fn address_space_share_count(memory_space: usize) -> usize {
         .count()
 }
 
+/// R142-1 FIX: Atomically remove an mmap_regions entry from the calling task
+/// and all CLONE_VM siblings sharing the same address space.
+///
+/// Under CLONE_VM, each task keeps its own `mmap_regions` snapshot
+/// (D3-ARC-MM-SHARED design limitation). Two siblings can concurrently
+/// munmap the same region and both reach Phase 3 bookkeeping. Without
+/// serialization, both remove from their own `mmap_regions` and both call
+/// `cgroup::uncharge_memory()` → double-uncharge drives `memory_current`
+/// below actual usage → `memory.max` bypass.
+///
+/// This function serializes the removal under `PROCESS_TABLE` lock so that
+/// only the first remover (the "winner") returns `true`. The loser finds
+/// its entry already removed by the winner's sibling-sync pass and returns
+/// `false`. Only the winner should proceed with cgroup uncharge.
+///
+/// Lock ordering: PROCESS_TABLE → Process (consistent with all sync_vm_*
+/// functions).
+///
+/// # Arguments
+///
+/// * `caller_pid` - PID of the calling task
+/// * `addr` - Base address of the mmap region to remove
+///
+/// # Returns
+///
+/// `true` if this caller was the first to remove the entry (should uncharge).
+pub fn atomic_remove_mmap_region(caller_pid: ProcessId, addr: usize) -> bool {
+    let table = PROCESS_TABLE.lock();
+
+    // Step 1: Remove from the caller's own mmap_regions
+    let Some(caller_arc) = table.get(caller_pid).and_then(|slot| slot.as_ref()) else {
+        return false;
+    };
+
+    let (removed, memory_space) = {
+        let mut proc = caller_arc.lock();
+        (proc.mmap_regions.remove(&addr).is_some(), proc.memory_space)
+    }; // Caller process lock dropped
+
+    if !removed {
+        // Another sibling already removed our entry via its sync pass.
+        return false;
+    }
+
+    // Step 2: Remove from all CLONE_VM siblings (same logic as
+    // sync_vm_siblings_remove_mmap, but executed atomically under the
+    // same PROCESS_TABLE lock acquisition that verified our own removal).
+    if memory_space != 0 {
+        for (idx, slot) in table.iter().enumerate() {
+            if idx == caller_pid {
+                continue;
+            }
+            if let Some(sib_arc) = slot {
+                let mut sib = sib_arc.lock();
+                if sib.memory_space == memory_space && sib.state != ProcessState::Terminated {
+                    sib.mmap_regions.remove(&addr);
+                }
+            }
+        }
+    }
+
+    true
+}
+
 /// R140-1 FIX: Synchronize mmap_regions removal across all tasks sharing the
 /// same address space (CLONE_VM siblings).
 ///

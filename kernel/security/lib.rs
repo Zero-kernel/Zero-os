@@ -58,7 +58,10 @@ pub use kptr::KptrGuard;
 pub use memory_hardening::{
     CleanupOutcome, HardeningError, IdentityCleanupStrategy, NxEnforcementSummary,
 };
-pub use rng::{fill_random, random_u32, random_u64, rdrand64_early, rdrand_available, try_fill_random, ChaCha20Rng, RngError};
+// R141-8 FIX: Removed ChaCha20Rng and rdrand64_early from public exports to
+// enforce the FIPS boundary. External callers use fill_random() for random bytes
+// and chacha20_xor_keystream() for keyed encryption.
+pub use rng::{chacha20_xor_keystream, fill_random, random_u32, random_u64, rdrand_available, try_fill_random, RngError};
 pub use spectre::{MitigationStatus, SpectreError, VulnerabilityInfo};
 pub use tests::{run_security_tests, SecurityTest, TestContext, TestReport, TestResult};
 pub use wxorx::{PageLevel, ValidationSummary, Violation, WxorxError};

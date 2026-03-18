@@ -257,6 +257,38 @@ pub fn random_range(max: u64) -> Result<u64, RngError> {
     }
 }
 
+/// R141-8 FIX: Public API for ChaCha20 XOR-keystream encryption.
+///
+/// Constructs a ChaCha20Rng internally and XORs the keystream over `buf`.
+/// This provides keyed encryption without exposing the ChaCha20Rng type
+/// through the public security API boundary.
+///
+/// # Arguments
+///
+/// * `key` - 256-bit encryption key (consumed and zeroed internally)
+/// * `nonce` - 96-bit nonce
+/// * `buf` - Buffer to XOR with keystream (encrypted in-place)
+pub fn chacha20_xor_keystream(mut key: [u8; 32], nonce: [u8; 12], buf: &mut [u8]) {
+    let mut cipher = ChaCha20Rng::new(key, nonce);
+    // Wipe the stack copy of the key now that it's been expanded into cipher state.
+    explicit_bzero(&mut key);
+
+    let mut keystream = [0u8; 64];
+    let mut offset = 0;
+    while offset < buf.len() {
+        let chunk = (buf.len() - offset).min(keystream.len());
+        cipher.fill_bytes(&mut keystream[..chunk]);
+        for i in 0..chunk {
+            buf[offset + i] ^= keystream[i];
+        }
+        offset += chunk;
+    }
+
+    // Defense-in-depth: wipe keystream buffer using write_volatile to
+    // prevent the compiler from optimizing away the zeroing.
+    explicit_bzero(&mut keystream);
+}
+
 // ============================================================================
 // Hardware Entropy Sources
 // ============================================================================
@@ -311,7 +343,9 @@ fn fill_entropy(buf: &mut [u8]) -> Result<(), RngError> {
 /// # Returns
 ///
 /// `Ok(u64)` on success, `Err(RngError)` if RDRAND is unsupported or fails
-pub fn rdrand64_early() -> Result<u64, RngError> {
+// R141-8 FIX: Restrict to crate-internal use. External callers should use
+// fill_random() which goes through the FIPS-gated path.
+pub(crate) fn rdrand64_early() -> Result<u64, RngError> {
     rdrand64()
 }
 
@@ -432,7 +466,11 @@ fn rdseed_supported() -> bool {
 // ============================================================================
 
 /// ChaCha20-based Cryptographically Secure PRNG
-pub struct ChaCha20Rng {
+///
+/// R141-8 FIX: Restricted to crate-internal visibility to enforce the FIPS
+/// boundary. External callers must use `fill_random()` for random bytes or
+/// `chacha20_xor_keystream()` for keyed encryption.
+pub(crate) struct ChaCha20Rng {
     /// ChaCha20 state (16 x 32-bit words)
     state: [u32; 16],
     /// Output buffer

@@ -36,7 +36,9 @@ use core::{
 };
 
 use compliance::{fips_state, FipsState};
-use security::{try_fill_random, ChaCha20Rng, KptrGuard};
+// R141-8 FIX: Use chacha20_xor_keystream instead of direct ChaCha20Rng access
+// to respect the FIPS API boundary.
+use security::{chacha20_xor_keystream, try_fill_random, KptrGuard};
 
 // ============================================================================
 // Constants
@@ -460,16 +462,13 @@ pub fn emit_encrypted_dump(dump: &CrashDump) {
     nonce.copy_from_slice(&seed[32..]);
     secure_bzero(&mut seed);
 
-    // Encrypt in place using ChaCha20
-    // R92-4 FIX: Clear key_for_cipher after creating the cipher to minimize exposure.
-    let mut key_for_cipher = key;
+    // R141-8 FIX: Use the public chacha20_xor_keystream API instead of
+    // constructing ChaCha20Rng directly, respecting the FIPS boundary.
+    // Key is passed by value (copied into the function), so we zero our
+    // local copy immediately after the call.
+    chacha20_xor_keystream(key, nonce, &mut out[..len]);
+    // R92-4 FIX: Zero key material after use to minimize exposure.
     secure_bzero(&mut key);
-
-    let mut cipher = ChaCha20Rng::new(key_for_cipher, nonce);
-    secure_bzero(&mut key_for_cipher);
-    xor_chacha20(&mut cipher, &mut out[..len]);
-    // Note: ChaCha20Rng internal state remains in memory until panic completes.
-    // This is acceptable in panic context where memory may already be compromised.
 
     // Emit header
     serial_write_str("\n--BEGIN ZOS-KDUMP--\n");
@@ -762,25 +761,6 @@ fn redact_if_kernel_ptr(val: u64) -> u64 {
     } else {
         val
     }
-}
-
-// ============================================================================
-// Encryption
-// ============================================================================
-
-/// XOR buffer with ChaCha20 keystream.
-fn xor_chacha20(cipher: &mut ChaCha20Rng, buf: &mut [u8]) {
-    let mut keystream = [0u8; 64];
-    let mut offset = 0;
-    while offset < buf.len() {
-        let chunk = (buf.len() - offset).min(keystream.len());
-        cipher.fill_bytes(&mut keystream[..chunk]);
-        for i in 0..chunk {
-            buf[offset + i] ^= keystream[i];
-        }
-        offset += chunk;
-    }
-    secure_bzero(&mut keystream);
 }
 
 // ============================================================================

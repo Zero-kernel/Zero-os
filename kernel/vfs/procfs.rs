@@ -235,7 +235,9 @@ impl Inode for ProcRootInode {
                 offset + 1,
                 DirEntry {
                     name: format!("{}", display_pid),
-                    ino: 1000 + global_pid as u64,
+                    // R142-3 FIX: Use namespace-local PID for inode number to
+                    // prevent leaking global kernel PIDs via d_ino in getdents64().
+                    ino: 1000 + display_pid as u64,
                     file_type: FileType::Directory,
                 },
             )));
@@ -375,7 +377,10 @@ impl ProcPidDirInode {
 
 impl Inode for ProcPidDirInode {
     fn ino(&self) -> u64 {
-        1000 + self.pid as u64
+        // R142-3 FIX: Use namespace-local PID to prevent leaking global PIDs
+        // via fstat()/getdents64() inode numbers on procfs PID directories.
+        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
+        1000 + display_pid as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -386,7 +391,7 @@ impl Inode for ProcPidDirInode {
         let (uid, gid) = get_process_owner(self.pid);
         Ok(Stat {
             dev: self.fs_id,
-            ino: 1000 + self.pid as u64,
+            ino: self.ino(),
             mode: FileMode::directory(0o555),
             nlink: 2,
             uid,
@@ -461,7 +466,9 @@ struct ProcPidStatusInode {
 
 impl Inode for ProcPidStatusInode {
     fn ino(&self) -> u64 {
-        10000 + self.pid as u64
+        // R142-3 FIX: Namespace-local PID for inode number
+        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
+        10000 + display_pid as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -523,7 +530,9 @@ struct ProcPidCmdlineInode {
 
 impl Inode for ProcPidCmdlineInode {
     fn ino(&self) -> u64 {
-        20000 + self.pid as u64
+        // R142-3 FIX: Namespace-local PID for inode number
+        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
+        20000 + display_pid as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -583,7 +592,9 @@ struct ProcPidStatInode {
 
 impl Inode for ProcPidStatInode {
     fn ino(&self) -> u64 {
-        30000 + self.pid as u64
+        // R142-3 FIX: Namespace-local PID for inode number
+        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
+        30000 + display_pid as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -643,7 +654,9 @@ struct ProcPidMapsInode {
 
 impl Inode for ProcPidMapsInode {
     fn ino(&self) -> u64 {
-        40000 + self.pid as u64
+        // R142-3 FIX: Namespace-local PID for inode number
+        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
+        40000 + display_pid as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -722,7 +735,9 @@ impl ProcPidFdDirInode {
 
 impl Inode for ProcPidFdDirInode {
     fn ino(&self) -> u64 {
-        50000 + self.pid as u64
+        // R142-3 FIX: Namespace-local PID for inode number
+        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
+        50000 + display_pid as u64
     }
 
     fn fs_id(&self) -> u64 {
@@ -802,7 +817,9 @@ struct ProcPidFdSymlink {
 
 impl Inode for ProcPidFdSymlink {
     fn ino(&self) -> u64 {
-        (50000 + self.pid as u64) * 1000 + self.fd as u64
+        // R142-3 FIX: Namespace-local PID for inode number
+        let display_pid = caller_ns_local_pid(self.pid).unwrap_or(self.pid);
+        (50000 + display_pid as u64) * 1000 + self.fd as u64
     }
 
     fn fs_id(&self) -> u64 {

@@ -2022,6 +2022,13 @@ pub fn syscall_dispatcher(
     // LSM hook: check syscall entry with security policy
     // Build context before dispatch; on denial, return EPERM
     let lsm_ctx = lsm::SyscallCtx::from_current(syscall_num, &args);
+    // R142-4 FIX: Defense-in-depth assertion — a user syscall without LSM context
+    // means current_pid() or current_credentials() returned None, which is a kernel
+    // bug (SYSCALL requires Ring 3 → requires a running process with valid PID).
+    debug_assert!(
+        lsm_ctx.is_some(),
+        "R142-4: LSM context missing for user syscall — kernel bug"
+    );
     if let Some(ref ctx) = lsm_ctx {
         if let Err(err) = lsm::hook_syscall_enter(ctx) {
             increment_counter(TraceCounter::SyscallDenied, 1);
@@ -5797,7 +5804,20 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     let vaddr = VirtAddr::new((new_top + offset) as u64);
                     let page = Page::containing_address(vaddr);
 
-                    if let Ok(frame) = manager.unmap_page(page) {
+                    // R142-2 FIX: Mirror sys_munmap() fallback for non-present PTEs.
+                    // Without this, brk shrink after mprotect(PROT_NONE) silently
+                    // skips non-present PTEs → frames leak while cgroup IS uncharged
+                    // → memory_current undercount → memory.max bypass.
+                    let frame_opt = match manager.unmap_page(page) {
+                        Ok(frame) => Some(frame),
+                        Err(mm::page_table::UnmapError::PageNotMapped) => {
+                            // PT_LOCK is held (we're inside with_current_manager).
+                            manager.take_nonpresent_leaf_frame(page)
+                        }
+                        Err(_) => None,
+                    };
+
+                    if let Some(frame) = frame_opt {
                         let phys_addr = frame.start_address().as_u64() as usize;
 
                         // R126-1 FIX: 检查是否为 COW 共享页
@@ -6310,31 +6330,37 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         return Err(e);
     }
 
-    // Phase 3: Remove the PCB record now that PT operations completed successfully.
-    let memory_space = {
+    // R142-1 FIX: Phase 3 — Atomic region removal + sibling sync.
+    //
+    // Under CLONE_VM, two siblings can concurrently munmap the same region.
+    // Both capture charge info in Phase 1 from their own mmap_regions, both
+    // complete Phase 2 (second sees PageNotMapped, harmless), and both reach
+    // Phase 3. Without serialization, both remove their own entry and both
+    // call uncharge_memory → double-uncharge drives memory_current to zero
+    // while physical frames remain allocated → memory.max bypass.
+    //
+    // atomic_remove_mmap_region() serializes under PROCESS_TABLE lock:
+    // the first sibling removes from self + all siblings; the second sibling
+    // finds its entry already gone (removed by the first's sibling-sync pass)
+    // and returns false → skips uncharge.
+    let is_first_remover = crate::process::atomic_remove_mmap_region(pid, addr);
+
+    // R131-6 FIX: Decrement per-task charge tracker so non-last CLONE_VM
+    // exit does not over-uncharge.  Saturating: inherited regions may have
+    // been munmapped before the task accumulated any independent charges.
+    if (committed_flags & MMAP_REGION_FLAG_PROT_NONE) == 0 {
         let mut proc = process.lock();
-        proc.mmap_regions.remove(&addr);
-        // R131-6 FIX: Decrement per-task charge tracker so non-last CLONE_VM
-        // exit does not over-uncharge.  Saturating: inherited regions may have
-        // been munmapped before the task accumulated any independent charges.
-        if (committed_flags & MMAP_REGION_FLAG_PROT_NONE) == 0 {
-            proc.vm_charged_bytes = proc
-                .vm_charged_bytes
-                .saturating_sub(recorded_length as u64);
-        }
-        proc.memory_space
-    };
+        proc.vm_charged_bytes = proc
+            .vm_charged_bytes
+            .saturating_sub(recorded_length as u64);
+    }
 
-    // R140-1 FIX: Remove the stale mmap_regions entry from ALL CLONE_VM siblings.
-    // Without this, the last sibling to exit would iterate its stale mmap_regions,
-    // find this already-munmapped/uncharged region, and double-uncharge the cgroup
-    // (memory_current undercount → memory.max bypass).
-    crate::process::sync_vm_siblings_remove_mmap(memory_space, addr, pid);
-
-    // F.2 Cgroup: Atomically uncharge memory after successful munmap.
+    // F.2 Cgroup: Uncharge memory only if we were the first to remove.
     // R123-1 FIX: PROT_NONE reservations never allocated frames or charged
     // cgroup memory, so skip uncharge to maintain correct accounting.
-    if (committed_flags & MMAP_REGION_FLAG_PROT_NONE) == 0 {
+    // R142-1 FIX: Gate on is_first_remover to prevent double-uncharge
+    // when concurrent CLONE_VM siblings both munmap the same region.
+    if is_first_remover && (committed_flags & MMAP_REGION_FLAG_PROT_NONE) == 0 {
         cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
     }
 
@@ -6667,11 +6693,48 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
 
             let pid = current_pid().ok_or(SyscallError::ESRCH)?;
             let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
-            let filter = seccomp::strict_filter();
 
+            // R142-8 FIX: Reject STRICT mode in multi-threaded processes or when
+            // CLONE_VM siblings exist. Without this, only the calling thread is
+            // sandboxed while other threads sharing the address space retain full
+            // syscall access — defeating the purpose of strict sandboxing.
+            //
+            // Lock ordering: read tgid/memory_space under process lock, drop it,
+            // then call thread_group_size/non_thread_group_vm_share_count (which
+            // acquire PROCESS_TABLE lock). PROCESS_TABLE → Process ordering preserved.
+            let (tgid, memory_space) = {
+                let proc = proc_arc.lock();
+                // R26-3 FIX: Check if another thread is already installing
+                if proc.seccomp_installing {
+                    return Err(SyscallError::EBUSY);
+                }
+                (proc.tgid, proc.memory_space)
+            }; // Process lock dropped
+
+            let thread_count = crate::process::thread_group_size(tgid);
+            if thread_count > 1 {
+                klog!(Warn,
+                    "[sys_seccomp] PID={} STRICT mode REJECTED: threads={} (multi-threaded)",
+                    pid, thread_count
+                );
+                return Err(SyscallError::EPERM);
+            }
+
+            let pure_vm_siblings =
+                crate::process::non_thread_group_vm_share_count(memory_space, tgid);
+            if pure_vm_siblings > 0 {
+                klog!(Warn,
+                    "[sys_seccomp] PID={} STRICT mode REJECTED: {} CLONE_VM siblings",
+                    pid, pure_vm_siblings
+                );
+                return Err(SyscallError::EPERM);
+            }
+
+            let filter = seccomp::strict_filter();
             let mut proc = proc_arc.lock();
 
-            // R26-3 FIX: Check if another thread is already installing
+            // R26-3 FIX: Re-check after reacquiring lock (race window between
+            // the initial check above and the re-acquire here).
             if proc.seccomp_installing {
                 return Err(SyscallError::EBUSY);
             }
@@ -6695,20 +6758,29 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
 
             let pid = current_pid().ok_or(SyscallError::ESRCH)?;
             let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
-            let mut proc = proc_arc.lock();
 
-            // R26-3 FIX: Check if another thread is already installing
-            if proc.seccomp_installing {
-                return Err(SyscallError::EBUSY);
-            }
+            // R142-8 FIX: Read tgid/memory_space under process lock, then drop
+            // before calling thread_group_size/non_thread_group_vm_share_count
+            // (which acquire PROCESS_TABLE lock). Holding process lock while
+            // calling those helpers is a latent self-deadlock: the helpers
+            // iterate PROCESS_TABLE and lock each Process entry, including
+            // the caller's own entry → spin forever.
+            let (tgid, memory_space) = {
+                let proc = proc_arc.lock();
+                // R26-3 FIX: Check if another thread is already installing
+                if proc.seccomp_installing {
+                    return Err(SyscallError::EBUSY);
+                }
+                (proc.tgid, proc.memory_space)
+            }; // Process lock dropped
 
             // R25-6 FIX: Reject seccomp in multi-threaded processes without TSYNC
             // R37-1 FIX (Codex review): Correctly distinguish CLONE_THREAD vs pure CLONE_VM siblings.
             // - CLONE_THREAD siblings (same tgid) can be synchronized with TSYNC
             // - Pure CLONE_VM siblings (different tgid) cannot be synchronized with TSYNC
-            let thread_count = crate::process::thread_group_size(proc.tgid);
+            let thread_count = crate::process::thread_group_size(tgid);
             let pure_vm_siblings =
-                crate::process::non_thread_group_vm_share_count(proc.memory_space, proc.tgid);
+                crate::process::non_thread_group_vm_share_count(memory_space, tgid);
             let tsync_requested = flags & seccomp::SeccompFlags::TSYNC.bits() != 0;
 
             // Reject if multi-threaded without TSYNC (partial sandboxing)
@@ -6728,6 +6800,13 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
                     seccomp cannot secure shared address space",
                     pid, pure_vm_siblings
                 );
+                return Err(SyscallError::EBUSY);
+            }
+
+            let mut proc = proc_arc.lock();
+
+            // R26-3 FIX: Re-check after reacquiring lock
+            if proc.seccomp_installing {
                 return Err(SyscallError::EBUSY);
             }
 

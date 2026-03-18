@@ -574,7 +574,11 @@ static RSDP_PHYS_ADDR: AtomicU64 = AtomicU64::new(0);
 /// This temporarily makes the trampoline page executable.
 /// The trampoline should only run briefly during AP bring-up.
 fn make_trampoline_executable() {
-    unsafe {
+    // R142-5 FIX: Acquire PT_LOCK for consistency with the kernel's documented
+    // contract that all page table mutations must be serialized. While this is
+    // boot-only (no concurrent PT modifications possible), the lock acquisition
+    // makes the invariant explicitly enforced rather than implicitly assumed.
+    mm::page_table::with_pt_lock(|| unsafe {
         use mm::page_table::recursive_pt;
 
         // Identity map is in PML4[0]/PDPT[0]; PD[0] covers 0x0-0x200000 (first 2MB)
@@ -641,7 +645,7 @@ fn make_trampoline_executable() {
             mm::tlb_shootdown::flush_all_local();
             klog_always!("[SMP] Trampoline (4KB page) made executable");
         }
-    }
+    });
 }
 
 /// Restore NX bit on the trampoline page after SMP bring-up is complete.
@@ -653,7 +657,8 @@ fn make_trampoline_executable() {
 ///
 /// Handles both 2MB huge pages and 4KB pages (after L-5 split).
 fn make_trampoline_nonexecutable() {
-    unsafe {
+    // R142-5 FIX: Acquire PT_LOCK for consistency (see make_trampoline_executable).
+    mm::page_table::with_pt_lock(|| unsafe {
         use mm::page_table::recursive_pt;
 
         let pd = recursive_pd(0, 0);
@@ -698,7 +703,7 @@ fn make_trampoline_nonexecutable() {
         // CPUs with stale executable mappings, creating a code injection vector
         // where an attacker could place shellcode in the trampoline area.
         mm::flush_current_as_all();
-    }
+    });
 }
 
 // ============================================================================
