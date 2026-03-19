@@ -3862,6 +3862,43 @@ pub fn get_process_stats() -> ProcessStats {
     stats
 }
 
+/// Computes the total cgroup-charged memory bytes for a process.
+///
+/// R143-1 FIX: Used by cgroup migration to transfer memory charges from
+/// source to destination cgroup. Sums:
+/// 1. mmap_regions (excluding PROT_NONE reservations which never charged)
+/// 2. brk heap (page-aligned brk - brk_start)
+/// 3. elf_charged_bytes (PT_LOAD segments + user stack from ELF loader)
+///
+/// This mirrors the uncharge logic in `free_process_resources()`.
+pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
+    // Sum mmap region charges, skipping PROT_NONE reservations (never charged).
+    let mmap_bytes: u64 = proc
+        .mmap_regions
+        .iter()
+        .filter_map(|(&_base, &len_with_flags)| {
+            if (len_with_flags & crate::syscall::MMAP_REGION_FLAG_PROT_NONE) != 0 {
+                return None;
+            }
+            let len = crate::syscall::mmap_region_len(len_with_flags) as u64;
+            if len > 0 { Some(len) } else { None }
+        })
+        .sum();
+
+    // Compute brk heap charge (page-aligned).
+    const PAGE_SIZE: usize = 0x1000;
+    let brk_aligned = (proc.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let brk_start_aligned = (proc.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let heap_bytes = brk_aligned.saturating_sub(brk_start_aligned) as u64;
+
+    // ELF loader charges (PT_LOAD segments + user stack).
+    let elf_bytes = proc.elf_charged_bytes;
+
+    mmap_bytes
+        .saturating_add(heap_bytes)
+        .saturating_add(elf_bytes)
+}
+
 /// 进程统计信息
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProcessStats {
