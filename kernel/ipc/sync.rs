@@ -671,6 +671,17 @@ fn ensure_waitqueue_timer_registered() {
 
 /// 注册定时等待
 fn register_timed_wait(queue: usize, pid: ProcessId, deadline_tick: u64) {
+    // R143-5 FIX: All WaitQueue instances must be 'static (kernel BSS/data).
+    // If a heap/stack WaitQueue were used with timed waits, the raw `usize`
+    // address could dangle after the WaitQueue is dropped. This assert catches
+    // accidental non-static usage in debug builds. Kernel static data lives
+    // in the high-half address space (>= 0xFFFF_FFFF_8000_0000).
+    debug_assert!(
+        queue >= 0xFFFF_FFFF_8000_0000,
+        "R143-5: WaitQueue address 0x{:x} is not in kernel static range — \
+         timed waits require 'static WaitQueue instances",
+        queue
+    );
     TIMED_WAITERS.lock().push(TimedWaiter {
         queue,
         pid,

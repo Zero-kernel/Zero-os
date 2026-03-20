@@ -2621,7 +2621,9 @@ fn sys_clone(
         let has_cap_admin =
             with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
-        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
+        // R143-2 FIX: Use current_is_host_root() instead of namespace-local euid==0
+        // for consistency with sys_setns and cgroup governance gates.
+        let is_root = crate::current_is_host_root();
         if !is_root && !has_cap_admin {
             kprintln!("[sys_clone] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
             return Err(SyscallError::EPERM);
@@ -2640,7 +2642,8 @@ fn sys_clone(
         let has_cap_admin =
             with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
-        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
+        // R143-2 FIX: Use current_is_host_root() for consistency with sys_setns.
+        let is_root = crate::current_is_host_root();
         if !is_root && !has_cap_admin {
             kprintln!("[sys_clone] CLONE_NEWIPC denied: requires CAP_SYS_ADMIN or root");
             return Err(SyscallError::EPERM);
@@ -2659,7 +2662,8 @@ fn sys_clone(
         let has_cap_admin =
             with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
-        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
+        // R143-2 FIX: Use current_is_host_root() for consistency with sys_setns.
+        let is_root = crate::current_is_host_root();
         if !is_root && !has_cap_admin {
             kprintln!("[sys_clone] CLONE_NEWNET denied: requires CAP_NET_ADMIN or root");
             return Err(SyscallError::EPERM);
@@ -4684,7 +4688,8 @@ fn sys_unshare(flags: u64) -> SyscallResult {
         let has_cap_admin =
             with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
-        let is_root = crate::current_euid().map(|e| e == 0).unwrap_or(false);
+        // R143-2 FIX: Use current_is_host_root() for consistency with sys_setns.
+        let is_root = crate::current_is_host_root();
         if !is_root && !has_cap_admin {
             kprintln!("[sys_unshare] CLONE_NEWNS denied: requires CAP_SYS_ADMIN or root");
             return Err(SyscallError::EPERM);
@@ -9731,8 +9736,26 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     // Migrate task between cgroups
     match cgroup::migrate_task(pid as u64, old_cgroup_id, cgroup_id) {
         Ok(()) => {
-            // Update PCB with new cgroup
+            // R143-1 FIX: Transfer cgroup memory charges from source to
+            // destination. Hold process lock across charge snapshot and
+            // cgroup_id update to prevent mutation race (mmap/brk between
+            // snapshot and cgroup_id update).
             let mut proc = process.lock();
+            let total_charged_bytes =
+                crate::process::compute_cgroup_charged_bytes(&proc);
+
+            if let Err(_e) = cgroup::migrate_memory_charges(
+                total_charged_bytes,
+                old_cgroup_id,
+                cgroup_id,
+            ) {
+                // Charge transfer failed. Roll back PIDs migration.
+                drop(proc);
+                let _ = cgroup::migrate_task(pid as u64, cgroup_id, old_cgroup_id);
+                return Err(SyscallError::ENOMEM);
+            }
+
+            // Update PCB with new cgroup (still under process lock).
             proc.cgroup_id = cgroup_id;
             Ok(0)
         }

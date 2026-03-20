@@ -652,10 +652,14 @@ impl CgroupCtrlInode {
                 // the wrong cgroup (destination instead of source), causing
                 // permanent memory_current leak in the source and undercount
                 // in the destination.
-                let total_charged_bytes = {
-                    let proc_guard = proc.lock();
-                    process::compute_cgroup_charged_bytes(&proc_guard)
-                };
+                //
+                // Hold the process lock across both charge snapshot and
+                // cgroup_id update to prevent the target process from changing
+                // its memory footprint (mmap/munmap/brk/exec) between the two
+                // operations (Codex review finding: mutation race window).
+                let mut proc_guard = proc.lock();
+                let total_charged_bytes =
+                    process::compute_cgroup_charged_bytes(&proc_guard);
 
                 if let Err(e) = cgroup::migrate_memory_charges(
                     total_charged_bytes,
@@ -666,6 +670,7 @@ impl CgroupCtrlInode {
                     // Roll back the PIDs migration to leave the process in its
                     // original cgroup. Ignore rollback error -- force_attach_task
                     // in migrate_task handles orphan prevention.
+                    drop(proc_guard);
                     let _ = cgroup::migrate_task(pid_num, self.cgroup_id, old_cgroup_id);
                     return Err(match e {
                         CgroupError::MemoryLimitExceeded => FsError::NoSpace,
@@ -674,8 +679,10 @@ impl CgroupCtrlInode {
                     });
                 }
 
-                // Update process's cgroup_id in PCB to keep state synchronized
-                proc.lock().cgroup_id = self.cgroup_id;
+                // Update process's cgroup_id in PCB to keep state synchronized.
+                // Still under process lock — no window for concurrent memory ops
+                // to charge against the wrong cgroup.
+                proc_guard.cgroup_id = self.cgroup_id;
                 Ok(())
             }
             CtrlKind::SubtreeControl => {

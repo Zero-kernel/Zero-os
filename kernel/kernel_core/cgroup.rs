@@ -1846,12 +1846,15 @@ pub fn migrate_memory_charges(
         return Ok(());
     }
 
-    // Hold registry read lock to block concurrent delete_cgroup during transfer.
-    let _reg_guard = CGROUP_REGISTRY.read();
-
-    // Validate both cgroups exist before modifying counters.
-    lookup_cgroup(from_id).ok_or(CgroupError::NotFound)?;
-    lookup_cgroup(to_id).ok_or(CgroupError::NotFound)?;
+    // Validate both cgroups exist. The returned Arc keeps them alive for the
+    // duration of this function even without holding CGROUP_REGISTRY — the Arc
+    // prevents deallocation even if a concurrent delete_cgroup removes them
+    // from the registry. We intentionally do NOT hold the registry read lock
+    // because uncharge_memory/try_charge_memory internally call lookup_cgroup
+    // which acquires the same spin::RwLock, and spin::RwLock does not support
+    // re-entrant readers on the same CPU (would deadlock on uniprocessor).
+    let _from_arc = lookup_cgroup(from_id).ok_or(CgroupError::NotFound)?;
+    let _to_arc = lookup_cgroup(to_id).ok_or(CgroupError::NotFound)?;
 
     // Phase 1: Uncharge from source hierarchy.
     uncharge_memory(from_id, bytes);
@@ -1991,6 +1994,15 @@ pub fn charge_io(
 
     // Phase 2: All levels have sufficient tokens.  Commit consumption at
     // every level by calling the existing charge() method.
+    //
+    // R143-4 NOTE: The return value from charge() is intentionally discarded.
+    // A narrow TOCTOU race exists: an ancestor could transition to Throttled
+    // between Phase 1 check and Phase 2 commit (due to a concurrent IO charge
+    // on another CPU). If this occurs, one IO operation exceeds the throttle
+    // deadline. This is self-correcting: the next charge_io() call will see
+    // the throttle state and wait. The performance cost of full rollback +
+    // retry outweighs the impact of a single leaked IO in this microsecond
+    // race window.
     for cgroup in &chain {
         let limits = cgroup.limits.lock();
         let _ = cgroup
