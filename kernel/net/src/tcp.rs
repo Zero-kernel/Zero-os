@@ -1118,37 +1118,67 @@ impl TcpControlBlock {
                 let cur_data_end = new_seg.seq.wrapping_add(new_seg.data.len() as u32);
 
                 // Data-only end for buffer sizing (FIN occupies 0 bytes in buffer).
-                let merged_data_end = if seq_ge(rm_data_end, cur_data_end) {
+                let mut merged_data_end = if seq_ge(rm_data_end, cur_data_end) {
                     rm_data_end
                 } else {
                     cur_data_end
                 };
+
+                // R144-2 FIX: Truncate merged data at the earliest FIN position.
+                //
+                // No legitimate data follows a FIN in the same stream direction.
+                // If either segment carries FIN, the merged range must not extend
+                // past the FIN position (the data-end of the FIN-bearing segment).
+                // Without this truncation, an attacker who can inject an OOO segment
+                // adjacent to a FIN-bearing segment can merge data beyond FIN into
+                // the combined range; when ooo_drain_contiguous() delivers this
+                // merged segment, the post-FIN data reaches recv_buffer before the
+                // application sees EOF, enabling data injection past connection close.
+                let merged_fin = removed.fin || new_seg.fin;
+                if merged_fin {
+                    // Compute the earliest FIN position among the segments.
+                    let fin_pos = match (removed.fin, new_seg.fin) {
+                        (true, true) => {
+                            if seq_le(rm_data_end, cur_data_end) {
+                                rm_data_end
+                            } else {
+                                cur_data_end
+                            }
+                        }
+                        (true, false) => rm_data_end,
+                        (false, true) => cur_data_end,
+                        // unreachable because merged_fin is true
+                        (false, false) => merged_data_end,
+                    };
+                    if seq_lt(fin_pos, merged_data_end) {
+                        merged_data_end = fin_pos;
+                    }
+                }
+
                 let merged_len = merged_data_end.wrapping_sub(merged_start) as usize;
 
                 let mut merged_data = vec![0u8; merged_len];
 
                 // Copy removed segment's data at its relative offset
                 let rm_off = removed.seq.wrapping_sub(merged_start) as usize;
-                let rm_len = removed.data.len().min(merged_len.saturating_sub(rm_off));
-                merged_data[rm_off..rm_off + rm_len]
-                    .copy_from_slice(&removed.data[..rm_len]);
+                if rm_off < merged_len {
+                    let rm_len = removed.data.len().min(merged_len.saturating_sub(rm_off));
+                    merged_data[rm_off..rm_off + rm_len]
+                        .copy_from_slice(&removed.data[..rm_len]);
+                }
 
                 // Copy new segment's data (overwrites overlapping region)
                 let ns_off = new_seg.seq.wrapping_sub(merged_start) as usize;
-                let ns_len = new_seg.data.len().min(merged_len.saturating_sub(ns_off));
-                merged_data[ns_off..ns_off + ns_len]
-                    .copy_from_slice(&new_seg.data[..ns_len]);
+                if ns_off < merged_len {
+                    let ns_len = new_seg.data.len().min(merged_len.saturating_sub(ns_off));
+                    merged_data[ns_off..ns_off + ns_len]
+                        .copy_from_slice(&new_seg.data[..ns_len]);
+                }
 
-                // R135-4 FIX: Preserve FIN if EITHER segment carries it.
-                // TCP FIN means "no more data after this point in the stream".
-                // The previous logic required a FIN-carrying segment's seq_end
-                // to reach merged_seq_end, which fails when a FIN-only segment
-                // (data_len=0, fin=true) is merged with a following data segment:
-                // the FIN-only seg's seq_end (seq+1) doesn't reach the data
-                // segment's further extent, so FIN was silently dropped.
-                // Since no legitimate data can follow a FIN in the same stream
-                // direction, OR-merging is the correct semantic.
-                let merged_fin = removed.fin || new_seg.fin;
+                // R135-4 FIX + R144-2 FIX: Preserve FIN if EITHER segment carries it.
+                // The fin_pos truncation above ensures the merged data range never
+                // extends past the earliest FIN position, so FIN remains at the end
+                // of the merged range and no post-FIN data is buffered.
 
                 new_seg = OooSegment {
                     seq: merged_start,

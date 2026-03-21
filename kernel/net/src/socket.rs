@@ -4311,6 +4311,17 @@ impl SocketTable {
 
                 let mut data_received = false;
                 let mut response: Option<Vec<u8>> = None;
+                // R144-1 FIX: Save rcv_nxt AFTER in-order data but BEFORE OOO drain.
+                //
+                // When a segment carries both data and FIN, rcv_nxt advances by
+                // payload.len() for the data, then ooo_drain_contiguous() may
+                // advance it further for contiguous OOO segments.  The FIN check
+                // below compares header.seq_num + payload.len() against rcv_nxt,
+                // which must reflect the position immediately after the in-order
+                // data (the FIN position) -- not the post-drain position.
+                // Without this fix, the FIN is silently lost and the connection
+                // stays in Established state indefinitely (TCB leak).
+                let mut fin_expected_seq: Option<u32> = None;
 
                 // Process incoming data if present
                 if !payload.is_empty() {
@@ -4347,8 +4358,18 @@ impl SocketTable {
                         tcp_state.control.rcv_nxt =
                             tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
 
-                        // Drain contiguous data from OOO queue that now abuts rcv_nxt
-                        tcp_state.control.ooo_drain_contiguous();
+                        // R144-1 FIX: Snapshot rcv_nxt before OOO drain so the FIN
+                        // check uses the correct expected sequence.
+                        fin_expected_seq = Some(tcp_state.control.rcv_nxt);
+
+                        // R144-1 FIX: Skip OOO drain when the current segment carries
+                        // FIN.  The FIN handler below will clear the OOO queue (no data
+                        // is valid after FIN).  If we drained here, OOO data starting at
+                        // the FIN position would be appended to recv_buffer before FIN
+                        // acceptance, enabling post-FIN data injection.
+                        if !is_fin {
+                            tcp_state.control.ooo_drain_contiguous();
+                        }
 
                         // Build ACK (plain — no SACK blocks needed for in-order data
                         // with empty OOO queue; includes SACK if OOO queue is non-empty)
@@ -4385,9 +4406,14 @@ impl SocketTable {
 
                 // RFC 793: Handle FIN flag - peer wants to close
                 if is_fin {
-                    // FIN must be in-order (seq_num == rcv_nxt after any data)
+                    // R144-1 FIX: Use the pre-OOO-drain rcv_nxt (if available) so that
+                    // contiguous OOO segments drained after the in-order data do not
+                    // push rcv_nxt past the FIN position, silently losing FIN.
+                    let expected_fin_pos = fin_expected_seq
+                        .unwrap_or(tcp_state.control.rcv_nxt);
+                    // FIN must be in-order (seq_num + payload_len == expected position)
                     if header.seq_num.wrapping_add(payload.len() as u32)
-                        != tcp_state.control.rcv_nxt
+                        != expected_fin_pos
                     {
                         let dup_ack = build_tcp_segment(
                             dst_ip,
@@ -4403,9 +4429,24 @@ impl SocketTable {
                         return Some(dup_ack);
                     }
 
-                    // FIN consumes 1 sequence number
-                    tcp_state.control.rcv_nxt = tcp_state.control.rcv_nxt.wrapping_add(1);
+                    // R144-1 FIX: FIN consumes 1 sequence number.
+                    // Set rcv_nxt to expected_fin_pos + 1, since the OOO drain may
+                    // have already advanced rcv_nxt past the FIN position.  Data
+                    // delivered by OOO drain that was beyond the FIN is invalid
+                    // (no legitimate data can follow FIN in the same direction);
+                    // clearing the OOO queue below prevents further delivery.
+                    tcp_state.control.rcv_nxt = expected_fin_pos.wrapping_add(1);
                     tcp_state.control.fin_received = true;
+
+                    // R144-1 FIX: No data is valid after FIN.  Drop any buffered
+                    // OOO segments to prevent delivering data past FIN and to free
+                    // memory sooner.
+                    while let Some(stale) = tcp_state.control.ooo_queue.pop_front() {
+                        tcp_state.control.ooo_bytes = tcp_state
+                            .control
+                            .ooo_bytes
+                            .saturating_sub(stale.data.len() as u32);
+                    }
 
                     let window_after = tcp_state
                         .control
@@ -4555,6 +4596,8 @@ impl SocketTable {
 
                 let mut data_received = false;
                 let mut response: Option<Vec<u8>> = None;
+                // R144-1 FIX: See Established-state comment for rationale.
+                let mut fin_expected_seq: Option<u32> = None;
 
                 // Process incoming data (we can still receive in FIN_WAIT_1)
                 if !payload.is_empty() {
@@ -4584,7 +4627,11 @@ impl SocketTable {
                         tcp_state.control.recv_buffer.extend(payload.iter().copied());
                         tcp_state.control.rcv_nxt =
                             tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
-                        tcp_state.control.ooo_drain_contiguous();
+                        // R144-1 FIX: Snapshot before OOO drain; skip drain if FIN.
+                        fin_expected_seq = Some(tcp_state.control.rcv_nxt);
+                        if !is_fin {
+                            tcp_state.control.ooo_drain_contiguous();
+                        }
 
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         response = Some(Self::build_sack_ack(
@@ -4616,7 +4663,9 @@ impl SocketTable {
 
                 // Handle peer's FIN
                 if is_fin {
-                    let expected_fin_seq = tcp_state.control.rcv_nxt;
+                    // R144-1 FIX: Use pre-OOO-drain rcv_nxt.
+                    let expected_fin_seq = fin_expected_seq
+                        .unwrap_or(tcp_state.control.rcv_nxt);
                     if header.seq_num.wrapping_add(payload.len() as u32) != expected_fin_seq {
                         let dup_ack = build_tcp_segment(
                             dst_ip,
@@ -4632,8 +4681,17 @@ impl SocketTable {
                         return Some(dup_ack);
                     }
 
-                    tcp_state.control.rcv_nxt = tcp_state.control.rcv_nxt.wrapping_add(1);
+                    // R144-1 FIX: Set rcv_nxt to the FIN position + 1.
+                    tcp_state.control.rcv_nxt = expected_fin_seq.wrapping_add(1);
                     tcp_state.control.fin_received = true;
+
+                    // R144-1 FIX: Clear OOO queue — no data valid past FIN.
+                    while let Some(stale) = tcp_state.control.ooo_queue.pop_front() {
+                        tcp_state.control.ooo_bytes = tcp_state
+                            .control
+                            .ooo_bytes
+                            .saturating_sub(stale.data.len() as u32);
+                    }
 
                     let window_after = tcp_state
                         .control
@@ -4768,6 +4826,8 @@ impl SocketTable {
 
                 let mut data_received = false;
                 let mut response: Option<Vec<u8>> = None;
+                // R144-1 FIX: See Established-state comment for rationale.
+                let mut fin_expected_seq: Option<u32> = None;
 
                 // We can still receive data in FIN_WAIT_2
                 if !payload.is_empty() {
@@ -4797,7 +4857,11 @@ impl SocketTable {
                         tcp_state.control.recv_buffer.extend(payload.iter().copied());
                         tcp_state.control.rcv_nxt =
                             tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
-                        tcp_state.control.ooo_drain_contiguous();
+                        // R144-1 FIX: Snapshot before OOO drain; skip drain if FIN.
+                        fin_expected_seq = Some(tcp_state.control.rcv_nxt);
+                        if !is_fin {
+                            tcp_state.control.ooo_drain_contiguous();
+                        }
 
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         response = Some(Self::build_sack_ack(
@@ -4829,7 +4893,9 @@ impl SocketTable {
 
                 // Handle peer's FIN
                 if is_fin {
-                    let expected_fin_seq = tcp_state.control.rcv_nxt;
+                    // R144-1 FIX: Use pre-OOO-drain rcv_nxt.
+                    let expected_fin_seq = fin_expected_seq
+                        .unwrap_or(tcp_state.control.rcv_nxt);
                     if header.seq_num.wrapping_add(payload.len() as u32) != expected_fin_seq {
                         let dup_ack = build_tcp_segment(
                             dst_ip,
@@ -4845,8 +4911,17 @@ impl SocketTable {
                         return Some(dup_ack);
                     }
 
-                    tcp_state.control.rcv_nxt = tcp_state.control.rcv_nxt.wrapping_add(1);
+                    // R144-1 FIX: Set rcv_nxt to FIN position + 1.
+                    tcp_state.control.rcv_nxt = expected_fin_seq.wrapping_add(1);
                     tcp_state.control.fin_received = true;
+
+                    // R144-1 FIX: Clear OOO queue — no data valid past FIN.
+                    while let Some(stale) = tcp_state.control.ooo_queue.pop_front() {
+                        tcp_state.control.ooo_bytes = tcp_state
+                            .control
+                            .ooo_bytes
+                            .saturating_sub(stale.data.len() as u32);
+                    }
 
                     let window_after = tcp_state
                         .control
