@@ -115,6 +115,14 @@ pub fn cleanup_identity_map(
     _phys_offset: VirtAddr,
     strategy: IdentityCleanupStrategy,
 ) -> Result<CleanupOutcome, HardeningError> {
+    // R144-4 FIX: This function uses local-only TLB flush (flush_all_local),
+    // which is only safe before SMP bring-up.  Assert single-CPU to prevent
+    // future misuse after AP cores are online.
+    debug_assert!(
+        cpu_local::num_online_cpus() <= 1,
+        "cleanup_identity_map: must be called before SMP bring-up (local TLB flush only)"
+    );
+
     if strategy == IdentityCleanupStrategy::Skip {
         return Ok(CleanupOutcome::Skipped);
     }
@@ -236,6 +244,14 @@ pub fn enforce_nx_for_kernel(
     phys_offset: VirtAddr,
     frame_allocator: &mut FrameAllocator,
 ) -> Result<NxEnforcementSummary, HardeningError> {
+    // R144-4 FIX: This function uses local-only TLB flush (flush_all_local),
+    // which is only safe before SMP bring-up.  Assert single-CPU to prevent
+    // future misuse after AP cores are online.
+    debug_assert!(
+        cpu_local::num_online_cpus() <= 1,
+        "enforce_nx_for_kernel: must be called before SMP bring-up (local TLB flush only)"
+    );
+
     let mut summary = NxEnforcementSummary {
         text_rx_pages: 0,
         ro_pages: 0,

@@ -114,10 +114,17 @@ pub fn register_current_hooks(evaluator: SeccompEvaluator, enabled_check: Seccom
 
 /// Syscalls allowed in SECCOMP_MODE_STRICT.
 ///
-/// This mirrors Linux's strict mode whitelist.
+/// This mirrors Linux's strict mode whitelist (see seccomp(2)):
+/// read, write, exit, exit_group, and rt_sigreturn.
+///
+/// R144-3 FIX: Added rt_sigreturn(15). Without it, a process in strict mode
+/// that receives a signal cannot return from its signal handler — the sigreturn
+/// syscall is denied by seccomp, causing forced termination instead of graceful
+/// signal handling.
 const STRICT_ALLOWED: &[u64] = &[
     0,   // read
     1,   // write
+    15,  // rt_sigreturn — R144-3 FIX
     60,  // exit
     231, // exit_group
 ];
@@ -434,6 +441,9 @@ mod tests {
 
         // Write should be allowed
         assert_eq!(filter.evaluate(1, &args), SeccompAction::Allow);
+
+        // rt_sigreturn should be allowed (R144-3 FIX)
+        assert_eq!(filter.evaluate(15, &args), SeccompAction::Allow);
 
         // Exit should be allowed
         assert_eq!(filter.evaluate(60, &args), SeccompAction::Allow);

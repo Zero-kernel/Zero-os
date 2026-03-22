@@ -546,6 +546,13 @@ pub struct Process {
     /// Invariant: uses saturating arithmetic — never underflows.
     pub vm_charged_bytes: u64,
 
+    /// R144-1 FIX: Bytes already charged to cgroup via sys_brk growth that are
+    /// not yet reflected in `proc.brk`.  Non-zero only while the process lock is
+    /// dropped for PT operations (Phase 2 of sys_brk).  Included by
+    /// `compute_cgroup_charged_bytes()` so that cgroup migration during the
+    /// lock-drop window transfers the full charge amount, closing the TOCTOU gap.
+    pub brk_pending_growth: u64,
+
     /// R137-1 FIX: Cgroup memory bytes charged by the ELF loader for PT_LOAD
     /// segments and the initial user stack.
     ///
@@ -802,6 +809,7 @@ impl Process {
             user_memory_space: 0,
             mmap_regions: BTreeMap::new(),
             vm_charged_bytes: 0,
+            brk_pending_growth: 0,
             elf_charged_bytes: 0,
             next_mmap_addr: security::randomized_mmap_base(DEFAULT_MMAP_BASE),
             fd_table: BTreeMap::new(),
@@ -3891,11 +3899,18 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
     let brk_start_aligned = (proc.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let heap_bytes = brk_aligned.saturating_sub(brk_start_aligned) as u64;
 
+    // R144-1 FIX: Include pending brk growth that has been charged to the
+    // cgroup but not yet reflected in proc.brk (lock dropped for PT ops).
+    // Without this, cgroup migration during the window reads stale brk and
+    // transfers insufficient charges to the destination cgroup.
+    let pending_brk = proc.brk_pending_growth;
+
     // ELF loader charges (PT_LOAD segments + user stack).
     let elf_bytes = proc.elf_charged_bytes;
 
     mmap_bytes
         .saturating_add(heap_bytes)
+        .saturating_add(pending_brk)
         .saturating_add(elf_bytes)
 }
 

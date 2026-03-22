@@ -68,6 +68,16 @@ use crate::traits::FileSystem;
 /// This prevents resource exhaustion attacks via deeply nested namespaces.
 pub const MAX_MNT_NS_LEVEL: u8 = 32;
 
+/// R144-5 FIX: Maximum mounts per namespace.
+///
+/// Linux defaults to 100000 via `sysctl fs.mount-max`.  We use a much smaller
+/// limit since Zero-OS does not expose a sysctl interface and each mount
+/// allocates heap memory for the Mount struct + path strings.  4096 mounts is
+/// generous for any realistic workload; the limit prevents a CAP_SYS_ADMIN
+/// holder from exhausting kernel heap via a mount storm within a single
+/// namespace.
+pub const MAX_MOUNTS_PER_NS: usize = 4096;
+
 // ============================================================================
 // Mount Flags
 // ============================================================================
@@ -117,6 +127,8 @@ impl Default for MountFlags {
 pub enum MountNsError {
     /// Maximum namespace nesting depth exceeded
     MaxDepthExceeded,
+    /// R144-5 FIX: Maximum mounts per namespace exceeded
+    MaxMountsExceeded,
     /// Namespace is shutting down (unused, for future compatibility)
     NamespaceShuttingDown,
     /// Mount point already exists at the specified path
@@ -627,6 +639,12 @@ pub fn add_mount(
     mount.path = normalized_path.clone();
 
     let mut table = ns.mounts.write();
+
+    // R144-5 FIX: Enforce per-namespace mount count limit to prevent
+    // kernel heap exhaustion from a mount storm within a single namespace.
+    if table.len() >= MAX_MOUNTS_PER_NS {
+        return Err(MountNsError::MaxMountsExceeded);
+    }
 
     // Check for existing mount at this path
     if table.contains_key(&normalized_path) {

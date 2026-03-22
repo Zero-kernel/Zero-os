@@ -1562,10 +1562,13 @@ fn generate_maps(pid: u32) -> String {
             // R121-4 FIX: Strip pending-map/unmap flags from the stored length.
             // Page-aligned lengths use bits [12..] so mask off low 12 bits.
             let end = start.saturating_add(size & !0xfff);
+            // R144-2 FIX: Decode stored protection bits instead of hardcoding "rw-p".
+            let perms = kernel_core::mmap_flags_to_perms(size & 0xfff);
+            let perms_str = core::str::from_utf8(&perms).unwrap_or("rw-p");
             // Format: start-end perms offset dev:inode pathname
             let line = format!(
-                "{:016x}-{:016x} rw-p 00000000 00:00 0    [anon]\n",
-                start, end
+                "{:016x}-{:016x} {} 00000000 00:00 0    [anon]\n",
+                start, end, perms_str
             );
             if result.len().saturating_add(line.len()) > MAX_MAPS_OUTPUT {
                 truncated = true;

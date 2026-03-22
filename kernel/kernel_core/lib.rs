@@ -126,6 +126,8 @@ pub use syscall::{
     SyscallFrame, VfsStat,
     // R74-2 test helper
     test_is_mount_ns_callback_registered,
+    // R144-2 FIX: Decode mmap region flags to permission string for procfs
+    mmap_flags_to_perms,
 };
 pub use time::{current_timestamp_ms, get_ticks, on_timer_tick};
 pub use usercopy::{

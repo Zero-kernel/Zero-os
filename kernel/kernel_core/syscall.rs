@@ -4089,6 +4089,7 @@ fn sys_exec(
         // R131-6 FIX: Reset per-task charge counter — the old image's charges
         // were fully uncharged above; new ELF image starts with a clean slate.
         proc.vm_charged_bytes = 0;
+        proc.brk_pending_growth = 0; // R144-1 FIX: Clear pending brk growth on exec
         // R137-1 FIX: Record the new ELF image's cgroup charges (segments + stack)
         // so that process exit and subsequent exec can uncharge them. The old
         // image's elf_charged_bytes were already uncharged above alongside
@@ -5587,6 +5588,13 @@ const MMAP_REGION_FLAG_PENDING_UNMAP: usize = 1 << 1;
 // R124-1 FIX: Made pub(crate) so process exit/exec cleanup can skip uncharge for PROT_NONE.
 pub(crate) const MMAP_REGION_FLAG_PROT_NONE: usize = 1 << 2;
 
+// R144-2 FIX: Protection bit flags stored in mmap_regions entries so that
+// /proc/[pid]/maps can display accurate permissions instead of hardcoded "rw-p".
+// Public so that VFS procfs can decode permission strings via mmap_flags_to_perms().
+pub const MMAP_REGION_FLAG_PROT_READ: usize = 1 << 3;
+pub const MMAP_REGION_FLAG_PROT_WRITE: usize = 1 << 4;
+pub const MMAP_REGION_FLAG_PROT_EXEC: usize = 1 << 5;
+
 /// Mask of transient in-flight flags. Only these are stripped on fork/clone;
 /// persistent committed flags (e.g. PROT_NONE) are preserved.
 pub(crate) const MMAP_REGION_FLAG_TRANSIENT_MASK: usize =
@@ -5597,6 +5605,36 @@ pub(crate) const MMAP_REGION_FLAG_TRANSIENT_MASK: usize =
 #[inline]
 pub(crate) fn mmap_region_len(len_with_flags: usize) -> usize {
     len_with_flags & !MMAP_REGION_FLAG_MASK
+}
+
+/// R144-2 FIX: Encode POSIX prot bits (PROT_READ/WRITE/EXEC) into mmap region
+/// flags for storage in `mmap_regions`.  Used by `generate_maps()` in procfs
+/// to display accurate permission strings.
+#[inline]
+fn mmap_prot_to_flags(prot: i32) -> usize {
+    let mut flags = 0usize;
+    if prot & PROT_READ != 0 {
+        flags |= MMAP_REGION_FLAG_PROT_READ;
+    }
+    if prot & PROT_WRITE != 0 {
+        flags |= MMAP_REGION_FLAG_PROT_WRITE;
+    }
+    if prot & PROT_EXEC != 0 {
+        flags |= MMAP_REGION_FLAG_PROT_EXEC;
+    }
+    flags
+}
+
+/// R144-2 FIX: Decode mmap region flags back to a 4-char Linux-style permission
+/// string ("rwxp"/"r--p"/etc.).  All Zero-OS mmap regions are private (no shared
+/// mappings), so the 4th character is always 'p'.
+pub fn mmap_flags_to_perms(flags: usize) -> [u8; 4] {
+    [
+        if flags & MMAP_REGION_FLAG_PROT_READ != 0 { b'r' } else { b'-' },
+        if flags & MMAP_REGION_FLAG_PROT_WRITE != 0 { b'w' } else { b'-' },
+        if flags & MMAP_REGION_FLAG_PROT_EXEC != 0 { b'x' } else { b'-' },
+        b'p', // always private
+    ]
 }
 
 /// sys_brk - 改变数据段大小（堆管理）
@@ -5675,6 +5713,12 @@ fn sys_brk(addr: usize) -> SyscallResult {
         if cgroup::try_charge_memory(cgroup_id, grow_size as u64).is_err() {
             return Ok(old_brk); // Quota exceeded, return current brk
         }
+
+        // R144-1 FIX: Record the pending brk growth so that
+        // compute_cgroup_charged_bytes() includes it even though proc.brk
+        // hasn't been updated yet. This closes the TOCTOU window where
+        // cgroup migration could read stale brk during the lock drop.
+        proc.brk_pending_growth = grow_size as u64;
 
         // 释放锁后进行映射操作
         drop(proc);
@@ -5769,6 +5813,10 @@ fn sys_brk(addr: usize) -> SyscallResult {
             // 分配失败，返回旧值并回滚内存计费
             // F.2 Cgroup: Rollback memory charge on mapping failure
             cgroup::uncharge_memory(cgroup_id, grow_size as u64);
+            // R144-1 FIX: Clear pending growth on failure (charge rolled back).
+            let mut proc = process.lock();
+            proc.brk_pending_growth = 0;
+            drop(proc);
             return Ok(old_brk);
         }
 
@@ -5776,6 +5824,8 @@ fn sys_brk(addr: usize) -> SyscallResult {
         let memory_space = {
             let mut proc = process.lock();
             proc.brk = addr;
+            // R144-1 FIX: brk is now updated — clear pending growth.
+            proc.brk_pending_growth = 0;
             // R131-6 FIX: Track brk growth in per-task charge counter.
             proc.vm_charged_bytes = proc
                 .vm_charged_bytes
@@ -6165,10 +6215,13 @@ fn sys_mmap(
     }
 
     // Phase 3: Commit the reservation by clearing the PENDING_MAP flag.
-    // The entry transitions from (length | PENDING_MAP) to plain length.
+    // The entry transitions from (length | PENDING_MAP) to (length | prot flags).
+    // R144-2 FIX: Store protection bits so procfs /proc/[pid]/maps shows accurate perms.
+    let prot_flags = mmap_prot_to_flags(prot);
+    let committed_len_with_flags = length_aligned | prot_flags;
     let memory_space = {
         let mut proc = process.lock();
-        proc.mmap_regions.insert(base, length_aligned);
+        proc.mmap_regions.insert(base, committed_len_with_flags);
         // R131-6 FIX: Track this task's independent cgroup charge so non-last
         // CLONE_VM tasks can uncharge on exit (keep_address_space=true).
         proc.vm_charged_bytes = proc
@@ -6184,7 +6237,7 @@ fn sys_mmap(
     // Without this, a sibling that exits last iterates its stale mmap_regions
     // and cannot uncharge regions added by this task → permanent memory_current
     // inflation (cgroup DoS).
-    crate::process::sync_vm_siblings_add_mmap(memory_space, base, length_aligned, pid);
+    crate::process::sync_vm_siblings_add_mmap(memory_space, base, committed_len_with_flags, pid);
 
     // Note: Memory is already atomically charged via try_charge_memory() above.
     // R77-2 FIX: No separate accounting call needed - charge/uncharge model is complete.
