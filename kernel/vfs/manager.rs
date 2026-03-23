@@ -461,6 +461,12 @@ impl Vfs {
             return Err(FsError::Exists);
         }
 
+        // R144-5 FIX: Enforce per-namespace mount count limit to prevent
+        // kernel heap exhaustion from a mount storm within a single namespace.
+        if mounts.len() >= crate::mount_namespace::MAX_MOUNTS_PER_NS {
+            return Err(FsError::NoMem);
+        }
+
         mounts.insert(path.clone(), Mount { path: path.clone(), fs: fs.clone() });
 
         // Sync root_fs when mounting at "/"

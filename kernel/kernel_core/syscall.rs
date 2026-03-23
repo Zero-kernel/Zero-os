@@ -5811,12 +5811,17 @@ fn sys_brk(addr: usize) -> SyscallResult {
 
         if map_result.is_err() {
             // 分配失败，返回旧值并回滚内存计费
-            // F.2 Cgroup: Rollback memory charge on mapping failure
-            cgroup::uncharge_memory(cgroup_id, grow_size as u64);
-            // R144-1 FIX: Clear pending growth on failure (charge rolled back).
-            let mut proc = process.lock();
-            proc.brk_pending_growth = 0;
-            drop(proc);
+            // R144-1 FIX: Clear brk_pending_growth under lock BEFORE
+            // uncharging, and use the *current* cgroup_id (migration may
+            // have changed it while we held no lock).  Clearing pending
+            // first prevents a concurrent sys_cgroup_attach from migrating
+            // a charge that is about to be rolled back.
+            let rollback_cgroup_id = {
+                let mut proc = process.lock();
+                proc.brk_pending_growth = 0;
+                proc.cgroup_id
+            };
+            cgroup::uncharge_memory(rollback_cgroup_id, grow_size as u64);
             return Ok(old_brk);
         }
 
