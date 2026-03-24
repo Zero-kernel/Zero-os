@@ -833,12 +833,13 @@ impl ConntrackTable {
         dir: ConntrackDir,
         l4: &L4Meta,
     ) -> (CtProtoState, CtDecision) {
-        // Handle RST - always transitions to Close
+        // R145-4 FIX: Do NOT transition conntrack state on RST.  The
+        // conntrack layer lacks sequence numbers to validate RST legitimacy.
+        // Preserve the current state and let the socket layer (RFC 5961)
+        // perform proper RST validation.  The conntrack entry expires
+        // naturally via its idle timeout.
         if l4.is_rst() {
-            return (
-                CtProtoState::Tcp(TcpCtState::Close),
-                CtDecision::Established,
-            );
+            return (CtProtoState::Tcp(state), CtDecision::Established);
         }
 
         let new_state = match (state, dir) {

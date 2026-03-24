@@ -5914,9 +5914,7 @@ fn sys_brk(addr: usize) -> SyscallResult {
             proc.vm_charged_bytes = proc
                 .vm_charged_bytes
                 .saturating_sub(shrink_size as u64);
-            let ms = proc.memory_space;
-            drop(proc);
-            ms
+            proc.memory_space
         };
 
         // R140-1 FIX: Sync brk across CLONE_VM siblings. Without this, siblings
@@ -5924,8 +5922,11 @@ fn sys_brk(addr: usize) -> SyscallResult {
         // the cgroup for the difference (memory_current undercount → memory.max bypass).
         crate::process::sync_vm_siblings_brk(memory_space, addr, pid);
 
-        // F.2 Cgroup: Uncharge memory after successful heap shrink
-        cgroup::uncharge_memory(cgroup_id, shrink_size as u64);
+        // R145-1 FIX: Re-read cgroup_id under lock immediately before uncharge.
+        // Migration may have changed it while we held no lock during PT
+        // operations or sibling sync.
+        let shrink_cgroup_id = process.lock().cgroup_id;
+        cgroup::uncharge_memory(shrink_cgroup_id, shrink_size as u64);
 
         Ok(addr)
     }
@@ -6288,7 +6289,7 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     //   concurrent mmap/munmap can't race the PT operations.
     // Phase 2 (no Process lock): perform PT unmap via with_current_manager().
     // Phase 3 (Process lock): remove PCB record and uncharge cgroup.
-    let (recorded_length, committed_flags, cgroup_id) = {
+    let (recorded_length, committed_flags) = {
         let mut proc = process.lock();
 
         // 检查该区域是否在进程的 mmap 记录中
@@ -6322,7 +6323,9 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         proc.mmap_regions
             .insert(addr, recorded_length | committed_flags | MMAP_REGION_FLAG_PENDING_UNMAP);
 
-        (recorded_length, committed_flags, proc.cgroup_id)
+        // R145-1 FIX: Do NOT capture cgroup_id here — it may change during
+        // the lock-drop window (migration).  Re-read under lock in Phase 3.
+        (recorded_length, committed_flags)
     }; // Process lock dropped here — Phase 1 complete
 
     // 使用基于当前 CR3 的页表管理器进行取消映射
@@ -6423,7 +6426,10 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     // cgroup memory, so skip uncharge to maintain correct accounting.
     // R142-1 FIX: Gate on is_first_remover to prevent double-uncharge
     // when concurrent CLONE_VM siblings both munmap the same region.
+    // R145-1 FIX: Re-read cgroup_id under lock — migration may have changed
+    // it while we held no lock during Phase 2 PT operations.
     if is_first_remover && (committed_flags & MMAP_REGION_FLAG_PROT_NONE) == 0 {
+        let cgroup_id = process.lock().cgroup_id;
         cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
     }
 
@@ -6546,6 +6552,24 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
 
     // 刷新 TLB
     mm::flush_current_as_range(VirtAddr::new(addr as u64), len_aligned);
+
+    // R145-2 FIX: Update mmap_regions protection bits to match the new PTE
+    // flags.  Without this, /proc/[pid]/maps displays stale permissions
+    // after mprotect (the R144-2 prot bits are only set at mmap time).
+    {
+        let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+        let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+        let new_prot_flags = mmap_prot_to_flags(prot);
+        let prot_mask = MMAP_REGION_FLAG_PROT_READ
+            | MMAP_REGION_FLAG_PROT_WRITE
+            | MMAP_REGION_FLAG_PROT_EXEC;
+        let mut proc = process.lock();
+        // Update every mmap_regions entry whose base falls within [addr, end).
+        // mprotect may span multiple regions; each gets the same new prot bits.
+        for (_, len_with_flags) in proc.mmap_regions.range_mut(addr..end) {
+            *len_with_flags = (*len_with_flags & !prot_mask) | new_prot_flags;
+        }
+    }
 
     Ok(0)
 }

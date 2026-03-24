@@ -50,6 +50,15 @@ static mut BSP_KERNEL_STACK: AlignedStack<KERNEL_STACK_SIZE> = AlignedStack([0; 
 static mut BSP_DOUBLE_FAULT_STACK: AlignedStack<DOUBLE_FAULT_STACK_SIZE> =
     AlignedStack([0; DOUBLE_FAULT_STACK_SIZE]);
 
+/// R145-6 FIX: Per-AP dedicated double-fault IST stacks.  Without these,
+/// APs reuse their kernel stack for #DF handling, so a stack overflow
+/// triggers #PF → #DF on the same corrupted stack → triple fault.
+/// Uses AlignedStack to guarantee 16-byte alignment for x86-interrupt ABI.
+static mut AP_DOUBLE_FAULT_STACKS: [AlignedStack<DOUBLE_FAULT_STACK_SIZE>; MAX_CPUS] = {
+    const INIT: AlignedStack<DOUBLE_FAULT_STACK_SIZE> = AlignedStack([0; DOUBLE_FAULT_STACK_SIZE]);
+    [INIT; MAX_CPUS]
+};
+
 /// 段选择子集合
 #[derive(Debug, Clone, Copy)]
 pub struct Selectors {
@@ -286,9 +295,14 @@ pub unsafe fn init_for_ap(cpu_id: usize, kernel_stack_top: u64) {
         panic!("CPU ID {} exceeds MAX_CPUS {}", cpu_id, MAX_CPUS);
     }
 
-    // APs use their kernel stack for double fault handling too
-    // (In production, each AP should have a dedicated DF stack)
-    let df_stack_top = kernel_stack_top;
+    // R145-6 FIX: APs use a dedicated per-CPU IST stack for double-fault
+    // handling so that a kernel stack overflow does not corrupt the #DF
+    // handler's stack (which would escalate to a triple fault).
+    let df_stack_top = {
+        let stack_ptr = unsafe { &raw const AP_DOUBLE_FAULT_STACKS[cpu_id].0 };
+        let stack_start = x86_64::VirtAddr::from_ptr(stack_ptr);
+        (stack_start + DOUBLE_FAULT_STACK_SIZE as u64).as_u64()
+    };
 
     init_per_cpu_gdt(cpu_id, kernel_stack_top, df_stack_top);
     load_per_cpu_gdt(cpu_id);

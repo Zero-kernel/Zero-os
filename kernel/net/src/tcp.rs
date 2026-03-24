@@ -349,10 +349,17 @@ impl TcpState {
     }
 
     /// Check if the connection can receive data
+    ///
+    /// R145-3 FIX: Include CloseWait — the receive buffer may still contain
+    /// data buffered before the peer's FIN.  POSIX requires recv() to drain
+    /// the buffer and then return 0 (EOF) in CLOSE_WAIT.
     pub fn can_receive(&self) -> bool {
         matches!(
             self,
-            TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
+            TcpState::Established
+                | TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::CloseWait
         )
     }
 
@@ -1286,9 +1293,16 @@ impl TcpControlBlock {
     pub fn generate_sack_blocks(&self) -> Vec<SackBlock> {
         let mut blocks = Vec::with_capacity(TCP_SACK_MAX_BLOCKS);
         for seg in self.ooo_queue.iter().rev().take(TCP_SACK_MAX_BLOCKS) {
+            // R145-5 FIX: FIN occupies one sequence number after the data
+            // payload.  Include it in right_edge so the peer doesn't
+            // unnecessarily retransmit the FIN position.
+            let fin_len: u32 = if seg.fin { 1 } else { 0 };
             blocks.push(SackBlock {
                 left_edge: seg.seq,
-                right_edge: seg.seq.wrapping_add(seg.data.len() as u32),
+                right_edge: seg
+                    .seq
+                    .wrapping_add(seg.data.len() as u32)
+                    .wrapping_add(fin_len),
             });
         }
         blocks

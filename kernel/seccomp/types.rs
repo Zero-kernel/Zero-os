@@ -633,6 +633,14 @@ fn compute_fast_allow(prog: &[SeccompInsn]) -> FastAllowSet {
             continue;
         }
 
+        // R145-8 FIX: Only trust LdSyscallNr at program entry (pc=0).
+        // Dead code after an early Ret could contain LdSyscallNr→JmpEq→Allow
+        // patterns that would set fast_allow bits for syscalls the filter
+        // actually denies.  Restricting to position 0 eliminates the risk.
+        if i != 0 {
+            continue;
+        }
+
         // Check if next instruction is JmpEq
         if let SeccompInsn::JmpEq(nr, true_offset, _) = prog[i + 1] {
             // Calculate the target of the true branch
@@ -769,8 +777,10 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
     // Memory protection flags
     const PROT_EXEC: i32 = 0x4;
 
-    // Always allow exit
-    if syscall_nr == SYS_EXIT {
+    // R145-7 FIX: Always allow exit(60) and exit_group(231).  The libc
+    // exit() path calls exit_group; omitting it would kill pledged processes
+    // on normal termination.
+    if syscall_nr == SYS_EXIT || syscall_nr == 231 {
         return true;
     }
 

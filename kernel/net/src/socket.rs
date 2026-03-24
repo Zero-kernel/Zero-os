@@ -2807,6 +2807,13 @@ impl SocketTable {
 
                     return Ok(data);
                 }
+
+                // R145-3 FIX: EOF — FIN received and recv buffer fully drained.
+                // Return empty Vec (0 bytes) per POSIX instead of blocking
+                // forever or returning InvalidState.
+                if tcp_state.control.fin_received {
+                    return Ok(Vec::new());
+                }
             }
 
             // No data available, block on wait queue
