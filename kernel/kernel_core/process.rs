@@ -1889,6 +1889,63 @@ pub fn sync_vm_siblings_add_mmap(
     }
 }
 
+/// Synchronize mmap_regions protection flag changes across all tasks sharing
+/// the same address space (CLONE_VM siblings).
+///
+/// When mprotect toggles the PROT_NONE flag or changes prot bits, siblings must
+/// see the same bookkeeping so exit-time cgroup accounting (which iterates
+/// each task's mmap_regions) stays consistent.
+///
+/// # Arguments
+///
+/// * `memory_space` - Physical address of the shared PML4 (CR3 value)
+/// * `region_base` - Base address of the single region being updated
+/// * `region_end` - End address (exclusive) of the region
+/// * `new_len_with_flags` - Updated length|flags word to write for this region
+/// * `vm_charged_delta` - Signed delta applied to vm_charged_bytes (saturating):
+///   positive when PROT_NONE→real (charge added), negative when real→PROT_NONE
+///   (charge removed)
+/// * `caller_pid` - PID of the caller (already updated, skip)
+pub fn sync_vm_siblings_mprotect_flags(
+    memory_space: usize,
+    region_base: usize,
+    region_end: usize,
+    new_len_with_flags: usize,
+    vm_charged_delta: i64,
+    caller_pid: ProcessId,
+) {
+    if memory_space == 0 {
+        return;
+    }
+
+    let table = PROCESS_TABLE.lock();
+    for (idx, slot) in table.iter().enumerate() {
+        if idx == caller_pid {
+            continue; // Already handled by caller
+        }
+        if let Some(proc_arc) = slot {
+            let mut proc = proc_arc.lock();
+            if proc.memory_space == memory_space && proc.state != ProcessState::Terminated {
+                // Update matching mmap_regions entries in [region_base, region_end).
+                // Typically exactly one entry at region_base.
+                for (_, len_flags) in proc.mmap_regions.range_mut(region_base..region_end) {
+                    *len_flags = new_len_with_flags;
+                }
+
+                if vm_charged_delta >= 0 {
+                    proc.vm_charged_bytes = proc
+                        .vm_charged_bytes
+                        .saturating_add(vm_charged_delta as u64);
+                } else {
+                    proc.vm_charged_bytes = proc
+                        .vm_charged_bytes
+                        .saturating_sub(vm_charged_delta.unsigned_abs());
+                }
+            }
+        }
+    }
+}
+
 /// R37-1 FIX (Codex review): Count CLONE_VM siblings that are NOT in the same thread group.
 ///
 /// CLONE_THREAD siblings share memory_space AND have the same tgid - these can be TSYNC'd.

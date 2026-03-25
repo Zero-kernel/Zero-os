@@ -6493,6 +6493,34 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
         }
     }
 
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    let is_target_prot_none = prot == PROT_NONE;
+
+    // Phase 0: Under process lock, classify each mmap_regions entry in
+    // [addr, end) by its current PROT_NONE status.  This determines whether
+    // we need frame allocation (PROT_NONE → real) or frame deallocation
+    // (real → PROT_NONE).
+    let (prot_none_regions, real_regions, cgroup_id, memory_space) = {
+        let proc = process.lock();
+        let mut prot_none_regions: Vec<(usize, usize)> = Vec::new();
+        let mut real_regions: Vec<(usize, usize)> = Vec::new();
+
+        for (&region_base, &len_with_flags) in proc.mmap_regions.range(addr..end) {
+            let region_len = mmap_region_len(len_with_flags);
+            if region_len == 0 {
+                continue;
+            }
+            if (len_with_flags & MMAP_REGION_FLAG_PROT_NONE) != 0 {
+                prot_none_regions.push((region_base, region_len));
+            } else {
+                real_regions.push((region_base, region_len));
+            }
+        }
+
+        (prot_none_regions, real_regions, proc.cgroup_id, proc.memory_space)
+    };
+
     // 构建页表标志
     // R24-4 fix: PROT_NONE 需要清除 PRESENT 标志，使页面不可访问
     let flags = if prot == PROT_NONE {
@@ -6510,7 +6538,221 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
         f
     };
 
-    // 更新页表项
+    let new_prot_flags = mmap_prot_to_flags(prot);
+    let prot_mask = MMAP_REGION_FLAG_PROT_READ
+        | MMAP_REGION_FLAG_PROT_WRITE
+        | MMAP_REGION_FLAG_PROT_EXEC;
+
+    // ---------------------------------------------------------------
+    // Path A — PROT_NONE → real permissions:
+    // Allocate frames, charge cgroup, clear PROT_NONE flag.
+    // ---------------------------------------------------------------
+    if !is_target_prot_none && !prot_none_regions.is_empty() {
+        for &(region_base, region_len) in &prot_none_regions {
+            // Step 1: Charge cgroup for the reservation being materialized.
+            if cgroup::try_charge_memory(cgroup_id, region_len as u64).is_err() {
+                return Err(SyscallError::ENOMEM);
+            }
+
+            // Step 2: Allocate zeroed frames + map pages.
+            // Uses same pattern as sys_mmap with 3-phase rollback on failure.
+            let map_result: Result<(), SyscallError> = unsafe {
+                use mm::memory::FrameAllocator;
+                use x86_64::structures::paging::PhysFrame;
+
+                with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
+                    let mut frame_alloc = FrameAllocator::new();
+                    let mut mapped: vec::Vec<(Page, PhysFrame)> = vec::Vec::new();
+
+                    for offset in (0..region_len).step_by(0x1000) {
+                        let page = Page::containing_address(
+                            VirtAddr::new((region_base + offset) as u64),
+                        );
+
+                        let frame = match frame_alloc.allocate_frame() {
+                            Some(f) => f,
+                            None => {
+                                // 3-phase rollback: unmap → TLB flush → deallocate
+                                let flush_len = mapped.len() * 0x1000;
+                                let mut frames_to_free = vec::Vec::new();
+                                for (cp, cf) in mapped.drain(..) {
+                                    if manager.unmap_page(cp).is_ok() {
+                                        frames_to_free.push(cf);
+                                    }
+                                }
+                                if !frames_to_free.is_empty() {
+                                    mm::flush_current_as_range(
+                                        VirtAddr::new(region_base as u64),
+                                        flush_len,
+                                    );
+                                    for f in frames_to_free {
+                                        frame_alloc.deallocate_frame(f);
+                                    }
+                                }
+                                return Err(SyscallError::ENOMEM);
+                            }
+                        };
+
+                        // Security: zero new frame to prevent data leakage.
+                        let virt = mm::phys_to_virt(frame.start_address());
+                        core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
+
+                        if let Err(_) = manager.map_page(page, frame, flags, &mut frame_alloc) {
+                            frame_alloc.deallocate_frame(frame);
+                            let flush_len = mapped.len() * 0x1000;
+                            let mut frames_to_free = vec::Vec::new();
+                            for (cp, cf) in mapped.drain(..) {
+                                if manager.unmap_page(cp).is_ok() {
+                                    frames_to_free.push(cf);
+                                }
+                            }
+                            if !frames_to_free.is_empty() {
+                                mm::flush_current_as_range(
+                                    VirtAddr::new(region_base as u64),
+                                    flush_len,
+                                );
+                                for f in frames_to_free {
+                                    frame_alloc.deallocate_frame(f);
+                                }
+                            }
+                            return Err(SyscallError::ENOMEM);
+                        }
+
+                        mapped.push((page, frame));
+                    }
+
+                    Ok(())
+                })
+            };
+
+            if let Err(e) = map_result {
+                cgroup::uncharge_memory(cgroup_id, region_len as u64);
+                return Err(e);
+            }
+
+            // Step 3: Commit bookkeeping — clear PROT_NONE, set prot bits,
+            // track charge.
+            let region_end = region_base.saturating_add(region_len);
+            let committed = {
+                let mut proc = process.lock();
+                let old = *proc.mmap_regions.get(&region_base).unwrap_or(&0);
+                // Preserve transient flags; clear PROT_NONE + old prot bits.
+                let preserved = (old & MMAP_REGION_FLAG_MASK)
+                    & !(MMAP_REGION_FLAG_PROT_NONE | prot_mask);
+                let new_entry = region_len | preserved | new_prot_flags;
+                proc.mmap_regions.insert(region_base, new_entry);
+                proc.vm_charged_bytes = proc
+                    .vm_charged_bytes
+                    .saturating_add(region_len as u64);
+                new_entry
+            };
+
+            crate::process::sync_vm_siblings_mprotect_flags(
+                memory_space,
+                region_base,
+                region_end,
+                committed,
+                region_len as i64,
+                pid,
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Path B — real permissions → PROT_NONE:
+    // Unmap/free frames, uncharge cgroup, set PROT_NONE flag.
+    // ---------------------------------------------------------------
+    if is_target_prot_none && !real_regions.is_empty() {
+        for &(region_base, region_len) in &real_regions {
+            // Step 1: Unmap pages and free frames (COW-aware).
+            // Same pattern as sys_munmap Phase 2.
+            let _unmap_result: Result<(), SyscallError> = unsafe {
+                use mm::memory::FrameAllocator;
+
+                with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
+                    use alloc::vec::Vec;
+                    use x86_64::structures::paging::PhysFrame;
+
+                    let mut frame_alloc = FrameAllocator::new();
+                    let mut frames_to_free: Vec<PhysFrame> = Vec::new();
+
+                    for offset in (0..region_len).step_by(0x1000) {
+                        let page = Page::containing_address(
+                            VirtAddr::new((region_base + offset) as u64),
+                        );
+
+                        let frame_opt = match manager.unmap_page(page) {
+                            Ok(frame) => Some(frame),
+                            Err(mm::page_table::UnmapError::PageNotMapped) => {
+                                manager.take_nonpresent_leaf_frame(page)
+                            }
+                            Err(_) => None,
+                        };
+
+                        if let Some(frame) = frame_opt {
+                            let phys_addr = frame.start_address().as_u64() as usize;
+                            let should_free = if PAGE_REF_COUNT.get(phys_addr) > 0 {
+                                PAGE_REF_COUNT.decrement(phys_addr) == 0
+                            } else {
+                                true
+                            };
+                            if should_free {
+                                frames_to_free.push(frame);
+                            }
+                        }
+                    }
+
+                    // TLB shootdown then deallocate
+                    mm::flush_current_as_range(
+                        VirtAddr::new(region_base as u64),
+                        region_len,
+                    );
+                    for frame in frames_to_free {
+                        frame_alloc.deallocate_frame(frame);
+                    }
+
+                    Ok(())
+                })
+            };
+
+            // Step 2: Commit bookkeeping — set PROT_NONE, clear prot bits,
+            // decrement charge.
+            let region_end = region_base.saturating_add(region_len);
+            let mut did_transition = false;
+            let mut committed = 0usize;
+            {
+                let mut proc = process.lock();
+                if let Some(&old) = proc.mmap_regions.get(&region_base) {
+                    if (old & MMAP_REGION_FLAG_PROT_NONE) == 0 {
+                        // Preserve transient flags; clear old prot bits.
+                        let preserved = (old & MMAP_REGION_FLAG_MASK) & !prot_mask;
+                        let new_entry =
+                            region_len | preserved | MMAP_REGION_FLAG_PROT_NONE;
+                        proc.mmap_regions.insert(region_base, new_entry);
+                        proc.vm_charged_bytes = proc
+                            .vm_charged_bytes
+                            .saturating_sub(region_len as u64);
+                        did_transition = true;
+                        committed = new_entry;
+                    }
+                }
+            }
+
+            if did_transition {
+                cgroup::uncharge_memory(cgroup_id, region_len as u64);
+                crate::process::sync_vm_siblings_mprotect_flags(
+                    memory_space,
+                    region_base,
+                    region_end,
+                    committed,
+                    -(region_len as i64),
+                    pid,
+                );
+            }
+        }
+    }
+
+    // 更新页表项 (Path C: normal PTE flag update for all pages in range)
     let result: Result<(), SyscallError> = unsafe {
         with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
             for offset in (0..len_aligned).step_by(0x1000) {
@@ -6553,19 +6795,13 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // 刷新 TLB
     mm::flush_current_as_range(VirtAddr::new(addr as u64), len_aligned);
 
-    // R145-2 FIX: Update mmap_regions protection bits to match the new PTE
-    // flags.  Without this, /proc/[pid]/maps displays stale permissions
-    // after mprotect (the R144-2 prot bits are only set at mmap time).
+    // R145-2 FIX: Update mmap_regions protection display bits to match the
+    // new PTE flags.  Path A/B already handled PROT_NONE transitions above;
+    // this block updates the prot display bits (READ/WRITE/EXEC) for all
+    // regions in [addr, end) so /proc/[pid]/maps shows accurate permissions.
+    // For Path A/B regions this is a harmless no-op (bits already correct).
     {
-        let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-        let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
-        let new_prot_flags = mmap_prot_to_flags(prot);
-        let prot_mask = MMAP_REGION_FLAG_PROT_READ
-            | MMAP_REGION_FLAG_PROT_WRITE
-            | MMAP_REGION_FLAG_PROT_EXEC;
         let mut proc = process.lock();
-        // Update every mmap_regions entry whose base falls within [addr, end).
-        // mprotect may span multiple regions; each gets the same new prot bits.
         for (_, len_with_flags) in proc.mmap_regions.range_mut(addr..end) {
             *len_with_flags = (*len_with_flags & !prot_mask) | new_prot_flags;
         }
