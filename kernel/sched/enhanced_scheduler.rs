@@ -234,6 +234,13 @@ impl Scheduler {
         }
 
         // BTreeMap 按 key 升序排列，所以优先级数值最小（最高优先级）的在前面
+        //
+        // R146-6 NOTE: Within a same-priority bucket, iteration follows BTreeMap
+        // key (PID) order, so lower PIDs are always selected first. CPU-bound
+        // tasks are mitigated by decrease_dynamic_priority() which separates
+        // effective priorities. I/O-bound tasks at the same priority may
+        // experience deterministic bias toward lower PIDs. A future enhancement
+        // (VecDeque-based round-robin per bucket) would eliminate this bias.
         for (_priority, bucket) in queue.iter() {
             for (&pid, pcb) in bucket.iter() {
                 // 跳过指定的进程（用于 yield 场景）

@@ -1771,6 +1771,117 @@ pub fn atomic_remove_mmap_region(caller_pid: ProcessId, addr: usize) -> bool {
     true
 }
 
+/// R146-1 FIX: Atomically transition a region from real → PROT_NONE across
+/// the caller and all CLONE_VM siblings sharing the same address space.
+///
+/// Under CLONE_VM, each task keeps its own `mmap_regions` snapshot
+/// (D3-ARC-MM-SHARED design limitation). Two siblings can concurrently
+/// mprotect the same region from real permissions to PROT_NONE and both decide
+/// they were first, leading to double cgroup uncharge → `memory.max` bypass.
+///
+/// This function serializes the transition under `PROCESS_TABLE` lock:
+/// the first caller updates its own entry and propagates to all siblings,
+/// returning `(true, cgroup_id)`. A concurrent sibling finds its entry
+/// already marked PROT_NONE (by the winner's propagation) and returns
+/// `(false, cgroup_id)`, so it skips cgroup uncharge.
+///
+/// Also incorporates R146-2 FIX: returns the `cgroup_id` re-read under lock,
+/// so the caller uses the current (post-migration) cgroup for uncharge.
+///
+/// Lock ordering: PROCESS_TABLE → Process (consistent with all sync_vm_*
+/// functions).
+///
+/// # Arguments
+///
+/// * `caller_pid` - PID of the calling task
+/// * `region_base` - Base address of the mmap region to transition
+/// * `region_len` - Expected page-aligned length of the region
+///
+/// # Returns
+///
+/// `(did_transition, cgroup_id)` — `did_transition` is true only for the
+/// first sibling that performs the transition (should uncharge).
+pub fn atomic_mprotect_prot_none_transition(
+    caller_pid: ProcessId,
+    region_base: usize,
+    region_len: usize,
+) -> (bool, crate::cgroup::CgroupId) {
+    use crate::syscall::{
+        mmap_region_len, MMAP_REGION_FLAG_MASK, MMAP_REGION_FLAG_PROT_NONE,
+        MMAP_REGION_FLAG_PROT_READ, MMAP_REGION_FLAG_PROT_WRITE, MMAP_REGION_FLAG_PROT_EXEC,
+    };
+
+    let prot_mask = MMAP_REGION_FLAG_PROT_READ
+        | MMAP_REGION_FLAG_PROT_WRITE
+        | MMAP_REGION_FLAG_PROT_EXEC;
+
+    let table = PROCESS_TABLE.lock();
+
+    // Step 0: Find the caller slot.
+    let Some(caller_arc) = table.get(caller_pid).and_then(|slot| slot.as_ref()) else {
+        return (false, 0);
+    };
+
+    // Step 1: Check + update the caller's bookkeeping under PROCESS_TABLE lock.
+    let (memory_space, cgroup_id) = {
+        let mut proc = caller_arc.lock();
+        let cgroup_id = proc.cgroup_id;
+        let memory_space = proc.memory_space;
+
+        let Some(entry) = proc.mmap_regions.get_mut(&region_base) else {
+            return (false, cgroup_id);
+        };
+
+        let old = *entry;
+        // Another sibling already performed the transition and propagated it.
+        if (old & MMAP_REGION_FLAG_PROT_NONE) != 0 {
+            return (false, cgroup_id);
+        }
+        // Sanity: length must match what the caller captured in Phase 0.
+        if mmap_region_len(old) != region_len {
+            return (false, cgroup_id);
+        }
+
+        // Preserve transient flags; clear old prot display bits, set PROT_NONE.
+        let preserved = (old & MMAP_REGION_FLAG_MASK) & !prot_mask;
+        *entry = region_len | preserved | MMAP_REGION_FLAG_PROT_NONE;
+
+        proc.vm_charged_bytes = proc.vm_charged_bytes.saturating_sub(region_len as u64);
+
+        (memory_space, cgroup_id)
+    }; // Caller process lock dropped
+
+    // Step 2: Propagate to all CLONE_VM siblings under the same PROCESS_TABLE
+    // lock acquisition that verified our own transition (atomicity guarantee).
+    if memory_space != 0 {
+        for (idx, slot) in table.iter().enumerate() {
+            if idx == caller_pid {
+                continue;
+            }
+            if let Some(sib_arc) = slot {
+                let mut sib = sib_arc.lock();
+                if sib.memory_space == memory_space && sib.state != ProcessState::Terminated {
+                    if let Some(sib_entry) = sib.mmap_regions.get_mut(&region_base) {
+                        let sib_old = *sib_entry;
+                        let sib_len = mmap_region_len(sib_old);
+                        if sib_len == region_len
+                            && (sib_old & MMAP_REGION_FLAG_PROT_NONE) == 0
+                        {
+                            let preserved = (sib_old & MMAP_REGION_FLAG_MASK) & !prot_mask;
+                            *sib_entry =
+                                region_len | preserved | MMAP_REGION_FLAG_PROT_NONE;
+                            sib.vm_charged_bytes =
+                                sib.vm_charged_bytes.saturating_sub(region_len as u64);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (true, cgroup_id)
+}
+
 /// R140-1 FIX: Synchronize mmap_regions removal across all tasks sharing the
 /// same address space (CLONE_VM siblings).
 ///
@@ -1926,20 +2037,30 @@ pub fn sync_vm_siblings_mprotect_flags(
         if let Some(proc_arc) = slot {
             let mut proc = proc_arc.lock();
             if proc.memory_space == memory_space && proc.state != ProcessState::Terminated {
-                // Update matching mmap_regions entries in [region_base, region_end).
-                // Typically exactly one entry at region_base.
-                for (_, len_flags) in proc.mmap_regions.range_mut(region_base..region_end) {
-                    *len_flags = new_len_with_flags;
+                // R146-4 FIX: Use exact-key get_mut with length verification
+                // instead of range_mut, preventing accidental overwrites if
+                // sibling bookkeeping has diverged.
+                let mut updated = false;
+                if let Some(len_flags) = proc.mmap_regions.get_mut(&region_base) {
+                    let existing_len = crate::syscall::mmap_region_len(*len_flags);
+                    let existing_end = region_base.saturating_add(existing_len);
+                    if existing_end == region_end {
+                        *len_flags = new_len_with_flags;
+                        updated = true;
+                    }
                 }
 
-                if vm_charged_delta >= 0 {
-                    proc.vm_charged_bytes = proc
-                        .vm_charged_bytes
-                        .saturating_add(vm_charged_delta as u64);
-                } else {
-                    proc.vm_charged_bytes = proc
-                        .vm_charged_bytes
-                        .saturating_sub(vm_charged_delta.unsigned_abs());
+                // Only adjust vm_charged_bytes if the entry was actually updated.
+                if updated {
+                    if vm_charged_delta >= 0 {
+                        proc.vm_charged_bytes = proc
+                            .vm_charged_bytes
+                            .saturating_add(vm_charged_delta as u64);
+                    } else {
+                        proc.vm_charged_bytes = proc
+                            .vm_charged_bytes
+                            .saturating_sub(vm_charged_delta.unsigned_abs());
+                    }
                 }
             }
         }

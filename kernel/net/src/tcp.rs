@@ -969,6 +969,12 @@ impl TcpControlBlock {
         let mut tcb = Self::new_client(local_ip, local_port, remote_ip, remote_port, iss);
         tcb.irs = irs;
         tcb.rcv_nxt = irs.wrapping_add(1);
+        // R146-NET-1 FIX: Advance snd_nxt past the SYN-ACK sequence number.
+        // Per RFC 793, sending SYN-ACK consumes one sequence number, so
+        // snd_nxt must be ISS+1. Without this, the SynReceived handler's
+        // `ack_num == snd_nxt` check rejects compliant clients that send
+        // ack_num = ISS+1, breaking all stateful TCP passive opens.
+        tcb.snd_nxt = iss.wrapping_add(1);
         tcb.state = TcpState::SynReceived;
         tcb
     }

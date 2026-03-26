@@ -182,6 +182,9 @@ pub enum TcpCtState {
     Established,
     /// FIN sent, waiting for ACK
     FinWait,
+    /// R146-NET-2 FIX: FIN acknowledged, waiting for peer FIN (half-close).
+    /// RFC 793 FIN_WAIT_2 — peer may still send data before closing.
+    FinWait2,
     /// FIN received, waiting for close
     CloseWait,
     /// Final ACK sent
@@ -201,6 +204,7 @@ impl TcpCtState {
             TcpCtState::SynRecv => CT_TCP_TIMEOUT_SYN_RECV_MS,
             TcpCtState::Established => CT_TCP_TIMEOUT_ESTABLISHED_MS,
             TcpCtState::FinWait => CT_TCP_TIMEOUT_FIN_WAIT_MS,
+            TcpCtState::FinWait2 => CT_TCP_TIMEOUT_FIN_WAIT_MS,
             TcpCtState::CloseWait => CT_TCP_TIMEOUT_CLOSE_WAIT_MS,
             TcpCtState::LastAck => CT_TCP_TIMEOUT_LAST_ACK_MS,
             TcpCtState::TimeWait => CT_TCP_TIMEOUT_TIME_WAIT_MS,
@@ -857,8 +861,12 @@ impl ConntrackTable {
                 ConntrackDir::Reply => TcpCtState::CloseWait,
             },
             // FIN wait - handle reply FIN or ACK
+            // R146-NET-2 FIX: FinWait→FinWait2 on ACK (half-close; peer may
+            // still send data), FinWait→LastAck on simultaneous FIN.
             (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_fin() => TcpCtState::LastAck,
-            (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_ack() => TcpCtState::TimeWait,
+            (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_ack() => TcpCtState::FinWait2,
+            // FinWait2 → TimeWait when peer sends FIN (normal half-close close)
+            (TcpCtState::FinWait2, ConntrackDir::Reply) if l4.is_fin() => TcpCtState::TimeWait,
             // Close wait - handle FIN
             (TcpCtState::CloseWait, ConntrackDir::Original) if l4.is_fin() => TcpCtState::LastAck,
             // Last ACK - handle final ACK
@@ -891,6 +899,7 @@ impl ConntrackTable {
             (TcpCtState::Close, TcpCtState::Close)
             | (TcpCtState::TimeWait, TcpCtState::TimeWait)
             | (TcpCtState::FinWait, TcpCtState::FinWait)
+            | (TcpCtState::FinWait2, TcpCtState::FinWait2)
             | (TcpCtState::CloseWait, TcpCtState::CloseWait)
             | (TcpCtState::LastAck, TcpCtState::LastAck)
                 if is_pure_syn =>

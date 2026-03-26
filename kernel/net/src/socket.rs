@@ -1349,7 +1349,14 @@ impl SocketState {
     fn pop_rx(&self) -> Option<PendingDatagram> {
         let pkt = self.rx_queue.lock().pop_front();
         if let Some(ref pkt) = pkt {
-            GLOBAL_UDP_QUEUED_BYTES.fetch_sub(pkt.data.len(), Ordering::Relaxed);
+            // R146-NET-4 FIX: Saturating decrement prevents underflow wrap
+            // in case of hypothetical double-dequeue, which would permanently
+            // block all UDP receive queueing.
+            let _ = GLOBAL_UDP_QUEUED_BYTES.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(pkt.data.len())),
+            );
         }
         pkt
     }
@@ -1378,7 +1385,12 @@ impl Drop for SocketState {
             .map(|pkt| pkt.data.len())
             .sum();
         if queued_bytes > 0 {
-            GLOBAL_UDP_QUEUED_BYTES.fetch_sub(queued_bytes, Ordering::Relaxed);
+            // R146-NET-4 FIX: Saturating decrement prevents underflow wrap.
+            let _ = GLOBAL_UDP_QUEUED_BYTES.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(queued_bytes)),
+            );
         }
     }
 }
@@ -3473,7 +3485,12 @@ impl SocketTable {
                             // In SYN_SENT: RST is valid if ACK acknowledges our SYN
                             header.ack_num == tcp_state.control.snd_nxt
                         }
-                        TcpState::Established
+                        // R146-NET-3 FIX: Accept RST in SynReceived so
+                        // half-open connections can be aborted and SYN queue
+                        // slots freed. Per RFC 793 Section 3.4, a valid RST
+                        // in SYN_RECEIVED returns the connection to CLOSED.
+                        TcpState::SynReceived
+                        | TcpState::Established
                         | TcpState::FinWait1
                         | TcpState::FinWait2
                         | TcpState::CloseWait
@@ -3524,6 +3541,7 @@ impl SocketTable {
                     if matches!(
                         old_state,
                         TcpState::SynSent
+                            | TcpState::SynReceived
                             | TcpState::Established
                             | TcpState::FinWait1
                             | TcpState::FinWait2

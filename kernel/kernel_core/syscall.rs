@@ -6507,6 +6507,14 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
         let mut real_regions: Vec<(usize, usize)> = Vec::new();
 
         for (&region_base, &len_with_flags) in proc.mmap_regions.range(addr..end) {
+            // R146-5 FIX: Reject transient (in-flight) regions, mirroring
+            // sys_munmap's EBUSY check at line 6299. Prevents mprotect from
+            // racing with concurrent mmap/munmap 3-phase operations, which
+            // could cause cross-syscall double-uncharge.
+            if (len_with_flags & MMAP_REGION_FLAG_TRANSIENT_MASK) != 0 {
+                return Err(SyscallError::EBUSY);
+            }
+
             let region_len = mmap_region_len(len_with_flags);
             if region_len == 0 {
                 continue;
@@ -6546,6 +6554,14 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // ---------------------------------------------------------------
     // Path A — PROT_NONE → real permissions:
     // Allocate frames, charge cgroup, clear PROT_NONE flag.
+    //
+    // R146-3 NOTE: If mprotect spans multiple PROT_NONE regions and a later
+    // region fails (cgroup charge exhaustion or frame allocation failure),
+    // earlier regions that were successfully committed are NOT rolled back.
+    // POSIX mprotect(2) allows indeterminate state on error ("if the call
+    // fails, some of the address space may have been changed"), so this is
+    // not a spec violation. Callers MUST NOT assume all-or-nothing atomicity
+    // for multi-region mprotect operations.
     // ---------------------------------------------------------------
     if !is_target_prot_none && !prot_none_regions.is_empty() {
         for &(region_base, region_len) in &prot_none_regions {
@@ -6626,7 +6642,11 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
             };
 
             if let Err(e) = map_result {
-                cgroup::uncharge_memory(cgroup_id, region_len as u64);
+                // R146-2 FIX: Re-read cgroup_id under lock before rollback
+                // uncharge — cgroup migration may have occurred while we held
+                // no lock during PT operations.
+                let rollback_cgroup_id = process.lock().cgroup_id;
+                cgroup::uncharge_memory(rollback_cgroup_id, region_len as u64);
                 return Err(e);
             }
 
@@ -6715,39 +6735,25 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 })
             };
 
-            // Step 2: Commit bookkeeping — set PROT_NONE, clear prot bits,
-            // decrement charge.
-            let region_end = region_base.saturating_add(region_len);
-            let mut did_transition = false;
-            let mut committed = 0usize;
-            {
-                let mut proc = process.lock();
-                if let Some(&old) = proc.mmap_regions.get(&region_base) {
-                    if (old & MMAP_REGION_FLAG_PROT_NONE) == 0 {
-                        // Preserve transient flags; clear old prot bits.
-                        let preserved = (old & MMAP_REGION_FLAG_MASK) & !prot_mask;
-                        let new_entry =
-                            region_len | preserved | MMAP_REGION_FLAG_PROT_NONE;
-                        proc.mmap_regions.insert(region_base, new_entry);
-                        proc.vm_charged_bytes = proc
-                            .vm_charged_bytes
-                            .saturating_sub(region_len as u64);
-                        did_transition = true;
-                        committed = new_entry;
-                    }
-                }
-            }
+            // R146-1 FIX: Atomically commit bookkeeping under PROCESS_TABLE
+            // lock and propagate to all CLONE_VM siblings. Only the first
+            // sibling to observe non-PROT_NONE gets did_transition=true and
+            // should uncharge. This prevents two siblings from independently
+            // deciding to uncharge the same region → double-uncharge →
+            // memory.max bypass.
+            //
+            // R146-2 FIX: The atomic function re-reads cgroup_id under lock,
+            // so uncharge uses the post-migration cgroup if migration occurred
+            // during the PT operations above.
+            let (did_transition, uncharge_cgroup_id) =
+                crate::process::atomic_mprotect_prot_none_transition(
+                    pid,
+                    region_base,
+                    region_len,
+                );
 
             if did_transition {
-                cgroup::uncharge_memory(cgroup_id, region_len as u64);
-                crate::process::sync_vm_siblings_mprotect_flags(
-                    memory_space,
-                    region_base,
-                    region_end,
-                    committed,
-                    -(region_len as i64),
-                    pid,
-                );
+                cgroup::uncharge_memory(uncharge_cgroup_id, region_len as u64);
             }
         }
     }
@@ -6800,11 +6806,33 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // this block updates the prot display bits (READ/WRITE/EXEC) for all
     // regions in [addr, end) so /proc/[pid]/maps shows accurate permissions.
     // For Path A/B regions this is a harmless no-op (bits already correct).
-    {
+    //
+    // R146-8 FIX: Also propagate display-bit updates to CLONE_VM siblings
+    // so their /proc/[pid]/maps shows consistent permissions. Collect
+    // updated entries and sync after releasing the process lock.
+    let display_updates: Vec<(usize, usize)> = {
         let mut proc = process.lock();
-        for (_, len_with_flags) in proc.mmap_regions.range_mut(addr..end) {
+        let mut updates = Vec::new();
+        for (&region_base, len_with_flags) in proc.mmap_regions.range_mut(addr..end) {
             *len_with_flags = (*len_with_flags & !prot_mask) | new_prot_flags;
+            updates.push((region_base, *len_with_flags));
         }
+        updates
+    };
+
+    // R146-8 FIX: Sync Path C prot display-bit changes to CLONE_VM siblings.
+    // vm_charged_delta=0 since display-bit changes do not affect cgroup charges.
+    for (region_base, new_len_with_flags) in display_updates {
+        let region_len = mmap_region_len(new_len_with_flags);
+        let region_end = region_base.saturating_add(region_len);
+        crate::process::sync_vm_siblings_mprotect_flags(
+            memory_space,
+            region_base,
+            region_end,
+            new_len_with_flags,
+            0, // No cgroup charge delta for display-bit-only changes
+            pid,
+        );
     }
 
     Ok(0)
