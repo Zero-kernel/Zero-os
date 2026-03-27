@@ -1809,6 +1809,7 @@ pub fn atomic_mprotect_prot_none_transition(
     use crate::syscall::{
         mmap_region_len, MMAP_REGION_FLAG_MASK, MMAP_REGION_FLAG_PROT_NONE,
         MMAP_REGION_FLAG_PROT_READ, MMAP_REGION_FLAG_PROT_WRITE, MMAP_REGION_FLAG_PROT_EXEC,
+        MMAP_REGION_FLAG_TRANSIENT_MASK,
     };
 
     let prot_mask = MMAP_REGION_FLAG_PROT_READ
@@ -1835,6 +1836,12 @@ pub fn atomic_mprotect_prot_none_transition(
         let old = *entry;
         // Another sibling already performed the transition and propagated it.
         if (old & MMAP_REGION_FLAG_PROT_NONE) != 0 {
+            return (false, cgroup_id);
+        }
+        // Defense-in-depth: reject if a concurrent munmap/mmap has set a
+        // transient flag since our Phase 0 check. This closes the window
+        // where mprotect and munmap could both uncharge the same region.
+        if (old & MMAP_REGION_FLAG_TRANSIENT_MASK) != 0 {
             return (false, cgroup_id);
         }
         // Sanity: length must match what the caller captured in Phase 0.
