@@ -3205,6 +3205,10 @@ fn sys_clone(
             // mmap/munmap from different threads can diverge until we introduce a
             // shared MmState per address space (D3-ARC-MM-SHARED). This is a known
             // architectural limitation carried as design finding D3-ARC-MM-SHARED.
+            // R147-L1 FIX: Transient PENDING_MAP/PENDING_UNMAP flags are already
+            // stripped from parent_mmap at snapshot time (line ~2793, R121-4 FIX).
+            // Direct assignment is safe; the reconciliation step below (R147-5)
+            // will re-snapshot under PROCESS_TABLE lock for final consistency.
             child.mmap_regions = parent_mmap;
             child.next_mmap_addr = parent_next_mmap;
             child.brk_start = parent_brk_start;
@@ -3414,6 +3418,14 @@ fn sys_clone(
 
         // 设置进程状态为就绪
         child.state = ProcessState::Ready;
+    }
+
+    // R147-5 FIX: Reconcile CLONE_VM child's mmap_regions with current parent
+    // state.  Between create_process() insertion (memory_space=0) and the child
+    // lock block above, sync_vm_siblings_* calls skip the child.  Re-snapshot
+    // under PROCESS_TABLE lock to pick up any concurrent munmap/mprotect syncs.
+    if is_shared_space {
+        crate::process::reconcile_clone_vm_mmap_regions(parent_pid, child_pid);
     }
 
     // F.1 PID Namespace: Translate child's global PID to parent's namespace view
@@ -4090,6 +4102,7 @@ fn sys_exec(
         // were fully uncharged above; new ELF image starts with a clean slate.
         proc.vm_charged_bytes = 0;
         proc.brk_pending_growth = 0; // R144-1 FIX: Clear pending brk growth on exec
+        proc.mprotect_pending_bytes = 0; // R147-1 FIX: Clear pending mprotect charges on exec
         // R137-1 FIX: Record the new ELF image's cgroup charges (segments + stack)
         // so that process exit and subsequent exec can uncharge them. The old
         // image's elf_charged_bytes were already uncharged above alongside
@@ -6501,7 +6514,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // [addr, end) by its current PROT_NONE status.  This determines whether
     // we need frame allocation (PROT_NONE → real) or frame deallocation
     // (real → PROT_NONE).
-    let (prot_none_regions, real_regions, cgroup_id, memory_space) = {
+    let (prot_none_regions, real_regions, memory_space) = {
         let proc = process.lock();
         let mut prot_none_regions: Vec<(usize, usize)> = Vec::new();
         let mut real_regions: Vec<(usize, usize)> = Vec::new();
@@ -6526,7 +6539,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
             }
         }
 
-        (prot_none_regions, real_regions, proc.cgroup_id, proc.memory_space)
+        (prot_none_regions, real_regions, proc.memory_space)
     };
 
     // 构建页表标志
@@ -6566,8 +6579,17 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     if !is_target_prot_none && !prot_none_regions.is_empty() {
         for &(region_base, region_len) in &prot_none_regions {
             // Step 1: Charge cgroup for the reservation being materialized.
-            if cgroup::try_charge_memory(cgroup_id, region_len as u64).is_err() {
-                return Err(SyscallError::ENOMEM);
+            //
+            // R147-1 FIX: Record the in-flight charge under the process lock so
+            // compute_cgroup_charged_bytes() includes it during cgroup migration.
+            // Read cgroup_id fresh (not from Phase 0) in case migration occurred.
+            {
+                let mut proc = process.lock();
+                let cgroup_id = proc.cgroup_id;
+                if cgroup::try_charge_memory(cgroup_id, region_len as u64).is_err() {
+                    return Err(SyscallError::ENOMEM);
+                }
+                proc.mprotect_pending_bytes = region_len as u64;
             }
 
             // Step 2: Allocate zeroed frames + map pages.
@@ -6645,7 +6667,12 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 // R146-2 FIX: Re-read cgroup_id under lock before rollback
                 // uncharge — cgroup migration may have occurred while we held
                 // no lock during PT operations.
-                let rollback_cgroup_id = process.lock().cgroup_id;
+                // R147-1 FIX: Clear mprotect_pending_bytes before uncharge.
+                let rollback_cgroup_id = {
+                    let mut proc = process.lock();
+                    proc.mprotect_pending_bytes = 0;
+                    proc.cgroup_id
+                };
                 cgroup::uncharge_memory(rollback_cgroup_id, region_len as u64);
                 return Err(e);
             }
@@ -6664,6 +6691,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 proc.vm_charged_bytes = proc
                     .vm_charged_bytes
                     .saturating_add(region_len as u64);
+                // R147-1 FIX: Charge is now reflected in mmap_regions.
+                proc.mprotect_pending_bytes = 0;
                 new_entry
             };
 

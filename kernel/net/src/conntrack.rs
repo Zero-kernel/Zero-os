@@ -43,7 +43,10 @@ const CT_MAX_ENTRIES_PER_NS: usize = 16384;
 /// TCP timeout values (milliseconds)
 pub const CT_TCP_TIMEOUT_SYN_SENT_MS: u64 = 60_000;
 pub const CT_TCP_TIMEOUT_SYN_RECV_MS: u64 = 60_000;
-pub const CT_TCP_TIMEOUT_ESTABLISHED_MS: u64 = 300_000; // 5 minutes
+// R147-4 FIX: Increased from 300_000 (5 min) to 7_200_000 (2 hours).
+// 5 minutes silently dropped SSH, DB, and long-poll connections.
+// 2 hours balances memory usage against real-world idle connection lifetimes.
+pub const CT_TCP_TIMEOUT_ESTABLISHED_MS: u64 = 7_200_000; // 2 hours
 pub const CT_TCP_TIMEOUT_FIN_WAIT_MS: u64 = 120_000; // 2 minutes
 pub const CT_TCP_TIMEOUT_CLOSE_WAIT_MS: u64 = 60_000;
 pub const CT_TCP_TIMEOUT_LAST_ACK_MS: u64 = 30_000;

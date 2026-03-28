@@ -763,6 +763,7 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
     const SYS_WAIT4: u64 = 61;
     const SYS_KILL: u64 = 62;
     const SYS_FUTEX: u64 = 202;
+    const SYS_CLOCK_GETTIME: u64 = 228; // R147-3 FIX: TIME promise needs clock_gettime
     const SYS_GETRANDOM: u64 = 318;
     const SYS_OPENAT: u64 = 257;
 
@@ -876,8 +877,21 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
     }
 
     if promises.contains(PledgePromises::PROC) {
-        if matches!(syscall_nr, SYS_FORK | SYS_CLONE | SYS_WAIT4 | SYS_KILL) {
+        if matches!(syscall_nr, SYS_FORK | SYS_WAIT4 | SYS_KILL) {
             return true;
+        }
+        // R147-2 FIX: PROC allows clone() but rejects namespace-creating flags.
+        // A pledged "proc" process must not create new namespaces (privilege escalation).
+        if syscall_nr == SYS_CLONE {
+            let clone_flags = args[0];
+            const CLONE_NEWNS: u64 = 0x0002_0000;
+            const CLONE_NEWIPC: u64 = 0x0800_0000;
+            const CLONE_NEWUSER: u64 = 0x1000_0000;
+            const CLONE_NEWPID: u64 = 0x2000_0000;
+            const CLONE_NEWNET: u64 = 0x4000_0000;
+            let disallowed = CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUSER
+                | CLONE_NEWPID | CLONE_NEWNET;
+            return (clone_flags & disallowed) == 0;
         }
     }
 
@@ -888,13 +902,26 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
     }
 
     if promises.contains(PledgePromises::THREAD) {
-        if matches!(syscall_nr, SYS_CLONE | SYS_FUTEX) {
+        if syscall_nr == SYS_FUTEX {
             return true;
+        }
+        // R147-2 FIX: THREAD only allows thread-style clone (shared VM + sighand).
+        // Allowing arbitrary clone flags would let a pledged "thread" process
+        // create full child processes or namespaces.
+        if syscall_nr == SYS_CLONE {
+            let clone_flags = args[0];
+            const CLONE_VM: u64 = 0x0000_0100;
+            const CLONE_SIGHAND: u64 = 0x0000_0800;
+            const CLONE_THREAD: u64 = 0x0001_0000;
+            let required = CLONE_THREAD | CLONE_VM | CLONE_SIGHAND;
+            return (clone_flags & required) == required;
         }
     }
 
+    // R147-3 FIX: TIME promise must include clock_gettime (228) in addition
+    // to getrandom, matching pledge_to_filter() BPF path to avoid divergence.
     if promises.contains(PledgePromises::TIME) {
-        if syscall_nr == SYS_GETRANDOM {
+        if matches!(syscall_nr, SYS_CLOCK_GETTIME | SYS_GETRANDOM) {
             return true;
         }
     }

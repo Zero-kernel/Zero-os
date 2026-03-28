@@ -553,6 +553,13 @@ pub struct Process {
     /// lock-drop window transfers the full charge amount, closing the TOCTOU gap.
     pub brk_pending_growth: u64,
 
+    /// R147-1 FIX: Bytes charged to cgroup by mprotect(PROT_NONE → real) that
+    /// are not yet reflected in `mmap_regions`.  Non-zero only while the process
+    /// lock is dropped for PT operations (Step 2 of sys_mprotect Path A).
+    /// Included by `compute_cgroup_charged_bytes()` so that cgroup migration
+    /// during the lock-drop window transfers the full charge amount.
+    pub mprotect_pending_bytes: u64,
+
     /// R137-1 FIX: Cgroup memory bytes charged by the ELF loader for PT_LOAD
     /// segments and the initial user stack.
     ///
@@ -810,6 +817,7 @@ impl Process {
             mmap_regions: BTreeMap::new(),
             vm_charged_bytes: 0,
             brk_pending_growth: 0,
+            mprotect_pending_bytes: 0,
             elf_charged_bytes: 0,
             next_mmap_addr: security::randomized_mmap_base(DEFAULT_MMAP_BASE),
             fd_table: BTreeMap::new(),
@@ -2072,6 +2080,56 @@ pub fn sync_vm_siblings_mprotect_flags(
             }
         }
     }
+}
+
+/// R147-5 FIX: Reconcile a CLONE_VM child's mmap_regions with the current
+/// parent state under PROCESS_TABLE lock.
+///
+/// Between `create_process()` insertion (child has `memory_space = 0`) and
+/// the sys_clone block that sets `memory_space` + copies `mmap_regions`, any
+/// `sync_vm_siblings_*` call from a concurrent sibling skips the child because
+/// its `memory_space` doesn't match.  After the child lock block, the child's
+/// snapshot may be stale (a sibling munmap was not propagated).
+///
+/// This function re-snapshots the parent's mmap_regions into the child under
+/// PROCESS_TABLE lock, serializing with all sync_vm_siblings_* functions.
+/// Transient flags are stripped (matching fork_inner semantics).
+///
+/// Lock ordering: PROCESS_TABLE → parent Process → child Process.
+pub fn reconcile_clone_vm_mmap_regions(
+    parent_pid: ProcessId,
+    child_pid: ProcessId,
+) {
+    let table = PROCESS_TABLE.lock();
+
+    let (parent_arc, child_arc) = {
+        let parent = match table.get(parent_pid).and_then(|s| s.as_ref()) {
+            Some(arc) => arc.clone(),
+            None => return,
+        };
+        let child = match table.get(child_pid).and_then(|s| s.as_ref()) {
+            Some(arc) => arc.clone(),
+            None => return,
+        };
+        (parent, child)
+    };
+
+    let parent_guard = parent_arc.lock();
+    let mut child_guard = child_arc.lock();
+
+    // Re-snapshot parent's mmap_regions, stripping transient flags.
+    child_guard.mmap_regions = parent_guard
+        .mmap_regions
+        .iter()
+        .map(|(&base, &len_with_flags)| {
+            (base, len_with_flags & !crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK)
+        })
+        .collect();
+
+    // Also refresh brk/next_mmap_addr to stay consistent.
+    child_guard.brk = parent_guard.brk;
+    child_guard.brk_start = parent_guard.brk_start;
+    child_guard.next_mmap_addr = parent_guard.next_mmap_addr;
 }
 
 /// R37-1 FIX (Codex review): Count CLONE_VM siblings that are NOT in the same thread group.
@@ -4062,6 +4120,7 @@ pub fn get_process_stats() -> ProcessStats {
 /// 1. mmap_regions (excluding PROT_NONE reservations which never charged)
 /// 2. brk heap (page-aligned brk - brk_start)
 /// 3. elf_charged_bytes (PT_LOAD segments + user stack from ELF loader)
+/// 4. mprotect_pending_bytes (R147-1 FIX: in-flight PROT_NONE→real charges)
 ///
 /// This mirrors the uncharge logic in `free_process_resources()`.
 pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
@@ -4090,12 +4149,18 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
     // transfers insufficient charges to the destination cgroup.
     let pending_brk = proc.brk_pending_growth;
 
+    // R147-1 FIX: Include pending mprotect PROT_NONE→real charges that have
+    // been charged to the cgroup but not yet reflected in mmap_regions (lock
+    // dropped for PT operations in Step 2 of sys_mprotect Path A).
+    let pending_mprotect = proc.mprotect_pending_bytes;
+
     // ELF loader charges (PT_LOAD segments + user stack).
     let elf_bytes = proc.elf_charged_bytes;
 
     mmap_bytes
         .saturating_add(heap_bytes)
         .saturating_add(pending_brk)
+        .saturating_add(pending_mprotect)
         .saturating_add(elf_bytes)
 }
 
