@@ -885,12 +885,13 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
         if syscall_nr == SYS_CLONE {
             let clone_flags = args[0];
             const CLONE_NEWNS: u64 = 0x0002_0000;
+            const CLONE_NEWUTS: u64 = 0x0400_0000;
             const CLONE_NEWIPC: u64 = 0x0800_0000;
             const CLONE_NEWUSER: u64 = 0x1000_0000;
             const CLONE_NEWPID: u64 = 0x2000_0000;
             const CLONE_NEWNET: u64 = 0x4000_0000;
-            let disallowed = CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUSER
-                | CLONE_NEWPID | CLONE_NEWNET;
+            let disallowed = CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC
+                | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
             return (clone_flags & disallowed) == 0;
         }
     }

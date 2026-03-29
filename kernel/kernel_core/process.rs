@@ -2095,41 +2095,41 @@ pub fn sync_vm_siblings_mprotect_flags(
 /// PROCESS_TABLE lock, serializing with all sync_vm_siblings_* functions.
 /// Transient flags are stripped (matching fork_inner semantics).
 ///
-/// Lock ordering: PROCESS_TABLE → parent Process → child Process.
+/// Lock ordering: PROCESS_TABLE → Process (one at a time; never two Process
+/// locks simultaneously to avoid future deadlock hazards).
 pub fn reconcile_clone_vm_mmap_regions(
     parent_pid: ProcessId,
     child_pid: ProcessId,
 ) {
     let table = PROCESS_TABLE.lock();
 
-    let (parent_arc, child_arc) = {
-        let parent = match table.get(parent_pid).and_then(|s| s.as_ref()) {
-            Some(arc) => arc.clone(),
-            None => return,
-        };
-        let child = match table.get(child_pid).and_then(|s| s.as_ref()) {
-            Some(arc) => arc.clone(),
-            None => return,
-        };
-        (parent, child)
+    // Phase 1: Snapshot parent state into locals (single Process lock).
+    let parent_arc = match table.get(parent_pid).and_then(|s| s.as_ref()) {
+        Some(arc) => arc.clone(),
+        None => return,
     };
+    let (snapshot_mmap, snapshot_brk, snapshot_brk_start, snapshot_next_mmap) = {
+        let parent = parent_arc.lock();
+        let mmap: alloc::collections::BTreeMap<usize, usize> = parent
+            .mmap_regions
+            .iter()
+            .map(|(&base, &len_with_flags)| {
+                (base, len_with_flags & !crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK)
+            })
+            .collect();
+        (mmap, parent.brk, parent.brk_start, parent.next_mmap_addr)
+    }; // parent lock dropped
 
-    let parent_guard = parent_arc.lock();
-    let mut child_guard = child_arc.lock();
-
-    // Re-snapshot parent's mmap_regions, stripping transient flags.
-    child_guard.mmap_regions = parent_guard
-        .mmap_regions
-        .iter()
-        .map(|(&base, &len_with_flags)| {
-            (base, len_with_flags & !crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK)
-        })
-        .collect();
-
-    // Also refresh brk/next_mmap_addr to stay consistent.
-    child_guard.brk = parent_guard.brk;
-    child_guard.brk_start = parent_guard.brk_start;
-    child_guard.next_mmap_addr = parent_guard.next_mmap_addr;
+    // Phase 2: Write snapshot into child (single Process lock).
+    let child_arc = match table.get(child_pid).and_then(|s| s.as_ref()) {
+        Some(arc) => arc.clone(),
+        None => return,
+    };
+    let mut child = child_arc.lock();
+    child.mmap_regions = snapshot_mmap;
+    child.brk = snapshot_brk;
+    child.brk_start = snapshot_brk_start;
+    child.next_mmap_addr = snapshot_next_mmap;
 }
 
 /// R37-1 FIX (Codex review): Count CLONE_VM siblings that are NOT in the same thread group.
