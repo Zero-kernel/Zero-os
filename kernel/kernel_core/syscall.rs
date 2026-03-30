@@ -6223,13 +6223,19 @@ fn sys_mmap(
 
     // F.2 Cgroup: If mapping fails, rollback the memory charge and Phase 1
     // reservation to maintain correct accounting.
+    // R148-2 FIX: Remove reservation under process lock AND capture current
+    // cgroup_id, then uncharge with the fresh id. The cached cgroup_id from
+    // Phase 1 may be stale if cgroup migration occurred during PT operations.
     if let Err(e) = map_result {
-        cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
-        let mut proc = process.lock();
-        proc.mmap_regions.remove(&base);
-        if update_next && proc.next_mmap_addr == end {
-            proc.next_mmap_addr = old_next_mmap_addr;
-        }
+        let rollback_cgroup_id = {
+            let mut proc = process.lock();
+            proc.mmap_regions.remove(&base);
+            if update_next && proc.next_mmap_addr == end {
+                proc.next_mmap_addr = old_next_mmap_addr;
+            }
+            proc.cgroup_id
+        };
+        cgroup::uncharge_memory(rollback_cgroup_id, length_aligned as u64);
         return Err(e);
     }
 

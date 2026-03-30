@@ -1825,13 +1825,17 @@ pub fn uncharge_memory(cgroup_id: CgroupId, bytes: u64) {
 /// `memory_current` and the destination under-counts, enabling `memory.max`
 /// bypass.
 ///
-/// Transfer protocol:
-/// 1. Uncharge `bytes` from source hierarchy (saturating at zero)
-/// 2. Try to charge `bytes` to destination hierarchy
-/// 3. On destination charge failure, re-charge source and return error
+/// R148-1 FIX: Charge-destination-first protocol. The previous uncharge-first
+/// protocol could permanently lose charges when the destination charge failed
+/// and the rollback re-charge also failed under contention (source cgroup's
+/// freed budget consumed by concurrent allocators). The new protocol:
 ///
-/// Holds `CGROUP_REGISTRY` read lock to prevent concurrent deletion of either
-/// cgroup during the transfer window (same pattern as `migrate_task()`).
+/// 1. Try to charge `bytes` to destination hierarchy
+/// 2. Uncharge `bytes` from source hierarchy (saturating, cannot fail)
+///
+/// Shared ancestors are transiently over-counted (both source and destination
+/// charged) but never under-counted. Over-count is safe (conservative); under-
+/// count enables `memory.max` bypass.
 ///
 /// # Errors
 ///
@@ -1856,25 +1860,12 @@ pub fn migrate_memory_charges(
     let _from_arc = lookup_cgroup(from_id).ok_or(CgroupError::NotFound)?;
     let _to_arc = lookup_cgroup(to_id).ok_or(CgroupError::NotFound)?;
 
-    // Phase 1: Uncharge from source hierarchy.
-    uncharge_memory(from_id, bytes);
+    // Phase 1: Charge destination hierarchy first. If this fails (memory.max
+    // exceeded), return error — source is unchanged, no rollback needed.
+    try_charge_memory(to_id, bytes)?;
 
-    // Phase 2: Charge to destination hierarchy. If this fails (memory.max
-    // exceeded), roll back by re-charging the source.
-    if let Err(err) = try_charge_memory(to_id, bytes) {
-        // Rollback: re-charge source. This uses try_charge_memory rather than
-        // a raw atomic add because the source hierarchy's limits must be
-        // respected. If the rollback itself fails (source was concurrently
-        // capped), log a security event -- the charge is permanently lost,
-        // which is safe (over-count in source, not under-count).
-        if let Err(rollback_err) = try_charge_memory(from_id, bytes) {
-            klog_always!(
-                "SECURITY: cgroup memory migrate rollback failed: bytes={} source={} target={} err={:?}",
-                bytes, from_id, to_id, rollback_err
-            );
-        }
-        return Err(err);
-    }
+    // Phase 2: Uncharge source hierarchy (saturating, cannot fail).
+    uncharge_memory(from_id, bytes);
 
     Ok(())
 }

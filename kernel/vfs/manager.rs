@@ -1388,6 +1388,7 @@ fn fs_error_to_syscall(e: FsError) -> SyscallError {
         FsError::NotDir => SyscallError::ENOTDIR,
         FsError::IsDir => SyscallError::EISDIR,
         FsError::NotEmpty => SyscallError::EBUSY,
+        FsError::Busy => SyscallError::EBUSY,
         FsError::ReadOnly => SyscallError::EACCES,
         FsError::NoSpace | FsError::NoMem => SyscallError::ENOMEM,
         FsError::Io => SyscallError::EIO,

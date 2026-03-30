@@ -39,8 +39,12 @@ pub const KERNEL_STACK_SIZE: usize = 16 * 4096;
 /// 双重错误 IST 栈大小 (32 KB)
 pub const DOUBLE_FAULT_STACK_SIZE: usize = 8 * 4096;
 
-/// 16 字节对齐的内核栈结构
-#[repr(C, align(16))]
+/// Page-aligned kernel stack structure.
+///
+/// R148-4 FIX: Changed from 16-byte to 4096-byte alignment so that the
+/// bottom page of AP IST stacks can be unmapped as a guard page without
+/// affecting adjacent .bss data.
+#[repr(C, align(4096))]
 struct AlignedStack<const SIZE: usize>([u8; SIZE]);
 
 /// BSP 内核特权栈 (用于 syscall/中断时的栈切换)
@@ -298,11 +302,24 @@ pub unsafe fn init_for_ap(cpu_id: usize, kernel_stack_top: u64) {
     // R145-6 FIX: APs use a dedicated per-CPU IST stack for double-fault
     // handling so that a kernel stack overflow does not corrupt the #DF
     // handler's stack (which would escalate to a triple fault).
-    let df_stack_top = {
-        let stack_ptr = unsafe { &raw const AP_DOUBLE_FAULT_STACKS[cpu_id].0 };
-        let stack_start = x86_64::VirtAddr::from_ptr(stack_ptr);
-        (stack_start + DOUBLE_FAULT_STACK_SIZE as u64).as_u64()
-    };
+    let df_stack_start = x86_64::VirtAddr::from_ptr(unsafe {
+        &raw const AP_DOUBLE_FAULT_STACKS[cpu_id].0
+    });
+    let df_stack_top = (df_stack_start + DOUBLE_FAULT_STACK_SIZE as u64).as_u64();
+
+    // R148-4 FIX: Unmap the bottom page of the AP IST stack as a guard page.
+    // With the AlignedStack now page-aligned, the bottom page can be safely
+    // unmapped without affecting adjacent data. Overflow past the guard page
+    // triggers a page fault instead of silently corrupting .bss.
+    {
+        use x86_64::structures::paging::{Page, Size4KiB};
+        let guard_page = Page::<Size4KiB>::containing_address(df_stack_start);
+        unsafe {
+            mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
+                let _ = manager.unmap_page(guard_page);
+            });
+        }
+    }
 
     init_per_cpu_gdt(cpu_id, kernel_stack_top, df_stack_top);
     load_per_cpu_gdt(cpu_id);

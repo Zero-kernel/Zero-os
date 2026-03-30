@@ -638,6 +638,21 @@ impl CgroupCtrlInode {
                     }
                 }
 
+                // R148-5 FIX: Block migration for tasks with CLONE_VM shared
+                // address spaces. Migrating one sibling transfers ALL memory
+                // charges but leaves other siblings in the source cgroup with
+                // physical memory still mapped, enabling memory.max bypass.
+                // Note: must NOT hold proc.lock() when calling
+                // address_space_share_count (it acquires PROCESS_TABLE lock).
+                {
+                    let memory_space = proc.lock().memory_space;
+                    if memory_space != 0
+                        && process::address_space_share_count(memory_space) > 1
+                    {
+                        return Err(FsError::Busy);
+                    }
+                }
+
                 // Migrate task from old cgroup to this cgroup (atomic detach+attach)
                 cgroup::migrate_task(pid_num, old_cgroup_id, self.cgroup_id)
                     .map_err(|e| match e {

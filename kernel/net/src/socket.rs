@@ -6127,6 +6127,11 @@ impl SocketTable {
         let mut fin_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
         let mut data_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
         let mut syn_timeouts: Vec<(Arc<SocketState>, Ipv4Addr, Option<Vec<u8>>)> = Vec::new();
+        // R148-3 FIX: Collect listeners for deferred SYN queue sweep outside
+        // sockets lock. Sweeping under sockets.read() creates AB-BA deadlock
+        // with the SYN handler path: sockets.read()->listen.lock() vs
+        // listen.lock()->sockets.write().
+        let mut listeners_to_sweep: Vec<Arc<SocketState>> = Vec::new();
 
         // R65-6 FIX: Use blocking read lock - safe in non-IRQ context
         let sockets_guard = self.sockets.read();
@@ -6360,9 +6365,21 @@ impl SocketTable {
                 }
             }
 
-            // Sweep SYN queue for listening sockets
-            if sweep_time_wait {
-                let mut listen_guard = sock.listen.lock();
+            // R148-3 FIX: Defer SYN queue sweep outside sockets lock to avoid
+            // AB-BA deadlock with the RX SYN handler path.
+            if sweep_time_wait && sock.is_listening() {
+                listeners_to_sweep.push(sock.clone());
+            }
+        }
+
+        drop(sockets_guard);
+
+        // R148-3 FIX: Sweep SYN queues after releasing sockets lock. The RX
+        // SYN handler acquires listen.lock() then sockets.write(); sweeping
+        // under sockets.read() then listen.lock() would create AB-BA deadlock.
+        if sweep_time_wait {
+            for listener in &listeners_to_sweep {
+                let mut listen_guard = listener.listen.lock();
                 if let Some(listen_state) = listen_guard.as_mut() {
                     let mut expired_keys: Vec<TcpLookupKey> = Vec::new();
                     for (key, pending) in listen_state.syn_queue.iter() {
@@ -6409,8 +6426,6 @@ impl SocketTable {
                 }
             }
         }
-
-        drop(sockets_guard);
 
         // Cleanup phase (outside sockets lock)
         let mut ids_to_remove: Vec<u64> = Vec::new();

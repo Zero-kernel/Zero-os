@@ -213,6 +213,7 @@ fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
         FsError::NotSupported => SyscallError::ENOSYS,
         FsError::Pipe => SyscallError::EPIPE,
         FsError::NotEmpty => SyscallError::EBUSY,
+        FsError::Busy => SyscallError::EBUSY,
     }
 }
 

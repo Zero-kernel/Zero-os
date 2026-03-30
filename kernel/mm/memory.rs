@@ -178,11 +178,22 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         (false, true) => " (static, validated)",
         (false, false) => " (static)",
     };
+    // R148-8 FIX: Gate raw address logging behind debug_assertions to prevent
+    // KASLR bypass via heap base address leak in Performance profile (where
+    // KptrGuard is disabled).
+    #[cfg(debug_assertions)]
     klog!(
         Info,
         "Heap allocator initialized: {} KB at 0x{:x}{}",
         HEAP_SIZE / 1024,
         heap_base,
+        status
+    );
+    #[cfg(not(debug_assertions))]
+    klog!(
+        Info,
+        "Heap allocator initialized: {} KB{}",
+        HEAP_SIZE / 1024,
         status
     );
 
@@ -192,11 +203,19 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         (FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE)
     });
 
+    // R148-8 FIX: Physical memory region bounds also leak information.
+    #[cfg(debug_assertions)]
     klog!(
         Info,
         "  Physical memory region: 0x{:x} - 0x{:x} ({} MB)",
         pmm_base,
         pmm_base + pmm_size as u64,
+        pmm_size / (1024 * 1024)
+    );
+    #[cfg(not(debug_assertions))]
+    klog!(
+        Info,
+        "  Physical memory region: {} MB",
         pmm_size / (1024 * 1024)
     );
 
@@ -220,11 +239,20 @@ pub fn init() {
     } else {
         " (static)"
     };
+    // R148-8 FIX: Gate raw address logging behind debug_assertions.
+    #[cfg(debug_assertions)]
     klog!(
         Info,
         "Heap allocator initialized: {} KB at 0x{:x}{}",
         HEAP_SIZE / 1024,
         heap_base,
+        status
+    );
+    #[cfg(not(debug_assertions))]
+    klog!(
+        Info,
+        "Heap allocator initialized: {} KB{}",
+        HEAP_SIZE / 1024,
         status
     );
 

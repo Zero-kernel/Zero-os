@@ -219,6 +219,8 @@ pub enum FsError {
     NameTooLong,
     /// Not empty (for directory removal)
     NotEmpty,
+    /// Device or resource busy (EBUSY)
+    Busy,
     /// Cross-device link
     CrossDev,
     /// Too many symbolic links or symlink traversal disallowed
@@ -246,6 +248,7 @@ impl FsError {
             FsError::NoSpace => -28,      // ENOSPC
             FsError::NameTooLong => -36,  // ENAMETOOLONG
             FsError::NotEmpty => -39,     // ENOTEMPTY
+            FsError::Busy => -16,         // EBUSY
             FsError::CrossDev => -18,     // EXDEV
             FsError::SymlinkLoop => -40,  // ELOOP
             FsError::Seek => -29,         // ESPIPE
@@ -291,6 +294,7 @@ impl From<FsError> for SyscallError {
             FsError::NotDir => SyscallError::ENOTDIR,
             FsError::IsDir => SyscallError::EISDIR,
             FsError::NotEmpty => SyscallError::EBUSY,
+            FsError::Busy => SyscallError::EBUSY,
             FsError::ReadOnly => SyscallError::EACCES,
             FsError::NoSpace | FsError::NoMem => SyscallError::ENOMEM,
             FsError::Io => SyscallError::EIO,
