@@ -10114,6 +10114,19 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
         }
     }
 
+    // R148-5 FIX: Block migration for tasks with CLONE_VM shared address
+    // spaces. Migrating one sibling transfers ALL memory charges but
+    // leaves other siblings in the source cgroup with physical memory
+    // still mapped, enabling memory.max bypass.
+    {
+        let memory_space = process.lock().memory_space;
+        if memory_space != 0
+            && crate::process::address_space_share_count(memory_space) > 1
+        {
+            return Err(SyscallError::EBUSY);
+        }
+    }
+
     // Migrate task between cgroups
     match cgroup::migrate_task(pid as u64, old_cgroup_id, cgroup_id) {
         Ok(()) => {
