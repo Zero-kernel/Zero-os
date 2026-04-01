@@ -5675,8 +5675,9 @@ impl SocketTable {
         let mut fin_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
         // Data segment retransmissions (TCP retransmission RFC 6298)
         let mut data_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
-        // R52-1 FIX: Collect expired SYN queue entries for cleanup
-        let mut syn_timeouts: Vec<(Arc<SocketState>, Ipv4Addr, Option<Vec<u8>>)> = Vec::new();
+        // R149-2 FIX: Track whether any expired SYN entries were detected
+        // (non-destructive; actual removal deferred to blocking path).
+        let mut has_expired_syn = false;
 
         // R62-4 FIX: Avoid timer starvation under lock contention.
         // Previously, try_read failure would skip the entire sweep, allowing
@@ -5999,56 +6000,24 @@ impl SocketTable {
             //
             // R53-3: SYN queue cleanup only runs on slow timer (1s cadence)
             // to reduce iteration overhead for listening sockets.
+            //
+            // R149-2 FIX: In IRQ context, do NOT call take_syn() or perform
+            // any destructive SYN queue operations. Only detect whether any
+            // expired entries exist. All removal + cleanup is deferred to
+            // run_tcp_timers_blocking() in process context. Without this,
+            // take_syn() removes entries that are then dropped on the floor
+            // when we return false, leaking half-open counter slots.
             if sweep_time_wait {
-                if let Some(mut listen_guard) = sock.listen.try_lock() {
-                    if let Some(listen_state) = listen_guard.as_mut() {
-                        // Collect expired keys first to avoid borrow issues
-                        let mut expired_keys: Vec<TcpLookupKey> = Vec::new();
-                        for (key, pending) in listen_state.syn_queue.iter() {
+                if let Some(listen_guard) = sock.listen.try_lock() {
+                    if let Some(listen_state) = listen_guard.as_ref() {
+                        for (_key, pending) in listen_state.syn_queue.iter() {
                             if current_time_ms.saturating_sub(pending.syn_sent_at)
                                 >= TCP_SYN_TIMEOUT_MS
                             {
-                                expired_keys.push(*key);
-                            }
-                        }
-
-                        // Remove expired entries and queue for cleanup
-                        for key in expired_keys {
-                            if let Some(pending) = listen_state.take_syn(&key) {
-                                // Build best-effort RST+ACK for the peer
-                                let rst_seg =
-                                    if let Some(mut tcb_guard) = pending.sock.tcp.try_lock() {
-                                        if let Some(tcb) = tcb_guard.as_mut() {
-                                            // R106-10 FIX: key.0 is now NamespaceId; IPs/ports shifted by 1
-                                            let local_ip = Ipv4Addr(key.1.to_be_bytes());
-                                            let remote_ip = Ipv4Addr(key.3.to_be_bytes());
-                                            let seq = tcb.control.snd_nxt;
-                                            let ack = tcb.control.rcv_nxt;
-
-                                            Some(build_tcp_segment(
-                                                local_ip,
-                                                remote_ip,
-                                                key.2, // local_port
-                                                key.4, // remote_port
-                                                seq,
-                                                ack,
-                                                TCP_FLAG_RST | TCP_FLAG_ACK,
-                                                0,
-                                                &[],
-                                            ))
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    };
-
-                                // Queue for cleanup outside locks
-                                syn_timeouts.push((
-                                    pending.sock.clone(),
-                                    Ipv4Addr(key.3.to_be_bytes()),
-                                    rst_seg,
-                                ));
+                                // At least one expired SYN entry exists —
+                                // mark for deferred blocking cleanup.
+                                has_expired_syn = true;
+                                break;
                             }
                         }
                     }
@@ -6066,7 +6035,7 @@ impl SocketTable {
         // All blocking cleanup is deferred to `run_tcp_timers_blocking()` in
         // process context (called from `drain_deferred_tcp_timers()`).
         // Only non-blocking network transmits (FIN/data retransmissions) proceed here.
-        let needs_blocking_cleanup = !to_cleanup.is_empty() || !syn_timeouts.is_empty();
+        let needs_blocking_cleanup = !to_cleanup.is_empty() || has_expired_syn;
 
         // Transmit any pending FIN retransmissions (best-effort, no locks needed)
         for (dst_ip, seg) in fin_retransmit {
