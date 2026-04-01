@@ -285,7 +285,7 @@ pub fn run_usermode_test() -> bool {
     // user_memory_space is not yet available (created after ELF load), so pass None.
     kernel_core::process::activate_memory_space(memory_space, None);
 
-    let load_result = match load_elf(elf_data) {
+    let load_result = match load_elf(elf_data, 0) {
         Ok(result) => {
             klog!(Info, "      ✓ ELF loaded at entry 0x{:x}", result.entry);
             klog!(Info, "      ✓ User stack top at 0x{:x}", result.user_stack_top);
@@ -442,7 +442,7 @@ pub unsafe fn test_direct_ring3_jump() -> ! {
     kernel_core::process::activate_memory_space(memory_space, None);
 
     // Load ELF
-    let load_result = match load_elf(user_elf()) {
+    let load_result = match load_elf(user_elf(), 0) {
         Ok(result) => result,
         Err(e) => {
             kernel_core::process::activate_memory_space(saved_cr3, None);

@@ -560,6 +560,13 @@ pub struct Process {
     /// during the lock-drop window transfers the full charge amount.
     pub mprotect_pending_bytes: u64,
 
+    /// R149-3 FIX: Bytes charged to cgroup by sys_exec (ELF loader) that are
+    /// not yet reflected in `elf_charged_bytes`. Non-zero only between
+    /// successful load_elf() charge and exec commit. Included by
+    /// `compute_cgroup_charged_bytes()` so that cgroup migration during the
+    /// exec window transfers the full charge amount, closing the TOCTOU gap.
+    pub exec_pending_bytes: u64,
+
     /// R137-1 FIX: Cgroup memory bytes charged by the ELF loader for PT_LOAD
     /// segments and the initial user stack.
     ///
@@ -818,6 +825,7 @@ impl Process {
             vm_charged_bytes: 0,
             brk_pending_growth: 0,
             mprotect_pending_bytes: 0,
+            exec_pending_bytes: 0,
             elf_charged_bytes: 0,
             next_mmap_addr: security::randomized_mmap_base(DEFAULT_MMAP_BASE),
             fd_table: BTreeMap::new(),
@@ -4154,6 +4162,11 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
     // dropped for PT operations in Step 2 of sys_mprotect Path A).
     let pending_mprotect = proc.mprotect_pending_bytes;
 
+    // R149-3 FIX: Include pending exec (load_elf) charges that have been
+    // charged to the cgroup but not yet reflected in elf_charged_bytes.
+    // Non-zero only between load_elf() success and exec commit/rollback.
+    let pending_exec = proc.exec_pending_bytes;
+
     // ELF loader charges (PT_LOAD segments + user stack).
     let elf_bytes = proc.elf_charged_bytes;
 
@@ -4161,6 +4174,7 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
         .saturating_add(heap_bytes)
         .saturating_add(pending_brk)
         .saturating_add(pending_mprotect)
+        .saturating_add(pending_exec)
         .saturating_add(elf_bytes)
 }
 

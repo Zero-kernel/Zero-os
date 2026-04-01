@@ -110,6 +110,10 @@ pub fn reschedule_if_needed() {
     // IRQ-time processing was blocked by lock contention.
     crate::time::drain_deferred_tcp_timers();
 
+    // R149-1 FIX: Drain deferred stdin wakes from keyboard/serial IRQ.
+    // IRQ handlers only set a flag (no locks); actual wake happens here.
+    crate::syscall::drain_deferred_stdin_wakes();
+
     // E.4 RCU: Drain callbacks in process context.
     // This runs deferred destruction work for RCU-protected data.
     crate::rcu::poll();

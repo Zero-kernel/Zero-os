@@ -381,12 +381,25 @@ impl Drop for SocketFile {
 // ============================================================================
 
 use alloc::collections::VecDeque;
+use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 /// stdin 等待队列
 ///
 /// 当 sys_read(fd=0) 没有数据时，进程会被加入此队列并阻塞。
 /// 键盘/串口中断通过 wake_stdin_waiters() 唤醒等待者。
 static STDIN_WAITERS: spin::Mutex<VecDeque<ProcessId>> = spin::Mutex::new(VecDeque::new());
+
+/// R149-1 FIX: Deferred stdin wake flag for IRQ handlers.
+///
+/// Keyboard/serial IRQ handlers must NOT acquire PROCESS_TABLE or Process
+/// locks (deterministic deadlock if the interrupted context holds them).
+/// Instead, the IRQ handler sets this global flag and the actual wake is
+/// drained in process context by `drain_deferred_stdin_wakes()`.
+///
+/// Global (not per-CPU) because: (a) keyboard IRQ may fire on any CPU,
+/// (b) the blocked process may call stdin_finish_wait() on a different CPU,
+/// (c) any CPU's reschedule_if_needed() should be able to drain the wake.
+static STDIN_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// 准备等待 stdin 输入（第一阶段）
 ///
@@ -435,6 +448,12 @@ fn stdin_finish_wait() {
     // 当前进程已被标记为 Blocked，需要等待中断（键盘/串口）唤醒
     // 进入 HLT 循环，避免忙等消耗 CPU
     loop {
+        // R149-1 FIX: Drain deferred stdin wakes before checking state.
+        // This handles the case where the system is idle (no other runnable
+        // processes) and force_reschedule returned without switching — the
+        // only progress path is draining the flag here after HLT returns.
+        drain_deferred_stdin_wakes();
+
         // 必须在关中断状态下检查进程状态，避免与中断处理程序竞争
         // enable_and_hlt 后中断是开启的，需要先关闭再检查
         let should_continue = x86_64::instructions::interrupts::without_interrupts(|| {
@@ -460,11 +479,29 @@ fn stdin_finish_wait() {
     }
 }
 
-/// 唤醒一个等待 stdin 的进程
+/// 唤醒一个等待 stdin 的进程 (IRQ-safe fast path).
 ///
 /// 由键盘/串口中断处理器调用。
-/// 使用 wake_one 语义以避免惊群效应。
+/// R149-1 FIX: No locks acquired — just sets a deferred flag. The actual
+/// wake (which requires PROCESS_TABLE + Process locks) is performed by
+/// `drain_deferred_stdin_wakes()` in process context.
 pub fn wake_stdin_waiters() {
+    STDIN_WAKE_PENDING.store(true, AtomicOrdering::Release);
+}
+
+/// R149-1 FIX: Drain deferred stdin wakeups in safe (non-IRQ) process context.
+///
+/// Called from:
+/// - `scheduler_hook::reschedule_if_needed()` on syscall return
+/// - `stdin_finish_wait()` HLT loop (handles idle-system case)
+///
+/// Uses wake_one semantics to avoid thundering herd.
+pub fn drain_deferred_stdin_wakes() {
+    // Fast path: no wake pending
+    if !STDIN_WAKE_PENDING.swap(false, AtomicOrdering::Acquire) {
+        return;
+    }
+
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut waiters = STDIN_WAITERS.lock();
         // 清理已退出的进程并唤醒第一个有效等待者
@@ -3504,6 +3541,20 @@ fn sys_clone(
     // Must be AFTER enforce_lsm_task_fork() because that helper uses
     // cleanup_unscheduled_process() which skips cgroup/cpuset teardown.
     // We attach here so rollback paths below can detach symmetrically.
+    //
+    // R149-4 FIX: For CLONE_VM, the early parent_cgroup_id snapshot (captured
+    // under parent lock at line ~2802) may be stale — cgroup migration could
+    // have changed the parent's cgroup_id between snapshot and here.  By this
+    // point, child.memory_space is set (line ~3195), making share_count > 1,
+    // which blocks further migration via R148-5.  Re-read the parent's
+    // cgroup_id now to get the stable, post-migration value.
+    let parent_cgroup_id = if is_shared_space {
+        get_process(parent_pid)
+            .map(|p| p.lock().cgroup_id)
+            .unwrap_or(parent_cgroup_id)
+    } else {
+        parent_cgroup_id
+    };
     if !crate::cgroup::check_fork_allowed(parent_cgroup_id) {
         if let Some(parent) = get_process(parent_pid) {
             parent.lock().children.retain(|&p| p != child_pid);
@@ -3713,9 +3764,14 @@ fn sys_exec(
     // at PML4[255]) are established. See the "Phase 4: KPTI" block below.
 
     // 保存旧地址空间以便失败时恢复或成功时释放
-    let (old_memory_space, old_user_memory_space) = {
-        let proc = process.lock();
-        (proc.memory_space, proc.user_memory_space)
+    // R149-3 FIX: Capture cgroup_id under process lock once. This single
+    // snapshot is used for both load_elf() charging and ExecSpaceGuard
+    // rollback, eliminating the TOCTOU where concurrent cgroup migration
+    // could cause the guard to uncharge a different cgroup than was charged.
+    let (old_memory_space, old_user_memory_space, exec_cgroup_id) = {
+        let mut proc = process.lock();
+        proc.exec_pending_bytes = 0; // Clear any stale value
+        (proc.memory_space, proc.user_memory_space, proc.cgroup_id)
     };
 
     // S-7 fix: RAII guard to rollback address space on error
@@ -3725,11 +3781,16 @@ fn sys_exec(
     // R118-I1 FIX: ExecSpaceGuard now tracks new_user_space so that KPTI user
     // PML4 frames are freed on rollback (previously leaked on exec failure).
     struct ExecSpaceGuard {
+        /// R149-3 FIX: Process handle for clearing exec_pending_bytes and
+        /// re-reading cgroup_id on rollback (migration may have moved the
+        /// charge to a different cgroup).
+        process: Arc<spin::Mutex<crate::process::Process>>,
         old_space: usize,
         old_user_space: usize,
         new_space: usize,
         new_user_space: usize,
-        /// R125-1 FIX: Cgroup to uncharge on rollback.
+        /// R125-1 FIX: Cgroup to uncharge on rollback (may be overridden by
+        /// re-read in Drop if migration occurred).
         cgroup_id: cgroup::CgroupId,
         /// R125-1 FIX: Total bytes charged by load_elf() (segments + stack).
         charged_bytes: u64,
@@ -3737,8 +3798,14 @@ fn sys_exec(
     }
 
     impl ExecSpaceGuard {
-        fn new(old_space: usize, old_user_space: usize, new_space: usize) -> Self {
+        fn new(
+            process: Arc<spin::Mutex<crate::process::Process>>,
+            old_space: usize,
+            old_user_space: usize,
+            new_space: usize,
+        ) -> Self {
             Self {
+                process,
                 old_space,
                 old_user_space,
                 new_space,
@@ -3770,6 +3837,21 @@ fn sys_exec(
     impl Drop for ExecSpaceGuard {
         fn drop(&mut self) {
             if !self.committed {
+                // R149-3 FIX: Clear exec_pending_bytes and re-read cgroup_id
+                // under lock. If cgroup migration occurred after load_elf()
+                // charged exec_cgroup_id, the charge was transferred to the
+                // new cgroup by migrate_memory_charges(). We must uncharge
+                // the current (post-migration) cgroup_id, not the stale one.
+                if self.charged_bytes > 0 {
+                    let rollback_cgroup_id = {
+                        let mut proc = self.process.lock();
+                        proc.exec_pending_bytes = 0;
+                        proc.cgroup_id
+                    };
+                    // Use fresh cgroup_id from process (post-migration safe).
+                    self.cgroup_id = rollback_cgroup_id;
+                }
+
                 // Rollback: restore old address space and free new one
                 crate::process::activate_memory_space(self.old_space, Some(self.old_user_space));
                 // R118-I1 FIX: Free KPTI user PML4 before kernel PML4
@@ -3779,10 +3861,6 @@ fn sys_exec(
                 }
                 crate::process::free_address_space(self.new_space);
                 // R125-1 FIX: Uncharge cgroup memory that load_elf() charged
-                // for the new image's segments and stack.  Without this,
-                // exec failure after successful load_elf() permanently
-                // inflates memory_current (container DoS under memory
-                // pressure).
                 if self.charged_bytes > 0 {
                     cgroup::uncharge_memory(self.cgroup_id, self.charged_bytes);
                 }
@@ -3792,6 +3870,7 @@ fn sys_exec(
 
     // Create the guard before switching CR3
     let mut space_guard = ExecSpaceGuard::new(
+        process.clone(),
         old_memory_space,
         old_user_memory_space,
         new_memory_space,
@@ -3802,7 +3881,8 @@ fn sys_exec(
 
     // 加载 ELF 映像
     // S-7 fix: Let the guard handle rollback on error
-    let load_result = load_elf(&elf_data).map_err(|e| {
+    // R149-3 FIX: Pass exec_cgroup_id captured under lock, not re-read.
+    let load_result = load_elf(&elf_data, exec_cgroup_id).map_err(|e| {
         klog!(Error, "sys_exec: ELF load failed: {:?}", e);
         SyscallError::ENOEXEC
     })?;
@@ -3811,10 +3891,14 @@ fn sys_exec(
     // any subsequent step (copy_to_user, KPTI PML4 creation, etc.) fails,
     // ExecSpaceGuard::drop() will uncharge these bytes, preventing permanent
     // inflation of cgroup memory_current on exec rollback.
+    // R149-3 FIX: Use the same exec_cgroup_id for guard (not re-read).
+    // Also set exec_pending_bytes so compute_cgroup_charged_bytes() includes
+    // these in-flight charges during any concurrent migration.
     {
-        let cgroup_id = process.lock().cgroup_id;
-        space_guard.set_cgroup_charge(cgroup_id, load_result.charged_bytes);
+        let mut proc = process.lock();
+        proc.exec_pending_bytes = load_result.charged_bytes;
     }
+    space_guard.set_cgroup_charge(exec_cgroup_id, load_result.charged_bytes);
 
     // =========================================================================
     // 构建符合 System V AMD64 ABI 的用户栈布局：
@@ -4103,6 +4187,7 @@ fn sys_exec(
         proc.vm_charged_bytes = 0;
         proc.brk_pending_growth = 0; // R144-1 FIX: Clear pending brk growth on exec
         proc.mprotect_pending_bytes = 0; // R147-1 FIX: Clear pending mprotect charges on exec
+        proc.exec_pending_bytes = 0; // R149-3 FIX: Charge now reflected in elf_charged_bytes
         // R137-1 FIX: Record the new ELF image's cgroup charges (segments + stack)
         // so that process exit and subsequent exec can uncharge them. The old
         // image's elf_charged_bytes were already uncharged above alongside
@@ -5607,11 +5692,17 @@ pub(crate) const MMAP_REGION_FLAG_PROT_NONE: usize = 1 << 2;
 pub const MMAP_REGION_FLAG_PROT_READ: usize = 1 << 3;
 pub const MMAP_REGION_FLAG_PROT_WRITE: usize = 1 << 4;
 pub const MMAP_REGION_FLAG_PROT_EXEC: usize = 1 << 5;
+/// R149-6 FIX: Transient flag marking a mprotect Path A (PROT_NONE → real)
+/// operation in progress. Set under process lock before dropping for PT ops;
+/// cleared on commit or rollback. Concurrent munmap sees this flag via the
+/// transient mask and returns EBUSY, preventing the mprotect-vs-munmap race
+/// that leads to permanent cgroup charge leaks.
+const MMAP_REGION_FLAG_PENDING_MPROTECT: usize = 1 << 6;
 
 /// Mask of transient in-flight flags. Only these are stripped on fork/clone;
 /// persistent committed flags (e.g. PROT_NONE) are preserved.
 pub(crate) const MMAP_REGION_FLAG_TRANSIENT_MASK: usize =
-    MMAP_REGION_FLAG_PENDING_MAP | MMAP_REGION_FLAG_PENDING_UNMAP;
+    MMAP_REGION_FLAG_PENDING_MAP | MMAP_REGION_FLAG_PENDING_UNMAP | MMAP_REGION_FLAG_PENDING_MPROTECT;
 
 /// Extract the actual page-aligned length from an mmap_regions entry,
 /// stripping any in-flight state flags.
@@ -6596,6 +6687,21 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                     return Err(SyscallError::ENOMEM);
                 }
                 proc.mprotect_pending_bytes = region_len as u64;
+                // R149-6 FIX: Set transient flag so concurrent munmap sees
+                // the in-flight mprotect and returns EBUSY (matching existing
+                // PENDING_MAP/PENDING_UNMAP pattern). Without this, munmap can
+                // remove the region during Step 2 PT ops, causing a permanent
+                // cgroup charge leak.
+                if let Some(entry) = proc.mmap_regions.get_mut(&region_base) {
+                    *entry |= MMAP_REGION_FLAG_PENDING_MPROTECT;
+                } else {
+                    // Region vanished between Phase 0 classification and here;
+                    // roll back the charge and fail.
+                    proc.mprotect_pending_bytes = 0;
+                    drop(proc);
+                    cgroup::uncharge_memory(cgroup_id, region_len as u64);
+                    return Err(SyscallError::EFAULT);
+                }
             }
 
             // Step 2: Allocate zeroed frames + map pages.
@@ -6677,6 +6783,10 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 let rollback_cgroup_id = {
                     let mut proc = process.lock();
                     proc.mprotect_pending_bytes = 0;
+                    // R149-6 FIX: Clear the transient mprotect flag on rollback.
+                    if let Some(entry) = proc.mmap_regions.get_mut(&region_base) {
+                        *entry &= !MMAP_REGION_FLAG_PENDING_MPROTECT;
+                    }
                     proc.cgroup_id
                 };
                 cgroup::uncharge_memory(rollback_cgroup_id, region_len as u64);
@@ -6685,21 +6795,48 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
 
             // Step 3: Commit bookkeeping — clear PROT_NONE, set prot bits,
             // track charge.
+            //
+            // R149-6 FIX: Verify the entry still exists and has our transient
+            // PENDING_MPROTECT flag. If the entry was removed (e.g., by a
+            // concurrent munmap that raced before we set the flag — should be
+            // impossible with the flag, but defensive), roll back the charge
+            // instead of silently re-inserting a ghost entry.
             let region_end = region_base.saturating_add(region_len);
-            let committed = {
+            let commit_result: Result<usize, ()> = {
                 let mut proc = process.lock();
-                let old = *proc.mmap_regions.get(&region_base).unwrap_or(&0);
-                // Preserve transient flags; clear PROT_NONE + old prot bits.
-                let preserved = (old & MMAP_REGION_FLAG_MASK)
-                    & !(MMAP_REGION_FLAG_PROT_NONE | prot_mask);
-                let new_entry = region_len | preserved | new_prot_flags;
-                proc.mmap_regions.insert(region_base, new_entry);
-                proc.vm_charged_bytes = proc
-                    .vm_charged_bytes
-                    .saturating_add(region_len as u64);
-                // R147-1 FIX: Charge is now reflected in mmap_regions.
-                proc.mprotect_pending_bytes = 0;
-                new_entry
+                match proc.mmap_regions.get(&region_base).copied() {
+                    Some(old) if (old & MMAP_REGION_FLAG_PENDING_MPROTECT) != 0 => {
+                        // Entry present with our transient flag — commit.
+                        // Clear PROT_NONE + old prot bits + transient mprotect flag.
+                        let preserved = (old & MMAP_REGION_FLAG_MASK)
+                            & !(MMAP_REGION_FLAG_PROT_NONE | prot_mask | MMAP_REGION_FLAG_PENDING_MPROTECT);
+                        let new_entry = region_len | preserved | new_prot_flags;
+                        proc.mmap_regions.insert(region_base, new_entry);
+                        proc.vm_charged_bytes = proc
+                            .vm_charged_bytes
+                            .saturating_add(region_len as u64);
+                        // R147-1 FIX: Charge is now reflected in mmap_regions.
+                        proc.mprotect_pending_bytes = 0;
+                        Ok(new_entry)
+                    }
+                    _ => {
+                        // Entry gone or flag cleared — concurrent munmap removed it.
+                        // Roll back: uncharge the cgroup to prevent permanent leak.
+                        proc.mprotect_pending_bytes = 0;
+                        Err(())
+                    }
+                }
+            };
+
+            let committed = match commit_result {
+                Ok(entry) => entry,
+                Err(()) => {
+                    // R149-6 FIX: Rollback charge — entry was removed during PT ops.
+                    let rollback_cgroup_id = process.lock().cgroup_id;
+                    cgroup::uncharge_memory(rollback_cgroup_id, region_len as u64);
+                    // Continue with remaining regions (POSIX allows partial success).
+                    continue;
+                }
             };
 
             crate::process::sync_vm_siblings_mprotect_flags(

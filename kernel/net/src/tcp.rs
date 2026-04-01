@@ -2448,7 +2448,12 @@ fn isn_secret() -> u64 {
     }
 
     // Try to install or upgrade to strong entropy from CSPRNG
-    if let Ok(strong) = security::rng::random_u64() {
+    // R149-5 FIX: Use fill_random (FIPS boundary pub API).
+    let strong_result = {
+        let mut buf = [0u8; 8];
+        security::fill_random(&mut buf).ok().map(|()| u64::from_le_bytes(buf))
+    };
+    if let Some(strong) = strong_result {
         let prev = ISN_SECRET.load(Ordering::Acquire);
         let is_weak = ISN_SECRET_WEAK.load(Ordering::Relaxed);
 
@@ -2675,7 +2680,13 @@ fn syn_cookie_state(now_ms: u64) -> &'static Mutex<SynCookieSecrets> {
 /// Attempts to use CSPRNG; falls back to ISN secret if unavailable.
 #[inline]
 fn syn_cookie_get_key() -> u64 {
-    security::rng::random_u64().unwrap_or_else(|_| isn_secret())
+    // R149-5 FIX: Use fill_random (FIPS boundary pub API).
+    let mut buf = [0u8; 8];
+    if security::fill_random(&mut buf).is_ok() {
+        u64::from_le_bytes(buf)
+    } else {
+        isn_secret()
+    }
 }
 
 /// Parameters for SYN cookie MAC computation.

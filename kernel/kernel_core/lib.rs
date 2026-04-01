@@ -122,7 +122,7 @@ pub use syscall::{
     register_syscall_frame_callback, register_vfs_create_callback, register_vfs_lseek_callback,
     register_vfs_open_callback, register_vfs_open_with_resolve_callback,
     register_vfs_readdir_callback, register_vfs_stat_callback, register_vfs_truncate_callback,
-    register_vfs_unlink_callback, wake_stdin_waiters, DirEntry, FileType, SyscallError,
+    register_vfs_unlink_callback, wake_stdin_waiters, drain_deferred_stdin_wakes, DirEntry, FileType, SyscallError,
     SyscallFrame, VfsStat,
     // R74-2 test helper
     test_is_mount_ns_callback_registered,

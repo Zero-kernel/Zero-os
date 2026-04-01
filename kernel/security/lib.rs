@@ -61,7 +61,9 @@ pub use memory_hardening::{
 // R141-8 FIX: Removed ChaCha20Rng and rdrand64_early from public exports to
 // enforce the FIPS boundary. External callers use fill_random() for random bytes
 // and chacha20_xor_keystream() for keyed encryption.
-pub use rng::{chacha20_xor_keystream, fill_random, random_u32, random_u64, rdrand_available, try_fill_random, RngError};
+// R149-5 FIX: Removed random_u32, random_u64 from public re-exports to match
+// FIPS boundary (INV-FIPS-01). External callers use fill_random() instead.
+pub use rng::{chacha20_xor_keystream, fill_random, rdrand_available, try_fill_random, RngError};
 pub use spectre::{MitigationStatus, SpectreError, VulnerabilityInfo};
 pub use tests::{run_security_tests, SecurityTest, TestContext, TestReport, TestResult};
 pub use wxorx::{PageLevel, ValidationSummary, Violation, WxorxError};
@@ -410,7 +412,7 @@ pub fn init(
                 report.rng_ready = true;
 
                 // Verify RNG is working with a test read
-                match random_u64() {
+                match rng::random_u64() {
                     Ok(_) => {
                         klog_always!("      CSPRNG verified operational");
                         // Reseed kptr guard with strong entropy

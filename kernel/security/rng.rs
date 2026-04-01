@@ -228,21 +228,28 @@ pub fn try_fill_random(out: &mut [u8]) -> Result<(), RngError> {
 }
 
 /// Get a random 64-bit unsigned integer
-pub fn random_u64() -> Result<u64, RngError> {
+///
+/// R149-5 FIX: Restricted to pub(crate) to match FIPS boundary (INV-FIPS-01).
+/// External callers should use fill_random() instead.
+pub(crate) fn random_u64() -> Result<u64, RngError> {
     let mut buf = [0u8; 8];
     fill_random(&mut buf)?;
     Ok(u64::from_le_bytes(buf))
 }
 
 /// Get a random 32-bit unsigned integer
-pub fn random_u32() -> Result<u32, RngError> {
+///
+/// R149-5 FIX: Restricted to pub(crate) to match FIPS boundary (INV-FIPS-01).
+pub(crate) fn random_u32() -> Result<u32, RngError> {
     let mut buf = [0u8; 4];
     fill_random(&mut buf)?;
     Ok(u32::from_le_bytes(buf))
 }
 
 /// Get a random value in range [0, max)
-pub fn random_range(max: u64) -> Result<u64, RngError> {
+///
+/// R149-5 FIX: Restricted to pub(crate) to match FIPS boundary (INV-FIPS-01).
+pub(crate) fn random_range(max: u64) -> Result<u64, RngError> {
     if max == 0 {
         return Ok(0);
     }

@@ -406,8 +406,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                     // R102-L5 FIX: Validate RNG without printing raw output.
                     // Printing raw entropy values is unnecessary and could be
                     // sensitive if RNG is not fully initialized.
-                    match security::random_u64() {
-                        Ok(_) => klog!(Info, "        - RNG self-test: passed"),
+                    // R149-5 FIX: Use fill_random (FIPS boundary pub API).
+                    let mut rng_test_buf = [0u8; 8];
+                    match security::fill_random(&mut rng_test_buf) {
+                        Ok(()) => klog!(Info, "        - RNG self-test: passed"),
                         Err(e) => klog!(Error, "        ! RNG self-test failed: {:?}", e),
                     }
                 } else {

@@ -24,7 +24,7 @@ use xmas_elf::{
 
 // R93-6 FIX: Import cgroup module for memory accounting
 use crate::cgroup;
-use crate::process::current_cgroup_id;
+
 
 /// 用户地址空间起始（4MB）
 ///
@@ -101,20 +101,22 @@ pub struct ElfLoadResult {
 /// # Arguments
 ///
 /// * `image` - ELF 文件的原始字节
+/// * `cgroup_id` - R149-3 FIX: Cgroup ID for memory accounting, captured by
+///   the caller under process lock to avoid TOCTOU with concurrent migration.
 ///
 /// # Returns
 ///
 /// 成功返回入口点和用户栈顶，失败返回错误码
-pub fn load_elf(image: &[u8]) -> Result<ElfLoadResult, ElfLoadError> {
+pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResult, ElfLoadError> {
     let elf = ElfFile::new(image).map_err(|_| ElfLoadError::InvalidMagic)?;
 
     // 验证 ELF 头
     validate_elf_header(&elf)?;
 
-    // R93-6 FIX: Get current process's cgroup ID for memory accounting.
-    // Memory charged during ELF loading counts against the process's cgroup limits.
-    // This prevents cgroup escape by loading large binaries.
-    let cgroup_id = current_cgroup_id().unwrap_or(0);
+    // R149-3 FIX: Use caller-provided cgroup_id instead of re-reading via
+    // current_cgroup_id(). sys_exec captures this under the process lock and
+    // passes it here, eliminating the TOCTOU gap where concurrent cgroup
+    // migration could cause the ExecSpaceGuard to uncharge the wrong cgroup.
 
     // Z-10 fix: 追踪所有已映射的页，用于失败时统一回滚
     // 这确保如果段 N 失败，段 0..N-1 的映射也会被清理

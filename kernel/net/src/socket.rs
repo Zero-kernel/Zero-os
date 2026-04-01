@@ -3206,9 +3206,15 @@ impl SocketTable {
         // Try 2x range to give good coverage while limiting iterations
         for _ in 0..(range.saturating_mul(2)) {
             // Try CSPRNG first, fall back to RDTSC-based hash if RNG unavailable
-            let seed = security::rng::random_u32()
-                .map(|r| r as u16)
-                .unwrap_or_else(|_| self.fallback_port_seed());
+            // R149-5 FIX: Use fill_random (FIPS boundary pub API).
+            let seed = {
+                let mut buf = [0u8; 4];
+                if security::fill_random(&mut buf).is_ok() {
+                    u32::from_le_bytes(buf) as u16
+                } else {
+                    self.fallback_port_seed()
+                }
+            };
             let candidate = EPHEMERAL_PORT_START + (seed % range);
 
             // R75-1 FIX: Check namespace-scoped port binding
@@ -3246,9 +3252,15 @@ impl SocketTable {
         // Phase 1: Random selection using CSPRNG (preferred)
         for _ in 0..(range.saturating_mul(2)) {
             // R59-2 FIX: Use RDTSC-based fallback instead of predictable counter
-            let seed = security::rng::random_u32()
-                .map(|r| r as u16)
-                .unwrap_or_else(|_| self.fallback_port_seed());
+            // R149-5 FIX: Use fill_random (FIPS boundary pub API).
+            let seed = {
+                let mut buf = [0u8; 4];
+                if security::fill_random(&mut buf).is_ok() {
+                    u32::from_le_bytes(buf) as u16
+                } else {
+                    self.fallback_port_seed()
+                }
+            };
             let candidate = EPHEMERAL_PORT_START + (seed % range);
 
             // R75-1 FIX: Check namespace-scoped TCP port binding
@@ -6046,59 +6058,30 @@ impl SocketTable {
 
         drop(sockets_guard);
 
-        // Cleanup phase (outside sockets lock to avoid deadlock)
-        // First, collect socket IDs to remove (those marked closed by close())
-        let mut ids_to_remove: Vec<u64> = Vec::new();
-        for sock in &to_cleanup {
-            self.cleanup_tcp_connection(sock);
-            // Remove from sockets map if socket was marked closed by close()
-            // This handles the case where close() initiated graceful shutdown
-            // and sweep_time_wait is completing the cleanup after TIME_WAIT
-            if sock.is_closed() {
-                ids_to_remove.push(sock.id);
-            }
-        }
-
-        // R52-1 FIX: Cleanup expired SYN queue entries and send best-effort RSTs
+        // R149-2 FIX: In IRQ context, NEVER perform blocking cleanup that
+        // requires `sockets.write()`, `sock.tcp.lock()`, or `cleanup_tcp_connection()`.
+        // If the timer IRQ interrupted a code path holding `sockets.read()`,
+        // blocking `sockets.write()` would spin forever (reader can never release).
         //
-        // These child sockets were in SYN_RECEIVED state awaiting the final ACK
-        // but timed out. We clean up their resources and optionally send RST to
-        // notify the peer that the connection attempt failed.
-        for (child, dst_ip, rst_seg) in syn_timeouts {
-            child.mark_closed();
-            self.cleanup_tcp_connection(&child);
-            if let Some(seg) = rst_seg {
-                let _ = transmit_tcp_segment(dst_ip, &seg);
-            }
-            ids_to_remove.push(child.id);
-        }
+        // All blocking cleanup is deferred to `run_tcp_timers_blocking()` in
+        // process context (called from `drain_deferred_tcp_timers()`).
+        // Only non-blocking network transmits (FIN/data retransmissions) proceed here.
+        let needs_blocking_cleanup = !to_cleanup.is_empty() || !syn_timeouts.is_empty();
 
-        // Remove closed sockets from the sockets map
-        // R76-3 FIX (Codex review): Collect namespace IDs first, then decrement AFTER
-        // releasing sockets lock to avoid deadlock with create_* functions which
-        // lock per_ns_counts before sockets.
-        let mut ns_ids_to_decrement: Vec<NamespaceId> = Vec::new();
-        if !ids_to_remove.is_empty() {
-            let mut sockets = self.sockets.write();
-            for id in &ids_to_remove {
-                if let Some(sock) = sockets.remove(id) {
-                    ns_ids_to_decrement.push(sock.net_ns_id);
-                }
-            }
-        }
-        // Decrement namespace counts after releasing sockets lock
-        for ns_id in ns_ids_to_decrement {
-            self.dec_ns_count(ns_id);
-        }
-
-        // Transmit any pending FIN retransmissions (best-effort)
+        // Transmit any pending FIN retransmissions (best-effort, no locks needed)
         for (dst_ip, seg) in fin_retransmit {
             let _ = transmit_tcp_segment(dst_ip, &seg);
         }
 
-        // Transmit data segment retransmissions (RFC 6298 TCP retransmission)
+        // Transmit data segment retransmissions (RFC 6298, no locks needed)
         for (dst_ip, seg) in data_retransmit {
             let _ = transmit_tcp_segment(dst_ip, &seg);
+        }
+
+        // If any sockets need blocking cleanup, signal incomplete to caller
+        // so work is deferred to safe (non-IRQ) context.
+        if needs_blocking_cleanup {
+            return false;
         }
 
         // R65-6 FIX: Signal successful completion to caller
