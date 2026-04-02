@@ -1982,6 +1982,36 @@ static AUDIT_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static AUDIT_ENABLED: AtomicBool = AtomicBool::new(true);
 static AUDIT_TOTAL_EMITTED: AtomicU64 = AtomicU64::new(0);
 
+/// R148-I8 FIX: Registered timestamp callback for auto-filling audit event
+/// timestamps when callers pass 0.  Set via `register_timestamp_callback()` once
+/// kernel_core::time is available.  When unset, TSC-based fallback is used.
+static AUDIT_TIMESTAMP_CB: Mutex<Option<fn() -> u64>> = Mutex::new(None);
+
+/// R148-I8 FIX: Register a timestamp provider (typically kernel_core::time::current_timestamp_ms).
+/// Called once during kernel init after the timer subsystem is ready.
+pub fn register_timestamp_callback(cb: fn() -> u64) {
+    interrupts::without_interrupts(|| {
+        *AUDIT_TIMESTAMP_CB.lock() = Some(cb);
+    });
+}
+
+/// R148-I8 FIX: Get current timestamp via registered callback, or fall back to
+/// TSC (raw cycles) if no callback is registered yet.
+///
+/// Takes the callback pointer under IRQ-disabled lock, then calls it unlocked
+/// to avoid holding the Mutex across an arbitrary function call.
+fn current_audit_timestamp() -> u64 {
+    let cb = interrupts::without_interrupts(|| *AUDIT_TIMESTAMP_CB.lock());
+    if let Some(cb) = cb {
+        let ts = cb();
+        // Early boot: timer ticks may still be 0 even after registration.
+        if ts != 0 { ts } else { unsafe { core::arch::x86_64::_rdtsc() } }
+    } else {
+        // Pre-timer fallback: raw TSC provides monotonic ordering at minimum.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+}
+
 /// Global audit ring buffer (protected by Mutex with IRQ disable)
 static AUDIT_RING: Mutex<Option<AuditRing>> = Mutex::new(None);
 
@@ -2175,7 +2205,11 @@ pub fn emit(
         return Err(AuditError::Uninitialized);
     }
 
-    let event = AuditEvent::new(timestamp, kind, outcome, subject, object, args, errno);
+    let event = AuditEvent::new(
+        // R148-I8 FIX: Auto-fill timestamp when caller passes 0.
+        if timestamp == 0 { current_audit_timestamp() } else { timestamp },
+        kind, outcome, subject, object, args, errno,
+    );
 
     // Emit with interrupts disabled to prevent deadlock
     interrupts::without_interrupts(|| {

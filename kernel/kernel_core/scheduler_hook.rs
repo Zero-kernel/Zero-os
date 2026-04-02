@@ -34,8 +34,14 @@ static IRQ_RESCHED_PENDING: CpuLocal<AtomicBool> = CpuLocal::new(|| AtomicBool::
 ///
 /// R39-6 FIX: 支持多个回调注册，调度器和超时处理可以同时注册
 /// 调度器在初始化时调用此函数注册 on_clock_tick 处理器
+///
+/// R148-I6 FIX: Disable interrupts while holding TIMER_CBS lock to prevent
+/// deadlock if a timer IRQ fires during registration and on_scheduler_tick()
+/// tries to acquire the same lock.
 pub fn register_timer_callback(cb: TimerCallback) {
-    TIMER_CBS.lock().push(cb);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        TIMER_CBS.lock().push(cb);
+    });
 }
 
 /// 注册重调度回调
@@ -68,6 +74,10 @@ const MAX_TIMER_CALLBACKS: usize = 4;
 pub fn on_scheduler_tick() {
     // Copy callbacks to fixed stack array (no heap allocation in IRQ context)
     let mut callbacks: [Option<TimerCallback>; MAX_TIMER_CALLBACKS] = [None; MAX_TIMER_CALLBACKS];
+    // R148-I6 FIX: Blocking lock() is safe here because register_timer_callback()
+    // now wraps its lock acquisition in without_interrupts(), preventing timer IRQ
+    // from firing while the registration lock is held.  Using try_lock() here would
+    // skip ticks and break per-CPU scheduler time-slice accounting and timeout progress.
     let count = {
         let guard = TIMER_CBS.lock();
         let n = guard.len().min(MAX_TIMER_CALLBACKS);
@@ -75,7 +85,7 @@ pub fn on_scheduler_tick() {
             callbacks[i] = Some(*cb);
         }
         n
-    }; // Lock released here
+    };
 
     // Call callbacks outside of lock
     for cb in callbacks.iter().take(count) {

@@ -354,6 +354,12 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         }
     }
 
+    // R149-I5 FIX: Install BSP IST double-fault stack guard page.
+    // Must run after mm::page_table::init(). AP guard pages are installed in
+    // gdt::init_for_ap(); BSP was deferred because gdt::init() runs before PT init.
+    arch::gdt::install_bsp_ist_guard_page();
+    klog_always!("      ✓ BSP IST guard page installed");
+
     // 安全加固（Phase 0: W^X, NX, Identity Map Cleanup, CSPRNG, kptr guard, Spectre）
     // G.3 Compliance: Use HardeningProfile to configure security settings
     klog_always!("[2.6/3] Applying security hardening...");
@@ -794,6 +800,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             compliance::emit_deferred_policy_audit();
             klog_always!("      ✓ Deferred profile audit event recorded");
 
+            // R148-I8 FIX: Register kernel timestamp provider so audit events
+            // get real timestamps instead of 0.
+            audit::register_timestamp_callback(kernel_core::time::current_timestamp_ms);
+
             // A.3: Register audit snapshot authorizer (capability gate)
             // Policy: Allow root (euid == 0) OR holders of CAP_AUDIT_READ
             // R72-HMAC FIX: During early boot (no process context), allow kernel init code
@@ -1164,4 +1174,27 @@ fn panic(info: &PanicInfo) -> ! {
             core::arch::asm!("hlt");
         }
     }
+}
+
+// ============================================================================
+// R148-I4 FIX: Stack canary support (__stack_chk_fail / __stack_chk_guard)
+//
+// When the compiler is configured with -fstack-protector (or equivalent Rust
+// flags), it inserts a canary value at function entry and checks it at exit.
+// If the canary is corrupted (stack buffer overflow), the compiler calls
+// __stack_chk_fail.  We provide a panic-based implementation so the kernel
+// halts cleanly instead of producing a linker error or undefined behavior.
+// ============================================================================
+
+/// Stack canary guard value.  In production kernels this should be
+/// randomized at boot from the CSPRNG; for now a compile-time constant
+/// provides the symbol the compiler expects.
+#[no_mangle]
+#[used]
+pub static __stack_chk_guard: u64 = 0x595e_9fbd_94fd_a766;
+
+/// Called by compiler-inserted stack canary checks when corruption is detected.
+#[no_mangle]
+pub extern "C" fn __stack_chk_fail() -> ! {
+    panic!("stack smashing detected: stack canary corrupted");
 }

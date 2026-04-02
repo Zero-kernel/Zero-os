@@ -2664,15 +2664,16 @@ pub fn evaluate_seccomp(syscall_nr: u64, args: &[u64; 6]) -> SeccompVerdict {
         None => return SeccompVerdict::allow(),
     };
 
-    let table = PROCESS_TABLE.lock();
-    let slot = match table.get(pid) {
-        Some(s) => s,
+    // R148-I1 FIX: Use get_process() instead of holding PROCESS_TABLE lock
+    // for the entire seccomp evaluation.  get_process() briefly locks the
+    // table to clone the Arc, then releases.  Only the per-process Mutex is
+    // held during the O(n) filter evaluation, removing PROCESS_TABLE as a
+    // global contention point on every syscall.
+    let proc_arc = match get_process(pid) {
+        Some(p) => p,
         None => return SeccompVerdict::allow(),
     };
-    let proc = match slot.as_ref() {
-        Some(p) => p.lock(),
-        None => return SeccompVerdict::allow(),
-    };
+    let proc = proc_arc.lock();
 
     // First check pledge if set
     if let Some(ref pledge) = proc.pledge_state {

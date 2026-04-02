@@ -158,115 +158,117 @@ pub fn strict_filter() -> SeccompFilter {
 /// This compiles the promise set into a BPF-like filter that can be
 /// evaluated by the same code path as user-provided filters.
 pub fn pledge_to_filter(promises: PledgePromises) -> SeccompFilter {
+    use types::*;
     let mut prog = Vec::new();
     let mut allowed_syscalls: Vec<u64> = Vec::new();
 
+    // R149-I3 FIX: Use centralized syscall number constants from types.rs.
     // Always allow exit
-    allowed_syscalls.push(60); // exit
-    allowed_syscalls.push(231); // exit_group
+    allowed_syscalls.push(SYS_EXIT);
+    allowed_syscalls.push(SYS_EXIT_GROUP);
 
     // Add syscalls for each promise
     if promises.contains(PledgePromises::STDIO) {
         allowed_syscalls.extend_from_slice(&[
-            0,   // read
-            1,   // write
-            3,   // close
-            5,   // fstat
-            8,   // lseek
-            39,  // getpid
-            102, // getuid
-            104, // getgid
-            107, // geteuid
-            108, // getegid
-            110, // getppid
-            24,  // sched_yield
+            SYS_READ,
+            SYS_WRITE,
+            SYS_CLOSE,
+            SYS_FSTAT,
+            SYS_LSEEK,
+            SYS_GETPID,
+            SYS_GETUID,
+            SYS_GETGID,
+            SYS_GETEUID,
+            SYS_GETEGID,
+            SYS_GETPPID,
+            SYS_SCHED_YIELD,
         ]);
     }
 
     if promises.contains(PledgePromises::RPATH) {
         allowed_syscalls.extend_from_slice(&[
-            2,   // open (checked separately for flags)
-            4,   // stat
-            6,   // lstat
-            89,  // readlink
-            217, // getdents64
+            SYS_OPEN,
+            SYS_STAT,
+            SYS_LSTAT,
+            SYS_READLINK,
+            SYS_GETDENTS64,
         ]);
     }
 
     if promises.contains(PledgePromises::WPATH) {
         allowed_syscalls.extend_from_slice(&[
-            2,  // open (checked separately for flags)
-            82, // rename
-            87, // unlink
-            88, // symlink
+            SYS_OPEN,
+            SYS_RENAME,
+            SYS_UNLINK,
+            SYS_SYMLINK,
         ]);
     }
 
     if promises.contains(PledgePromises::CPATH) {
         allowed_syscalls.extend_from_slice(&[
-            83, // mkdir
-            84, // rmdir
-            86, // link
+            SYS_MKDIR,
+            SYS_RMDIR,
+            SYS_LINK,
         ]);
     }
 
     if promises.contains(PledgePromises::VM) {
         allowed_syscalls.extend_from_slice(&[
-            9,  // mmap
-            10, // mprotect
-            11, // munmap
-            12, // brk
-            25, // mremap
+            SYS_MMAP,
+            SYS_MPROTECT,
+            SYS_MUNMAP,
+            SYS_BRK,
+            SYS_MREMAP,
         ]);
     }
 
     if promises.contains(PledgePromises::PROC) {
         allowed_syscalls.extend_from_slice(&[
-            56,  // clone
-            57,  // fork
-            58,  // vfork
-            61,  // wait4
-            62,  // kill
-            247, // waitid
+            SYS_CLONE,
+            SYS_FORK,
+            SYS_VFORK,
+            SYS_WAIT4,
+            SYS_KILL,
+            SYS_WAITID,
         ]);
     }
 
     if promises.contains(PledgePromises::EXEC) {
-        allowed_syscalls.push(59); // execve
+        allowed_syscalls.push(SYS_EXECVE);
     }
 
     if promises.contains(PledgePromises::THREAD) {
         allowed_syscalls.extend_from_slice(&[
-            56,  // clone (for CLONE_THREAD)
-            202, // futex
-            218, // set_tid_address
+            SYS_CLONE,
+            SYS_FUTEX,
+            SYS_SET_TID_ADDRESS,
         ]);
     }
 
     if promises.contains(PledgePromises::TIME) {
         allowed_syscalls.extend_from_slice(&[
-            228, // clock_gettime
-            318, // getrandom
+            SYS_CLOCK_GETTIME,
+            SYS_GETRANDOM,
         ]);
     }
 
     if promises.contains(PledgePromises::SENDSIG) {
-        allowed_syscalls.push(62); // kill
+        allowed_syscalls.push(SYS_KILL);
     }
 
     if promises.contains(PledgePromises::FATTR) {
         allowed_syscalls.extend_from_slice(&[
-            90, // chmod
-            92, // chown
-            93, // fchmod
-            94, // fchown
+            SYS_CHMOD,
+            SYS_CHOWN,
+            SYS_FCHMOD,
+            SYS_FCHOWN,
         ]);
     }
 
     if promises.contains(PledgePromises::RLIMIT) {
         allowed_syscalls.extend_from_slice(&[
-            97,  // getrlimit
-            160, // setrlimit
+            SYS_GETRLIMIT,
+            SYS_SETRLIMIT,
         ]);
     }
 

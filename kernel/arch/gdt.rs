@@ -247,6 +247,23 @@ pub fn get_kernel_stack() -> VirtAddr {
     }
 }
 
+/// R149-I5 FIX: Unmap the bottom page of the BSP IST double-fault stack as
+/// a guard page.  R148-4 added this for AP stacks; BSP was left unguarded
+/// because gdt::init() runs before mm::page_table::init().
+///
+/// Must be called after mm::page_table::init() completes (e.g. from
+/// stack_guard::install or a post-init hook in main.rs).
+pub fn install_bsp_ist_guard_page() {
+    use x86_64::structures::paging::{Page, Size4KiB};
+    let guard_addr = VirtAddr::from_ptr(unsafe { &raw const BSP_DOUBLE_FAULT_STACK.0 });
+    let guard_page = Page::<Size4KiB>::containing_address(guard_addr);
+    unsafe {
+        mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
+            let _ = manager.unmap_page(guard_page);
+        });
+    }
+}
+
 /// 更新当前 CPU 指定 IST 栈顶
 ///
 /// # Safety

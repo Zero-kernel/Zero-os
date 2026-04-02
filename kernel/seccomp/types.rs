@@ -15,6 +15,84 @@ use bitflags::bitflags;
 use core::fmt;
 
 // ============================================================================
+// R149-I3 FIX: Centralized Linux x86_64 syscall number definitions.
+//
+// Single source of truth for all pledge/seccomp syscall filtering.
+// Both pledge_to_filter() (lib.rs) and promise_allows_syscall() (below)
+// MUST use these constants instead of local definitions or raw literals.
+// ============================================================================
+
+// Process lifecycle
+pub(crate) const SYS_EXIT: u64 = 60;
+pub(crate) const SYS_EXIT_GROUP: u64 = 231;
+pub(crate) const SYS_FORK: u64 = 57;
+pub(crate) const SYS_VFORK: u64 = 58;
+pub(crate) const SYS_CLONE: u64 = 56;
+pub(crate) const SYS_EXECVE: u64 = 59;
+pub(crate) const SYS_WAIT4: u64 = 61;
+pub(crate) const SYS_WAITID: u64 = 247;
+pub(crate) const SYS_KILL: u64 = 62;
+
+// File I/O
+pub(crate) const SYS_READ: u64 = 0;
+pub(crate) const SYS_WRITE: u64 = 1;
+pub(crate) const SYS_OPEN: u64 = 2;
+pub(crate) const SYS_CLOSE: u64 = 3;
+pub(crate) const SYS_STAT: u64 = 4;
+pub(crate) const SYS_FSTAT: u64 = 5;
+pub(crate) const SYS_LSTAT: u64 = 6;
+pub(crate) const SYS_LSEEK: u64 = 8;
+
+// Memory management
+pub(crate) const SYS_MMAP: u64 = 9;
+pub(crate) const SYS_MPROTECT: u64 = 10;
+pub(crate) const SYS_MUNMAP: u64 = 11;
+pub(crate) const SYS_BRK: u64 = 12;
+pub(crate) const SYS_MREMAP: u64 = 25;
+
+// Process info
+pub(crate) const SYS_GETPID: u64 = 39;
+pub(crate) const SYS_GETUID: u64 = 102;
+pub(crate) const SYS_GETGID: u64 = 104;
+pub(crate) const SYS_GETEUID: u64 = 107;
+pub(crate) const SYS_GETEGID: u64 = 108;
+pub(crate) const SYS_GETPPID: u64 = 110;
+pub(crate) const SYS_SCHED_YIELD: u64 = 24;
+
+// Directory / link operations
+pub(crate) const SYS_RENAME: u64 = 82;
+pub(crate) const SYS_MKDIR: u64 = 83;
+pub(crate) const SYS_RMDIR: u64 = 84;
+pub(crate) const SYS_LINK: u64 = 86;
+pub(crate) const SYS_UNLINK: u64 = 87;
+pub(crate) const SYS_SYMLINK: u64 = 88;
+pub(crate) const SYS_READLINK: u64 = 89;
+
+// File attributes
+pub(crate) const SYS_CHMOD: u64 = 90;
+pub(crate) const SYS_CHOWN: u64 = 92;
+pub(crate) const SYS_FCHMOD: u64 = 93;
+pub(crate) const SYS_FCHOWN: u64 = 94;
+
+// Resource limits
+pub(crate) const SYS_GETRLIMIT: u64 = 97;
+pub(crate) const SYS_SETRLIMIT: u64 = 160;
+
+// Threading
+pub(crate) const SYS_FUTEX: u64 = 202;
+pub(crate) const SYS_SET_TID_ADDRESS: u64 = 218;
+
+// Directories
+pub(crate) const SYS_GETDENTS64: u64 = 217;
+
+// *at() syscalls
+pub(crate) const SYS_OPENAT: u64 = 257;
+
+// Time / entropy
+pub(crate) const SYS_CLOCK_GETTIME: u64 = 228;
+pub(crate) const SYS_GETRANDOM: u64 = 318;
+
+// ============================================================================
 // Seccomp Actions
 // ============================================================================
 
@@ -743,29 +821,8 @@ fn compute_filter_id(prog: &[SeccompInsn]) -> u64 {
 ///
 /// This is a simplified mapping; real implementation would be more comprehensive.
 fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64; 6]) -> bool {
-    // Define syscall numbers (these should match kernel_core/syscall.rs)
-    const SYS_READ: u64 = 0;
-    const SYS_WRITE: u64 = 1;
-    const SYS_OPEN: u64 = 2;
-    const SYS_CLOSE: u64 = 3;
-    const SYS_STAT: u64 = 4;
-    const SYS_FSTAT: u64 = 5;
-    const SYS_LSEEK: u64 = 8;
-    const SYS_MMAP: u64 = 9;
-    const SYS_MPROTECT: u64 = 10;
-    const SYS_MUNMAP: u64 = 11;
-    const SYS_BRK: u64 = 12;
-    const SYS_GETPID: u64 = 39;
-    const SYS_FORK: u64 = 57;
-    const SYS_CLONE: u64 = 56;
-    const SYS_EXECVE: u64 = 59;
-    const SYS_EXIT: u64 = 60;
-    const SYS_WAIT4: u64 = 61;
-    const SYS_KILL: u64 = 62;
-    const SYS_FUTEX: u64 = 202;
-    const SYS_CLOCK_GETTIME: u64 = 228; // R147-3 FIX: TIME promise needs clock_gettime
-    const SYS_GETRANDOM: u64 = 318;
-    const SYS_OPENAT: u64 = 257;
+    // R149-I3 FIX: Syscall numbers now defined in module-level constants above.
+    // Removed local duplicates to prevent drift.
 
     // File open flag bits (must match VFS)
     const O_ACCMODE: u64 = 0x3;
@@ -781,7 +838,7 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
     // R145-7 FIX: Always allow exit(60) and exit_group(231).  The libc
     // exit() path calls exit_group; omitting it would kill pledged processes
     // on normal termination.
-    if syscall_nr == SYS_EXIT || syscall_nr == 231 {
+    if syscall_nr == SYS_EXIT || syscall_nr == SYS_EXIT_GROUP {
         return true;
     }
 

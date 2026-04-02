@@ -1317,10 +1317,19 @@ pub fn create_kpti_user_pml4(
         //
         // R118-5 FIX: Instead of copying the kernel's PML4[511] verbatim (512 GiB),
         // point to a dedicated PDPT that only maps the top 4 GiB (PDPT[508..=511]).
-        // This contains:
-        //   - Kernel text (.text at 0xffffffff80100000 → PDPT[510])
-        //   - Per-CPU data, IDT, GDT, TSS, scratch stacks (PDPT[510..=511])
-        //   - Kernel stacks (PDPT[508..=511] range depending on layout)
+        //
+        // R121-2 NOTE: All four PDPT entries are currently required:
+        //   - PDPT[508]: Per-process kernel stacks (KSTACK_BASE = 0xffff_ffff_0000_0000)
+        //                TSS.RSP0 points here; must be mapped during Ring 3→0 transitions.
+        //   - PDPT[509]: stack_guard guarded RSP0/IST stacks mapped during boot.
+        //   - PDPT[510]: Kernel .text/.rodata/.data/.bss + statics (GDT, TSS,
+        //                SYSCALL_PERCPU, scratch stacks).
+        //   - PDPT[511]: Heap allocations (IDT via lazy_static, etc.)
+        //
+        // A tighter island (R121-2 final) requires relocating kernel stacks
+        // into PDPT[510..=511] or using a dedicated entry stack in the island,
+        // plus moving IDT/GDT/TSS into dedicated linker sections at known
+        // page-aligned addresses — deferred to dedicated KPTI hardening cycle.
         //
         // All entries are supervisor-only (USER_ACCESSIBLE removed at both PML4
         // and PDPT levels) to prevent normal Ring 3 access and limit Meltdown-style
