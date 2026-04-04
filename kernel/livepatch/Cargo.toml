@@ -18,6 +18,8 @@ insecure-ecdsa-stub = []
 [dependencies]
 spin = "0.9"
 x86_64 = "0.15"
+# R148-I9 FIX: Shared SHA-256 implementation (eliminates duplicate crypto code)
+crypto = { path = "../crypto" }
 
 # P-256 curve arithmetic + SEC1 public key parsing (no ECDSA helpers, no sha2).
 # Using minimal features to avoid pulling in sha2 which has LLVM issues on bare-metal.

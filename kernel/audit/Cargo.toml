@@ -13,6 +13,9 @@ lazy_static = { version = "1.4", features = ["spin_no_std"] }
 x86_64 = "0.15"
 drivers = { path = "../drivers" }
 klog = { path = "../klog" }
+# R148-I9 FIX: Shared SHA-256 implementation (eliminates duplicate crypto code)
+# Aliased to avoid shadowing the existing `pub mod crypto` FIPS API submodule.
+kernel_crypto = { package = "crypto", path = "../crypto" }
 
 [features]
 default = []
