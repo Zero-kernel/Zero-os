@@ -400,7 +400,13 @@ lazy_static! {
         // CPU异常处理器 (0-31)
         idt.divide_error.set_handler_fn(divide_error_handler);
         idt.debug.set_handler_fn(debug_handler);
-        idt.non_maskable_interrupt.set_handler_fn(nmi_handler);
+        // R148-I5 FIX: NMI uses a dedicated IST stack to prevent stack corruption
+        // when NMI fires during other exception handlers with a near-full kernel stack.
+        unsafe {
+            idt.non_maskable_interrupt
+                .set_handler_fn(nmi_handler)
+                .set_stack_index(gdt::NMI_IST_INDEX);
+        }
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         idt.overflow.set_handler_fn(overflow_handler);
         idt.bound_range_exceeded.set_handler_fn(bound_range_exceeded_handler);

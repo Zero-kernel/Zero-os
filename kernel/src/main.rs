@@ -358,7 +358,8 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     // Must run after mm::page_table::init(). AP guard pages are installed in
     // gdt::init_for_ap(); BSP was deferred because gdt::init() runs before PT init.
     arch::gdt::install_bsp_ist_guard_page();
-    klog_always!("      ✓ BSP IST guard page installed");
+    arch::gdt::install_bsp_nmi_guard_page();
+    klog_always!("      ✓ BSP IST guard pages installed (double-fault + NMI)");
 
     // 安全加固（Phase 0: W^X, NX, Identity Map Cleanup, CSPRNG, kptr guard, Spectre）
     // G.3 Compliance: Use HardeningProfile to configure security settings

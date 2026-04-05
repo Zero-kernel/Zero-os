@@ -30,6 +30,13 @@ const MAX_CPUS: usize = 64;
 /// IST 索引：双重错误处理程序使用的栈
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+/// R148-I5 FIX: IST index for NMI handler.
+/// NMI can fire at any point (including inside other exception handlers).
+/// Without a dedicated stack, an NMI during a near-full kernel stack path
+/// (e.g., page fault handler) could overflow and corrupt the interrupted
+/// handler's stack frame.
+pub const NMI_IST_INDEX: u16 = 1;
+
 /// 特权级栈索引 (用于 Ring 3 -> Ring 0 切换)
 const KERNEL_PRIVILEGE_STACK_INDEX: usize = 0;
 
@@ -38,6 +45,9 @@ pub const KERNEL_STACK_SIZE: usize = 16 * 4096;
 
 /// 双重错误 IST 栈大小 (32 KB)
 pub const DOUBLE_FAULT_STACK_SIZE: usize = 8 * 4096;
+
+/// R148-I5 FIX: NMI IST stack size (32 KB, matches double-fault for consistency)
+pub const NMI_STACK_SIZE: usize = 8 * 4096;
 
 /// Page-aligned kernel stack structure.
 ///
@@ -54,12 +64,21 @@ static mut BSP_KERNEL_STACK: AlignedStack<KERNEL_STACK_SIZE> = AlignedStack([0; 
 static mut BSP_DOUBLE_FAULT_STACK: AlignedStack<DOUBLE_FAULT_STACK_SIZE> =
     AlignedStack([0; DOUBLE_FAULT_STACK_SIZE]);
 
+/// R148-I5 FIX: BSP NMI IST stack
+static mut BSP_NMI_STACK: AlignedStack<NMI_STACK_SIZE> = AlignedStack([0; NMI_STACK_SIZE]);
+
 /// R145-6 FIX: Per-AP dedicated double-fault IST stacks.  Without these,
 /// APs reuse their kernel stack for #DF handling, so a stack overflow
 /// triggers #PF → #DF on the same corrupted stack → triple fault.
 /// Uses AlignedStack to guarantee 16-byte alignment for x86-interrupt ABI.
 static mut AP_DOUBLE_FAULT_STACKS: [AlignedStack<DOUBLE_FAULT_STACK_SIZE>; MAX_CPUS] = {
     const INIT: AlignedStack<DOUBLE_FAULT_STACK_SIZE> = AlignedStack([0; DOUBLE_FAULT_STACK_SIZE]);
+    [INIT; MAX_CPUS]
+};
+
+/// R148-I5 FIX: Per-AP dedicated NMI IST stacks.
+static mut AP_NMI_STACKS: [AlignedStack<NMI_STACK_SIZE>; MAX_CPUS] = {
+    const INIT: AlignedStack<NMI_STACK_SIZE> = AlignedStack([0; NMI_STACK_SIZE]);
     [INIT; MAX_CPUS]
 };
 
@@ -117,7 +136,7 @@ static SELECTORS_CACHE: Once<Selectors> = Once::new();
 ///
 /// Must be called exactly once per CPU during initialization.
 /// The `kernel_stack_top` must be a valid stack address.
-unsafe fn init_per_cpu_gdt(cpu_id: usize, kernel_stack_top: u64, df_stack_top: u64) {
+unsafe fn init_per_cpu_gdt(cpu_id: usize, kernel_stack_top: u64, df_stack_top: u64, nmi_stack_top: u64) {
     if cpu_id >= MAX_CPUS {
         panic!("CPU ID {} exceeds MAX_CPUS {}", cpu_id, MAX_CPUS);
     }
@@ -126,6 +145,8 @@ unsafe fn init_per_cpu_gdt(cpu_id: usize, kernel_stack_top: u64, df_stack_top: u
     let tss = &mut PER_CPU_TSS[cpu_id];
     tss.privilege_stack_table[KERNEL_PRIVILEGE_STACK_INDEX] = VirtAddr::new(kernel_stack_top);
     tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = VirtAddr::new(df_stack_top);
+    // R148-I5 FIX: Configure dedicated NMI IST stack
+    tss.interrupt_stack_table[NMI_IST_INDEX as usize] = VirtAddr::new(nmi_stack_top);
 
     // Create this CPU's GDT with its TSS
     let mut gdt = GlobalDescriptorTable::new();
@@ -200,9 +221,14 @@ pub fn init() {
         let stack_start = VirtAddr::from_ptr(unsafe { &raw const BSP_DOUBLE_FAULT_STACK.0 });
         (stack_start + DOUBLE_FAULT_STACK_SIZE as u64).as_u64()
     };
+    // R148-I5 FIX: BSP NMI IST stack
+    let nmi_stack_top = {
+        let stack_start = VirtAddr::from_ptr(unsafe { &raw const BSP_NMI_STACK.0 });
+        (stack_start + NMI_STACK_SIZE as u64).as_u64()
+    };
 
     unsafe {
-        init_per_cpu_gdt(0, kernel_stack_top, df_stack_top);
+        init_per_cpu_gdt(0, kernel_stack_top, df_stack_top, nmi_stack_top);
         load_per_cpu_gdt(0);
     }
 
@@ -256,6 +282,19 @@ pub fn get_kernel_stack() -> VirtAddr {
 pub fn install_bsp_ist_guard_page() {
     use x86_64::structures::paging::{Page, Size4KiB};
     let guard_addr = VirtAddr::from_ptr(unsafe { &raw const BSP_DOUBLE_FAULT_STACK.0 });
+    let guard_page = Page::<Size4KiB>::containing_address(guard_addr);
+    unsafe {
+        mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
+            let _ = manager.unmap_page(guard_page);
+        });
+    }
+}
+
+/// R148-I5 FIX: Unmap the bottom page of the BSP NMI IST stack as a guard page.
+/// Must be called after mm::page_table::init() completes (same as install_bsp_ist_guard_page).
+pub fn install_bsp_nmi_guard_page() {
+    use x86_64::structures::paging::{Page, Size4KiB};
+    let guard_addr = VirtAddr::from_ptr(unsafe { &raw const BSP_NMI_STACK.0 });
     let guard_page = Page::<Size4KiB>::containing_address(guard_addr);
     unsafe {
         mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
@@ -338,7 +377,22 @@ pub unsafe fn init_for_ap(cpu_id: usize, kernel_stack_top: u64) {
         }
     }
 
-    init_per_cpu_gdt(cpu_id, kernel_stack_top, df_stack_top);
+    // R148-I5 FIX: Per-AP dedicated NMI IST stack + guard page
+    let nmi_stack_start = x86_64::VirtAddr::from_ptr(unsafe {
+        &raw const AP_NMI_STACKS[cpu_id].0
+    });
+    let nmi_stack_top = (nmi_stack_start + NMI_STACK_SIZE as u64).as_u64();
+    {
+        use x86_64::structures::paging::{Page, Size4KiB};
+        let guard_page = Page::<Size4KiB>::containing_address(nmi_stack_start);
+        unsafe {
+            mm::page_table::with_current_manager(VirtAddr::new(0), |manager| {
+                let _ = manager.unmap_page(guard_page);
+            });
+        }
+    }
+
+    init_per_cpu_gdt(cpu_id, kernel_stack_top, df_stack_top, nmi_stack_top);
     load_per_cpu_gdt(cpu_id);
 }
 
