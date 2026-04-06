@@ -860,6 +860,18 @@ pub struct TcpControlBlock {
     pub time_wait_start: u64,
     /// R65-5 FIX: FIN_WAIT_2 start timestamp (for idle timeout)
     pub fin_wait2_start: u64,
+
+    // === R148-I3 FIX: TCP Keepalive ===
+    /// Whether keepalive probes are enabled for this connection.
+    pub keepalive_enabled: bool,
+    /// Idle time before first keepalive probe (default: 7200s = 2 hours, per RFC 1122).
+    pub keepalive_idle_ms: u64,
+    /// Interval between successive keepalive probes (default: 75s).
+    pub keepalive_interval_ms: u64,
+    /// Maximum number of unacknowledged probes before declaring connection dead (default: 9).
+    pub keepalive_probes_max: u8,
+    /// Number of keepalive probes sent without receiving a response.
+    pub keepalive_probes_sent: u8,
 }
 
 /// A TCP segment for buffering
@@ -954,6 +966,13 @@ impl TcpControlBlock {
             last_activity: 0,
             time_wait_start: 0,
             fin_wait2_start: 0,
+            // R148-I3 FIX: TCP keepalive defaults per RFC 1122 §4.2.3.6.
+            // Disabled by default; applications opt in via socket option.
+            keepalive_enabled: false,
+            keepalive_idle_ms: 7_200_000,    // 2 hours
+            keepalive_interval_ms: 75_000,   // 75 seconds
+            keepalive_probes_max: 9,
+            keepalive_probes_sent: 0,
         }
     }
 
@@ -1665,6 +1684,12 @@ pub fn update_rtt(tcb: &mut TcpControlBlock, sample_us: u64) {
 /// - Karn's algorithm prevents RTT corruption from retransmissions
 pub fn handle_ack(tcb: &mut TcpControlBlock, ack_num: u32, now_ms: u64) -> AckUpdate {
     let mut update = AckUpdate::default();
+
+    // R148-I3 FIX: Any ACK from the peer (including duplicate ACKs from keepalive
+    // responses) proves the connection is alive — reset the keepalive probe count
+    // and update last_activity so the idle timer restarts.
+    tcb.keepalive_probes_sent = 0;
+    tcb.last_activity = now_ms;
 
     if seq_gt(ack_num, tcb.snd_una) {
         // New ACK - advances the acknowledgment point

@@ -4139,10 +4139,64 @@ impl SocketTable {
                 let is_syn = header.flags & TCP_FLAG_SYN != 0;
                 let is_ack = header.flags & TCP_FLAG_ACK != 0;
 
-                // RFC 793: In SYN-SENT, must receive SYN+ACK
-                // A pure ACK or other segment should elicit RST
+                // RFC 793: In SYN-SENT, must receive SYN+ACK (normal 3-way handshake)
+                // or SYN without ACK (simultaneous open).
                 if !is_ack {
-                    // No ACK flag - ignore (could be simultaneous open SYN)
+                    if is_syn {
+                        // R148-I2 FIX: RFC 793 simultaneous open.
+                        // Both endpoints independently sent SYN to each other.
+                        // Accept the remote's SYN, transition to SYN-RECEIVED,
+                        // and respond with SYN+ACK (our original ISS + ACK their SYN).
+                        tcp_state.control.irs = header.seq_num;
+                        tcp_state.control.rcv_nxt = header.seq_num.wrapping_add(1);
+
+                        // Process peer's TCP options (MSS, window scale, SACK)
+                        if tcp_state.control.wscale_requested {
+                            if let Some(peer_scale) = options.window_scale {
+                                tcp_state.control.snd_wscale =
+                                    peer_scale.min(TCP_MAX_WINDOW_SCALE);
+                                tcp_state.control.wscale_received = true;
+                            }
+                        }
+                        if tcp_state.control.sack_requested && options.sack_permitted {
+                            tcp_state.control.sack_received = true;
+                        }
+
+                        // Initialize send window (unscaled per RFC 7323 §2.2)
+                        tcp_state.control.snd_wnd = decode_window(header.window, 0);
+                        tcp_state.control.snd_wl1 = header.seq_num;
+
+                        tcp_state.control.state = TcpState::SynReceived;
+
+                        // Build SYN+ACK: retransmit our SYN (snd_una = ISS) + ACK their SYN
+                        let mut syn_ack_opts =
+                            alloc::vec![TcpOptionKind::Mss(TCP_ETHERNET_MSS)];
+                        if tcp_state.control.wscale_requested {
+                            syn_ack_opts.push(TcpOptionKind::WindowScale(
+                                tcp_state.control.rcv_wscale,
+                            ));
+                        }
+                        if tcp_state.control.sack_requested {
+                            syn_ack_opts.push(TcpOptionKind::SackPermitted);
+                        }
+
+                        let syn_ack = build_tcp_segment_with_options(
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
+                            tcp_state.control.snd_una, // Our original ISS
+                            tcp_state.control.rcv_nxt, // ACK their SYN
+                            TCP_FLAG_SYN | TCP_FLAG_ACK,
+                            TCP_DEFAULT_WINDOW, // Unscaled
+                            &syn_ack_opts,
+                            &[],
+                        );
+
+                        drop(guard);
+                        return Some(syn_ack);
+                    }
+                    // Non-SYN without ACK in SYN-SENT — ignore
                     return None;
                 }
 
@@ -5391,7 +5445,17 @@ impl SocketTable {
                 // Validate ACK acknowledges our SYN (ISS + 1)
                 let ack_valid = header.ack_num == tcp_state.control.snd_nxt;
                 let recv_wnd = tcp_state.control.rcv_wnd.max(1);
-                let seq_ok = seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
+                // R148-I2 FIX: During RFC 793 simultaneous open, the peer's SYN+ACK
+                // carries seq = their ISS (already received, below rcv_nxt). The SYN
+                // portion is a known retransmission — relax seq_in_window only for the
+                // exact expected simultaneous-open pattern: SYN+ACK with seq == rcv_nxt-1
+                // (the retransmitted SYN) and no payload.
+                let simultaneous_open_synack = is_syn
+                    && is_ack
+                    && header.seq_num == tcp_state.control.rcv_nxt.wrapping_sub(1)
+                    && payload.is_empty();
+                let seq_ok = simultaneous_open_synack
+                    || seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, recv_wnd);
 
                 if !ack_valid || !seq_ok {
                     // Invalid ACK - abort handshake, send RST
@@ -6079,6 +6143,8 @@ impl SocketTable {
         let mut fin_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
         let mut data_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
         let mut syn_timeouts: Vec<(Arc<SocketState>, Ipv4Addr, Option<Vec<u8>>)> = Vec::new();
+        // R148-I3 FIX: Collect keepalive probes to send after releasing locks.
+        let mut keepalive_probes: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
         // R148-3 FIX: Collect listeners for deferred SYN queue sweep outside
         // sockets lock. Sweeping under sockets.read() creates AB-BA deadlock
         // with the SYN handler path: sockets.read()->listen.lock() vs
@@ -6219,6 +6285,55 @@ impl SocketTable {
                                 tcp_state.control.state = TcpState::Closed;
                                 should_cleanup = true;
                                 mark_timeout_close = true;
+                            }
+                        }
+                    }
+                }
+
+                // R148-I3 FIX: TCP keepalive probes per RFC 1122 §4.2.3.6.
+                // Send probes only when idle (no outstanding data) in a state
+                // where the connection should remain alive.
+                if let Some((local_ip, local_port, remote_ip, remote_port)) = key_parts {
+                    if tcp_state.control.keepalive_enabled
+                        && tcp_state.control.send_buffer.is_empty()
+                        && matches!(
+                            tcp_state.control.state,
+                            TcpState::Established | TcpState::CloseWait
+                        )
+                        && tcp_state.control.last_activity != 0
+                    {
+                        let idle_ms =
+                            current_time_ms.saturating_sub(tcp_state.control.last_activity);
+                        let probes_sent = tcp_state.control.keepalive_probes_sent as u64;
+                        let threshold = tcp_state.control.keepalive_idle_ms
+                            + probes_sent * tcp_state.control.keepalive_interval_ms;
+
+                        if idle_ms >= threshold {
+                            if tcp_state.control.keepalive_probes_sent
+                                >= tcp_state.control.keepalive_probes_max
+                            {
+                                // Connection dead — too many unanswered probes
+                                tcp_state.control.state = TcpState::Closed;
+                                should_cleanup = true;
+                                mark_timeout_close = true;
+                            } else {
+                                // Send keepalive probe: seq = snd_una - 1 to elicit ACK
+                                let advertised_wnd =
+                                    Self::current_adv_window(&tcp_state.control);
+                                let probe = build_tcp_segment(
+                                    local_ip,
+                                    remote_ip,
+                                    local_port,
+                                    remote_port,
+                                    tcp_state.control.snd_una.wrapping_sub(1),
+                                    tcp_state.control.rcv_nxt,
+                                    TCP_FLAG_ACK,
+                                    advertised_wnd,
+                                    &[],
+                                );
+                                tcp_state.control.keepalive_probes_sent =
+                                    tcp_state.control.keepalive_probes_sent.saturating_add(1);
+                                keepalive_probes.push((remote_ip, probe));
                             }
                         }
                     }
@@ -6419,6 +6534,11 @@ impl SocketTable {
         }
 
         for (dst_ip, seg) in data_retransmit {
+            let _ = transmit_tcp_segment(dst_ip, &seg);
+        }
+
+        // R148-I3 FIX: Send keepalive probes
+        for (dst_ip, seg) in keepalive_probes {
             let _ = transmit_tcp_segment(dst_ip, &seg);
         }
 
