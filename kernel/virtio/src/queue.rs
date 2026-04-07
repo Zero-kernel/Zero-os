@@ -301,6 +301,15 @@ impl VirtQueue {
             self.last_used_idx
                 .store(last.wrapping_add(1), Ordering::Relaxed);
 
+            // R148-I7 FIX: Validate descriptor ID returned by the device.
+            // A malicious or buggy device could provide an out-of-bounds ID,
+            // causing callers' desc_mut(elem.id) to access memory beyond the
+            // descriptor table. Advance past the invalid entry (no stall)
+            // but don't expose it to the caller.
+            if elem.id >= self.size as u32 {
+                return None;
+            }
+
             Some(elem)
         }
     }

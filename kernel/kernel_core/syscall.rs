@@ -6182,6 +6182,18 @@ fn sys_mmap(
             }
         }
 
+        // R147-I1 FIX: Charge cgroup memory BEFORE inserting PENDING_MAP entry.
+        // compute_cgroup_charged_bytes() counts non-PROT_NONE entries regardless
+        // of transient flags. Without this fix, a migration snapshot taken between
+        // the PENDING_MAP insert and the (previously post-lock) cgroup charge could
+        // "move" bytes that were never charged to the source cgroup, causing a
+        // permanent accounting undercount in the source.
+        if !is_prot_none {
+            if cgroup::try_charge_memory(proc.cgroup_id, length_aligned as u64).is_err() {
+                return Err(SyscallError::ENOMEM);
+            }
+        }
+
         // Reserve the region in the PCB with PENDING_MAP flag before dropping
         // the process lock. This prevents concurrent mmap from selecting an
         // overlapping address while PT operations are in progress.
@@ -6226,16 +6238,10 @@ fn sys_mmap(
         return Ok(base);
     }
 
-    // F.2 Cgroup: Atomically charge memory AFTER all validation passes.
-    if cgroup::try_charge_memory(cgroup_id, length_aligned as u64).is_err() {
-        // Rollback Phase 1 reservation on cgroup charge failure.
-        let mut proc = process.lock();
-        proc.mmap_regions.remove(&base);
-        if update_next && proc.next_mmap_addr == end {
-            proc.next_mmap_addr = old_next_mmap_addr;
-        }
-        return Err(SyscallError::ENOMEM);
-    }
+    // R147-I1 FIX: Cgroup charge moved into Phase 1 (under process lock, before
+    // PENDING_MAP insert). This eliminates the window where migration could
+    // snapshot an uncharged PENDING_MAP entry. The old standalone charge call
+    // and its rollback are no longer needed.
 
     // 使用基于当前 CR3 的页表管理器进行映射
     // 使用 tracked vector 记录已映射的页，确保失败时完整回滚，避免帧泄漏
