@@ -366,6 +366,8 @@ impl VirtQueue {
 
     /// Get descriptor at index.
     unsafe fn desc(&self, idx: u16) -> &mut VringDesc {
+        // R150-I2 FIX: Catch out-of-bounds descriptor access in debug builds.
+        debug_assert!(idx < self.size, "blk desc: idx {} >= size {}", idx, self.size);
         &mut *self.desc.add(idx as usize)
     }
 }
