@@ -107,24 +107,27 @@ pub fn on_timer_tick() {
         run_tw = true;
     }
 
-    // Run TCP timers if either was claimed or we have deferred work
+    // R150-1 FIX: Never run TCP timers from timer IRQ context.
+    //
+    // run_tcp_timers() allocates heap memory (Vec, build_tcp_segment → Vec<u8>)
+    // and transmits packets (transmit_tcp_segment → device spinlock + DMA alloc).
+    // If the timer IRQ fires while the interrupted CPU holds the heap allocator
+    // lock or the net device lock, the IRQ spins forever on the same lock
+    // (single-CPU deadlock, no interrupt nesting possible).
+    //
+    // All TCP timer work (retransmit, FIN, keepalive, SYN sweep, cleanup) is
+    // deferred to process context via drain_deferred_tcp_timers() which is called
+    // from reschedule_if_needed() at every syscall return.
     if run_rto || run_tw || had_deferred {
-        let completed = net::socket_table().run_tcp_timers(current, run_tw);
-
-        // R65-6 FIX: If timer processing was incomplete, defer to safe context
-        if !completed {
-            TCP_TIMER_DEFERRED.store(true, Ordering::Release);
-            TCP_TIMER_DEFERRED_TS.store(current, Ordering::Relaxed);
-            if run_tw {
-                TCP_TIMER_DEFERRED_TW.store(true, Ordering::Relaxed);
-            }
-            // Request reschedule to drain in safe context
-            crate::request_resched_from_irq();
-        } else {
-            // Clear deferred flags on successful completion
-            TCP_TIMER_DEFERRED.store(false, Ordering::Release);
-            TCP_TIMER_DEFERRED_TW.store(false, Ordering::Relaxed);
+        // Store timestamp and TW flag before setting the DEFERRED flag (Release)
+        // so drain_deferred_tcp_timers() sees consistent values when it loads
+        // DEFERRED with Acquire.
+        TCP_TIMER_DEFERRED_TS.store(current, Ordering::Relaxed);
+        if run_tw {
+            TCP_TIMER_DEFERRED_TW.store(true, Ordering::Relaxed);
         }
+        TCP_TIMER_DEFERRED.store(true, Ordering::Release);
+        crate::request_resched_from_irq();
     }
 }
 

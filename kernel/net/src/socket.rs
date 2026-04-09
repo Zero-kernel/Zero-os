@@ -4161,6 +4161,15 @@ impl SocketTable {
                         if tcp_state.control.sack_requested && options.sack_permitted {
                             tcp_state.control.sack_received = true;
                         }
+                        // R150-2 FIX: Process peer MSS from bare SYN (simultaneous open).
+                        // Without this, snd_mss stays at TCP_DEFAULT_MSS (536) →
+                        // initial_cwnd = 536 × 10 = 5360 instead of 1460 × 10 = 14600.
+                        if let Some(mss) = options.mss {
+                            let clamped = mss.max(64).min(TCP_ETHERNET_MSS);
+                            tcp_state.control.snd_mss = clamped;
+                            tcp_state.control.cwnd =
+                                initial_cwnd(tcp_state.control.snd_mss);
+                        }
 
                         // Initialize send window (unscaled per RFC 7323 §2.2)
                         tcp_state.control.snd_wnd = decode_window(header.window, 0);
@@ -4250,6 +4259,15 @@ impl SocketTable {
                 // during the SYN/SYN-ACK handshake.
                 if tcp_state.control.sack_requested && options.sack_permitted {
                     tcp_state.control.sack_received = true;
+                }
+                // R150-2 FIX: Process peer MSS from SYN-ACK. Without this,
+                // snd_mss stays at TCP_DEFAULT_MSS (536) for ALL connect()-initiated
+                // connections → initial_cwnd = 536 × 10 = 5360 bytes instead of
+                // 1460 × 10 = 14600 bytes, throttling throughput ~60% in slow-start.
+                if let Some(mss) = options.mss {
+                    let clamped = mss.max(64).min(TCP_ETHERNET_MSS);
+                    tcp_state.control.snd_mss = clamped;
+                    tcp_state.control.cwnd = initial_cwnd(tcp_state.control.snd_mss);
                 }
 
                 // Initialize send window from SYN-ACK (window field is never scaled on SYNs)
@@ -5724,9 +5742,12 @@ impl SocketTable {
     ///
     /// # Safety
     ///
-    /// This function uses try_lock to avoid deadlock when called from timer
-    /// interrupt context. If the sockets lock is held, the sweep is skipped
-    /// and will be retried on the next timer tick.
+    /// R150-1 FIX: This function must NOT be called from hard IRQ context.
+    /// It allocates heap memory (Vec, build_tcp_segment → Vec<u8>) and may
+    /// transmit packets (transmit_tcp_segment → device spinlock + DMA alloc).
+    ///
+    /// Uses try_lock on the sockets lock to avoid blocking. If the lock is
+    /// held, the sweep is skipped and returns `false`.
     /// R65-6 FIX: Returns `true` if timer sweep completed successfully, `false` if
     /// skipped due to lock contention (caller should defer work to safe context).
     pub fn run_tcp_timers(&self, current_time_ms: u64, sweep_time_wait: bool) -> bool {
