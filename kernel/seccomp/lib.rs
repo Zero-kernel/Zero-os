@@ -188,6 +188,7 @@ pub fn pledge_to_filter(promises: PledgePromises) -> SeccompFilter {
     if promises.contains(PledgePromises::RPATH) {
         allowed_syscalls.extend_from_slice(&[
             SYS_OPEN,
+            SYS_OPENAT, // R150-3 FIX: match promise_allows_syscall() open/openat gating
             SYS_STAT,
             SYS_LSTAT,
             SYS_READLINK,
@@ -198,6 +199,7 @@ pub fn pledge_to_filter(promises: PledgePromises) -> SeccompFilter {
     if promises.contains(PledgePromises::WPATH) {
         allowed_syscalls.extend_from_slice(&[
             SYS_OPEN,
+            SYS_OPENAT, // R150-3 FIX: match promise_allows_syscall() open/openat gating
             SYS_RENAME,
             SYS_UNLINK,
             SYS_SYMLINK,
@@ -206,10 +208,19 @@ pub fn pledge_to_filter(promises: PledgePromises) -> SeccompFilter {
 
     if promises.contains(PledgePromises::CPATH) {
         allowed_syscalls.extend_from_slice(&[
+            SYS_OPEN,   // R150-3 FIX: CPATH is a valid path capability for open (creation)
+            SYS_OPENAT, // R150-3 FIX: match promise_allows_syscall() has_path gate
             SYS_MKDIR,
             SYS_RMDIR,
             SYS_LINK,
         ]);
+    }
+
+    // R150-3 FIX: TMPPATH is a valid path capability for open/openat with
+    // creation flags (O_CREAT, O_TRUNC). The semantic evaluator gates this
+    // on argument inspection; the BPF path must at least whitelist the syscalls.
+    if promises.contains(PledgePromises::TMPPATH) {
+        allowed_syscalls.extend_from_slice(&[SYS_OPEN, SYS_OPENAT]);
     }
 
     if promises.contains(PledgePromises::VM) {

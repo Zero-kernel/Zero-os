@@ -850,12 +850,23 @@ impl ConntrackTable {
         }
 
         let new_state = match (state, dir) {
-            // SYN sent, waiting for SYN-ACK
+            // SYN sent, waiting for SYN-ACK (normal 3-way handshake)
             (TcpCtState::SynSent, ConntrackDir::Reply) if l4.is_syn() && l4.is_ack() => {
                 TcpCtState::SynRecv
             }
-            // SYN-ACK received, waiting for ACK
+            // R150-I1 FIX: SYN sent, peer also sent bare SYN (simultaneous open).
+            // Both endpoints independently initiated; transition to SynRecv so the
+            // completing ACK (from either direction) moves to Established.
+            (TcpCtState::SynSent, ConntrackDir::Reply) if l4.is_syn() && !l4.is_ack() => {
+                TcpCtState::SynRecv
+            }
+            // SYN-ACK received, waiting for ACK (normal handshake completion)
             (TcpCtState::SynRecv, ConntrackDir::Original) if l4.is_ack() && !l4.is_syn() => {
+                TcpCtState::Established
+            }
+            // R150-I1 FIX: Simultaneous open — the reply side's ACK (or SYN+ACK)
+            // also completes the handshake.
+            (TcpCtState::SynRecv, ConntrackDir::Reply) if l4.is_ack() => {
                 TcpCtState::Established
             }
             // Established - handle FIN

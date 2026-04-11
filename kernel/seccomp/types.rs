@@ -906,35 +906,71 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
     }
 
     // Check each promise category
+    // R150-3 FIX: Synchronized with pledge_to_filter() to eliminate divergence.
+    // The BPF generator (pledge_to_filter) provides a first-pass syscall whitelist;
+    // this semantic evaluator adds argument-sensitive gating that BPF cannot express.
+    // Both paths must agree on which syscall numbers are allowed per promise.
+
     if promises.contains(PledgePromises::STDIO) {
         if matches!(
             syscall_nr,
-            SYS_READ | SYS_WRITE | SYS_CLOSE | SYS_FSTAT | SYS_LSEEK | SYS_GETPID
+            SYS_READ
+                | SYS_WRITE
+                | SYS_CLOSE
+                | SYS_FSTAT
+                | SYS_LSEEK
+                | SYS_GETPID
+                | SYS_GETUID      // R150-3 FIX
+                | SYS_GETGID      // R150-3 FIX
+                | SYS_GETEUID     // R150-3 FIX
+                | SYS_GETEGID     // R150-3 FIX
+                | SYS_GETPPID     // R150-3 FIX
+                | SYS_SCHED_YIELD // R150-3 FIX
         ) {
             return true;
         }
     }
 
     if promises.contains(PledgePromises::RPATH) {
-        if syscall_nr == SYS_STAT {
+        // R150-3 FIX: Added lstat, readlink, getdents64 to match pledge_to_filter().
+        if matches!(
+            syscall_nr,
+            SYS_STAT | SYS_LSTAT | SYS_READLINK | SYS_GETDENTS64
+        ) {
             return true;
         }
     }
 
     if promises.contains(PledgePromises::WPATH) {
-        if syscall_nr == SYS_WRITE {
+        // R150-3 FIX: Added rename, unlink, symlink to match pledge_to_filter().
+        if matches!(
+            syscall_nr,
+            SYS_RENAME | SYS_UNLINK | SYS_SYMLINK
+        ) {
+            return true;
+        }
+    }
+
+    // R150-3 FIX: CPATH was missing entirely from promise_allows_syscall().
+    if promises.contains(PledgePromises::CPATH) {
+        if matches!(syscall_nr, SYS_MKDIR | SYS_RMDIR | SYS_LINK) {
             return true;
         }
     }
 
     if promises.contains(PledgePromises::VM) {
-        if matches!(syscall_nr, SYS_MUNMAP | SYS_BRK) {
+        // R150-3 FIX: Added mremap to match pledge_to_filter().
+        if matches!(syscall_nr, SYS_MUNMAP | SYS_BRK | SYS_MREMAP) {
             return true;
         }
     }
 
     if promises.contains(PledgePromises::PROC) {
-        if matches!(syscall_nr, SYS_FORK | SYS_WAIT4 | SYS_KILL) {
+        // R150-3 FIX: Added vfork, waitid to match pledge_to_filter().
+        if matches!(
+            syscall_nr,
+            SYS_FORK | SYS_VFORK | SYS_WAIT4 | SYS_WAITID | SYS_KILL
+        ) {
             return true;
         }
         // R147-2 FIX: PROC allows clone() but rejects namespace-creating flags.
@@ -947,8 +983,8 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
             const CLONE_NEWUSER: u64 = 0x1000_0000;
             const CLONE_NEWPID: u64 = 0x2000_0000;
             const CLONE_NEWNET: u64 = 0x4000_0000;
-            let disallowed = CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC
-                | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+            let disallowed =
+                CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
             return (clone_flags & disallowed) == 0;
         }
     }
@@ -960,7 +996,8 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
     }
 
     if promises.contains(PledgePromises::THREAD) {
-        if syscall_nr == SYS_FUTEX {
+        // R150-3 FIX: Added set_tid_address to match pledge_to_filter().
+        if matches!(syscall_nr, SYS_FUTEX | SYS_SET_TID_ADDRESS) {
             return true;
         }
         // R147-2 FIX: THREAD only allows thread-style clone (shared VM + sighand).
@@ -980,6 +1017,30 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
     // to getrandom, matching pledge_to_filter() BPF path to avoid divergence.
     if promises.contains(PledgePromises::TIME) {
         if matches!(syscall_nr, SYS_CLOCK_GETTIME | SYS_GETRANDOM) {
+            return true;
+        }
+    }
+
+    // R150-3 FIX: SENDSIG allows kill independently of PROC.
+    if promises.contains(PledgePromises::SENDSIG) {
+        if syscall_nr == SYS_KILL {
+            return true;
+        }
+    }
+
+    // R150-3 FIX: FATTR was missing entirely from promise_allows_syscall().
+    if promises.contains(PledgePromises::FATTR) {
+        if matches!(
+            syscall_nr,
+            SYS_CHMOD | SYS_CHOWN | SYS_FCHMOD | SYS_FCHOWN
+        ) {
+            return true;
+        }
+    }
+
+    // R150-3 FIX: RLIMIT was missing entirely from promise_allows_syscall().
+    if promises.contains(PledgePromises::RLIMIT) {
+        if matches!(syscall_nr, SYS_GETRLIMIT | SYS_SETRLIMIT) {
             return true;
         }
     }
