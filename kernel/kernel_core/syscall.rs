@@ -6197,8 +6197,17 @@ fn sys_mmap(
         // Reserve the region in the PCB with PENDING_MAP flag before dropping
         // the process lock. This prevents concurrent mmap from selecting an
         // overlapping address while PT operations are in progress.
+        //
+        // R150-4 FIX: Include PROT_NONE flag in Phase 1 reservation so that
+        // compute_cgroup_charged_bytes() skips this entry during the window
+        // between lock drop (Phase 1 end) and reacquisition (PROT_NONE commit).
+        // Without this flag, cgroup migration in the window counts phantom
+        // charged bytes (PROT_NONE skips charging), causing permanent
+        // memory_current undercount in the source cgroup.
+        let phase1_flags = MMAP_REGION_FLAG_PENDING_MAP
+            | if is_prot_none { MMAP_REGION_FLAG_PROT_NONE } else { 0 };
         proc.mmap_regions
-            .insert(base, length_aligned | MMAP_REGION_FLAG_PENDING_MAP);
+            .insert(base, length_aligned | phase1_flags);
 
         // Advance next_mmap_addr early so concurrent auto-mmaps don't collide.
         let old_next_mmap_addr = proc.next_mmap_addr;
