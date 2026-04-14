@@ -1385,10 +1385,13 @@ fn is_directory_mode(mode: u32) -> bool {
 /// 内核空间使用高半区（0xFFFF_8000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF）
 const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
 
-/// sys_exec 允许的最大 ELF 映像大小（16 MB）
+/// sys_exec 允许的最大 ELF 映像大小（512 KiB）
 ///
-/// 防止恶意用户请求过大的内存分配导致内核资源耗尽
-const MAX_EXEC_IMAGE_SIZE: usize = 16 * 1024 * 1024;
+/// R151-1 FIX: Reduced from 16 MiB to 512 KiB. The kernel heap is only 1 MiB
+/// (HEAP_SIZE); the previous 16 MiB limit allowed infallible vec! allocation to
+/// exhaust the heap and trigger the alloc_error_handler panic — a deterministic
+/// kernel crash from unprivileged userspace.
+const MAX_EXEC_IMAGE_SIZE: usize = 512 * 1024;
 
 /// R41-4 FIX: 用于 LSM 策略检查的 ELF 前缀哈希长度
 ///
@@ -3733,7 +3736,13 @@ fn sys_exec(
 
     // 【关键】在切换 CR3 前将用户数据复制到内核堆
     // 切换地址空间后原用户指针将失效
-    let mut elf_data = vec![0u8; image_len];
+    // R151-1 FIX: Use fallible allocation to prevent kernel panic on OOM.
+    // The global alloc_error_handler panics; try_reserve_exact returns Err instead.
+    let mut elf_data: Vec<u8> = Vec::new();
+    elf_data
+        .try_reserve_exact(image_len)
+        .map_err(|_| SyscallError::ENOMEM)?;
+    elf_data.resize(image_len, 0);
     copy_from_user(&mut elf_data, image)?;
 
     // 复制 argv 和 envp 到内核

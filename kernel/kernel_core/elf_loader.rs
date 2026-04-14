@@ -42,6 +42,13 @@ pub const USER_STACK_SIZE: usize = 0x20_0000;
 /// 页大小
 const PAGE_SIZE: usize = 0x1000;
 
+/// R151-2 FIX: Maximum pages per single ELF PT_LOAD segment.
+///
+/// Caps attacker-controlled `p_memsz` to bound kernel heap usage when tracking
+/// mapped pages. 256 pages × 4 KiB = 1 MiB maximum per segment. Each
+/// MappedEntry is 16 bytes, so 256 entries = 4 KiB — well within heap budget.
+const MAX_ELF_SEGMENT_PAGES: usize = 256;
+
 /// Z-10 fix: 页映射记录类型，用于失败时统一回滚
 type MappedEntry = (Page<Size4KiB>, PhysFrame<Size4KiB>);
 
@@ -329,6 +336,14 @@ fn load_segment_tracked(
     let map_len = page_offset + memsz;
     let page_count = (map_len + PAGE_SIZE - 1) / PAGE_SIZE;
 
+    // R151-2 FIX: Reject segments whose page_count exceeds the heap-safe limit.
+    // The VA-range check above permits memsz up to ~140 TB but does not bound
+    // page_count. A crafted ELF with small p_filesz but huge p_memsz exhausts
+    // the 1 MiB heap via Vec::with_capacity(page_count).
+    if page_count > MAX_ELF_SEGMENT_PAGES {
+        return Err(ElfLoadError::SegmentOutOfRange);
+    }
+
     // R93-6 FIX: Pre-charge memory for this segment.
     // This enforces cgroup memory limits during ELF loading, preventing bypass
     // by loading large binaries that exceed memory.max.
@@ -357,7 +372,13 @@ fn load_segment_tracked(
 
     // Z-10 fix: 本段成功映射的页（用于数据复制）
     // 【性能优化】预分配精确容量，避免 push 时重新分配
-    let mut segment_mapped: Vec<MappedEntry> = Vec::with_capacity(page_count);
+    // R151-2 FIX: Use fallible allocation instead of infallible with_capacity.
+    let mut segment_mapped: Vec<MappedEntry> = Vec::new();
+    if segment_mapped.try_reserve_exact(page_count).is_err() {
+        // Cgroup was already charged; uncharge since no pages were mapped.
+        cgroup::uncharge_memory(cgroup_id, charge_bytes);
+        return Err(ElfLoadError::OutOfMemory);
+    }
     let mut frame_alloc = FrameAllocator::new();
 
     // R105-2 FIX: Segment layout diagnostics moved to debug-gated kprintln!.
