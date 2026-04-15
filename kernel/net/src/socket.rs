@@ -3490,12 +3490,14 @@ impl SocketTable {
                 if let Some(tcp_state) = guard.as_mut() {
                     let old_state = tcp_state.control.state;
 
-                    // R50-4 FIX: Validate RST sequence/ack per RFC 5961 before honoring
-                    // This prevents off-path RST injection attacks
-                    let accept_rst = match old_state {
+                    // R151-7 FIX: Validate RST per RFC 5961 Section 3.2.
+                    // In synchronized states, accept RST ONLY if SEG.SEQ == RCV.NXT (exact match).
+                    // In-window but non-exact RSTs trigger a rate-limited challenge ACK.
+                    // Out-of-window RSTs are silently dropped.
+                    let (accept_rst, send_challenge) = match old_state {
                         TcpState::SynSent => {
                             // In SYN_SENT: RST is valid if ACK acknowledges our SYN
-                            header.ack_num == tcp_state.control.snd_nxt
+                            (header.ack_num == tcp_state.control.snd_nxt, true)
                         }
                         // R146-NET-3 FIX: Accept RST in SynReceived so
                         // half-open connections can be aborted and SYN queue
@@ -3508,14 +3510,26 @@ impl SocketTable {
                         | TcpState::CloseWait
                         | TcpState::Closing
                         | TcpState::LastAck => {
-                            // In synchronized states: RST must be in receive window
+                            // R151-7 FIX: RFC 5961 strict RST validation.
+                            // Only exact seq match accepts RST; in-window triggers challenge ACK.
                             let wnd = tcp_state.control.rcv_wnd.max(1);
-                            seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, wnd)
+                            if header.seq_num == tcp_state.control.rcv_nxt {
+                                (true, false)
+                            } else if seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, wnd) {
+                                (false, true)
+                            } else {
+                                (false, false)
+                            }
                         }
-                        _ => false, // Ignore RST in other states
+                        _ => (false, false), // Silently drop RST in other states
                     };
 
                     if !accept_rst {
+                        // R151-7 FIX: Out-of-window RSTs are silently dropped (no challenge ACK).
+                        if !send_challenge {
+                            drop(guard);
+                            return None;
+                        }
                         // R54-2 FIX: Rate limit challenge ACKs to prevent amplification attacks
                         // An attacker could send spoofed RST packets at high rate to exhaust
                         // CPU and bandwidth via unlimited challenge ACK responses.
@@ -4062,6 +4076,15 @@ impl SocketTable {
                                 cookie_data.iss,
                                 irs,
                             );
+
+                            // R151-8 FIX: SYN cookie connections do not negotiate window
+                            // scaling. Cap rcv_wnd to what can be advertised in the 16-bit
+                            // TCP window field without WSopt. Without this cap, the stack
+                            // accepts up to 256 KiB per connection while only advertising
+                            // 64 KiB, enabling 4x memory amplification under SYN flood.
+                            if !tcb.wscale_enabled() {
+                                tcb.rcv_wnd = tcb.rcv_wnd.min(u16::MAX as u32);
+                            }
 
                             // Set MSS from cookie
                             tcb.snd_mss = cookie_data.mss;
