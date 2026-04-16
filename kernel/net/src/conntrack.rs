@@ -618,6 +618,15 @@ impl ConntrackTable {
             if let Some(entry_lock) = entries.get(&key) {
                 let mut entry = entry_lock.lock();
 
+                // R151-10 FIX: Treat expired entries as absent so late packets
+                // don't revive stale flows. Fall through to create_entry() which
+                // will remove the expired entry under write lock and create fresh state.
+                if entry.is_expired(now_ms) {
+                    drop(entry);
+                    drop(entries);
+                    return self.create_entry(key, dir, proto, l4, now_ms);
+                }
+
                 // R63-1 FIX: Compute state machine direction based on true initiator.
                 // FlowKey normalization uses lexicographic ordering, but the state machine
                 // needs to know if this packet is from the initiator (Original) or responder (Reply).
@@ -708,6 +717,19 @@ impl ConntrackTable {
         if let Some(entry_lock) = entries.get(&key) {
             let mut entry = entry_lock.lock();
 
+            // R151-10 FIX: If the existing entry is expired, remove it and fall
+            // through to create a fresh entry below.
+            if entry.is_expired(now_ms) {
+                drop(entry);
+                if entries.remove(&key).is_some() {
+                    self.dec_ns_entry_count(key.net_ns_id);
+                    self.stats.timeout_deletes.fetch_add(1, Ordering::Relaxed);
+                    self.stats.entries_deleted.fetch_add(1, Ordering::Relaxed);
+                    self.stats.current_entries.fetch_sub(1, Ordering::Relaxed);
+                }
+                // Fall through to create new entry below
+            } else {
+
             // Calculate state direction relative to initiator
             let state_dir = if dir == entry.initiator_dir {
                 ConntrackDir::Original
@@ -747,6 +769,7 @@ impl ConntrackTable {
                 state: new_state,
                 dir,
             };
+            } // else (non-expired)
         }
 
         // R63-2 FIX: Check table capacity UNDER the write lock to prevent

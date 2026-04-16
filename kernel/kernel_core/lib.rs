@@ -109,8 +109,8 @@ pub use cap::{
     Shm, Socket, Timer,
 };
 pub use scheduler_hook::{
-    force_reschedule, on_scheduler_tick, register_resched_callback, register_timer_callback,
-    request_resched_from_irq, reschedule_if_needed,
+    force_init_resched_locals, force_reschedule, on_scheduler_tick, register_resched_callback,
+    register_timer_callback, request_resched_from_irq, reschedule_if_needed,
 };
 pub use signal::{
     default_action, register_resume_callback, send_signal, signal_name, PendingSignals, Signal,

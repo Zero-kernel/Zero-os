@@ -975,17 +975,46 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
         }
         // R147-2 FIX: PROC allows clone() but rejects namespace-creating flags.
         // A pledged "proc" process must not create new namespaces (privilege escalation).
+        //
+        // R151-2 FIX: Also reject CLONE_VM under PROC. CLONE_VM creates an
+        // address-space-sharing sibling, which is a thread-like semantic that
+        // should require the THREAD promise. Without this, a process pledged
+        // with only "proc" could call clone(CLONE_VM) to share its address
+        // space with a child, bypassing the THREAD promise boundary.
+        //
+        // Exception: if the THREAD promise is also present and the flags
+        // satisfy the THREAD-required pattern (CLONE_THREAD|CLONE_VM|
+        // CLONE_SIGHAND all set), the clone is allowed under THREAD semantics.
+        // This preserves correct behavior for "proc|thread" combined pledges.
         if syscall_nr == SYS_CLONE {
             let clone_flags = args[0];
+            const CLONE_VM: u64 = 0x0000_0100;
+            const CLONE_SIGHAND: u64 = 0x0000_0800;
+            const CLONE_THREAD: u64 = 0x0001_0000;
             const CLONE_NEWNS: u64 = 0x0002_0000;
             const CLONE_NEWUTS: u64 = 0x0400_0000;
             const CLONE_NEWIPC: u64 = 0x0800_0000;
             const CLONE_NEWUSER: u64 = 0x1000_0000;
             const CLONE_NEWPID: u64 = 0x2000_0000;
             const CLONE_NEWNET: u64 = 0x4000_0000;
-            let disallowed =
+            let ns_disallowed =
                 CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
-            return (clone_flags & disallowed) == 0;
+
+            // Always reject namespace-creating flags under PROC.
+            if (clone_flags & ns_disallowed) != 0 {
+                return false;
+            }
+
+            // R151-2 FIX: If CLONE_VM is requested, only allow when THREAD
+            // promise is also present and all thread-required flags are set.
+            if (clone_flags & CLONE_VM) != 0 {
+                let thread_required = CLONE_THREAD | CLONE_VM | CLONE_SIGHAND;
+                return promises.contains(PledgePromises::THREAD)
+                    && (clone_flags & thread_required) == thread_required;
+            }
+
+            // Fork-like clone (no CLONE_VM, no namespace flags): allowed.
+            return true;
         }
     }
 

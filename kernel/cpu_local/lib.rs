@@ -38,6 +38,23 @@ const INVALID_CPU_ID: usize = usize::MAX;
 /// Size of LAPIC ID reverse mapping table (covers all 8-bit LAPIC IDs)
 const LAPIC_ID_REVERSE_MAP_SIZE: usize = 256;
 
+/// R151-6 FIX: Flag set when SMP bring-up is complete.
+///
+/// After this point, `current_cpu_id()` must not silently fall back to CPU 0
+/// because doing so aliases per-CPU slots and corrupts TLB shootdown mailboxes,
+/// IRQ nesting counters, FPU save areas, and scheduler state.
+static CPU_LOCAL_SMP_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Mark SMP initialization complete for the cpu_local subsystem.
+///
+/// Called by arch SMP bring-up code once all CPU registrations are finished.
+/// After this call, `current_cpu_id()` will panic instead of returning 0 for
+/// unregistered LAPIC IDs.
+#[inline]
+pub fn set_smp_init_done() {
+    CPU_LOCAL_SMP_DONE.store(true, Ordering::Release);
+}
+
 /// Marker for "no FPU owner" in per-CPU lazy FPU tracking
 pub const NO_FPU_OWNER: usize = usize::MAX;
 
@@ -434,6 +451,17 @@ impl<T> CpuLocal<T> {
         })
     }
 
+    /// Force-initialize the backing heap allocation in non-IRQ context.
+    ///
+    /// R151-5 FIX: `CpuLocal` lazily heap-allocates via `Once::call_once()`.
+    /// If the first access occurs in IRQ context while another code path holds
+    /// the heap allocator lock, the IRQ handler deadlocks. Call this during
+    /// BSP/AP init before enabling interrupts.
+    #[inline]
+    pub fn force_init(&self) {
+        let _ = self.get_slots();
+    }
+
     /// Access the current CPU's slot immutably
     ///
     /// # Safety
@@ -570,18 +598,16 @@ pub fn current_cpu_id() -> usize {
         return cpu_idx;
     }
 
-    // Fallback to CPU 0 - only safe during early boot before registration
-    // R67-8 FIX: In debug builds, warn about potential slot aliasing
-    #[cfg(debug_assertions)]
-    {
-        // Only warn once SMP could be active (after BSP registration)
-        // LAPIC_ID_MAP[0] being valid indicates BSP has registered
-        if LAPIC_ID_MAP[0].load(Ordering::Relaxed) != INVALID_LAPIC_ID as u32 {
-            // This is a potential bug - LAPIC ID not registered
-            // Could cause slot 0 aliasing under SMP
-            // In release builds we silently fall back, but this should be investigated
-        }
+    // R151-6 FIX: After SMP init, an unregistered LAPIC ID is a critical bug
+    // that would silently alias CPU 0's per-CPU data. Panic immediately.
+    if CPU_LOCAL_SMP_DONE.load(Ordering::Acquire) {
+        panic!(
+            "current_cpu_id: LAPIC ID {} not registered after SMP init complete",
+            apic_id
+        );
     }
+
+    // Fallback to CPU 0 - only safe during early boot before registration
     0
 }
 

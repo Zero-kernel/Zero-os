@@ -86,6 +86,18 @@ static IRQ_FPU_DEPTH: CpuLocal<core::sync::atomic::AtomicU32> =
 /// the original TS state so lazy FPU semantics continue for the user process.
 static IRQ_FPU_TS_WAS_SET: CpuLocal<AtomicBool> = CpuLocal::new(|| AtomicBool::new(false));
 
+/// R151-5 FIX: Force-initialize all IRQ-path CpuLocal statics.
+///
+/// Must be called during BSP/AP init before interrupts are enabled.
+/// Without this, the first IRQ triggering `irq_save_fpu()` may deadlock
+/// if `Once::call_once()` attempts to heap-allocate while the heap lock
+/// is held by the interrupted code path.
+pub fn force_init_irq_cpu_locals() {
+    IRQ_FPU_AREAS.force_init();
+    IRQ_FPU_DEPTH.force_init();
+    IRQ_FPU_TS_WAS_SET.force_init();
+}
+
 /// R65-18 FIX + R66-7 FIX + R67-7 FIX: Save FPU/SSE state before IRQ handler work.
 ///
 /// Uses per-CPU storage to support SMP. Must be called at the beginning
@@ -847,33 +859,51 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 /// #TS - Invalid TSS (无效TSS)
-extern "x86-interrupt" fn invalid_tss_handler(_stack_frame: InterruptStackFrame, _error_code: u64) {
+///
+/// R151-4 FIX: User-mode #TS terminates the process with SIGSEGV instead of
+/// crashing the kernel (mirrors the #GP handler pattern).
+extern "x86-interrupt" fn invalid_tss_handler(stack_frame: InterruptStackFrame, _error_code: u64) {
     clac_if_smap();
     INTERRUPT_STATS.invalid_tss.fetch_add(1, Ordering::Relaxed);
+    if handle_user_exception(&stack_frame, 139) {
+        return;
+    }
     panic!("Invalid Task State Segment");
 }
 
 /// #NP - Segment Not Present (段不存在)
+///
+/// R151-4 FIX: User-mode #NP terminates the process with SIGSEGV instead of
+/// crashing the kernel (mirrors the #GP handler pattern).
 extern "x86-interrupt" fn segment_not_present_handler(
-    _stack_frame: InterruptStackFrame,
+    stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) {
     clac_if_smap();
     INTERRUPT_STATS
         .segment_not_present
         .fetch_add(1, Ordering::Relaxed);
+    if handle_user_exception(&stack_frame, 139) {
+        return;
+    }
     panic!("Segment not present");
 }
 
 /// #SS - Stack Segment Fault (栈段错误)
+///
+/// R151-4 FIX: User-mode #SS terminates the process with SIGSEGV instead of
+/// crashing the kernel (mirrors the #GP handler pattern).
 extern "x86-interrupt" fn stack_segment_fault_handler(
-    _stack_frame: InterruptStackFrame,
+    stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) {
     clac_if_smap();
     INTERRUPT_STATS
         .stack_segment_fault
         .fetch_add(1, Ordering::Relaxed);
+    if handle_user_exception(&stack_frame, 139) {
+        return;
+    }
     panic!("Stack segment fault");
 }
 

@@ -686,6 +686,11 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             kernel_stack_top, // IRQ stack (same as kernel stack for now)
             kernel_stack_top, // Syscall stack (same for now)
         );
+        // R151-5 FIX: Force-initialize IRQ-path CpuLocal statics before interrupts
+        // are enabled. Without this, the first IRQ triggering irq_save_fpu() can
+        // deadlock if Once::call_once() heap-allocates while the heap lock is held.
+        arch::interrupts::force_init_irq_cpu_locals();
+        kernel_core::force_init_resched_locals();
         klog_always!("      ✓ BSP per-CPU data initialized");
 
         // R67-8 FIX: Initialize per-CPU syscall metadata and GS base for BSP

@@ -193,6 +193,15 @@ pub fn drain_deferred_tcp_timers() {
     let sweep_tw = TCP_TIMER_DEFERRED_TW.load(Ordering::Relaxed);
     let current = if ts == 0 { current_timestamp_ms() } else { ts };
 
+    // R151-9 FIX: Drive fragment reassembly cleanup from the slow TCP timer sweep.
+    // cleanup_expired_fragments() is never called from the timer IRQ infrastructure
+    // (handle_timer_tick in stack.rs is not wired to kernel/kernel_core/time.rs).
+    // Without periodic cleanup, expired fragment queues persist indefinitely,
+    // pinning up to 64 MB (GLOBAL_MAX_FRAG_BYTES) and disabling reassembly.
+    if sweep_tw {
+        let _ = net::handle_timer_tick(current);
+    }
+
     // Use blocking variant which will wait for locks
     let completed = net::socket_table().run_tcp_timers_blocking(current, sweep_tw);
 

@@ -30,6 +30,15 @@ static RESCHED_CB: Mutex<Option<ReschedCallback>> = Mutex::new(None);
 /// sets the flag and another clears it.
 static IRQ_RESCHED_PENDING: CpuLocal<AtomicBool> = CpuLocal::new(|| AtomicBool::new(false));
 
+/// R151-5 FIX: Force-initialize the per-CPU resched flag before IRQs are enabled.
+///
+/// `IRQ_RESCHED_PENDING` is accessed from `request_resched_from_irq()` in timer
+/// and keyboard interrupt handlers. Without pre-initialization, the first IRQ on
+/// a CPU can deadlock inside `Once::call_once()` heap allocation.
+pub fn force_init_resched_locals() {
+    IRQ_RESCHED_PENDING.force_init();
+}
+
 /// 注册定时器回调
 ///
 /// R39-6 FIX: 支持多个回调注册，调度器和超时处理可以同时注册

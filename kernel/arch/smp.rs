@@ -758,6 +758,7 @@ pub fn start_aps() -> usize {
     if ap_lapic_ids.is_empty() {
         klog_always!("[SMP] Single-core system detected");
         SMP_INIT_DONE.store(true, Ordering::Release);
+        cpu_local::set_smp_init_done(); // R151-6 FIX
         TOTAL_CPUS.store(1, Ordering::Release);
         return 1;
     }
@@ -854,6 +855,7 @@ pub fn start_aps() -> usize {
                 let partial_total = AP_ONLINE_COUNT.load(Ordering::Acquire) + 1;
                 TOTAL_CPUS.store(partial_total, Ordering::Release);
                 SMP_INIT_DONE.store(true, Ordering::Release);
+                cpu_local::set_smp_init_done(); // R151-6 FIX
                 make_trampoline_nonexecutable();
                 return partial_total;
             }
@@ -878,6 +880,7 @@ pub fn start_aps() -> usize {
     let total = AP_ONLINE_COUNT.load(Ordering::Acquire) + 1; // +1 for BSP
     TOTAL_CPUS.store(total, Ordering::Release);
     SMP_INIT_DONE.store(true, Ordering::Release);
+    cpu_local::set_smp_init_done(); // R151-6 FIX
 
     // Restore security: make trampoline page non-executable again
     // This is important for W^X policy compliance
@@ -994,6 +997,10 @@ pub extern "C" fn ap_rust_entry(
         stack_top as usize, // IRQ stack (same for now)
         stack_top as usize, // Syscall stack (same for now)
     );
+    // R151-5 FIX: Force-initialize IRQ-path CpuLocal statics before interrupts
+    // are enabled on this AP. Prevents deadlock on first IRQ if heap lock is held.
+    interrupts::force_init_irq_cpu_locals();
+    kernel_core::force_init_resched_locals();
 
     // R67-8 FIX: Initialize per-CPU syscall metadata and GS base for this AP
     unsafe {

@@ -680,19 +680,35 @@ pub fn add_mount(
 ///
 /// Caller must have already verified CAP_SYS_ADMIN or equivalent capability.
 pub fn remove_mount(ns: &Arc<MountNamespace>, path: &str) -> Result<(), MountNsError> {
-    // Check for submounts
-    if ns.has_submounts(path) {
-        return Err(MountNsError::MountBusy);
-    }
+    // R151-1 FIX: Normalize the path to match add_mount() semantics.
+    // Without normalization, "/mnt/" and "/mnt" are treated as different keys,
+    // causing remove_mount to miss entries inserted by add_mount (which normalizes).
+    let normalized_path = normalize_mount_path(path)?;
 
+    // R151-1 FIX: Take the write lock up-front so the submount check and removal
+    // are atomic. Previously, has_submounts() took a read lock which was released
+    // before the write lock was acquired, allowing a concurrent add_mount() to
+    // insert a submount between the check and the removal.
     let mut table = ns.mounts.write();
 
-    if table.remove(path).is_some() {
+    // Check for submounts under the write lock (inlined from has_submounts).
+    if normalized_path == "/" {
+        if table.len() > 1 || !table.contains_key("/") {
+            return Err(MountNsError::MountBusy);
+        }
+    } else {
+        let prefix = format!("{}/", normalized_path);
+        if table.keys().any(|k| k != &normalized_path && k.starts_with(&prefix)) {
+            return Err(MountNsError::MountBusy);
+        }
+    }
+
+    if table.remove(&normalized_path).is_some() {
         // Emit audit event (use Fs kind for umount operations)
         #[cfg(feature = "audit")]
         {
             use audit::{emit, AuditKind};
-            let path_hash = hash_path(path);
+            let path_hash = hash_path(&normalized_path);
             emit(AuditKind::Fs, ns.id.raw(), path_hash, 1);  // 1 = umount operation
         }
 
