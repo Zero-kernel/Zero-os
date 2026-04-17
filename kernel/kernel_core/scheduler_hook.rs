@@ -57,7 +57,12 @@ pub fn register_timer_callback(cb: TimerCallback) {
 ///
 /// 调度器在初始化时调用此函数注册 reschedule_now 处理器
 pub fn register_resched_callback(cb: ReschedCallback) {
-    *RESCHED_CB.lock() = Some(cb);
+    // R152-11 FIX: Disable IRQs while holding RESCHED_CB lock.
+    // force_reschedule() also acquires this lock and is reachable from signal paths
+    // that may run in interrupt-adjacent context. Matches register_timer_callback().
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        *RESCHED_CB.lock() = Some(cb);
+    });
 }
 
 /// Maximum number of timer callbacks (prevents allocation in IRQ context)

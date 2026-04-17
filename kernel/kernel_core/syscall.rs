@@ -9072,7 +9072,7 @@ fn resolve_socket(
 ///
 /// # Security
 /// - Invokes LSM hook_net_socket for policy check
-/// - Creates CapEntry with READ|WRITE|BIND rights
+/// - Creates CapEntry with READ|WRITE|BIND rights (TCP also gets CONNECT|LISTEN|ACCEPT)
 /// - Stores CapId in fd_table via SocketFile wrapper
 fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
     // Parse domain
@@ -9126,10 +9126,16 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
     } else {
         cap::CapFlags::empty()
     };
+    // R152-1 FIX: TCP sockets get CONNECT/LISTEN/ACCEPT rights at creation.
+    // These rights enable least-privilege delegation (e.g., connect-only cap).
+    let mut rights = cap::CapRights::READ | cap::CapRights::WRITE | cap::CapRights::BIND;
+    if ty == net::SocketType::Stream && proto == net::SocketProtocol::Tcp {
+        rights |= cap::CapRights::CONNECT | cap::CapRights::LISTEN | cap::CapRights::ACCEPT;
+    }
     let cap_entry = cap::CapEntry::with_flags(
         // R75-1 FIX: Pass network namespace ID to Socket capability for isolation tracking
         cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(socket.id, socket.net_ns_id.raw()))),
-        cap::CapRights::READ | cap::CapRights::WRITE | cap::CapRights::BIND,
+        rights,
         cap_flags,
     );
 
@@ -9294,7 +9300,8 @@ fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
 /// * `backlog` - Maximum pending connections (clamped to system limits)
 ///
 /// # Security
-/// - Verifies CapRights::BIND (required for listen)
+/// - Verifies CapRights::LISTEN (required for listen)
+/// - Verifies CapRights::BIND if auto-bind is needed
 /// - Invokes LSM hook_net_listen for policy check
 /// - Auto-binds to ephemeral port if not already bound
 fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
@@ -9310,8 +9317,13 @@ fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
         return Err(SyscallError::EOPNOTSUPP);
     }
 
-    // BIND right required for listen
-    if !entry.rights.allows(cap::CapRights::BIND) {
+    // R152-1 FIX: LISTEN right required for listen()
+    if !entry.rights.allows(cap::CapRights::LISTEN) {
+        return Err(SyscallError::EACCES);
+    }
+
+    // R152-1 FIX: BIND right required only if listen() must auto-bind
+    if socket.local_port().is_none() && !entry.rights.allows(cap::CapRights::BIND) {
         return Err(SyscallError::EACCES);
     }
 
@@ -9342,7 +9354,7 @@ fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
 /// * `addrlen` - Optional pointer to address length
 ///
 /// # Security
-/// - Verifies CapRights::READ (required for accept)
+/// - Verifies CapRights::ACCEPT (required for accept)
 /// - Invokes LSM hook_net_accept for policy check
 /// - Returns EAGAIN for non-blocking if no connections pending
 fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResult {
@@ -9354,8 +9366,8 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
         return Err(SyscallError::EOPNOTSUPP);
     }
 
-    // READ right required for accept
-    if !entry.rights.allows(cap::CapRights::READ) {
+    // R152-1 FIX: ACCEPT right required for accept()
+    if !entry.rights.allows(cap::CapRights::ACCEPT) {
         return Err(SyscallError::EACCES);
     }
 
@@ -9445,9 +9457,13 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
 
     // Allocate capability + fd for child socket
     // R75-1 FIX: Pass network namespace ID to Socket capability (inherited from listener)
+    // R152-1 FIX: Child socket rights are limited to (READ|WRITE) & listener_rights.
+    // This enforces capability monotonicity: a restricted listener cannot mint
+    // broader child capabilities via accept().
+    let child_rights = (cap::CapRights::READ | cap::CapRights::WRITE) & entry.rights;
     let cap_entry = cap::CapEntry::with_flags(
         cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(child.id, child.net_ns_id.raw()))),
-        cap::CapRights::READ | cap::CapRights::WRITE | cap::CapRights::BIND,
+        child_rights,
         cap::CapFlags::empty(),
     );
 
@@ -9552,6 +9568,7 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
 /// * `addrlen` - Length of address structure
 ///
 /// # Security
+/// - Verifies CapRights::CONNECT for initiating connect()
 /// - Verifies CapRights::WRITE for sending SYN
 /// - Verifies CapRights::BIND if socket not yet bound (auto-bind)
 /// - Invokes LSM hook_net_send for policy check
@@ -9567,6 +9584,11 @@ fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult 
     // Only stream sockets are supported for connect()
     if socket.ty != net::SocketType::Stream || socket.proto != net::SocketProtocol::Tcp {
         return Err(SyscallError::EOPNOTSUPP);
+    }
+
+    // R152-1 FIX: CONNECT right required for connect()
+    if !entry.rights.allows(cap::CapRights::CONNECT) {
+        return Err(SyscallError::EACCES);
     }
 
     // WRITE right required to transmit SYN

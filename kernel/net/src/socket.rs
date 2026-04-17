@@ -2420,26 +2420,38 @@ impl SocketTable {
                 return Err(SocketError::Closed);
             }
 
-            // Try to get a datagram
-            if let Some(pkt) = sock.pop_rx() {
-                // Build LSM context with actual CapId
-                let mut ctx = self.ctx_from_socket(sock);
-                ctx.remote = ipv4_to_u64(pkt.src_ip.0);
-                ctx.remote_port = pkt.src_port;
-                ctx.cap = Some(cap_id); // R47-2 FIX: Pass actual CapId
+            // R152-13 FIX: Peek at front datagram and perform LSM check BEFORE popping.
+            // This prevents data loss when LSM denies the recv operation.
+            // Codex review: pop must happen under the SAME lock to avoid checked-A-popped-B race.
+            {
+                let mut queue = sock.rx_queue.lock();
+                if let Some(pkt) = queue.front() {
+                    let mut ctx = self.ctx_from_socket(sock);
+                    ctx.remote = ipv4_to_u64(pkt.src_ip.0);
+                    ctx.remote_port = pkt.src_port;
+                    ctx.cap = Some(cap_id);
 
-                // Check LSM policy using CURRENT process context
-                hook_net_recv(current, &ctx, pkt.data.len())?;
+                    hook_net_recv(current, &ctx, pkt.data.len())?;
 
-                return Ok(pkt);
-            }
-
-            // Block on wait queue
-            match sock.waiters.wait_with_timeout(timeout_ns) {
-                WaitOutcome::Woken => continue,
-                WaitOutcome::TimedOut => return Err(SocketError::Timeout),
-                WaitOutcome::Closed => return Err(SocketError::Closed),
-                WaitOutcome::NoProcess => return Err(SocketError::NoProcess),
+                    // LSM approved — pop the exact datagram we checked (same lock held)
+                    let pkt = queue.pop_front().unwrap();
+                    // Account for global UDP bytes
+                    let _ = GLOBAL_UDP_QUEUED_BYTES.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |current| Some(current.saturating_sub(pkt.data.len())),
+                    );
+                    return Ok(pkt);
+                } else {
+                    drop(queue);
+                    // Block on wait queue
+                    match sock.waiters.wait_with_timeout(timeout_ns) {
+                        WaitOutcome::Woken => continue,
+                        WaitOutcome::TimedOut => return Err(SocketError::Timeout),
+                        WaitOutcome::Closed => return Err(SocketError::Closed),
+                        WaitOutcome::NoProcess => return Err(SocketError::NoProcess),
+                    }
+                }
             }
         }
     }
@@ -2797,21 +2809,34 @@ impl SocketTable {
 
                 // Check if we have data in the buffer
                 if !tcp_state.control.recv_buffer.is_empty() {
-                    let mut data = Vec::new();
                     let take = core::cmp::min(max_len, tcp_state.control.recv_buffer.len());
 
-                    for _ in 0..take {
+                    // R152-14 FIX: Perform LSM check BEFORE draining recv_buffer.
+                    // This prevents permanent data loss when LSM denies the recv.
+                    drop(guard);
+                    let mut ctx = self.ctx_from_socket(sock);
+                    ctx.cap = Some(cap_id);
+                    hook_net_recv(current, &ctx, take)?;
+
+                    // Re-acquire TCP lock and drain buffer after LSM approval
+                    // Codex review: if another reader drained the buffer during LSM check,
+                    // actual_take can be 0 — loop again instead of returning spurious EOF.
+                    let mut guard = sock.tcp.lock();
+                    let tcp_state = guard.as_mut().ok_or(SocketError::Closed)?;
+                    let actual_take = core::cmp::min(take, tcp_state.control.recv_buffer.len());
+                    if actual_take == 0 {
+                        // Buffer was drained by another reader — retry the loop
+                        drop(guard);
+                        continue;
+                    }
+                    let mut data = Vec::new();
+                    for _ in 0..actual_take {
                         if let Some(b) = tcp_state.control.recv_buffer.pop_front() {
                             data.push(b);
                         }
                     }
 
                     drop(guard);
-
-                    // LSM check for recv delivery
-                    let mut ctx = self.ctx_from_socket(sock);
-                    ctx.cap = Some(cap_id);
-                    hook_net_recv(current, &ctx, data.len())?;
 
                     // Update statistics
                     sock.rx_bytes
@@ -3496,8 +3521,11 @@ impl SocketTable {
                     // Out-of-window RSTs are silently dropped.
                     let (accept_rst, send_challenge) = match old_state {
                         TcpState::SynSent => {
-                            // In SYN_SENT: RST is valid if ACK acknowledges our SYN
-                            (header.ack_num == tcp_state.control.snd_nxt, true)
+                            // R152-6 FIX: In SYN_SENT, require ACK flag on RST per RFC 793 §3.4.
+                            // Never send challenge ACK — RFC 5961 challenge ACKs are for
+                            // synchronized states only. Bare RST (no ACK) is silently dropped.
+                            let has_ack = header.flags & TCP_FLAG_ACK != 0;
+                            (has_ack && header.ack_num == tcp_state.control.snd_nxt, false)
                         }
                         // R146-NET-3 FIX: Accept RST in SynReceived so
                         // half-open connections can be aborted and SYN queue

@@ -242,6 +242,10 @@ impl BuddyAllocator {
             // 从空闲链表中移除buddy
             if let Some(pos) = self.free_lists[order].iter().position(|&x| x == buddy_idx) {
                 self.free_lists[order].remove(pos);
+            } else {
+                // R152-15 FIX: Buddy bitmap says free but not in this order's free list.
+                // Abort merge to prevent overlapping free blocks.
+                break;
             }
 
             // 合并：使用较小的索引作为合并后的块

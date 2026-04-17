@@ -348,8 +348,17 @@ impl WaitQueue {
                 return false;
             }
 
+            // R152-8 FIX: Check for duplicate enqueue before pushing.
+            // Without this, spurious reschedule returns cause the same PID
+            // to accumulate in the deque, consuming wake signals meant for
+            // other waiters.
+            let mut waiters = self.waiters.lock();
+            if waiters.iter().any(|&p| p == pid) {
+                return true; // Already enqueued — no duplicate
+            }
+
             // 将当前进程加入等待队列
-            self.waiters.lock().push_back(pid);
+            waiters.push_back(pid);
 
             // 将进程状态设为阻塞
             if let Some(proc_arc) = process::get_process(pid) {
