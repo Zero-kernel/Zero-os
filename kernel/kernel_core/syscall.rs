@@ -735,24 +735,41 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
         let queue_addr = queue as *const _ as usize;
 
         // Phase 1: Add to wait queue and mark blocked (with interrupts disabled)
-        x86_64::instructions::interrupts::without_interrupts(|| {
+        // R152-2 FIX: Consume wake token *after* registering the waiter,
+        // while interrupts are disabled and SOCKET_WAITERS is locked.
+        // This closes the missed-wakeup race where wake_one() can run between
+        // a pre-check and waiter registration.
+        let immediate = x86_64::instructions::interrupts::without_interrupts(|| {
             let mut waiters = SOCKET_WAITERS.lock();
 
             // Avoid duplicate entries
             if let Some(q) = waiters.waiters.get(&queue_addr) {
                 if q.iter().any(|(p, _)| *p == pid) {
-                    return; // Already waiting
+                    return None; // Already waiting
                 }
             }
 
             waiters.add_waiter(queue_addr, pid, deadline);
+
+            // R152-2 FIX: Check for pending wake AFTER registration.
+            // If a wake arrived before we registered, consume the token and
+            // remove ourselves — no need to block.
+            if queue.try_consume_wakeup() {
+                waiters.remove_waiter(queue_addr, pid);
+                return Some(net::WaitOutcome::Woken);
+            }
 
             // Mark process as blocked
             if let Some(proc_arc) = get_process(pid) {
                 let mut proc = proc_arc.lock();
                 proc.state = ProcessState::Blocked;
             }
+            None
         });
+
+        if let Some(outcome) = immediate {
+            return outcome;
+        }
 
         // Phase 2: Yield CPU and wait for wakeup
         crate::force_reschedule();
@@ -2340,36 +2357,12 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
             t
         };
 
-        // Collect all other tasks in the same thread group (excluding ourselves).
-        // R115-1 FIX: Include both thread-group leader and child threads (any
-        // process sharing our tgid that is still alive).
-        let sibling_pids: alloc::vec::Vec<ProcessId> = {
-            let table = crate::process::process_table_snapshot();
-            table
-                .iter()
-                .filter(|&&p| p != pid)
-                .filter(|&&p| {
-                    if let Some(proc_arc) = get_process(p) {
-                        let proc = proc_arc.lock();
-                        proc.tgid == tgid
-                            && proc.state != ProcessState::Zombie
-                            && proc.state != ProcessState::Terminated
-                    } else {
-                        false
-                    }
-                })
-                .copied()
-                .collect()
-        };
-
-        // R115-1 FIX: Request termination of siblings via pending-kill flag.
-        // Do NOT call terminate_process() cross-CPU — that causes UAF.
-        let mut marked = 0usize;
-        for &sibling_pid in &sibling_pids {
-            if crate::process::request_process_exit(sibling_pid, exit_code) {
-                marked += 1;
-            }
-        }
+        // R152-10 FIX: Atomically mark all siblings under PROCESS_TABLE lock.
+        // This prevents a concurrent sys_clone(CLONE_THREAD) from creating a
+        // new thread that escapes the exit_group scan. The old snapshot-then-mark
+        // pattern had a TOCTOU window where new threads could be created between
+        // the snapshot and the marking loop.
+        let marked = crate::process::request_exit_group_atomic(pid, tgid, exit_code);
 
         // R115-1 FIX: Removed duplicate hook_task_exit() call.
         // terminate_process() is the sole call site for the LSM exit hook.
@@ -2639,6 +2632,18 @@ fn sys_clone(
                 "[sys_clone] CLONE_THREAD rejected: NULL stack would share parent's user stack"
             );
             return Err(SyscallError::EINVAL);
+        }
+
+        // R152-10 FIX: Reject CLONE_THREAD if the caller's thread group is
+        // exiting. This prevents new threads from escaping an exit_group().
+        // The caller itself may not have pending_kill set (it might be the
+        // exit_group caller), but any sibling with pending_kill means the
+        // group is shutting down.
+        if let Some(parent_arc) = get_process(parent_pid) {
+            let parent = parent_arc.lock();
+            if parent.pending_kill.load(core::sync::atomic::Ordering::Acquire) {
+                return Err(SyscallError::EINVAL);
+            }
         }
     }
 
@@ -3226,6 +3231,18 @@ fn sys_clone(
             }
             child.tgid = parent_tgid; // 加入父进程的线程组
             child.is_thread = true;
+
+            // R152-10 FIX: After setting child.tgid, re-check if the thread group
+            // is exiting. The atomic exit_group scan may have missed this child
+            // because it was inserted with default tgid before we set it here.
+            // If the parent has pending_kill, the group is shutting down — immediately
+            // mark the child so it self-terminates at its first safe point.
+            if let Some(parent_arc) = get_process(parent_pid) {
+                if parent_arc.lock().pending_kill.load(core::sync::atomic::Ordering::Acquire) {
+                    child.pending_exit_code.store(0, core::sync::atomic::Ordering::Relaxed);
+                    child.pending_kill.store(true, core::sync::atomic::Ordering::Release);
+                }
+            }
         } else {
             child.tgid = child_pid; // 新线程组
             child.is_thread = false;
