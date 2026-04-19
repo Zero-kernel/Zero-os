@@ -412,9 +412,13 @@ pub fn alloc_physical_pages(count: usize) -> Option<PhysFrame> {
         return None;
     }
 
-    let order = count.next_power_of_two().trailing_zeros() as usize;
-    // Buddy allocator 实际分配的页数（向上取整到 2 的幂）
-    let pages_needed = 1usize << order;
+    // R152-17 FIX: Use checked_next_power_of_two to prevent overflow to 0
+    // on huge count values, matching the pattern in free_physical_pages().
+    let pages_needed = match count.checked_next_power_of_two() {
+        Some(p) => p,
+        None => return None,
+    };
+    let order = pages_needed.trailing_zeros() as usize;
 
     // 第一次尝试分配
     let result = BUDDY_ALLOCATOR

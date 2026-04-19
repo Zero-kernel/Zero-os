@@ -408,6 +408,14 @@ pub unsafe fn with_active_level_4_table<T, F>(f: F) -> T
 where
     F: FnOnce(&mut PageTable) -> T,
 {
+    // R152-16 FIX: This function bypasses PT_LOCK and uses no interrupt guard.
+    // It is only safe before SMP bring-up. Assert single-CPU to prevent
+    // concurrent page table mutation if called post-SMP.
+    assert!(
+        cpu_local::num_online_cpus() <= 1,
+        "with_active_level_4_table: must be called before SMP bring-up (PT_LOCK bypass)"
+    );
+
     let phys_offset = get_phys_offset();
     let level_4_table = active_level_4_table(phys_offset);
     f(level_4_table)
