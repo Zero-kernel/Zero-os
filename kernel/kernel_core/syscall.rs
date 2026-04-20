@@ -3197,6 +3197,9 @@ fn sys_clone(
         if is_shared_space && parent_seccomp_installing {
             child.state = ProcessState::Terminated;
             drop(child);
+            // R152-12 FIX: Drop child_arc before cleanup so namespace Arc refcount
+            // reaches zero promptly, allowing PidNamespace::drop to decrement PID_NS_COUNT.
+            drop(child_arc);
             // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process
             // to avoid cgroup/cpuset/IPC detach on never-joined subsystems.
             if let Some(parent) = get_process(parent_pid) {
@@ -3221,6 +3224,8 @@ fn sys_clone(
                 // Clean up: terminate the child process we just created
                 child.state = ProcessState::Terminated;
                 drop(child);
+                // R152-12 FIX: Drop child_arc before cleanup for prompt namespace counter release
+                drop(child_arc);
                 // H.0.9 FIX: Child was never scheduled — use cleanup_unscheduled_process
                 // to avoid cgroup/cpuset/IPC detach on never-joined subsystems.
                 if let Some(parent) = get_process(parent_pid) {
@@ -9439,7 +9444,8 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
             let mut out = SockAddrIn::default();
             out.sin_family = AF_INET as u16;
             out.sin_port = rport.to_be();
-            out.sin_addr = u32::from_le_bytes(rip).swap_bytes();
+            // R152-7 FIX: Use from_be_bytes directly instead of from_le_bytes().swap_bytes()
+            out.sin_addr = u32::from_be_bytes(rip);
 
             if let Err(e) = validate_user_ptr(addr as *const u8, core::mem::size_of::<SockAddrIn>())
             {

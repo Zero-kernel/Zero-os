@@ -118,7 +118,9 @@ pub fn cleanup_identity_map(
     // R144-4 FIX: This function uses local-only TLB flush (flush_all_local),
     // which is only safe before SMP bring-up.  Assert single-CPU to prevent
     // future misuse after AP cores are online.
-    debug_assert!(
+    // R152-19 FIX: Use assert! instead of debug_assert! so the pre-SMP guard
+    // is enforced in release builds, preventing silent TLB stale entries.
+    assert!(
         cpu_local::num_online_cpus() <= 1,
         "cleanup_identity_map: must be called before SMP bring-up (local TLB flush only)"
     );
@@ -247,7 +249,9 @@ pub fn enforce_nx_for_kernel(
     // R144-4 FIX: This function uses local-only TLB flush (flush_all_local),
     // which is only safe before SMP bring-up.  Assert single-CPU to prevent
     // future misuse after AP cores are online.
-    debug_assert!(
+    // R152-19 FIX: Use assert! instead of debug_assert! so the pre-SMP guard
+    // is enforced in release builds, preventing silent NX bypass on remote CPUs.
+    assert!(
         cpu_local::num_online_cpus() <= 1,
         "enforce_nx_for_kernel: must be called before SMP bring-up (local TLB flush only)"
     );
