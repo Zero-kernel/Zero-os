@@ -469,9 +469,10 @@ impl Vfs {
 
         mounts.insert(path.clone(), Mount { path: path.clone(), fs: fs.clone() });
 
-        // Sync root_fs when mounting at "/"
+        // R152-9 FIX: Update root_fs while still holding mounts lock
+        // to prevent a concurrent find_mount from observing an inconsistent
+        // state between mounts and root_fs.
         if path == "/" {
-            drop(mounts); // Release lock before acquiring root_fs lock
             *table.root_fs.write() = Some(fs);
         }
 
@@ -525,9 +526,8 @@ impl Vfs {
         let mut mounts = table.mounts.write();
 
         if mounts.remove(&path).is_some() {
-            // Sync root_fs when unmounting "/"
+            // R152-9 FIX: Update root_fs while holding mounts lock for consistency
             if path == "/" {
-                drop(mounts); // Release lock before acquiring root_fs lock
                 *table.root_fs.write() = None;
             }
             Ok(())

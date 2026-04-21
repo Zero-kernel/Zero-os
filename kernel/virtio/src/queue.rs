@@ -55,8 +55,9 @@ impl VirtQueue {
     /// each aligned to 4KB for DMA compatibility.
     pub fn layout_size(queue_size: u16) -> usize {
         let desc_size = core::mem::size_of::<VringDesc>() * queue_size as usize;
-        let avail_size = 4 + 2 * queue_size as usize; // flags + idx + ring
-        let used_size = 4 + 8 * queue_size as usize; // flags + idx + ring
+        // R152-18 FIX: Include +2 for used_event/avail_event per VirtIO spec
+        let avail_size = 4 + 2 * queue_size as usize + 2; // flags + idx + ring + used_event
+        let used_size = 4 + 8 * queue_size as usize + 2; // flags + idx + ring + avail_event
 
         // Align each section to 4KB for DMA
         let desc_pages = (desc_size + 4095) / 4096;
@@ -85,7 +86,8 @@ impl VirtQueue {
         notify_off: u16,
     ) -> Self {
         let desc_size = core::mem::size_of::<VringDesc>() * queue_size as usize;
-        let avail_size = 4 + 2 * queue_size as usize;
+        // R152-18 FIX: Include +2 for used_event per VirtIO spec
+        let avail_size = 4 + 2 * queue_size as usize + 2;
 
         // Calculate aligned offsets
         let desc_pages = (desc_size + 4095) / 4096;
