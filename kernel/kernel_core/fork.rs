@@ -111,42 +111,38 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
     // allocations succeed, so we need to roll back if cgroup attach fails.
     let parent_cpuset_id = parent.cpuset_id;
 
+    // R152-5 FIX: Attach child to cgroup BEFORE the expensive fork_inner() PT copy.
+    // This eliminates the pids.max TOCTOU window where multiple concurrent forks
+    // all pass check_fork_allowed but waste kernel resources (kernel stack, PID,
+    // page table copy) before attach_task() serially rejects them.
+    let mut cgroup_attached = false;
+    if let Some(cgroup) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+        if let Err(_) = cgroup.attach_task(child_pid as u64) {
+            parent.children.retain(|&pid| pid != child_pid);
+            drop(parent);
+            cleanup_partial_child(child_pid);
+            return Err(ForkError::CgroupPidsLimitExceeded);
+        }
+        cgroup_attached = true;
+    }
+
     let result = fork_inner(&mut parent, child_pid, parent_root);
 
     if result.is_err() {
         // 从父进程子列表移除失败的占位 PID，防止悬挂
         parent.children.retain(|&pid| pid != child_pid);
+        // R152-5: Detach from cgroup if we attached before fork_inner
+        if cgroup_attached {
+            if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+                let _ = cg.detach_task(child_pid as u64);
+            }
+        }
         // H.0.9 FIX: Do NOT roll back cpuset task count on fork_inner failure.
-        //
-        // fork_inner() calls notify_cpuset_task_joined() (line 190) only AFTER
-        // the critical frame allocation succeeds. All error paths that can trigger
-        // (MemoryAllocationFailed, PageTableCopyFailed, ProcessNotFound) occur
-        // either before or independently of the cpuset join. Since the task count
-        // was never incremented, decrementing it causes fetch_sub underflow on the
-        // AtomicU32 counter (cpuset.rs task_left uses fetch_sub, not saturating_sub).
-        //
-        // The cgroup-attach-failure path in the `else` branch below correctly calls
-        // notify_cpuset_task_left because fork_inner succeeded (cpuset WAS joined).
+        // (see original comment — cpuset join happens inside fork_inner after
+        // frame allocation, so it was never incremented on this error path)
         drop(parent);
         cleanup_partial_child(child_pid);
     } else {
-        // F.2: On success, attach child to parent's cgroup
-        // CODEX FIX: Properly propagate attach failures instead of ignoring
-        // This maintains attach/detach symmetry and prevents pids.max bypass
-        if let Some(cgroup) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
-            if let Err(_) = cgroup.attach_task(child_pid as u64) {
-                // Attachment failed (likely TOCTOU race at pids.max boundary)
-                // Must roll back the entire fork to maintain accounting integrity
-                parent.children.retain(|&pid| pid != child_pid);
-                // R77-3 FIX: Rollback cpuset task count to prevent leak.
-                // fork_inner already called notify_cpuset_task_joined(), so we
-                // must undo it here when cgroup attach fails post-fork.
-                crate::process::notify_cpuset_task_left(parent_cpuset_id);
-                drop(parent);
-                cleanup_partial_child(child_pid);
-                return Err(ForkError::CgroupPidsLimitExceeded);
-            }
-        }
 
         // R138-1 FIX: Worst-case COW cgroup memory charging.
         //
