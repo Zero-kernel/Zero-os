@@ -700,39 +700,54 @@ fn validate_program(prog: &[SeccompInsn]) -> Result<(), SeccompError> {
 fn compute_fast_allow(prog: &[SeccompInsn]) -> FastAllowSet {
     let mut set = FastAllowSet::empty();
 
-    // For each instruction, check if it's a pattern we can optimize
-    for (i, insn) in prog.iter().enumerate() {
-        // Look for: LdSyscallNr followed by JmpEq
-        if i + 1 >= prog.len() {
-            continue;
-        }
+    // R152-I1 FIX: Walk the false-branch chain of JmpEq instructions.
+    //
+    // Pledge/strict filters are generated as a linear chain:
+    //   [0] LdSyscallNr
+    //   [1] JmpEq(nr0, t0, f0)   // true→Ret(Allow), false→next JmpEq
+    //   [2] JmpEq(nr1, t1, f1)
+    //   ...
+    //   [N] Ret(Kill)
+    //
+    // The old implementation only examined prog[1] and missed all subsequent
+    // syscalls. This version walks the false-branch chain to set bits for
+    // every syscall that unconditionally leads to Ret(Allow).
+    //
+    // R145-8 safety: Only trust an entry-point LdSyscallNr at pc=0 to avoid
+    // dead-code fast_allow bits.
+    if prog.len() < 2 {
+        return set;
+    }
+    if !matches!(prog[0], SeccompInsn::LdSyscallNr) {
+        return set;
+    }
 
-        if !matches!(insn, SeccompInsn::LdSyscallNr) {
-            continue;
-        }
-
-        // R145-8 FIX: Only trust LdSyscallNr at program entry (pc=0).
-        // Dead code after an early Ret could contain LdSyscallNr→JmpEq→Allow
-        // patterns that would set fast_allow bits for syscalls the filter
-        // actually denies.  Restricting to position 0 eliminates the risk.
-        if i != 0 {
-            continue;
-        }
-
-        // Check if next instruction is JmpEq
-        if let SeccompInsn::JmpEq(nr, true_offset, _) = prog[i + 1] {
-            // Calculate the target of the true branch
-            let true_target = i + 2 + true_offset as usize;
-
-            // Verify the target is within bounds and is Ret(Allow)
-            if true_target < prog.len() {
-                if let SeccompInsn::Ret(SeccompAction::Allow) = prog[true_target] {
-                    // This syscall number unconditionally leads to Allow
+    let mut pc: usize = 1;
+    let mut steps: usize = 0;
+    // Hard cap to prevent infinite loops on malformed programs (should be
+    // caught by validate_seccomp_program, but stay defensive).
+    while pc < prog.len() && steps < prog.len() {
+        steps += 1;
+        match prog[pc] {
+            SeccompInsn::JmpEq(nr, true_off, false_off) => {
+                // Check if the true branch leads directly to Ret(Allow)
+                let true_target = pc + 1 + true_off as usize;
+                if true_target < prog.len()
+                    && matches!(prog[true_target], SeccompInsn::Ret(SeccompAction::Allow))
+                {
                     if nr < 512 {
                         set.set(nr as usize);
                     }
                 }
+
+                // Follow the false branch to the next JmpEq in the chain
+                let next_pc = pc + 1 + false_off as usize;
+                if next_pc <= pc {
+                    break; // Backwards jump — stop to prevent loops
+                }
+                pc = next_pc;
             }
+            _ => break, // Non-JmpEq instruction — end of chain
         }
     }
 

@@ -236,6 +236,20 @@ impl WaitQueue {
         }
     }
 
+    /// Try to consume one pending wake token.
+    ///
+    /// Returns `true` if a token was consumed.
+    ///
+    /// R152-2 FIX: SocketWaitHooks implementations must consume wake tokens
+    /// *after* waiter registration to avoid missed-wakeup races.
+    pub fn try_consume_wakeup(&self) -> bool {
+        self.wakeup_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current > 0).then(|| current - 1)
+            })
+            .is_ok()
+    }
+
     /// Wait with optional timeout.
     ///
     /// # Arguments
@@ -260,24 +274,17 @@ impl WaitQueue {
             return WaitOutcome::TimedOut;
         }
 
-        // Consume any pending wake signal that arrived before we registered
-        // to avoid sleeping despite a ready datagram.
-        if self
-            .wakeup_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current > 0).then(|| current - 1)
-            })
-            .is_ok()
-        {
-            return WaitOutcome::Woken;
-        }
-
-        // Delegate to scheduler hooks for true blocking
+        // R152-2 FIX: Delegate to scheduler hooks for true blocking.
+        // Wake token consumption must happen *after* waiter registration inside
+        // the hooks implementation, otherwise a wake that arrives between the
+        // pre-check and registration is missed.
         if let Some(hooks) = socket_wait_hooks() {
             hooks.wait(self, timeout_ns)
+        } else if self.try_consume_wakeup() {
+            WaitOutcome::Woken
         } else {
-            // No scheduler hooks registered - fall back to non-blocking
-            // This happens early in boot or in kernel threads
+            // No scheduler hooks registered - fall back to non-blocking.
+            // This happens early in boot or in kernel threads.
             WaitOutcome::TimedOut
         }
     }
@@ -5567,6 +5574,59 @@ impl SocketTable {
                     tcp_state.control.rcv_wnd = u16::MAX as u32;
                 }
 
+                // R152-4 FIX: Process any payload piggybacked on the completing ACK.
+                // RFC 793 §3.4 permits data on the third handshake segment.
+                // Without this, the payload is silently discarded and the peer
+                // must retransmit, adding an unnecessary RTT of latency.
+                let mut ack_response: Option<Vec<u8>> = None;
+                let is_fin = header.flags & TCP_FLAG_FIN != 0;
+
+                if !payload.is_empty()
+                    && header.seq_num == tcp_state.control.rcv_nxt
+                {
+                    let consumed = tcp_state.control.recv_buffer.len() as u32;
+                    let available = tcp_state.control.rcv_wnd.saturating_sub(consumed);
+                    if (payload.len() as u32) <= available {
+                        tcp_state.control.recv_buffer.extend(payload.iter().copied());
+                        tcp_state.control.rcv_nxt = tcp_state
+                            .control
+                            .rcv_nxt
+                            .wrapping_add(payload.len() as u32);
+                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                        ack_response = Some(Self::build_sack_ack(
+                            &tcp_state.control,
+                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            ack_wnd,
+                        ));
+                    }
+                }
+
+                // Handle FIN piggybacked on completing ACK (passive close)
+                if is_fin
+                    && header.seq_num.wrapping_add(payload.len() as u32)
+                        == tcp_state.control.rcv_nxt
+                {
+                    tcp_state.control.rcv_nxt = tcp_state.control.rcv_nxt.wrapping_add(1);
+                    tcp_state.control.fin_received = true;
+                    tcp_state.control.state = TcpState::CloseWait;
+                    let window = tcp_state
+                        .control
+                        .rcv_wnd
+                        .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
+                    ack_response = Some(build_tcp_segment(
+                        dst_ip, src_ip,
+                        header.dst_port, header.src_port,
+                        tcp_state.control.snd_nxt,
+                        tcp_state.control.rcv_nxt,
+                        TCP_FLAG_ACK,
+                        Self::encode_adv_window(&tcp_state.control, window),
+                        &[],
+                    ));
+                }
+
+                // Codex review: only wake data waiters if we actually buffered something
+                let has_data = ack_response.is_some();
+
                 drop(guard);
 
                 // Remove from SYN queue and add to accept queue
@@ -5590,8 +5650,12 @@ impl SocketTable {
                 }
 
                 // Wake any waiters (accept queue changed)
+                // R152-4 FIX: Also wake data waiters if payload was buffered
+                if has_data {
+                    sock.wake_tcp_data_waiters();
+                }
                 sock.wake_tcp_waiters();
-                None
+                ack_response
             }
 
             TcpState::Listen => {

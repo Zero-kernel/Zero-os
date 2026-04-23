@@ -2187,6 +2187,33 @@ pub fn process_table_snapshot() -> alloc::vec::Vec<ProcessId> {
         .collect()
 }
 
+/// R152-10 FIX: Atomically mark all threads in a thread group for exit.
+///
+/// Holds PROCESS_TABLE lock while iterating and marking, preventing a concurrent
+/// sys_clone(CLONE_THREAD) from creating a new thread that escapes the exit_group.
+/// Returns the number of siblings marked for exit.
+pub fn request_exit_group_atomic(caller_pid: ProcessId, tgid: ProcessId, exit_code: i32) -> usize {
+    let table = PROCESS_TABLE.lock();
+    let mut marked = 0usize;
+    for (i, slot) in table.iter().enumerate() {
+        let pid = i;
+        if pid == caller_pid {
+            continue; // Skip caller — it will self-terminate
+        }
+        if let Some(proc_arc) = slot {
+            let proc = proc_arc.lock();
+            if proc.tgid == tgid
+                && !matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated)
+            {
+                proc.pending_exit_code.store(exit_code, Ordering::Relaxed);
+                proc.pending_kill.store(true, Ordering::Release);
+                marked += 1;
+            }
+        }
+    }
+    marked
+}
+
 /// R115-1 FIX: Request that a remote process terminates itself at a safe point.
 ///
 /// Used by `exit_group()` to avoid cross-CPU UAF: sibling threads may be running

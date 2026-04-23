@@ -1033,9 +1033,13 @@ impl Scheduler {
             }
 
             // R65-19 FIX: 饥饿防止 - 增加等待进程的等待计数并检查饥饿
+            // R152-3 FIX: Collect re-bucketing operations during iteration,
+            // then apply after iteration to keep BTreeMap keys consistent.
             {
+                let mut rebucket: alloc::vec::Vec<(Pid, ProcessControlBlock, u8, u8)> =
+                    alloc::vec::Vec::new();
                 let queue = ready_queue.lock();
-                for (_priority, bucket) in queue.iter() {
+                for (&priority, bucket) in queue.iter() {
                     for (&pid, pcb) in bucket.iter() {
                         // 跳过当前运行的进程
                         if Some(pid) == current_pid {
@@ -1044,10 +1048,41 @@ impl Scheduler {
                         let mut proc = pcb.lock();
                         if proc.state == ProcessState::Ready && !proc.stopped {
                             // R98-1 FIX: Only count non-stopped ready processes for starvation
+                            let old_prio = proc.dynamic_priority;
                             // 增加等待时间
                             proc.increment_wait_ticks();
                             // 检查并提升饥饿进程的优先级
                             proc.check_and_boost_starved();
+                            let new_prio = proc.dynamic_priority;
+                            // R152-3 FIX: Record if priority changed for re-bucketing
+                            if new_prio != old_prio {
+                                rebucket.push((pid, pcb.clone(), priority, new_prio));
+                            }
+                        }
+                    }
+                }
+                drop(queue);
+
+                // R152-3 FIX: Apply re-bucketing outside the immutable iteration.
+                // Codex review: Only insert into new bucket if removal from old
+                // bucket succeeded, to prevent double-queueing after migration.
+                if !rebucket.is_empty() {
+                    let mut queue = ready_queue.lock();
+                    for (pid, pcb, old_prio, new_prio) in rebucket {
+                        // Remove from old bucket — if not found, task was
+                        // migrated by load balancer; skip insert to avoid
+                        // double-scheduling on two CPUs.
+                        let removed = if let Some(bucket) = queue.get_mut(&old_prio) {
+                            let r = bucket.remove(&pid).is_some();
+                            if r && bucket.is_empty() {
+                                queue.remove(&old_prio);
+                            }
+                            r
+                        } else {
+                            false
+                        };
+                        if removed {
+                            queue.entry(new_prio).or_default().insert(pid, pcb);
                         }
                     }
                 }
