@@ -2350,11 +2350,15 @@ fn sys_exit(exit_code: i32) -> SyscallResult {
 /// The calling thread terminates itself directly (same-CPU, always safe).
 fn sys_exit_group(exit_code: i32) -> SyscallResult {
     if let Some(pid) = current_pid() {
-        // Determine our thread group ID
+        // Determine our thread group ID and publish the group-exiting flag.
         let tgid = {
             let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
-            let t = proc_arc.lock().tgid;
-            t
+            let proc = proc_arc.lock();
+            // R153-3 FIX: Publish thread-group "exiting" flag before marking
+            // siblings. This prevents concurrent sys_clone(CLONE_THREAD) from
+            // slipping in between this point and the atomic marking scan below.
+            proc.thread_group_exiting.store(true, core::sync::atomic::Ordering::Release);
+            proc.tgid
         };
 
         // R152-10 FIX: Atomically mark all siblings under PROCESS_TABLE lock.
@@ -2634,14 +2638,16 @@ fn sys_clone(
             return Err(SyscallError::EINVAL);
         }
 
-        // R152-10 FIX: Reject CLONE_THREAD if the caller's thread group is
-        // exiting. This prevents new threads from escaping an exit_group().
-        // The caller itself may not have pending_kill set (it might be the
-        // exit_group caller), but any sibling with pending_kill means the
-        // group is shutting down.
-        if let Some(parent_arc) = get_process(parent_pid) {
+        // R153-3 FIX: Reject CLONE_THREAD if the thread group is exiting.
+        // The shared thread_group_exiting flag is set by exit_group() BEFORE
+        // the per-thread pending_kill scan, closing the TOCTOU window where
+        // the caller hasn't been marked yet. Also check pending_kill as a
+        // fallback for single-thread exit paths.
+        {
             let parent = parent_arc.lock();
-            if parent.pending_kill.load(core::sync::atomic::Ordering::Acquire) {
+            if parent.thread_group_exiting.load(core::sync::atomic::Ordering::Acquire)
+                || parent.pending_kill.load(core::sync::atomic::Ordering::Acquire)
+            {
                 return Err(SyscallError::EINVAL);
             }
         }
@@ -2764,6 +2770,7 @@ fn sys_clone(
         parent_space,
         parent_user_memory_space, // H.3 KPTI: user CR3 root for CLONE_VM sharing
         parent_tgid,
+        parent_thread_group_exiting, // R153-3 FIX: shared exiting flag
         parent_mmap,
         parent_next_mmap,
         parent_brk_start,
@@ -2831,6 +2838,7 @@ fn sys_clone(
             parent.memory_space,
             parent.user_memory_space, // H.3 KPTI
             parent.tgid,
+            parent.thread_group_exiting.clone(), // R153-3 FIX
             // R121-4 FIX: Strip only transient pending-map/unmap flags from
             // mmap_regions when snapshotting for clone. Preserve committed
             // per-region flags (e.g. PROT_NONE) so the child inherits
@@ -3236,17 +3244,16 @@ fn sys_clone(
             }
             child.tgid = parent_tgid; // 加入父进程的线程组
             child.is_thread = true;
+            child.thread_group_exiting = parent_thread_group_exiting.clone(); // R153-3 FIX
 
-            // R152-10 FIX: After setting child.tgid, re-check if the thread group
-            // is exiting. The atomic exit_group scan may have missed this child
-            // because it was inserted with default tgid before we set it here.
-            // If the parent has pending_kill, the group is shutting down — immediately
-            // mark the child so it self-terminates at its first safe point.
-            if let Some(parent_arc) = get_process(parent_pid) {
-                if parent_arc.lock().pending_kill.load(core::sync::atomic::Ordering::Acquire) {
-                    child.pending_exit_code.store(0, core::sync::atomic::Ordering::Relaxed);
-                    child.pending_kill.store(true, core::sync::atomic::Ordering::Release);
-                }
+            // R153-3 FIX: After setting child.tgid, re-check the shared
+            // thread_group_exiting flag. exit_group() may have started while
+            // sys_clone was in progress, and the atomic scan may have missed
+            // this child (it had default tgid at insert time). The shared flag
+            // is set BEFORE the scan, so checking it here is race-free.
+            if parent_thread_group_exiting.load(core::sync::atomic::Ordering::Acquire) {
+                child.pending_exit_code.store(0, core::sync::atomic::Ordering::Relaxed);
+                child.pending_kill.store(true, core::sync::atomic::Ordering::Release);
             }
         } else {
             child.tgid = child_pid; // 新线程组

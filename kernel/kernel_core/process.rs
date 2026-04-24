@@ -607,6 +607,14 @@ pub struct Process {
     /// 退出码
     pub exit_code: Option<i32>,
 
+    /// R153-3 FIX: Thread-group exiting flag (shared among CLONE_THREAD siblings).
+    ///
+    /// Set by exit_group() before sibling marking begins. sys_clone(CLONE_THREAD)
+    /// checks this flag to prevent new threads from being created during
+    /// exit_group(), closing the TOCTOU window where per-thread pending_kill
+    /// has not yet been set.
+    pub thread_group_exiting: Arc<AtomicBool>,
+
     /// R115-1 FIX: Cross-CPU exit request flag.
     ///
     /// `exit_group()` terminates sibling threads that may be running on other CPUs.
@@ -832,6 +840,7 @@ impl Process {
             cloexec_fds: BTreeSet::new(),
             cap_table: Arc::new(CapTable::new()),
             exit_code: None,
+            thread_group_exiting: Arc::new(AtomicBool::new(false)),
             pending_kill: AtomicBool::new(false),
             pending_exit_code: AtomicI32::new(0),
             waiting_child: None,
@@ -2192,6 +2201,10 @@ pub fn process_table_snapshot() -> alloc::vec::Vec<ProcessId> {
 /// Holds PROCESS_TABLE lock while iterating and marking, preventing a concurrent
 /// sys_clone(CLONE_THREAD) from creating a new thread that escapes the exit_group.
 /// Returns the number of siblings marked for exit.
+/// R153-4 NOTE: PID reuse TOCTOU is structurally prevented here because we
+/// iterate the PROCESS_TABLE slots directly under the table lock (not raw PIDs).
+/// Each slot holds an Arc<Mutex<Process>>, so identity is verified by the slot
+/// position under lock, not by a stale PID lookup.
 pub fn request_exit_group_atomic(caller_pid: ProcessId, tgid: ProcessId, exit_code: i32) -> usize {
     let table = PROCESS_TABLE.lock();
     let mut marked = 0usize;
@@ -2201,12 +2214,25 @@ pub fn request_exit_group_atomic(caller_pid: ProcessId, tgid: ProcessId, exit_co
             continue; // Skip caller — it will self-terminate
         }
         if let Some(proc_arc) = slot {
-            let proc = proc_arc.lock();
+            let mut proc = proc_arc.lock();
             if proc.tgid == tgid
                 && !matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated)
             {
                 proc.pending_exit_code.store(exit_code, Ordering::Relaxed);
                 proc.pending_kill.store(true, Ordering::Release);
+                // R153-5 FIX: Unblock threads so they observe pending_kill
+                // promptly. Without this, threads in kernel waits (futex,
+                // pipe read, socket recv) remain blocked indefinitely,
+                // delaying exit_group completion and pinning resources.
+                //
+                // NOTE: The thread may still be registered in a WaitQueue's
+                // waiters list. This stale entry is benign: when wake_one()
+                // encounters a non-Blocked PID it skips it, and the thread
+                // will self-terminate at syscall return before re-entering
+                // any wait. The R153-1 dedup check also prevents re-enqueue.
+                if proc.state == ProcessState::Blocked {
+                    proc.state = ProcessState::Ready;
+                }
                 marked += 1;
             }
         }
@@ -2228,7 +2254,7 @@ pub fn request_process_exit(pid: ProcessId, exit_code: i32) -> bool {
         None => return false,
     };
 
-    let proc = proc_arc.lock();
+    let mut proc = proc_arc.lock();
     if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
         return false;
     }
@@ -2237,6 +2263,11 @@ pub fn request_process_exit(pid: ProcessId, exit_code: i32) -> bool {
     // so the consumer (AcqRel swap) sees a consistent exit_code.
     proc.pending_exit_code.store(exit_code, Ordering::Relaxed);
     proc.pending_kill.store(true, Ordering::Release);
+
+    // R153-5 FIX: Unblock the target so it observes pending_kill promptly.
+    if proc.state == ProcessState::Blocked {
+        proc.state = ProcessState::Ready;
+    }
     true
 }
 
