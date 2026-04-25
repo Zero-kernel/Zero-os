@@ -133,8 +133,16 @@ impl WaitQueue {
                 return;
             }
 
-            // 将当前进程加入等待队列
-            self.waiters.lock().push_back(pid);
+            // R153-1 FIX: Check for duplicate before enqueue. A spurious
+            // reschedule can re-enter wait_with_timeout() for the same PID,
+            // causing multiple copies that consume wake signals meant for
+            // other waiters (Semaphore/CondVar/socket recv all affected).
+            {
+                let mut waiters = self.waiters.lock();
+                if !waiters.iter().any(|&p| p == pid) {
+                    waiters.push_back(pid);
+                }
+            }
 
             // 将进程状态设为阻塞
             if let Some(proc_arc) = process::get_process(pid) {
@@ -626,15 +634,30 @@ impl CondVar {
     /// 调用者必须在持有相关锁的情况下调用此函数。
     /// 此函数会释放锁、等待唤醒、然后重新获取锁。
     ///
+    /// # R153-7 FIX: Use prepare_to_wait/finish_wait pattern.
+    ///
+    /// The old sequence (unlock → wait) had a lost-wakeup window: if
+    /// notify_one() fires between mutex.unlock() and wait_queue enqueue,
+    /// the wake signal is lost because the waiter is not yet registered.
+    /// Now we register BEFORE releasing the mutex, so the wake cannot
+    /// be missed.
+    ///
     /// # Arguments
     ///
     /// * `mutex` - 保护条件的互斥锁
     pub fn wait(&self, mutex: &KMutex) {
-        // 释放锁
+        // R153-7 FIX: Register in wait queue BEFORE releasing mutex.
+        // If notify_one() fires after mutex release, our PID is already
+        // in the queue and the wake signal will be delivered.
+        if !self.wait_queue.prepare_to_wait() {
+            return; // No current process or queue closed
+        }
+
+        // 释放锁 — notifiers can now run
         mutex.unlock();
 
-        // 等待唤醒
-        self.wait_queue.wait();
+        // 实际阻塞
+        self.wait_queue.finish_wait();
 
         // 重新获取锁
         mutex.lock();
