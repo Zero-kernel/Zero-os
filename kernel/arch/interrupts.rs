@@ -795,34 +795,58 @@ extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptSta
             return;
         }
 
-        // Save previous owner's FPU state if needed
-        if prev_owner != NO_FPU_OWNER {
-            if let Some(prev_proc) = get_process(prev_owner) {
-                let mut pcb = prev_proc.lock();
-                let fx_ptr = pcb.context.fx.data.as_mut_ptr();
-                unsafe {
-                    core::arch::asm!("fxsave64 [{}]", in(reg) fx_ptr, options(nostack));
-                }
-                pcb.fpu_used = true;
-            } else {
-                // Previous owner no longer exists, just clear ownership
-                per_cpu.clear_fpu_owner_if(prev_owner);
-            }
-        }
+        // R154-4 FIX: Use try_lock() to avoid deadlock if #NM interrupts code
+        // already holding a Process lock. If ANY try_lock fails, abort the full
+        // ownership transfer — leave fpu_owner unchanged and CR0.TS cleared.
+        // The faulting instruction will proceed with stale FPU state (acceptable:
+        // the interrupted code holds the lock because it's modifying the PCB,
+        // and the normal context-switch path will do a proper save/restore).
+        //
+        // IMPORTANT: We must not fxrstor current without first fxsave previous,
+        // because that would destroy the previous owner's unsaved live FPU state.
 
-        // Restore or initialize current process's FPU state
-        if let Some(cur_proc) = get_process(current) {
-            let mut pcb = cur_proc.lock();
-            let fx_ptr = pcb.context.fx.data.as_ptr();
-            unsafe {
-                core::arch::asm!("fxrstor64 [{}]", in(reg) fx_ptr, options(nostack));
+        // Step 1: Save previous owner's FPU state if needed
+        let prev_saved = if prev_owner != NO_FPU_OWNER {
+            if let Some(prev_proc) = get_process(prev_owner) {
+                if let Some(mut pcb) = prev_proc.try_lock() {
+                    let fx_ptr = pcb.context.fx.data.as_mut_ptr();
+                    unsafe {
+                        core::arch::asm!("fxsave64 [{}]", in(reg) fx_ptr, options(nostack));
+                    }
+                    pcb.fpu_used = true;
+                    true
+                } else {
+                    false // Lock contended — abort transfer
+                }
+            } else {
+                // Previous owner no longer exists — safe to proceed
+                per_cpu.clear_fpu_owner_if(prev_owner);
+                true
             }
-            pcb.fpu_used = true;
-            per_cpu.set_fpu_owner(current);
         } else {
-            // Current process doesn't exist (shouldn't happen in normal operation)
-            per_cpu.set_fpu_owner(NO_FPU_OWNER);
+            true // No previous owner — nothing to save
+        };
+
+        // Step 2: Only restore current if we successfully saved previous
+        if prev_saved {
+            if let Some(cur_proc) = get_process(current) {
+                if let Some(mut pcb) = cur_proc.try_lock() {
+                    let fx_ptr = pcb.context.fx.data.as_ptr();
+                    unsafe {
+                        core::arch::asm!("fxrstor64 [{}]", in(reg) fx_ptr, options(nostack));
+                    }
+                    pcb.fpu_used = true;
+                    per_cpu.set_fpu_owner(current);
+                }
+                // If cur try_lock fails: CR0.TS cleared, runs with stale state.
+                // Context switch will do proper save/restore later.
+            } else {
+                per_cpu.set_fpu_owner(NO_FPU_OWNER);
+            }
         }
+        // If prev_saved == false: neither save nor restore happened.
+        // CR0.TS is cleared, prev_owner retains fpu_owner. The faulting
+        // instruction proceeds; next context switch does eager save/restore.
     });
 
     // R117-4 FIX: Check pending_kill after FPU state is settled.
