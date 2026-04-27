@@ -118,8 +118,12 @@ impl WaitQueue {
         }
 
         // 计算超时截止时间（tick）
+        // R154-10 FIX: Use checked_add to prevent overflow when user supplies
+        // huge timeout values (e.g. u64::MAX). The previous (ns + NS_PER_MS - 1)
+        // expression wraps around for ns > u64::MAX - NS_PER_MS + 1, producing a
+        // near-zero tick count and effectively no timeout.
         let deadline_tick = timeout_ns.map(|ns| {
-            let ticks = (ns + NS_PER_MS - 1) / NS_PER_MS;
+            let ticks = ns.checked_add(NS_PER_MS - 1).unwrap_or(u64::MAX) / NS_PER_MS;
             let ticks = if ticks == 0 { 1 } else { ticks };
             kernel_core::get_ticks().saturating_add(ticks)
         });
@@ -513,7 +517,16 @@ impl KMutex {
     }
 
     /// 释放锁
+    ///
+    /// R154-16 FIX: Debug assertion verifying caller owns the lock.
     pub fn unlock(&self) {
+        debug_assert!(
+            {
+                let owner = self.owner.lock();
+                owner.is_none() || *owner == process::current_pid()
+            },
+            "KMutex::unlock() called by non-owner"
+        );
         *self.owner.lock() = None;
         self.locked.store(false, Ordering::Release);
 
@@ -559,11 +572,19 @@ impl Semaphore {
     /// P操作（等待/获取）
     ///
     /// 如果计数大于0，减1并继续；否则阻塞直到计数大于0
+    ///
+    /// # R154-6 FIX: Use prepare_to_wait/cancel_wait pattern to prevent lost wakeup.
+    ///
+    /// The old sequence had a classic lost-wakeup race: (1) load count=0,
+    /// (2) signal() fires — count becomes 1, wake_one() sees empty queue,
+    /// (3) process enters wait_queue.wait() and blocks forever.
+    /// Now we register in the wait queue BEFORE checking count, so any
+    /// signal() between check and block will find us in the queue.
     pub fn wait(&self) {
         loop {
+            // Fast path: try to decrement without blocking
             let current = self.count.load(Ordering::SeqCst);
             if current > 0 {
-                // 尝试减少计数
                 if self
                     .count
                     .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
@@ -571,12 +592,33 @@ impl Semaphore {
                 {
                     return;
                 }
-                // CAS失败，重试
                 continue;
             }
 
-            // 计数为0，阻塞
-            self.wait_queue.wait();
+            // R154-6 FIX: Register in wait queue BEFORE re-checking count.
+            if !self.wait_queue.prepare_to_wait() {
+                return; // No current process or queue closed
+            }
+
+            // Re-check count after registration: a signal() between our
+            // initial load and prepare_to_wait would have incremented count
+            // AND called wake_one (which now sees us in the queue).
+            let current = self.count.load(Ordering::SeqCst);
+            if current > 0 {
+                if self
+                    .count
+                    .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    // Got the permit — cancel the wait, don't block.
+                    self.wait_queue.cancel_wait();
+                    return;
+                }
+                // CAS failed — someone else grabbed it. Stay in queue and block.
+            }
+
+            // Block until woken by signal()
+            self.wait_queue.finish_wait();
         }
     }
 
@@ -602,8 +644,13 @@ impl Semaphore {
     /// V操作（发布/释放）
     ///
     /// 增加计数并唤醒一个等待者
+    ///
+    /// R154-17 FIX: Use saturating increment to prevent u32 wrap-around
+    /// that would clear all permits (count wraps from MAX to 0).
     pub fn signal(&self) {
-        self.count.fetch_add(1, Ordering::SeqCst);
+        let _ = self.count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+            Some(v.saturating_add(1))
+        });
         self.wait_queue.wake_one();
     }
 
@@ -714,11 +761,18 @@ fn register_timed_wait(queue: usize, pid: ProcessId, deadline_tick: u64) {
          timed waits require 'static WaitQueue instances",
         queue
     );
-    TIMED_WAITERS.lock().push(TimedWaiter {
-        queue,
-        pid,
-        deadline_tick,
-    });
+    // R154-10 FIX: Deduplicate before pushing. A spurious reschedule or
+    // re-entrant wait path can call register_timed_wait() for the same
+    // (queue, pid) pair, creating duplicate entries that consume extra
+    // timeout slots and may cause double-wakeup.
+    let mut waiters = TIMED_WAITERS.lock();
+    if !waiters.iter().any(|w| w.queue == queue && w.pid == pid) {
+        waiters.push(TimedWaiter {
+            queue,
+            pid,
+            deadline_tick,
+        });
+    }
 }
 
 /// 取消定时等待
