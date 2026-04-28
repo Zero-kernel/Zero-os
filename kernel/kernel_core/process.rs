@@ -3619,10 +3619,13 @@ pub fn cleanup_zombie(pid: ProcessId) {
         // Free kernel-internal resources (stack, mmap, fd_table, address space).
         // This is safe because the Arc we hold is the only remaining reference —
         // the table slot was cleared in Phase 1c.
-        {
+        // R154-3 FIX: Extract fd_table under lock, drop destructors outside to
+        // prevent lock inversion (socket close → wake_all → other Process lock).
+        let _fds_to_drop = {
             let mut proc = process.lock();
-            free_process_resources(&mut proc, keep_address_space);
-        }
+            free_process_resources(&mut proc, keep_address_space)
+        };
+        // _fds_to_drop dropped here — Process lock is released, safe for socket destructors.
 
         // Cross-subsystem cleanup: IPC endpoint teardown + futex waiter cleanup.
         // These callbacks may re-lock PROCESS_TABLE (e.g., thread_group_size(),
@@ -3734,10 +3737,12 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
         }
 
         // Free kernel-internal resources (stack, mmap, fd_table, address space).
-        {
+        // R154-3 FIX: Extract fd_table under lock, drop destructors outside.
+        let _fds_to_drop = {
             let mut proc = process.lock();
-            free_process_resources(&mut proc, keep_address_space);
-        }
+            free_process_resources(&mut proc, keep_address_space)
+        };
+        // _fds_to_drop dropped here — safe for socket destructors outside lock.
 
         // F.1 PID Namespace: Detach from all namespaces.
         crate::pid_namespace::detach_pid_chain(&pid_ns_chain, pid);
@@ -3769,7 +3774,7 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
 ///
 /// * `proc` - 进程引用
 /// * `keep_address_space` - R24-1 fix: 如果为 true，不释放地址空间（其他线程仍在使用）
-fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
+fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTreeMap<i32, FileDescriptor> {
     let region_count = proc.mmap_regions.len();
     // R123-5 FIX: Mask low-bit flags (PENDING/PROT_NONE) before summing,
     // so diagnostic logs reflect actual region lengths, not inflated values.
@@ -3857,10 +3862,13 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
     // 清理 mmap 区域跟踪
     proc.mmap_regions.clear();
 
-    // 关闭并清理所有文件描述符
-    // 通过 clear() 触发每个 FileDescriptor 的 Drop，自动释放管道等资源
+    // R154-3 FIX: Extract fd_table entries WITHOUT dropping them here.
+    // Socket destructors (close → wake_all) can lock other Process PCBs,
+    // causing lock inversion if we drop while holding the caller's Process lock.
+    // The extracted fds are returned; the caller drops them AFTER releasing the lock.
     let fd_count = proc.fd_table.len();
-    proc.fd_table.clear();
+    let extracted_fds = core::mem::take(&mut proc.fd_table);
+    proc.cloexec_fds.clear();
     // R104-2 FIX: Gate all resource-cleanup diagnostics behind debug_assertions
     // to prevent leaking fd count, page table root addresses, and PID in release.
     if fd_count > 0 {
@@ -3919,6 +3927,10 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) {
             proc.pid
         );
     }
+
+    // R154-3 FIX: Return extracted fd_table so caller drops destructors
+    // OUTSIDE the Process lock, preventing socket close lock inversion.
+    extracted_fds
 }
 
 /// 释放指定进程的内核栈
