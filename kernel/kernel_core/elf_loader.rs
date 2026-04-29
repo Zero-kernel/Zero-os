@@ -79,6 +79,10 @@ pub enum ElfLoadError {
     OutOfMemory,
     /// R93-6 FIX: Cgroup memory limit exceeded
     CgroupLimitExceeded,
+    /// R154-5 FIX: Too many PT_LOAD segments (DoS prevention)
+    TooManySegments,
+    /// R154-12 FIX: PT_LOAD segments have overlapping virtual address ranges
+    OverlappingSegments,
 }
 
 /// ELF 加载结果
@@ -132,7 +136,9 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
     // 估算：典型 ELF 约 10 个 LOAD 段 + 512 页用户栈
     // 每段平均 10 页 = 100 页 + 512 = ~612 页
     // 使用 1024 作为合理上限，避免堆碎片化
-    let mut all_mappings: Vec<MappedEntry> = Vec::with_capacity(1024);
+    // R154-14 FIX: Use fallible allocation to avoid panic on heap exhaustion.
+    // Start with empty Vec; load_segment_tracked uses try_reserve internally.
+    let mut all_mappings: Vec<MappedEntry> = Vec::new();
 
     // 追踪所有段的最高地址，用于计算 brk_start
     let mut highest_segment_end: usize = 0;
@@ -142,14 +148,51 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
     // uncharge on exec rollback (ExecSpaceGuard::drop).
     let mut charged_bytes: u64 = 0;
 
+    // R154-5 FIX: Limit PT_LOAD segment count to prevent DoS via crafted ELF
+    // with thousands of tiny segments (e_phnum allows up to 65535). Each segment
+    // triggers cgroup charge, heap growth, PT mapping, and TLB flush.
+    const MAX_ELF_LOAD_SEGMENTS: usize = 32;
+    let mut load_segment_count: usize = 0;
+
+    // R154-12 FIX: Track loaded segment vaddr ranges to detect overlaps.
+    // A malicious ELF with overlapping PT_LOAD segments could cause double-map
+    // of the same virtual pages, leading to cgroup charge confusion, stale TLB
+    // entries, or data corruption from a later segment overwriting an earlier one.
+    let mut loaded_ranges: Vec<(usize, usize)> = Vec::new(); // (start, end) pairs
+
     // 加载所有 PT_LOAD 段
     for ph in elf.program_iter() {
         if ph.get_type() == Ok(PhType::Load) {
+            load_segment_count += 1;
+            if load_segment_count > MAX_ELF_LOAD_SEGMENTS {
+                klog!(Error,
+                    "ELF loader: too many PT_LOAD segments ({} > {})",
+                    load_segment_count, MAX_ELF_LOAD_SEGMENTS
+                );
+                rollback_all_mappings(&mut all_mappings, cgroup_id);
+                return Err(ElfLoadError::TooManySegments);
+            }
+
             // 计算段结束地址
             let vaddr = ph.virtual_addr() as usize;
             let memsz = ph.mem_size() as usize;
             if memsz > 0 {
                 let segment_end = vaddr.saturating_add(memsz);
+
+                // R154-12 FIX: Check overlap with all previously loaded segments.
+                for &(prev_start, prev_end) in loaded_ranges.iter() {
+                    // Two ranges [a, b) and [c, d) overlap iff a < d && c < b.
+                    if vaddr < prev_end && prev_start < segment_end {
+                        klog!(Error,
+                            "ELF loader: PT_LOAD segment [{:#x}, {:#x}) overlaps with [{:#x}, {:#x})",
+                            vaddr, segment_end, prev_start, prev_end
+                        );
+                        rollback_all_mappings(&mut all_mappings, cgroup_id);
+                        return Err(ElfLoadError::OverlappingSegments);
+                    }
+                }
+                loaded_ranges.push((vaddr, segment_end));
+
                 if segment_end > highest_segment_end {
                     highest_segment_end = segment_end;
                 }
@@ -509,8 +552,8 @@ fn allocate_user_stack_tracked(
         | PageTableFlags::NO_EXECUTE;
 
     // Z-10 fix: 本段成功映射的页（用于数据清零）
-    // 【性能优化】预分配精确容量，避免 push 时重新分配
-    let mut stack_mapped: Vec<MappedEntry> = Vec::with_capacity(page_count);
+    // R154-14 FIX: Use fallible allocation to avoid panic on heap exhaustion.
+    let mut stack_mapped: Vec<MappedEntry> = Vec::new();
     let mut frame_alloc = FrameAllocator::new();
 
     let map_result = unsafe {
