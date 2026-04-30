@@ -724,10 +724,13 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
 
         // Calculate deadline in ticks (if timeout specified)
         // Timer tick is 1ms (time::on_timer_tick increments every millisecond)
+        // R154-10 FIX: Use checked_add to prevent overflow when user supplies
+        // huge timeout values (e.g. u64::MAX). The previous (ns + NS_PER_TICK - 1)
+        // expression wraps around for ns > u64::MAX - NS_PER_TICK + 1.
         const NS_PER_TICK: u64 = 1_000_000;
         let deadline = timeout_ns.map(|ns| {
             let current = crate::get_ticks();
-            let ticks = (ns + NS_PER_TICK - 1) / NS_PER_TICK; // Round up
+            let ticks = ns.checked_add(NS_PER_TICK - 1).unwrap_or(u64::MAX) / NS_PER_TICK; // Round up (overflow-safe)
             current.saturating_add(ticks)
         });
 
@@ -1461,6 +1464,14 @@ fn validate_user_ptr(ptr: *const u8, len: usize) -> Result<(), SyscallError> {
     };
 
     // 用户空间边界检查：确保整个缓冲区都在用户空间内
+    // R154-I5 FIX: This uses `>` (end > USER_SPACE_TOP) while usercopy::validate_user_range()
+    // uses `<` (end < USER_SPACE_TOP). The difference is intentional:
+    //   - validate_user_ptr: `end > USER_SPACE_TOP` rejects end == TOP+1 but allows end == TOP.
+    //     Since len >= 1 is enforced above, end == TOP means the last byte is at TOP-1 (valid).
+    //   - validate_user_range: `end < USER_SPACE_TOP` is stricter, rejecting end == TOP.
+    //     This is conservative for usercopy where USER_SPACE_TOP itself is never a valid byte.
+    // Both are safe: the canonical hole starts at USER_SPACE_TOP, so the strictest correct
+    // bound is `end <= USER_SPACE_TOP` (which `end > TOP` implements via negation).
     if end > USER_SPACE_TOP {
         return Err(SyscallError::EFAULT);
     }
@@ -1968,6 +1979,19 @@ pub fn syscall_dispatcher(
 
     // G.1: Count every syscall entry (per-CPU, lock-free, IRQ-safe)
     increment_counter(TraceCounter::SyscallEntry, 1);
+
+    // R154-I1 FIX: Early-exit if this thread is marked for death by exit_group().
+    // Without this, a pending_kill thread can execute one full syscall before the
+    // flag is consumed at the normal syscall-return check point.
+    // We use take_pending_process_exit() (which atomically clears the flag) and
+    // terminate_self_and_halt() so the thread actually dies rather than looping
+    // on EINTR indefinitely.
+    if let Some(pid) = crate::process::current_pid() {
+        if let Some(exit_code) = crate::process::take_pending_process_exit(pid) {
+            increment_counter(TraceCounter::SyscallExit, 1);
+            terminate_self_and_halt(pid, exit_code);
+        }
+    }
 
     // Evaluate seccomp/pledge filters before dispatch
     let args = [arg0, arg1, arg2, arg3, arg4, arg5];
@@ -3251,9 +3275,21 @@ fn sys_clone(
             // sys_clone was in progress, and the atomic scan may have missed
             // this child (it had default tgid at insert time). The shared flag
             // is set BEFORE the scan, so checking it here is race-free.
+            //
+            // R154-13 FIX: Return EINTR instead of marking pending_exit_code=0.
+            // The previous code set exit code to 0 regardless of the actual
+            // exit_group code, which is incorrect. Since the group is already
+            // exiting, the cleanest approach is to abort the clone entirely —
+            // the child never needs to run.
             if parent_thread_group_exiting.load(core::sync::atomic::Ordering::Acquire) {
-                child.pending_exit_code.store(0, core::sync::atomic::Ordering::Relaxed);
-                child.pending_kill.store(true, core::sync::atomic::Ordering::Release);
+                child.state = ProcessState::Terminated;
+                drop(child);
+                drop(child_arc);
+                if let Some(parent) = get_process(parent_pid) {
+                    parent.lock().children.retain(|&p| p != child_pid);
+                }
+                cleanup_unscheduled_process(child_pid);
+                return Err(SyscallError::EINTR);
             }
         } else {
             child.tgid = child_pid; // 新线程组
@@ -8354,6 +8390,12 @@ fn sys_lstat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
 /// sys_fstatat - 相对路径stat
 ///
 /// 当前仅支持AT_FDCWD或绝对路径。
+///
+/// # R154-8 FIX: AT_SYMLINK_NOFOLLOW documentation
+/// The `flags` parameter (including AT_SYMLINK_NOFOLLOW = 0x100) is currently
+/// ignored because the VFS does not implement symbolic links. When symlink
+/// support is added, this function must inspect `flags` and branch on
+/// AT_SYMLINK_NOFOLLOW to lstat() the link itself rather than its target.
 ///
 /// # R96-5 FIX: TOCTOU Protection
 /// Copies the entire path once and uses the kernel copy for both the
