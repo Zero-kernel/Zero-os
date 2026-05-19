@@ -298,6 +298,11 @@ pub unsafe extern "C" fn switch_context(_old_ctx: *mut Context, _new_ctx: *const
         "or rax, {cr0_ts}",
         "mov cr0, rax",
 
+        // R158-12 FIX: Zero DR7 to disable all hardware breakpoints.
+        // Prevents debug register state from leaking between processes.
+        "xor eax, eax",
+        "mov dr7, rax",
+
         // 加载新上下文从 new_ctx (rcx)
         "mov rax, [rcx + 0x00]",   // 恢复rax
         "mov rbx, [rcx + 0x08]",   // 恢复rbx

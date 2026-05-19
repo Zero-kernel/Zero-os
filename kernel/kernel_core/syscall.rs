@@ -6889,7 +6889,31 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
         let mut prot_none_regions: Vec<(usize, usize)> = Vec::new();
         let mut real_regions: Vec<(usize, usize)> = Vec::new();
 
+        // R158-17 FIX: Track coverage to detect unmapped gaps in [addr, end).
+        // Linux returns ENOMEM if any part of the range is unmapped.
+        let mut coverage = addr;
+
+        // Check for a region starting before addr that extends into the range.
+        if let Some((&prev_base, &prev_lf)) = proc.mmap_regions.range(..addr).next_back() {
+            let prev_len = mmap_region_len(prev_lf);
+            let prev_end = prev_base.saturating_add(prev_len);
+            if prev_end > addr {
+                if (prev_lf & MMAP_REGION_FLAG_TRANSIENT_MASK) != 0 {
+                    return Err(SyscallError::EBUSY);
+                }
+                coverage = prev_end.min(end);
+            }
+        }
+
         for (&region_base, &len_with_flags) in proc.mmap_regions.range(addr..end) {
+            let region_len = mmap_region_len(len_with_flags);
+
+            // R158-17: Gap detection before transient check — unmapped gap
+            // should return ENOMEM, not EBUSY from a later transient region.
+            if region_len > 0 && region_base > coverage {
+                return Err(SyscallError::ENOMEM);
+            }
+
             // R146-5 FIX: Reject transient (in-flight) regions, mirroring
             // sys_munmap's EBUSY check at line 6299. Prevents mprotect from
             // racing with concurrent mmap/munmap 3-phase operations, which
@@ -6898,15 +6922,25 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 return Err(SyscallError::EBUSY);
             }
 
-            let region_len = mmap_region_len(len_with_flags);
             if region_len == 0 {
                 continue;
             }
+
+            let region_end = region_base.saturating_add(region_len);
+            if region_end > coverage {
+                coverage = region_end;
+            }
+
             if (len_with_flags & MMAP_REGION_FLAG_PROT_NONE) != 0 {
                 prot_none_regions.push((region_base, region_len));
             } else {
                 real_regions.push((region_base, region_len));
             }
+        }
+
+        // R158-17: Verify full coverage of [addr, end).
+        if coverage < end {
+            return Err(SyscallError::ENOMEM);
         }
 
         (prot_none_regions, real_regions, proc.memory_space)

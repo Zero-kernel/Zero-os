@@ -262,6 +262,14 @@ pub const TCP_MAX_SEND_SIZE: usize = 64 * 1024;
 /// since those iterate the buffer.
 pub const TCP_MAX_SEND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
+/// R158-10 FIX: Explicit per-connection receive buffer cap (256 KB).
+///
+/// Matches TCP_DEFAULT_RCV_WINDOW_BYTES. The receive window already prevents
+/// remote peers from sending more than rcv_wnd bytes, but this constant
+/// provides defense-in-depth against OOO drain extending the buffer beyond
+/// the advertised window (e.g. after window shrink).
+pub const TCP_MAX_RECV_BUFFER_BYTES: usize = 256 * 1024;
+
 // ============================================================================
 // Congestion Control Constants (RFC 5681)
 // ============================================================================
@@ -1265,6 +1273,11 @@ impl TcpControlBlock {
                     // Some new data past rcv_nxt
                     let skip = self.rcv_nxt.wrapping_sub(front.seq) as usize;
                     let useful = &self.ooo_queue.front().unwrap().data[skip..];
+                    // R158-10 FIX: Cap recv_buffer to prevent unbounded growth.
+                    let room = TCP_MAX_RECV_BUFFER_BYTES.saturating_sub(self.recv_buffer.len());
+                    if useful.len() > room {
+                        break;
+                    }
                     self.recv_buffer.extend(useful);
                     let useful_len = useful.len() as u32;
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(useful_len);

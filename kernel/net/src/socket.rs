@@ -2889,6 +2889,11 @@ impl SocketTable {
                         }
                     }
 
+                    // R158-10 FIX: Retry OOO drain after freeing recv_buffer space.
+                    // Without this, contiguous OOO data could sit undelivered until
+                    // the next packet arrival, causing unnecessary read stalls.
+                    tcp_state.control.ooo_drain_contiguous();
+
                     drop(guard);
 
                     // Update statistics
