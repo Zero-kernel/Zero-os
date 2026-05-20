@@ -529,8 +529,11 @@ pub fn parse_arp(buf: &[u8]) -> Result<ArpPacket, ArpError> {
         return Err(ArpError::InvalidSender);
     }
 
-    // Reject zero sender IP (unless it's ARP probe, but we don't support that yet)
-    if sender_ip.is_unspecified() {
+    // R159-15 FIX: Reject invalid sender IPs using comprehensive validation.
+    // Previously only checked is_unspecified(); now rejects loopback, multicast,
+    // broadcast, 0/8 reserved, and .255 directed broadcasts — matching the
+    // is_valid_source() validation used for IP packets.
+    if !sender_ip.is_valid_source() {
         return Err(ArpError::InvalidSender);
     }
 
