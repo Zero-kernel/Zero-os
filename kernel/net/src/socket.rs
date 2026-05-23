@@ -3563,6 +3563,18 @@ impl SocketTable {
         payload: &[u8],
         options: &TcpOptions,
     ) -> Option<Vec<u8>> {
+        // R160-9 FIX: Reject invalid TCP flag combinations per RFC 793 §3.4.
+        // SYN+RST is always invalid (connection-setup contradicts abort).
+        // SYN+FIN is suspicious and rejected by modern stacks. These malformed
+        // segments are typically from port scanners or exploit attempts.
+        let flags = header.flags;
+        if flags & TCP_FLAG_SYN != 0 && flags & TCP_FLAG_RST != 0 {
+            return None;
+        }
+        if flags & TCP_FLAG_SYN != 0 && flags & TCP_FLAG_FIN != 0 {
+            return None;
+        }
+
         // RFC 793/5961: Handle RST segments with sequence validation
         if header.flags & TCP_FLAG_RST != 0 {
             // If we have a connection, validate RST before accepting
@@ -6437,7 +6449,8 @@ impl SocketTable {
         let mut data_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
         let mut syn_timeouts: Vec<(Arc<SocketState>, Ipv4Addr, Option<Vec<u8>>)> = Vec::new();
         // R148-I3 FIX: Collect keepalive probes to send after releasing locks.
-        let mut keepalive_probes: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
+        // R160-8 FIX: Extended tuple includes conntrack seeding metadata.
+        let mut keepalive_probes: Vec<(Ipv4Addr, Vec<u8>, u64, Ipv4Addr, u16, u16)> = Vec::new();
         // R148-3 FIX: Collect listeners for deferred SYN queue sweep outside
         // sockets lock. Sweeping under sockets.read() creates AB-BA deadlock
         // with the SYN handler path: sockets.read()->listen.lock() vs
@@ -6626,7 +6639,7 @@ impl SocketTable {
                                 );
                                 tcp_state.control.keepalive_probes_sent =
                                     tcp_state.control.keepalive_probes_sent.saturating_add(1);
-                                keepalive_probes.push((remote_ip, probe));
+                                keepalive_probes.push((remote_ip, probe, sock.net_ns_id.0, local_ip, local_port, remote_port));
                             }
                         }
                     }
@@ -6830,8 +6843,18 @@ impl SocketTable {
             let _ = transmit_tcp_segment(dst_ip, &seg);
         }
 
-        // R148-I3 FIX: Send keepalive probes
-        for (dst_ip, seg) in keepalive_probes {
+        // R148-I3 + R160-8 FIX: Send keepalive probes with conntrack seeding.
+        // Without conntrack refresh, idle connections could see their conntrack
+        // entry expire while the socket layer still considers the connection alive.
+        for (dst_ip, seg, ns_id, local_ip, local_port, remote_port) in keepalive_probes {
+            #[cfg(feature = "conntrack")]
+            {
+                use crate::conntrack::ct_process_tcp;
+                let _ = ct_process_tcp(
+                    ns_id, local_ip, dst_ip, local_port, remote_port,
+                    TCP_FLAG_ACK, 0, current_time_ms,
+                );
+            }
             let _ = transmit_tcp_segment(dst_ip, &seg);
         }
 

@@ -1114,9 +1114,17 @@ impl TcpControlBlock {
             (data, fin)
         };
 
+        // R160-I2 FIX: Fallible initial segment allocation (data is bounded
+        // by rcv_wnd but should still be fallible under OOM).
+        let mut seg_data = Vec::new();
+        if seg_data.try_reserve_exact(data.len()).is_err() {
+            return 0;
+        }
+        seg_data.extend_from_slice(data);
+
         let mut new_seg = OooSegment {
             seq,
-            data: data.to_vec(),
+            data: seg_data,
             fin,
         };
 
@@ -1145,19 +1153,20 @@ impl TcpControlBlock {
             // Two ranges [a, b) and [c, d) overlap or touch if a <= d && c <= b
             // Use sequence-space endpoints (including FIN) for adjacency detection.
             if seq_le(new_seg.seq, ex_seq_end) && seq_le(existing.seq, ns_seq_end) {
-                // Merge: remove existing, extend new_seg to cover both
-                let removed = self.ooo_queue.remove(i).unwrap();
-                removed_bytes = removed_bytes.saturating_add(removed.data.len() as u32);
-                let rm_data_end = removed.seq.wrapping_add(removed.data.len() as u32);
+                // R160-I2 FIX: Compute merge parameters from reference BEFORE
+                // removing existing segment. The previous code removed first then
+                // allocated — on alloc failure the removed segment was lost.
+                let ex_seq = existing.seq;
+                let ex_fin = existing.fin;
+                let rm_data_end = ex_seq.wrapping_add(existing.data.len() as u32);
 
-                let merged_start = if seq_le(removed.seq, new_seg.seq) {
-                    removed.seq
+                let merged_start = if seq_le(ex_seq, new_seg.seq) {
+                    ex_seq
                 } else {
                     new_seg.seq
                 };
                 let cur_data_end = new_seg.seq.wrapping_add(new_seg.data.len() as u32);
 
-                // Data-only end for buffer sizing (FIN occupies 0 bytes in buffer).
                 let mut merged_data_end = if seq_ge(rm_data_end, cur_data_end) {
                     rm_data_end
                 } else {
@@ -1165,19 +1174,9 @@ impl TcpControlBlock {
                 };
 
                 // R144-2 FIX: Truncate merged data at the earliest FIN position.
-                //
-                // No legitimate data follows a FIN in the same stream direction.
-                // If either segment carries FIN, the merged range must not extend
-                // past the FIN position (the data-end of the FIN-bearing segment).
-                // Without this truncation, an attacker who can inject an OOO segment
-                // adjacent to a FIN-bearing segment can merge data beyond FIN into
-                // the combined range; when ooo_drain_contiguous() delivers this
-                // merged segment, the post-FIN data reaches recv_buffer before the
-                // application sees EOF, enabling data injection past connection close.
-                let merged_fin = removed.fin || new_seg.fin;
+                let merged_fin = ex_fin || new_seg.fin;
                 if merged_fin {
-                    // Compute the earliest FIN position among the segments.
-                    let fin_pos = match (removed.fin, new_seg.fin) {
+                    let fin_pos = match (ex_fin, new_seg.fin) {
                         (true, true) => {
                             if seq_le(rm_data_end, cur_data_end) {
                                 rm_data_end
@@ -1187,7 +1186,6 @@ impl TcpControlBlock {
                         }
                         (true, false) => rm_data_end,
                         (false, true) => cur_data_end,
-                        // unreachable because merged_fin is true
                         (false, false) => merged_data_end,
                     };
                     if seq_lt(fin_pos, merged_data_end) {
@@ -1197,9 +1195,19 @@ impl TcpControlBlock {
 
                 let merged_len = merged_data_end.wrapping_sub(merged_start) as usize;
 
-                let mut merged_data = vec![0u8; merged_len];
+                // R159-3 + R160-I2 FIX: Attempt allocation BEFORE removing
+                // existing segment. On failure, skip merge and keep both segments.
+                let mut merged_data = Vec::new();
+                if merged_data.try_reserve_exact(merged_len).is_err() {
+                    i += 1;
+                    continue;
+                }
+                merged_data.resize(merged_len, 0);
 
-                // Copy removed segment's data at its relative offset
+                // Safe to remove now — allocation succeeded
+                let removed = self.ooo_queue.remove(i).unwrap();
+                removed_bytes = removed_bytes.saturating_add(removed.data.len() as u32);
+
                 let rm_off = removed.seq.wrapping_sub(merged_start) as usize;
                 if rm_off < merged_len {
                     let rm_len = removed.data.len().min(merged_len.saturating_sub(rm_off));
@@ -1207,7 +1215,6 @@ impl TcpControlBlock {
                         .copy_from_slice(&removed.data[..rm_len]);
                 }
 
-                // Copy new segment's data (overwrites overlapping region)
                 let ns_off = new_seg.seq.wrapping_sub(merged_start) as usize;
                 if ns_off < merged_len {
                     let ns_len = new_seg.data.len().min(merged_len.saturating_sub(ns_off));
@@ -1216,9 +1223,6 @@ impl TcpControlBlock {
                 }
 
                 // R135-4 FIX + R144-2 FIX: Preserve FIN if EITHER segment carries it.
-                // The fin_pos truncation above ensures the merged data range never
-                // extends past the earliest FIN position, so FIN remains at the end
-                // of the merged range and no post-FIN data is buffered.
 
                 new_seg = OooSegment {
                     seq: merged_start,

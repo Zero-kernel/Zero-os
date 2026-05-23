@@ -1633,24 +1633,23 @@ fn copy_user_cstring(ptr: *const u8) -> Result<Vec<u8>, SyscallError> {
         return Err(SyscallError::EFAULT);
     }
 
+    // R160-2 FIX: Pre-reserve capacity for the cstring buffer. The old code
+    // used infallible push() per byte, up to MAX_ARG_STRLEN (4096) iterations.
+    // Under OOM, any push could trigger alloc_error_handler → kernel panic.
     let mut buf = Vec::new();
+    buf.try_reserve(256).map_err(|_| SyscallError::ENOMEM)?;
 
     for i in 0..=MAX_ARG_STRLEN {
-        // V-2 fix: 使用容错单字节拷贝
-        // copy_from_user_safe 内部会：
-        // 1. 创建 UserAccessGuard 处理 SMAP
-        // 2. 创建 UserCopyGuard 登记 usercopy 状态
-        // 3. 页错误时安全返回 Err 而非 panic
         let mut byte = [0u8; 1];
-        // R102-9 FIX: Use integer arithmetic instead of ptr.add() for user pointers.
-        // User pointers are not within any Rust allocation, so ptr.add() is technically
-        // UB under Rust's pointer provenance model. Integer arithmetic is provenance-safe.
         let src_addr = (ptr as usize).wrapping_add(i) as *const u8;
         crate::usercopy::copy_from_user_safe(&mut byte, src_addr)
             .map_err(|_| SyscallError::EFAULT)?;
 
         if byte[0] == 0 {
             return Ok(buf);
+        }
+        if buf.try_reserve(1).is_err() {
+            return Err(SyscallError::ENOMEM);
         }
         buf.push(byte[0]);
     }
@@ -1672,33 +1671,32 @@ fn copy_user_str_array(list_ptr: *const *const u8) -> Result<Vec<Vec<u8>>, Sysca
 
     let word = mem::size_of::<usize>();
     let base = list_ptr as usize;
+    // R160-2 FIX: Fallible allocation for argument list. The old infallible
+    // push could panic under OOM with up to MAX_ARG_COUNT (256) entries.
     let mut items: Vec<Vec<u8>> = Vec::new();
     let mut total = 0usize;
 
     for idx in 0..MAX_ARG_COUNT {
-        // 计算当前条目地址
         let entry_addr = base.checked_add(idx * word).ok_or(SyscallError::EFAULT)?;
 
-        // V-2 fix: 使用容错拷贝读取指针值
-        // 这确保了即使用户在我们读取时取消映射，也不会导致内核 panic
         let mut raw_ptr = [0u8; core::mem::size_of::<usize>()];
         crate::usercopy::copy_from_user_safe(&mut raw_ptr, entry_addr as *const u8)
             .map_err(|_| SyscallError::EFAULT)?;
         let entry = usize::from_ne_bytes(raw_ptr) as *const u8;
 
         if entry.is_null() {
-            break; // NULL 终止
+            break;
         }
 
-        // 复制字符串内容（copy_user_cstring 现在也使用容错拷贝）
         let s = copy_user_cstring(entry)?;
         total = total
-            .checked_add(s.len() + 1) // +1 for trailing '\0'
+            .checked_add(s.len() + 1)
             .ok_or(SyscallError::E2BIG)?;
         if total > MAX_ARG_TOTAL {
             return Err(SyscallError::E2BIG);
         }
 
+        items.try_reserve(1).map_err(|_| SyscallError::ENOMEM)?;
         items.push(s);
     }
 
@@ -3041,11 +3039,27 @@ fn sys_clone(
         }
     };
 
-    // 创建子任务名称
-    let child_name = if flags & CLONE_THREAD != 0 {
-        alloc::format!("{}-thread", parent_name)
+    // R160-14 FIX: Truncate child name to prevent unbounded growth from
+    // deeply nested clone chains. The old infallible format!() could
+    // accumulate ~230KB names and panic under OOM.
+    let suffix = if flags & CLONE_THREAD != 0 { "-thread" } else { "-clone" };
+    let max_name = 256;
+    let child_name = if parent_name.len() + suffix.len() > max_name {
+        let mut name = String::new();
+        if name.try_reserve(max_name).is_ok() {
+            let truncated = &parent_name[..max_name.saturating_sub(suffix.len())];
+            name.push_str(truncated);
+            name.push_str(suffix);
+        }
+        name
     } else {
-        alloc::format!("{}-clone", parent_name)
+        let mut name = String::new();
+        if name.try_reserve(parent_name.len() + suffix.len()).is_err() {
+            return Err(SyscallError::ENOMEM);
+        }
+        name.push_str(&parent_name);
+        name.push_str(suffix);
+        name
     };
 
     // F.1: Handle CLONE_NEWNS - create new mount namespace
@@ -4083,8 +4097,11 @@ fn sys_exec(
     // ── Phase 1: Compute user-space addresses without touching user memory ──
 
     let mut sp = stack_top;
-    let mut argv_ptrs: Vec<usize> = Vec::with_capacity(argc);
-    let mut envp_ptrs: Vec<usize> = Vec::with_capacity(envc);
+    // R160-15 FIX: Fallible allocation (with_capacity is infallible).
+    let mut argv_ptrs: Vec<usize> = Vec::new();
+    argv_ptrs.try_reserve_exact(argc).map_err(|_| SyscallError::ENOMEM)?;
+    let mut envp_ptrs: Vec<usize> = Vec::new();
+    envp_ptrs.try_reserve_exact(envc).map_err(|_| SyscallError::ENOMEM)?;
 
     // 1. 计算 argv 字符串位置（从高地址向低地址生长）
     for s in argv_vec.iter().rev() {
@@ -10247,6 +10264,13 @@ fn sys_recvfrom(
     if len > MAX_RW_SIZE {
         return Err(SyscallError::EINVAL);
     }
+
+    // R160-1 FIX: Validate user buffer BEFORE any socket operation. The
+    // previous code called tcp_recv/recv_from_udp (which dequeues data)
+    // before checking the buffer pointer. On EFAULT, the dequeued data was
+    // irretrievably lost — violating TCP's reliable delivery at the syscall
+    // boundary. This matches the pattern in sys_read (line 5255).
+    validate_user_ptr_mut(buf, len)?;
 
     // Check flags
     let flag_bits = flags as u32;

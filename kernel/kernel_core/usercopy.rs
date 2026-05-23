@@ -930,7 +930,11 @@ pub fn copy_user_cstring(src: *const u8) -> Result<alloc::vec::Vec<u8>, ()> {
         return Err(());
     }
 
-    let mut result = Vec::with_capacity(256); // Typical path length
+    // R160-18 FIX: Fallible allocation (with_capacity is infallible).
+    let mut result = Vec::new();
+    if result.try_reserve(256).is_err() {
+        return Err(());
+    }
     let mut offset = 0usize;
 
     // P1-7: Chunked SMAP windows for string copies.  Each chunk scopes its

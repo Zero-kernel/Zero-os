@@ -195,12 +195,19 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
                     }
                 };
 
-                // R154-12 FIX: Check overlap with all previously loaded segments.
+                // R154-12 + R160-I1 FIX: Check overlap using page-aligned ranges.
+                // Two segments with non-overlapping byte ranges may share the same
+                // page, causing map_page to fail with PageAlreadyMapped. Aligning
+                // to page boundaries catches this at validation time.
+                let page_mask: usize = 0xFFF;
+                let page_start = vaddr & !page_mask;
+                let page_end = (segment_end + page_mask) & !page_mask;
                 for &(prev_start, prev_end) in loaded_ranges.iter() {
-                    // Two ranges [a, b) and [c, d) overlap iff a < d && c < b.
-                    if vaddr < prev_end && prev_start < segment_end {
+                    let prev_page_start = prev_start & !page_mask;
+                    let prev_page_end = (prev_end + page_mask) & !page_mask;
+                    if page_start < prev_page_end && prev_page_start < page_end {
                         klog!(Error,
-                            "ELF loader: PT_LOAD segment [{:#x}, {:#x}) overlaps with [{:#x}, {:#x})",
+                            "ELF loader: PT_LOAD segment [{:#x}, {:#x}) overlaps with [{:#x}, {:#x}) at page level",
                             vaddr, segment_end, prev_start, prev_end
                         );
                         rollback_all_mappings(&mut all_mappings, cgroup_id);

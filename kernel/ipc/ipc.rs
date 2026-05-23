@@ -682,11 +682,18 @@ pub fn receive_message_blocking(endpoint_id: EndpointId) -> Result<ReceivedMessa
                 return Ok(msg);
             }
             Ok(None) => {
-                // Still empty — block until woken by sender.
                 wq.finish_wait();
             }
             Err(e) => {
                 wq.cancel_wait();
+                // R160-5 FIX: Remove stale WaitQueue entry when endpoint
+                // doesn't exist. Without this, repeated blocking receives on
+                // non-existent endpoints leak WaitQueue entries in the global
+                // BTreeMap, causing unbounded memory growth.
+                if matches!(e, IpcError::EndpointNotFound) {
+                    let mut queues = ENDPOINT_WAIT_QUEUES.lock();
+                    queues.remove(&endpoint_id);
+                }
                 return Err(e);
             }
         }

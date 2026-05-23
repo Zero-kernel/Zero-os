@@ -329,7 +329,8 @@ impl FirewallRuleBuilder {
                 dst_port: None,
                 proto: None,
                 ct_state: CtStateMask::ANY,
-                action: FirewallAction::Accept,
+                // R160-7 FIX: Use default() (Drop) instead of Accept.
+                action: FirewallAction::default(),
                 log: false,
             },
         }

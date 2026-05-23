@@ -556,6 +556,22 @@ pub unsafe extern "C" fn enter_usermode(ctx: *const Context) -> ! {
         // between fxrstor64 and IRETQ could clobber the restored FPU state.
         // IRETQ pops RFLAGS (with IF=1) to re-enable on usermode entry.
         "cli",
+
+        // R160-6 FIX: Zero all debug registers before entering usermode,
+        // matching the switch_context pattern (R159-11). Without this, the
+        // first process to enter Ring 3 could inherit kernel debug register
+        // values (DR0-DR3 breakpoint addresses, DR6 status, DR7 control),
+        // leaking kernel virtual addresses and defeating KASLR.
+        "push rdi",
+        "xor eax, eax",
+        "mov dr0, rax",
+        "mov dr1, rax",
+        "mov dr2, rax",
+        "mov dr3, rax",
+        "mov dr6, rax",
+        "mov dr7, rax",
+        "pop rdi",
+
         "fxrstor64 [rdi + {fxoff}]",
 
         // 恢复通用寄存器（除了 RSP，它由 IRETQ 恢复）

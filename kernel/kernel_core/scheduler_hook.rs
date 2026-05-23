@@ -144,15 +144,18 @@ pub fn reschedule_if_needed() {
     // R67-4 FIX: Consume this CPU's IRQ-triggered reschedule request
     let irq_pending = IRQ_RESCHED_PENDING.with(|flag| flag.swap(false, Ordering::SeqCst));
 
-    // R159-I10 FIX: Wrap RESCHED_CB lock in without_interrupts to prevent
-    // deadlock if an IRQ fires while we hold the lock and the IRQ handler
-    // calls force_reschedule (same lock). Currently no IRQ path calls
-    // force_reschedule, but this is structurally safe by construction.
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        if let Some(cb) = *RESCHED_CB.lock() {
-            cb(irq_pending);
-        }
+    // R160-3 FIX: Copy callback out of lock before invoking. The previous
+    // `if let Some(cb) = *RESCHED_CB.lock() { cb(...); }` pattern held the
+    // MutexGuard across the callback (Rust 2021 temporary lifetime rules).
+    // The callback triggers context switches — holding a global spinlock
+    // across switch_context corrupts the lock when the resumed task drops
+    // its own stale MutexGuard. Same copy-then-call pattern as on_scheduler_tick().
+    let cb = x86_64::instructions::interrupts::without_interrupts(|| {
+        *RESCHED_CB.lock()
     });
+    if let Some(cb) = cb {
+        cb(irq_pending);
+    }
 }
 
 /// 强制执行重调度
@@ -160,12 +163,13 @@ pub fn reschedule_if_needed() {
 /// 由 sys_yield 调用，无论 NEED_RESCHED 标志如何都执行调度
 #[inline]
 pub fn force_reschedule() {
-    // R159-I10 FIX: IRQ-safe lock acquisition (same reasoning as reschedule_if_needed).
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        if let Some(cb) = *RESCHED_CB.lock() {
-            cb(true);
-        }
+    // R160-3 FIX: Copy callback out of lock before invoking (same fix as reschedule_if_needed).
+    let cb = x86_64::instructions::interrupts::without_interrupts(|| {
+        *RESCHED_CB.lock()
     });
+    if let Some(cb) = cb {
+        cb(true);
+    }
 }
 
 /// 【新增】从中断上下文请求抢占

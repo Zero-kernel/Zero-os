@@ -3497,6 +3497,13 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             reparent_orphans(&children_to_reparent);
         }
 
+        // R160-16 FIX: Deliver SIGCHLD to parent per POSIX. Previously only
+        // the waitpid wakeup path was used. SIGCHLD enables async notification
+        // for parents using signal handlers instead of blocking waitpid.
+        if parent_pid > 0 {
+            let _ = crate::signal::send_signal_kernel(parent_pid, crate::signal::Signal::SIGCHLD);
+        }
+
         // 唤醒等待此进程的父进程
         let mut wake_parent = false;
 
@@ -3530,39 +3537,45 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
 fn reparent_orphans(orphans: &[ProcessId]) {
     const ROOT_INIT_PID: ProcessId = 1;
 
+    // R160-4 FIX: Single PROCESS_TABLE lock acquisition for the entire
+    // reparenting batch. The previous 3-lock-per-orphan pattern had a race:
+    // between updating child.ppid and pushing to adopter.children, the adopter
+    // could terminate on another CPU → child stuck with ppid pointing to a dead
+    // process and never added to any children list → permanent zombie leak.
+    let table = PROCESS_TABLE.lock();
+
     for &child_pid in orphans {
-        // Determine the init process of the child's owning PID namespace
-        let adopt_pid = if let Some(child_proc) = get_process(child_pid) {
-            let ns_init = {
-                let child = child_proc.lock();
-                crate::pid_namespace::owning_namespace(&child.pid_ns_chain)
-                    .and_then(|ns| ns.init_global_pid())
-            };
-            // If namespace has an init, use it; otherwise fall back to root init
-            ns_init.unwrap_or(ROOT_INIT_PID)
-        } else {
-            ROOT_INIT_PID
+        let child_arc = match table.get(child_pid).and_then(|s| s.clone()) {
+            Some(arc) => arc,
+            None => continue,
         };
 
-        // Update child's recorded parent
-        if let Some(child_process) = get_process(child_pid) {
-            let mut child = child_process.lock();
+        let adopt_pid = {
+            let child = child_arc.lock();
+            let ns_init = crate::pid_namespace::owning_namespace(&child.pid_ns_chain)
+                .and_then(|ns| ns.init_global_pid());
+            ns_init.unwrap_or(ROOT_INIT_PID)
+        };
+
+        // Atomically: set child.ppid AND push to adopter.children under one table lock.
+        {
+            let mut child = child_arc.lock();
             child.ppid = adopt_pid;
         }
 
-        // Add to adopter's children list if the adopter exists
-        if let Some(adopter) = get_process(adopt_pid) {
-            let mut adopter_proc = adopter.lock();
+        if let Some(Some(adopter_arc)) = table.get(adopt_pid) {
+            let mut adopter_proc = adopter_arc.lock();
             if !adopter_proc.children.contains(&child_pid) {
                 if adopter_proc.children.try_reserve(1).is_ok() {
                     adopter_proc.children.push(child_pid);
                 } else {
-                    // R158-4 Phase 2: Signal sys_wait to use PROCESS_TABLE fallback scan.
                     adopter_proc.children_incomplete = true;
                 }
             }
         }
     }
+
+    drop(table);
 
     if !orphans.is_empty() {
         klog!(Info, "Reparented {} orphan process(es)", orphans.len());
