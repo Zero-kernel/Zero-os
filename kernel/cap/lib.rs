@@ -309,30 +309,39 @@ impl CapTable {
     /// The child table inherits the parent's `next_generation` counter
     /// to maintain the monotonic property across fork. This prevents
     /// early generation wrap in the child process.
-    pub fn clone_for_fork(&self) -> Self {
+    // R161-4 FIX: Return Result instead of infallible Self. The old
+    // with_capacity used vec![None; capacity] which panics under OOM
+    // with up to MAX_CAP_SLOTS=65535 entries.
+    pub fn try_clone_for_fork(&self) -> Result<Self, ()> {
         interrupts::without_interrupts(|| {
             let inner = self.inner.lock();
-            let mut new_inner = CapTableInner::with_capacity(inner.slots.len());
+            let capacity = inner.slots.len().min(MAX_CAP_SLOTS);
+            let mut slots = Vec::new();
+            slots.try_reserve_exact(capacity).map_err(|_| ())?;
+            slots.resize(capacity, None);
+            let mut free = Vec::new();
+            free.try_reserve_exact(capacity).map_err(|_| ())?;
+            free.extend((0..capacity).map(|i| i as u16));
 
-            // Inherit parent's generation counter to prevent early wrap
-            new_inner.next_generation = inner.next_generation;
+            let mut new_inner = CapTableInner {
+                slots,
+                free,
+                next_generation: inner.next_generation,
+            };
 
             for (idx, slot_opt) in inner.slots.iter().enumerate() {
                 if let Some(slot) = slot_opt {
                     if slot.entry.inherits_on_fork() {
-                        // Clone the entry with the same generation
-                        // (child gets identical CapId values for inherited caps)
                         new_inner.slots[idx] = Some(slot.clone());
                     }
                 }
             }
 
-            // Rebuild free list for the new table
             new_inner.rebuild_free_list();
 
-            Self {
+            Ok(Self {
                 inner: Mutex::new(new_inner),
-            }
+            })
         })
     }
 

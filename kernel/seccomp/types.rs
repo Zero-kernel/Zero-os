@@ -585,6 +585,20 @@ impl SeccompState {
     pub fn has_filters(&self) -> bool {
         !self.filters.is_empty()
     }
+
+    // R161-3 FIX: Fallible clone for fork/clone path. The derived Clone
+    // uses infallible Vec::clone which panics under OOM. Arc<SeccompFilter>
+    // clone is just a refcount bump (cheap), but the Vec growth is the issue.
+    pub fn try_clone(&self) -> Result<Self, ()> {
+        let mut filters = Vec::new();
+        filters.try_reserve_exact(self.filters.len()).map_err(|_| ())?;
+        filters.extend_from_slice(&self.filters);
+        Ok(Self {
+            filters,
+            no_new_privs: self.no_new_privs,
+            log_violations: self.log_violations,
+        })
+    }
 }
 
 impl Default for SeccompState {

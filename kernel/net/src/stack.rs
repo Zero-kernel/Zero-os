@@ -942,6 +942,40 @@ fn build_frame_and_transmit(
         return Err(TxError::InvalidBuffer);
     }
 
+    // R161-7 FIX: Evaluate egress firewall before building and transmitting
+    // the frame. Previously only the RX (ingress) path evaluated firewall
+    // rules; egress DROP rules were completely unenforced. Uses root
+    // namespace (0) as default since the TX path lacks namespace context.
+    // TCP and UDP payloads have src_port/dst_port at offset 0-3.
+    #[cfg(feature = "conntrack")]
+    {
+        let (src_port, dst_port) = if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp)
+            && payload.len() >= 4
+        {
+            (
+                Some(u16::from_be_bytes([payload[0], payload[1]])),
+                Some(u16::from_be_bytes([payload[2], payload[3]])),
+            )
+        } else {
+            (None, None)
+        };
+        let cfg_pre = network_config();
+        let fw_pkt = FirewallPacket {
+            net_ns_id: 0,
+            src_ip: cfg_pre.our_ip,
+            dst_ip,
+            proto,
+            src_port,
+            dst_port,
+            ct_state: None,
+        };
+        let fw_table = firewall_table_for_ns(0);
+        let fw_verdict = fw_table.evaluate(&fw_pkt);
+        if matches!(fw_verdict.action, FirewallAction::Drop | FirewallAction::Reject { .. }) {
+            return Err(TxError::InvalidBuffer);
+        }
+    }
+
     let cfg = network_config();
     if cfg.our_mac == EthAddr::ZERO {
         // No network device available

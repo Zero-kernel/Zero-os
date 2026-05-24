@@ -357,7 +357,9 @@ fn fork_inner(
         //
         // clone_for_fork() 会过滤掉带有 CLOFORK 标志的能力条目，
         // 并保持生成计数器的单调性以防止 wrap 攻击。
-        child.cap_table = Arc::new(parent.cap_table.clone_for_fork());
+        // R161-4 FIX: Use fallible try_clone_for_fork to avoid OOM panic
+        child.cap_table = Arc::new(parent.cap_table.try_clone_for_fork()
+            .map_err(|_| ForkError::MemoryAllocationFailed)?);
 
         child.time_slice = parent.time_slice;
         child.cpu_time = 0;

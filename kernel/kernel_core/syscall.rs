@@ -2895,7 +2895,8 @@ fn sys_clone(
             parent.cap_table.clone()
         } else {
             // R25-8 FIX: Non-thread cases must inherit and filter CLOFORK entries
-            Arc::new(parent.cap_table.clone_for_fork())
+            // R161-4 FIX: Fallible clone + Arc wrapping
+            Arc::new(parent.cap_table.try_clone_for_fork().map_err(|_| SyscallError::ENOMEM)?)
         };
 
         // R157-3 FIX: Fallible mmap_regions snapshot. BTreeMap::collect()
@@ -2935,7 +2936,7 @@ fn sys_clone(
             parent.gs_base,
             parent.credentials.clone(), // R39-3 FIX: 获取凭证 Arc
             parent.umask,
-            parent.seccomp_state.clone(),
+            parent.seccomp_state.try_clone().map_err(|_| SyscallError::ENOMEM)?,
             parent.pledge_state.clone(),
             parent.seccomp_installing,
             parent.pid_ns_for_children.clone(), // F.1: PID namespace
@@ -4869,6 +4870,20 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
 
     // 验证信号编号
     let signal = Signal::from_raw(sig)?;
+
+    // R161-2 FIX: Invoke LSM hook_signal_send before signal delivery.
+    // The hook was defined in lsm/lib.rs:1416 but never wired into sys_kill,
+    // meaning MAC policy could not restrict signal operations.
+    if let Some(task_ctx) = lsm_current_process_ctx() {
+        let sig_ctx = lsm::SignalCtx {
+            target_pid: target_global_pid,
+            sig,
+            cap: None,
+        };
+        if let Err(err) = lsm::hook_signal_send(&task_ctx, &sig_ctx) {
+            return Err(lsm_error_to_syscall(err));
+        }
+    }
 
     // 发送信号 (using global PID)
     let _action = send_signal(target_global_pid, signal)?;
@@ -10306,9 +10321,15 @@ fn sys_recvfrom(
             .tcp_recv(&socket, &ctx, cap_id, len, timeout)
             .map_err(socket_error_to_syscall)?;
 
+        // R161-1 FIX: Remove redundant validate_user_ptr_mut(buf, copy_len).
+        // The buffer was already validated at line 10273 with the full `len`.
+        // When tcp_recv returns empty Vec (TCP EOF / FIN), copy_len == 0,
+        // and validate_user_ptr rejects len==0 → EFAULT, breaking EOF detection.
+        // Guard copy with copy_len > 0; return 0 for EOF (POSIX recv semantics).
         let copy_len = core::cmp::min(len, data.len());
-        validate_user_ptr_mut(buf, copy_len)?;
-        copy_to_user(buf, &data[..copy_len])?;
+        if copy_len > 0 {
+            copy_to_user(buf, &data[..copy_len])?;
+        }
         return Ok(copy_len);
     }
 
@@ -10322,10 +10343,12 @@ fn sys_recvfrom(
         .recv_from_udp(&socket, &ctx, cap_id, timeout)
         .map_err(socket_error_to_syscall)?;
 
-    // Copy data to user space
+    // R161-1 FIX: Same fix as TCP path — remove redundant validation.
+    // A 0-length UDP datagram is protocol-legal (RFC 768); returning EFAULT is wrong.
     let copy_len = core::cmp::min(len, pkt.data.len());
-    validate_user_ptr_mut(buf, copy_len)?;
-    copy_to_user(buf, &pkt.data[..copy_len])?;
+    if copy_len > 0 {
+        copy_to_user(buf, &pkt.data[..copy_len])?;
+    }
 
     // Write source address if requested
     if !src_addr.is_null() {

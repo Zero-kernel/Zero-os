@@ -986,9 +986,14 @@ pub fn copy_user_cstring(src: *const u8) -> Result<alloc::vec::Vec<u8>, ()> {
             // Guards dropped here: CLAC executed, interrupts re-enabled.
         }
 
-        // Heap allocation (Vec extend) happens here, outside the SMAP window,
-        // with interrupts enabled and per-CPU state cleared.
+        // R161-5 FIX: Fallible allocation before extend. The initial
+        // try_reserve(256) only covers the first 256 bytes; strings up to
+        // MAX_CSTRING_LEN (4096) caused infallible Vec growth via
+        // extend_from_slice, which panics under OOM.
         if chunk_count > 0 {
+            if result.try_reserve(chunk_count).is_err() {
+                return Err(());
+            }
             result.extend_from_slice(&chunk_buf[..chunk_count]);
         }
 

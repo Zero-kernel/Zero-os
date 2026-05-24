@@ -1652,6 +1652,12 @@ fn vfs_readdir_callback(fd: i32, max_bytes: usize) -> Result<alloc::vec::Vec<ker
                     crate::types::FileType::Fifo => kernel_core::FileType::Fifo,
                     crate::types::FileType::Socket => kernel_core::FileType::Socket,
                 };
+                // R161-6 FIX: Fallible allocation before push. The byte
+                // budget bounds entry count (~30K at 1MB) but Vec::push
+                // growth is infallible, panicking under OOM.
+                if entries.try_reserve(1).is_err() {
+                    break;
+                }
                 entries.push(kernel_core::DirEntry {
                     name: entry.name,
                     ino: entry.ino,
