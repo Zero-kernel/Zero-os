@@ -2085,6 +2085,84 @@ pub fn sync_vm_siblings_remove_mmap(memory_space: usize, addr: usize, caller_pid
     }
 }
 
+/// R161-10 FIX: Propagate mmap_regions boundary splits to CLONE_VM siblings.
+///
+/// When sys_mprotect splits a region at addr/end boundaries (because the
+/// mprotect range partially overlaps it), the same split must be propagated
+/// to all siblings sharing the address space to keep bookkeeping consistent.
+pub fn sync_vm_siblings_split_region(
+    memory_space: usize,
+    caller_pid: ProcessId,
+    addr: usize,
+    end: usize,
+) {
+    if memory_space == 0 {
+        return;
+    }
+
+    use crate::syscall::{mmap_region_len, MMAP_REGION_FLAG_MASK, MMAP_REGION_FLAG_TRANSIENT_MASK};
+
+    let table = PROCESS_TABLE.lock();
+    for (idx, slot) in table.iter().enumerate() {
+        if idx == caller_pid {
+            continue;
+        }
+        if let Some(proc_arc) = slot {
+            let mut proc = proc_arc.lock();
+            if proc.memory_space != memory_space || proc.state == ProcessState::Terminated {
+                continue;
+            }
+
+            // Split preceding region at addr
+            let preceding = proc
+                .mmap_regions
+                .range(..addr)
+                .next_back()
+                .map(|(&b, &lf)| (b, lf));
+            if let Some((prev_base, prev_lf)) = preceding {
+                let prev_len = mmap_region_len(prev_lf);
+                let prev_end = prev_base.saturating_add(prev_len);
+                if prev_end > addr
+                    && prev_len > 0
+                    && (prev_lf & MMAP_REGION_FLAG_TRANSIENT_MASK) == 0
+                {
+                    let prev_flags = prev_lf & MMAP_REGION_FLAG_MASK;
+                    let left_len = addr - prev_base;
+                    proc.mmap_regions.insert(prev_base, left_len | prev_flags);
+                    let tail_end = prev_end.min(end);
+                    let tail_len = tail_end - addr;
+                    proc.mmap_regions.insert(addr, tail_len | prev_flags);
+                    if prev_end > end {
+                        let right_len = prev_end - end;
+                        proc.mmap_regions.insert(end, right_len | prev_flags);
+                    }
+                }
+            }
+
+            // Split trailing region at end
+            let trailing = proc
+                .mmap_regions
+                .range(addr..end)
+                .next_back()
+                .map(|(&b, &lf)| (b, lf));
+            if let Some((last_base, last_lf)) = trailing {
+                let last_len = mmap_region_len(last_lf);
+                let last_end = last_base.saturating_add(last_len);
+                if last_end > end
+                    && last_len > 0
+                    && (last_lf & MMAP_REGION_FLAG_TRANSIENT_MASK) == 0
+                {
+                    let last_flags = last_lf & MMAP_REGION_FLAG_MASK;
+                    let in_range_len = end - last_base;
+                    let right_len = last_end - end;
+                    proc.mmap_regions.insert(last_base, in_range_len | last_flags);
+                    proc.mmap_regions.insert(end, right_len | last_flags);
+                }
+            }
+        }
+    }
+}
+
 /// R140-1 FIX: Synchronize brk value across all tasks sharing the same
 /// address space (CLONE_VM siblings).
 ///

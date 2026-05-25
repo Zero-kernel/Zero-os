@@ -123,7 +123,8 @@ pub(crate) const PCI_VENDOR_INVALID: u16 = 0xFFFF;
 
 /// Lock for PCI configuration space access serialization.
 /// R86-2 FIX: Prevents concurrent read-modify-write races.
-pub(crate) static PCI_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+/// R161-15 FIX: Made public so block/pci.rs can share the same lock.
+pub static PCI_CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
 // ============================================================================
 // Global State

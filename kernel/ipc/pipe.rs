@@ -319,13 +319,15 @@ impl Pipe {
     /// 增加读端引用
     fn add_reader(&self) {
         let mut inner = self.inner.lock();
-        inner.readers += 1;
+        // R161-14 FIX: Use saturating_add for consistency with saturating_sub on decrement.
+        inner.readers = inner.readers.saturating_add(1);
     }
 
     /// 增加写端引用
     fn add_writer(&self) {
         let mut inner = self.inner.lock();
-        inner.writers += 1;
+        // R161-14 FIX: Use saturating_add for consistency with saturating_sub on decrement.
+        inner.writers = inner.writers.saturating_add(1);
     }
 
     /// 获取管道状态

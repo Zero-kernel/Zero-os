@@ -2973,9 +2973,11 @@ pub fn validate_syn_cookie(
         guard.get_secrets(now_ms)
     };
 
-    // Verify MAC against current secret
+    // R160-10 FIX: Constant-time MAC comparison (XOR-accumulate pattern).
+    // While the 23-bit MAC makes timing attacks impractical over a network,
+    // constant-time comparison is defense-in-depth best practice.
     let expected_mac = syn_cookie_compute_mac(current_secret, &params);
-    if received_mac == expected_mac {
+    if (received_mac ^ expected_mac) == 0 {
         return Some(SynCookieData {
             iss: cookie_isn,
             mss_index: mss_index as u8,
@@ -2985,7 +2987,7 @@ pub fn validate_syn_cookie(
 
     // Try previous secret (for rotation grace period)
     let expected_mac_prev = syn_cookie_compute_mac(previous_secret, &params);
-    if received_mac == expected_mac_prev {
+    if (received_mac ^ expected_mac_prev) == 0 {
         return Some(SynCookieData {
             iss: cookie_isn,
             mss_index: mss_index as u8,

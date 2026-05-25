@@ -253,7 +253,7 @@ impl UserAccessGuard {
         if smap_active {
             // Only execute STAC when this is the outermost guard (depth 0→1)
             // V-5 fix: Use per-CPU depth counter
-            let prev_depth = SMAP_GUARD_DEPTH.with(|d| d.fetch_add(1, Ordering::SeqCst)); // lint-fetch-add: allow (per-CPU depth counter)
+            let prev_depth = SMAP_GUARD_DEPTH.with(|d| d.fetch_add(1, Ordering::Relaxed)); // lint-fetch-add: allow (per-CPU depth counter); R161-I5: Relaxed suffices (per-CPU, IRQ-disabled)
             if prev_depth == 0 {
                 // R25-10 FIX: Disable interrupts before setting AC flag
                 // This prevents interrupt handlers from running with user access allowed
@@ -312,9 +312,9 @@ impl Drop for UserAccessGuard {
                 }
                 // Best-effort: decrement the *current* CPU's depth counter if possible.
                 // This is imprecise but prevents underflow assertion on subsequent guards.
-                let cur_depth = SMAP_GUARD_DEPTH.with(|d| d.load(Ordering::SeqCst));
+                let cur_depth = SMAP_GUARD_DEPTH.with(|d| d.load(Ordering::Relaxed));
                 if cur_depth > 0 {
-                    SMAP_GUARD_DEPTH.with(|d| d.fetch_sub(1, Ordering::SeqCst));
+                    SMAP_GUARD_DEPTH.with(|d| d.fetch_sub(1, Ordering::Relaxed));
                 }
                 if self.interrupts_were_enabled {
                     x86_64::instructions::interrupts::enable();
@@ -331,7 +331,7 @@ impl Drop for UserAccessGuard {
         if self.smap_active {
             // Only execute CLAC when this is the outermost guard (depth 1→0)
             // V-5 fix: Use per-CPU depth counter
-            let prev_depth = SMAP_GUARD_DEPTH.with(|d| d.fetch_sub(1, Ordering::SeqCst));
+            let prev_depth = SMAP_GUARD_DEPTH.with(|d| d.fetch_sub(1, Ordering::Relaxed));
             // Check for underflow (should never happen with correct nesting)
             assert!(prev_depth > 0, "SMAP guard depth underflow");
             if prev_depth == 1 {
@@ -1134,10 +1134,12 @@ impl<T: Copy> UserPtr<T> {
             .checked_mul(elem_size as isize)
             .ok_or(UsercopyError)?;
 
+        // R161-I1 FIX: Use checked_neg to avoid overflow on isize::MIN
         let new_addr = if offset_bytes >= 0 {
             self.addr().checked_add(offset_bytes as usize)
         } else {
-            self.addr().checked_sub((-offset_bytes) as usize)
+            let pos = offset_bytes.checked_neg().ok_or(UsercopyError)? as usize;
+            self.addr().checked_sub(pos)
         }
         .ok_or(UsercopyError)?;
 

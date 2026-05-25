@@ -49,7 +49,11 @@ pub fn force_init_resched_locals() {
 /// tries to acquire the same lock.
 pub fn register_timer_callback(cb: TimerCallback) {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        TIMER_CBS.lock().push(cb);
+        let mut cbs = TIMER_CBS.lock();
+        // R161-I2 FIX: Bounds check before push to prevent unbounded growth.
+        if cbs.len() < MAX_TIMER_CALLBACKS {
+            cbs.push(cb);
+        }
     });
 }
 

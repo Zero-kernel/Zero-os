@@ -301,8 +301,16 @@ pub fn futex_lock_pi(
         let mut b = bucket.lock();
 
         // 清理已死亡的 owner（robust futex）
+        // R161-13 FIX: Also detect zombie/terminated owners, not just reaped ones.
         if let Some(owner) = b.owner {
-            if process::get_process(owner).is_none() {
+            let owner_dead = match process::get_process(owner) {
+                None => true,
+                Some(proc_arc) => {
+                    let state = proc_arc.lock().state;
+                    matches!(state, process::ProcessState::Zombie | process::ProcessState::Terminated)
+                }
+            };
+            if owner_dead {
                 b.owner = None;
                 b.owner_dead = true;
             }

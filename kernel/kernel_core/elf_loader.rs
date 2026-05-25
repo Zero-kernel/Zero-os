@@ -297,7 +297,7 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
     let initial_rsp = USER_STACK_TOP - 16;
 
     Ok(ElfLoadResult {
-        entry: elf.header.pt2.entry_point(),
+        entry,
         user_stack_top: initial_rsp,
         brk_start,
         charged_bytes,

@@ -2894,6 +2894,14 @@ impl SocketTable {
                     // the next packet arrival, causing unnecessary read stalls.
                     tcp_state.control.ooo_drain_contiguous();
 
+                    // R161-11 FIX: OOO drain in recv path may deliver buffered FIN,
+                    // triggering FinWait2→TimeWait. Initialize time_wait_start.
+                    if tcp_state.control.state == TcpState::TimeWait
+                        && tcp_state.control.time_wait_start == 0
+                    {
+                        tcp_state.control.time_wait_start = self.time_wait_now();
+                    }
+
                     drop(guard);
 
                     // Update statistics
@@ -4662,7 +4670,19 @@ impl SocketTable {
                         );
                         return Some(sack_ack);
                     } else {
-                        // Retransmitted/duplicate data (seq < rcv_nxt): ACK with current state
+                        // R161-12 FIX: Per RFC 793, accept in-window portion of partial
+                        // retransmission overlaps (seq < rcv_nxt, seq+len > rcv_nxt).
+                        let seg_end = header.seq_num.wrapping_add(payload.len() as u32);
+                        if seq_gt(seg_end, tcp_state.control.rcv_nxt) {
+                            let skip = tcp_state.control.rcv_nxt
+                                .wrapping_sub(header.seq_num) as usize;
+                            let useful = &payload[skip..];
+                            tcp_state.control.ooo_insert(
+                                tcp_state.control.rcv_nxt, useful, false,
+                            );
+                            tcp_state.control.ooo_drain_contiguous();
+                            data_received = true;
+                        }
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let dup_ack = Self::build_sack_ack(
                             &tcp_state.control,
@@ -4915,6 +4935,14 @@ impl SocketTable {
                             // R155-15 FIX: OOO drain may deliver buffered FIN.
                             if tcp_state.control.fin_received {
                                 ooo_fin_delivered = true;
+                                // R161-11 FIX: OOO drain may transition FinWait2→TimeWait
+                                // (when FIN ACK above moved us to FinWait2 first).
+                                // Set time_wait_start immediately.
+                                if tcp_state.control.state == TcpState::TimeWait
+                                    && tcp_state.control.time_wait_start == 0
+                                {
+                                    tcp_state.control.time_wait_start = self.time_wait_now();
+                                }
                             }
                         }
 
@@ -4936,6 +4964,18 @@ impl SocketTable {
                         );
                         return Some(sack_ack);
                     } else {
+                        // R161-12 FIX: Accept in-window portion of partial overlap.
+                        let seg_end = header.seq_num.wrapping_add(payload.len() as u32);
+                        if seq_gt(seg_end, tcp_state.control.rcv_nxt) {
+                            let skip = tcp_state.control.rcv_nxt
+                                .wrapping_sub(header.seq_num) as usize;
+                            let useful = &payload[skip..];
+                            tcp_state.control.ooo_insert(
+                                tcp_state.control.rcv_nxt, useful, false,
+                            );
+                            tcp_state.control.ooo_drain_contiguous();
+                            data_received = true;
+                        }
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let dup_ack = Self::build_sack_ack(
                             &tcp_state.control,
@@ -5158,6 +5198,13 @@ impl SocketTable {
                             // (FinWait2→TimeWait transition inside tcp.rs).
                             if tcp_state.control.fin_received {
                                 ooo_fin_delivered = true;
+                                // R161-11 FIX: Set time_wait_start immediately on
+                                // OOO-drain-triggered FinWait2→TimeWait transition.
+                                if tcp_state.control.state == TcpState::TimeWait
+                                    && tcp_state.control.time_wait_start == 0
+                                {
+                                    tcp_state.control.time_wait_start = self.time_wait_now();
+                                }
                             }
                         }
 
@@ -5179,6 +5226,18 @@ impl SocketTable {
                         );
                         return Some(sack_ack);
                     } else {
+                        // R161-12 FIX: Accept in-window portion of partial overlap.
+                        let seg_end = header.seq_num.wrapping_add(payload.len() as u32);
+                        if seq_gt(seg_end, tcp_state.control.rcv_nxt) {
+                            let skip = tcp_state.control.rcv_nxt
+                                .wrapping_sub(header.seq_num) as usize;
+                            let useful = &payload[skip..];
+                            tcp_state.control.ooo_insert(
+                                tcp_state.control.rcv_nxt, useful, false,
+                            );
+                            tcp_state.control.ooo_drain_contiguous();
+                            data_received = true;
+                        }
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let dup_ack = Self::build_sack_ack(
                             &tcp_state.control,

@@ -2707,10 +2707,16 @@ fn sys_clone(
         return Err(SyscallError::EINVAL);
     }
 
+    // R161-16 FIX: When CLONE_NEWUSER is present alongside other namespace flags,
+    // skip privilege checks for those flags. Linux processes CLONE_NEWUSER first,
+    // granting capabilities within the new user namespace. We match this behavior
+    // by deferring the check — the new user namespace grants CAP_SYS_ADMIN within it.
+    let creating_user_ns = flags & CLONE_NEWUSER != 0;
+
     // R156-2 FIX: CLONE_NEWPID requires CAP_SYS_ADMIN or root, matching
     // the gates on CLONE_NEWNS/NEWIPC/NEWNET. Previously ungated, allowing
     // unprivileged PID namespace creation and quota exhaustion.
-    if flags & CLONE_NEWPID != 0 {
+    if flags & CLONE_NEWPID != 0 && !creating_user_ns {
         let has_cap_admin =
             with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
         let is_root = crate::current_is_host_root();
@@ -2728,7 +2734,7 @@ fn sys_clone(
     }
 
     // F.1 Security: CLONE_NEWNS requires CAP_SYS_ADMIN (CapRights::ADMIN) or root
-    if flags & CLONE_NEWNS != 0 {
+    if flags & CLONE_NEWNS != 0 && !creating_user_ns {
         let has_cap_admin =
             with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
@@ -2749,7 +2755,7 @@ fn sys_clone(
     }
 
     // F.1 Security: CLONE_NEWIPC requires CAP_SYS_ADMIN or root
-    if flags & CLONE_NEWIPC != 0 {
+    if flags & CLONE_NEWIPC != 0 && !creating_user_ns {
         let has_cap_admin =
             with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
@@ -2769,7 +2775,7 @@ fn sys_clone(
     }
 
     // F.1 Security: CLONE_NEWNET requires CAP_NET_ADMIN (CapRights::ADMIN) or root
-    if flags & CLONE_NEWNET != 0 {
+    if flags & CLONE_NEWNET != 0 && !creating_user_ns {
         let has_cap_admin =
             with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
         // R93-3 FIX: Fail-closed - missing credentials denies access (was unwrap_or(true))
@@ -4868,6 +4874,12 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
         }
     }
 
+    // R161-I6 FIX: POSIX kill(pid, 0) — permission check without delivery.
+    // Signal 0 is used to test if a process exists and the caller has permission.
+    if sig == 0 {
+        return Ok(0);
+    }
+
     // 验证信号编号
     let signal = Signal::from_raw(sig)?;
 
@@ -5380,13 +5392,17 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     copy_from_user(&mut tmp, buf)?;
 
     // stdout(1)/stderr(2): 直接打印
+    // R158-I9 FIX: Accept non-UTF-8 bytes (POSIX write(2) is byte-oriented).
+    // Display valid UTF-8 as text; replace invalid sequences with U+FFFD.
     if fd == 1 || fd == 2 {
-        if let Ok(s) = core::str::from_utf8(&tmp) {
-            print!("{}", s);
-            Ok(tmp.len())
-        } else {
-            Err(SyscallError::EINVAL)
+        match core::str::from_utf8(&tmp) {
+            Ok(s) => print!("{}", s),
+            Err(_) => {
+                let s = alloc::string::String::from_utf8_lossy(&tmp);
+                print!("{}", s);
+            }
         }
+        Ok(tmp.len())
     } else if fd == 0 {
         // stdin 不支持写入
         Err(SyscallError::EBADF)
@@ -6917,7 +6933,50 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     // we need frame allocation (PROT_NONE → real) or frame deallocation
     // (real → PROT_NONE).
     let (prot_none_regions, real_regions, memory_space) = {
-        let proc = process.lock();
+        let mut proc = process.lock();
+
+        // R161-10 FIX: Split regions that partially overlap [addr, end) at the
+        // boundary points. This ensures the classification loop below only sees
+        // entries fully contained within the mprotect range, so Path A/B process
+        // exactly the correct pages and bookkeeping updates find entries by key.
+
+        // Split preceding region whose tail extends into [addr, end).
+        if let Some((&prev_base, &prev_lf)) = proc.mmap_regions.range(..addr).next_back() {
+            let prev_len = mmap_region_len(prev_lf);
+            let prev_end = prev_base.saturating_add(prev_len);
+            if prev_end > addr && prev_len > 0 {
+                if (prev_lf & MMAP_REGION_FLAG_TRANSIENT_MASK) != 0 {
+                    return Err(SyscallError::EBUSY);
+                }
+                let prev_flags = prev_lf & MMAP_REGION_FLAG_MASK;
+                let left_len = addr - prev_base;
+                proc.mmap_regions.insert(prev_base, left_len | prev_flags);
+                let tail_end = prev_end.min(end);
+                let tail_len = tail_end - addr;
+                proc.mmap_regions.insert(addr, tail_len | prev_flags);
+                if prev_end > end {
+                    let right_len = prev_end - end;
+                    proc.mmap_regions.insert(end, right_len | prev_flags);
+                }
+            }
+        }
+
+        // Split trailing region that starts in [addr, end) but extends past end.
+        if let Some((&last_base, &last_lf)) = proc.mmap_regions.range(addr..end).next_back() {
+            let last_len = mmap_region_len(last_lf);
+            let last_end = last_base.saturating_add(last_len);
+            if last_end > end && last_len > 0 {
+                if (last_lf & MMAP_REGION_FLAG_TRANSIENT_MASK) != 0 {
+                    return Err(SyscallError::EBUSY);
+                }
+                let last_flags = last_lf & MMAP_REGION_FLAG_MASK;
+                let in_range_len = end - last_base;
+                let right_len = last_end - end;
+                proc.mmap_regions.insert(last_base, in_range_len | last_flags);
+                proc.mmap_regions.insert(end, right_len | last_flags);
+            }
+        }
+
         let mut prot_none_regions: Vec<(usize, usize)> = Vec::new();
         let mut real_regions: Vec<(usize, usize)> = Vec::new();
         // R159-8 FIX: Pre-reserve based on region count to avoid infallible
@@ -6933,18 +6992,6 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
         // R158-17 FIX: Track coverage to detect unmapped gaps in [addr, end).
         // Linux returns ENOMEM if any part of the range is unmapped.
         let mut coverage = addr;
-
-        // Check for a region starting before addr that extends into the range.
-        if let Some((&prev_base, &prev_lf)) = proc.mmap_regions.range(..addr).next_back() {
-            let prev_len = mmap_region_len(prev_lf);
-            let prev_end = prev_base.saturating_add(prev_len);
-            if prev_end > addr {
-                if (prev_lf & MMAP_REGION_FLAG_TRANSIENT_MASK) != 0 {
-                    return Err(SyscallError::EBUSY);
-                }
-                coverage = prev_end.min(end);
-            }
-        }
 
         for (&region_base, &len_with_flags) in proc.mmap_regions.range(addr..end) {
             let region_len = mmap_region_len(len_with_flags);
@@ -6986,6 +7033,12 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
 
         (prot_none_regions, real_regions, proc.memory_space)
     };
+
+    // R161-10 FIX: Propagate region splits to CLONE_VM siblings so their
+    // mmap_regions bookkeeping stays consistent with the caller's.
+    if memory_space != 0 {
+        crate::process::sync_vm_siblings_split_region(memory_space, pid, addr, end);
+    }
 
     // 构建页表标志
     // R24-4 fix: PROT_NONE 需要清除 PRESENT 标志，使页面不可访问

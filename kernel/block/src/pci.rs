@@ -244,6 +244,10 @@ fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
 /// * `Some((pci_id, pci_addrs, device_name))` - Found device with modern virtio-pci capabilities
 /// * `None` - No compatible virtio-blk device found
 pub fn probe_virtio_blk() -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)> {
+    // R161-15 FIX: Acquire shared PCI config lock to prevent concurrent
+    // access with IOMMU's PCI operations on SMP.
+    let _pci_lock = iommu::PCI_CONFIG_LOCK.lock();
+
     // Scan all PCI buses (0-255)
     for bus in 0u8..=255 {
         for dev in 0u8..32 {
