@@ -493,6 +493,12 @@ impl CapTableInner {
             return Err(CapError::DelegationDenied);
         }
 
+        // R162-9-2 FIX: Namespace capabilities are non-transferable by default
+        // to prevent cross-namespace capability leaks.
+        if matches!(source_entry.object, CapObject::Namespace(_)) {
+            return Err(CapError::DelegationDenied);
+        }
+
         // R25-1 FIX: Enforce source restrictions on delegated capability
         // Source flags (CLOEXEC, CLOFORK, O_PATH, NOXFER) must be inherited to prevent
         // privilege escalation via flag stripping attacks

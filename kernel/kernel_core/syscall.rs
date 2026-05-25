@@ -4874,18 +4874,9 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
         }
     }
 
-    // R161-I6 FIX: POSIX kill(pid, 0) — permission check without delivery.
-    // Signal 0 is used to test if a process exists and the caller has permission.
-    if sig == 0 {
-        return Ok(0);
-    }
-
-    // 验证信号编号
-    let signal = Signal::from_raw(sig)?;
-
-    // R161-2 FIX: Invoke LSM hook_signal_send before signal delivery.
-    // The hook was defined in lsm/lib.rs:1416 but never wired into sys_kill,
-    // meaning MAC policy could not restrict signal operations.
+    // R161-2 FIX + R162-1-1 FIX: Invoke LSM hook_signal_send BEFORE sig==0
+    // check so MAC policy can deny process existence probes across security
+    // domains (matching Linux SELinux/AppArmor behavior).
     if let Some(task_ctx) = lsm_current_process_ctx() {
         let sig_ctx = lsm::SignalCtx {
             target_pid: target_global_pid,
@@ -4896,6 +4887,16 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
             return Err(lsm_error_to_syscall(err));
         }
     }
+
+    // R161-I6 FIX: POSIX kill(pid, 0) — permission check without delivery.
+    // Signal 0 is used to test if a process exists and the caller has permission.
+    // Placed after LSM check so MAC policy can deny existence probes.
+    if sig == 0 {
+        return Ok(0);
+    }
+
+    // 验证信号编号
+    let signal = Signal::from_raw(sig)?;
 
     // 发送信号 (using global PID)
     let _action = send_signal(target_global_pid, signal)?;
@@ -10114,7 +10115,7 @@ fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult 
 
     // Phase 2: Transmit the SYN segment via network device
     // R51-5 FIX: Abort connection if TX fails to prevent TCB/binding leak
-    if let Err(e) = net::transmit_tcp_segment(syn_result.dst_ip, &syn_result.segment) {
+    if let Err(e) = net::transmit_tcp_segment(syn_result.dst_ip, &syn_result.segment, socket.net_ns_id.0) {
         net::socket_table().abort_tcp_connect(&socket);
         return Err(tx_error_to_syscall(e));
     }
@@ -10243,7 +10244,7 @@ fn sys_sendto(
 
         // Transmit all TCP segments via network device
         for segment in segments {
-            net::transmit_tcp_segment(remote_ip, &segment).map_err(tx_error_to_syscall)?;
+            net::transmit_tcp_segment(remote_ip, &segment, socket.net_ns_id.0).map_err(tx_error_to_syscall)?;
         }
 
         return Ok(bytes_sent);
@@ -10300,7 +10301,8 @@ fn sys_sendto(
         .map_err(socket_error_to_syscall)?;
 
     // Transmit the UDP datagram via network device
-    net::transmit_udp_datagram(dst_ip, &datagram).map_err(tx_error_to_syscall)?;
+    // R162-7-2 FIX: Pass socket's namespace for per-NS egress firewall evaluation.
+    net::transmit_udp_datagram(dst_ip, &datagram, socket.net_ns_id.0).map_err(tx_error_to_syscall)?;
 
     Ok(len)
 }
@@ -10463,7 +10465,7 @@ fn sys_shutdown(fd: i32, how: i32) -> SyscallResult {
         Ok(Some(fin_segment)) => {
             // Transmit the FIN segment
             if let Some(dst_ip) = socket.remote_ip() {
-                let _ = net::transmit_tcp_segment(net::Ipv4Addr(dst_ip), &fin_segment);
+                let _ = net::transmit_tcp_segment(net::Ipv4Addr(dst_ip), &fin_segment, socket.net_ns_id.0);
             }
             Ok(0)
         }

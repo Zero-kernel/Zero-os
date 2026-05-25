@@ -3038,7 +3038,7 @@ impl SocketTable {
         };
 
         let mut keep_registered = false;
-        let mut fin_to_send: Option<(Ipv4Addr, Vec<u8>)> = None;
+        let mut fin_to_send: Option<(Ipv4Addr, Vec<u8>, u64)> = None;
 
         // TCP sockets may need to send FIN and stay registered for TIME_WAIT/ACK handling.
         if sock.proto == SocketProtocol::Tcp {
@@ -3080,7 +3080,7 @@ impl SocketTable {
                                     advertised_wnd,
                                     &[],
                                 );
-                                fin_to_send = Some((remote_ip, fin_segment));
+                                fin_to_send = Some((remote_ip, fin_segment, sock.net_ns_id.0));
                             }
                         }
                         TcpState::CloseWait => {
@@ -3110,7 +3110,7 @@ impl SocketTable {
                                     advertised_wnd,
                                     &[],
                                 );
-                                fin_to_send = Some((remote_ip, fin_segment));
+                                fin_to_send = Some((remote_ip, fin_segment, sock.net_ns_id.0));
                             }
                         }
                         TcpState::FinWait1
@@ -3231,8 +3231,8 @@ impl SocketTable {
         }
 
         // Transmit FIN after releasing locks to avoid blocking critical sections.
-        if let Some((dst_ip, segment)) = fin_to_send {
-            let _ = transmit_tcp_segment(dst_ip, &segment);
+        if let Some((dst_ip, segment, ns_id)) = fin_to_send {
+            let _ = transmit_tcp_segment(dst_ip, &segment, ns_id);
         }
     }
 
@@ -4809,7 +4809,7 @@ impl SocketTable {
                         // Transmit fast retransmit segment asynchronously
                         let meta = sock.meta_snapshot();
                         if let Some(remote_ip) = meta.remote_ip.map(Ipv4Addr) {
-                            let _ = transmit_tcp_segment(remote_ip, &fr_seg);
+                            let _ = transmit_tcp_segment(remote_ip, &fr_seg, sock.net_ns_id.0);
                         }
                     }
 
@@ -4821,7 +4821,7 @@ impl SocketTable {
                     drop(guard);
                     let meta = sock.meta_snapshot();
                     if let Some(remote_ip) = meta.remote_ip.map(Ipv4Addr) {
-                        let _ = transmit_tcp_segment(remote_ip, &fr_seg);
+                        let _ = transmit_tcp_segment(remote_ip, &fr_seg, sock.net_ns_id.0);
                     }
                     return None; // Fast retransmit sent via transmit_tcp_segment
                 }
@@ -6158,9 +6158,9 @@ impl SocketTable {
 
         // Collect sockets for cleanup and FIN retransmissions
         let mut to_cleanup: Vec<Arc<SocketState>> = Vec::new();
-        let mut fin_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
+        let mut fin_retransmit: Vec<(Ipv4Addr, Vec<u8>, u64)> = Vec::new();
         // Data segment retransmissions (TCP retransmission RFC 6298)
-        let mut data_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
+        let mut data_retransmit: Vec<(Ipv4Addr, Vec<u8>, u64)> = Vec::new();
         // R149-2 FIX: Track whether any expired SYN entries were detected
         // (non-destructive; actual removal deferred to blocking path).
         let mut has_expired_syn = false;
@@ -6351,7 +6351,7 @@ impl SocketTable {
                                 // R57-1: Update activity timestamp for idle detection
                                 tcp_state.control.last_activity = current_time_ms;
 
-                                data_retransmit.push((remote_ip, seg_bytes));
+                                data_retransmit.push((remote_ip, seg_bytes, sock.net_ns_id.0));
                             }
 
                             // Exponential backoff: double RTO on each retransmission
@@ -6444,7 +6444,7 @@ impl SocketTable {
                                     tcp_state.control.fin_retries.saturating_add(1);
                                 tcp_state.control.fin_sent_time = current_time_ms;
 
-                                fin_retransmit.push((remote_ip, seg));
+                                fin_retransmit.push((remote_ip, seg, sock.net_ns_id.0));
                             }
                         }
                     }
@@ -6524,13 +6524,13 @@ impl SocketTable {
         let needs_blocking_cleanup = !to_cleanup.is_empty() || has_expired_syn;
 
         // Transmit any pending FIN retransmissions (best-effort, no locks needed)
-        for (dst_ip, seg) in fin_retransmit {
-            let _ = transmit_tcp_segment(dst_ip, &seg);
+        for (dst_ip, seg, ns_id) in fin_retransmit {
+            let _ = transmit_tcp_segment(dst_ip, &seg, ns_id);
         }
 
         // Transmit data segment retransmissions (RFC 6298, no locks needed)
-        for (dst_ip, seg) in data_retransmit {
-            let _ = transmit_tcp_segment(dst_ip, &seg);
+        for (dst_ip, seg, ns_id) in data_retransmit {
+            let _ = transmit_tcp_segment(dst_ip, &seg, ns_id);
         }
 
         // If any sockets need blocking cleanup, signal incomplete to caller
@@ -6562,8 +6562,8 @@ impl SocketTable {
 
         // Collect sockets for cleanup and FIN retransmissions
         let mut to_cleanup: Vec<Arc<SocketState>> = Vec::new();
-        let mut fin_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
-        let mut data_retransmit: Vec<(Ipv4Addr, Vec<u8>)> = Vec::new();
+        let mut fin_retransmit: Vec<(Ipv4Addr, Vec<u8>, u64)> = Vec::new();
+        let mut data_retransmit: Vec<(Ipv4Addr, Vec<u8>, u64)> = Vec::new();
         let mut syn_timeouts: Vec<(Arc<SocketState>, Ipv4Addr, Option<Vec<u8>>)> = Vec::new();
         // R148-I3 FIX: Collect keepalive probes to send after releasing locks.
         // R160-8 FIX: Extended tuple includes conntrack seeding metadata.
@@ -6694,7 +6694,7 @@ impl SocketTable {
                                 first_seg.sent_at = current_time_ms;
                                 tcp_state.control.last_activity = current_time_ms;
 
-                                data_retransmit.push((remote_ip, seg_bytes));
+                                data_retransmit.push((remote_ip, seg_bytes, sock.net_ns_id.0));
                             }
 
                             tcp_state.control.retries = tcp_state.control.retries.saturating_add(1);
@@ -6829,7 +6829,7 @@ impl SocketTable {
                                 tcp_state.control.fin_retries.saturating_add(1);
                             tcp_state.control.fin_sent_time = current_time_ms;
 
-                            fin_retransmit.push((remote_ip, seg));
+                            fin_retransmit.push((remote_ip, seg, sock.net_ns_id.0));
                         }
                     }
                 }
@@ -6927,10 +6927,11 @@ impl SocketTable {
         }
 
         for (child, dst_ip, rst_seg) in syn_timeouts {
+            let child_ns = child.net_ns_id.0;
             child.mark_closed();
             self.cleanup_tcp_connection(&child);
             if let Some(seg) = rst_seg {
-                let _ = transmit_tcp_segment(dst_ip, &seg);
+                let _ = transmit_tcp_segment(dst_ip, &seg, child_ns);
             }
             ids_to_remove.push(child.id);
         }
@@ -6952,12 +6953,12 @@ impl SocketTable {
             self.dec_ns_count(ns_id);
         }
 
-        for (dst_ip, seg) in fin_retransmit {
-            let _ = transmit_tcp_segment(dst_ip, &seg);
+        for (dst_ip, seg, ns_id) in fin_retransmit {
+            let _ = transmit_tcp_segment(dst_ip, &seg, ns_id);
         }
 
-        for (dst_ip, seg) in data_retransmit {
-            let _ = transmit_tcp_segment(dst_ip, &seg);
+        for (dst_ip, seg, ns_id) in data_retransmit {
+            let _ = transmit_tcp_segment(dst_ip, &seg, ns_id);
         }
 
         // R148-I3 + R160-8 FIX: Send keepalive probes with conntrack seeding.
@@ -6972,7 +6973,7 @@ impl SocketTable {
                     TCP_FLAG_ACK, 0, current_time_ms,
                 );
             }
-            let _ = transmit_tcp_segment(dst_ip, &seg);
+            let _ = transmit_tcp_segment(dst_ip, &seg, ns_id);
         }
 
         // Blocking variant always succeeds

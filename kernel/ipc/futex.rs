@@ -485,9 +485,16 @@ pub fn futex_unlock_pi(tgid: ProcessId, uaddr: usize) -> Result<usize, FutexErro
             return Err(FutexError::InvalidOperation);
         }
 
-        // 移除已退出的等待者，避免唤醒僵尸
-        b.pi_waiters
-            .retain(|waiter, _| process::get_process(*waiter).is_some());
+        // R162-8-2 FIX: Filter out zombie/terminated waiters (not just reaped).
+        b.pi_waiters.retain(|waiter, _| {
+            match process::get_process(*waiter) {
+                None => false,
+                Some(proc_arc) => !matches!(
+                    proc_arc.lock().state,
+                    process::ProcessState::Zombie | process::ProcessState::Terminated
+                ),
+            }
+        });
 
         let queue = b.queue.clone();
         let next = select_highest_waiter(&b.pi_waiters);
@@ -848,9 +855,16 @@ fn apply_pi_and_propagate(
 fn recompute_pi_state(key: FutexKey, bucket: &Arc<Mutex<FutexBucket>>) {
     let (owner, donation) = {
         let mut b = bucket.lock();
-        // 清理已退出的 owner
+        // R162-8-1 FIX: Detect zombie/terminated owners (same pattern as R161-13).
         if let Some(owner_pid) = b.owner {
-            if process::get_process(owner_pid).is_none() {
+            let owner_dead = match process::get_process(owner_pid) {
+                None => true,
+                Some(proc_arc) => {
+                    let state = proc_arc.lock().state;
+                    matches!(state, process::ProcessState::Zombie | process::ProcessState::Terminated)
+                }
+            };
+            if owner_dead {
                 b.owner = None;
                 b.owner_dead = true;
             }

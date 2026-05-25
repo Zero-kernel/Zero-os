@@ -1313,7 +1313,16 @@ fn isolate_device(record: &FaultRecord, segment: u16, unit: &Arc<VtdUnit>) {
     }
 
     // R86-2 FIX: Serialize PCI config space access to prevent RMW races
-    let _pci_lock = PCI_CONFIG_LOCK.lock();
+    // R162-10-2 FIX: Use try_lock to avoid deadlock when called from IRQ
+    // context (handle_dma_faults via timer). If lock is contended, skip
+    // isolation this tick — the fault handler will retry on next invocation.
+    let Some(_pci_lock) = PCI_CONFIG_LOCK.try_lock() else {
+        kprintln!(
+            "[IOMMU] Isolation deferred: PCI_CONFIG_LOCK contended for {:02x}:{:02x}.{}",
+            bus, device, function
+        );
+        return;
+    };
 
     // Validate device exists by checking vendor ID
     let vendor_device = pci_cfg_read32(bus, device, function, 0x00);

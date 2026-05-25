@@ -996,8 +996,11 @@ pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
             }
             Err(e) => {
                 // R82-3 FIX: Disable bus mastering on MMIO mapping failure
+                // R162-10-1 FIX: Acquire PCI_CONFIG_LOCK for RMW serialization
+                let _pci_lock = iommu::PCI_CONFIG_LOCK.lock();
                 let cmd = pci::pci_config_read32(pci_id.bus, pci_id.device, pci_id.function, 0x04) as u16;
                 pci::pci_config_write16(pci_id.bus, pci_id.device, pci_id.function, 0x04, cmd & !0x04);
+                drop(_pci_lock);
                 klog!(Error,
                     "    Failed to map virtio-blk MMIO region {:#x}-{:#x}: {:?} (bus master disabled)",
                     min_phys, max_phys, e
@@ -1025,8 +1028,11 @@ pub fn probe_devices() -> Option<(Arc<dyn BlockDevice>, &'static str)> {
             }
             Err(e) => {
                 // R82-3 FIX: Disable bus mastering on driver probe failure
+                // R162-10-1 FIX: Acquire PCI_CONFIG_LOCK for RMW serialization
+                let _pci_lock = iommu::PCI_CONFIG_LOCK.lock();
                 let cmd = pci::pci_config_read32(pci_id.bus, pci_id.device, pci_id.function, 0x04) as u16;
                 pci::pci_config_write16(pci_id.bus, pci_id.device, pci_id.function, 0x04, cmd & !0x04);
+                drop(_pci_lock);
                 klog!(Warn,
                     "    Failed to probe virtio-blk /dev/{} @ {:02x}:{:02x}.{} (pci caps @ {:#x}): {:?} (bus master disabled)",
                     name,

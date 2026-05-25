@@ -933,10 +933,12 @@ fn resolve_dst_mac(dst_ip: Ipv4Addr, cfg: &NetConfigSnapshot) -> EthAddr {
 }
 
 /// Build complete Ethernet frame and transmit via network device.
+/// R162-7-2 FIX: Added net_ns_id for per-namespace egress firewall evaluation.
 fn build_frame_and_transmit(
     proto: Ipv4Proto,
     dst_ip: Ipv4Addr,
     payload: &[u8],
+    net_ns_id: u64,
 ) -> Result<(), TxError> {
     if payload.is_empty() || payload.len() > DEFAULT_MTU {
         return Err(TxError::InvalidBuffer);
@@ -966,7 +968,7 @@ fn build_frame_and_transmit(
         // default ESTABLISHED|RELATED ACCEPT rule to not match, triggering
         // default-DROP on all egress.
         let fw_pkt = FirewallPacket {
-            net_ns_id: 0,
+            net_ns_id,
             src_ip: cfg_pre.our_ip,
             dst_ip,
             proto,
@@ -974,7 +976,7 @@ fn build_frame_and_transmit(
             dst_port,
             ct_state: Some(crate::conntrack::CtDecision::Established),
         };
-        let fw_table = firewall_table_for_ns(0);
+        let fw_table = firewall_table_for_ns(net_ns_id);
         let fw_verdict = fw_table.evaluate(&fw_pkt);
         if matches!(fw_verdict.action, FirewallAction::Drop | FirewallAction::Reject { .. }) {
             return Err(TxError::InvalidBuffer);
@@ -1039,8 +1041,8 @@ fn build_frame_and_transmit(
 /// # Returns
 /// * `Ok(())` on successful transmission
 /// * `Err(TxError)` on failure
-pub fn transmit_tcp_segment(dst_ip: Ipv4Addr, segment: &[u8]) -> Result<(), TxError> {
-    build_frame_and_transmit(Ipv4Proto::Tcp, dst_ip, segment)
+pub fn transmit_tcp_segment(dst_ip: Ipv4Addr, segment: &[u8], net_ns_id: u64) -> Result<(), TxError> {
+    build_frame_and_transmit(Ipv4Proto::Tcp, dst_ip, segment, net_ns_id)
 }
 
 /// Transmit a serialized UDP datagram (without IP/Ethernet headers).
@@ -1055,8 +1057,8 @@ pub fn transmit_tcp_segment(dst_ip: Ipv4Addr, segment: &[u8]) -> Result<(), TxEr
 /// # Returns
 /// * `Ok(())` on successful transmission
 /// * `Err(TxError)` on failure
-pub fn transmit_udp_datagram(dst_ip: Ipv4Addr, datagram: &[u8]) -> Result<(), TxError> {
-    build_frame_and_transmit(Ipv4Proto::Udp, dst_ip, datagram)
+pub fn transmit_udp_datagram(dst_ip: Ipv4Addr, datagram: &[u8], net_ns_id: u64) -> Result<(), TxError> {
+    build_frame_and_transmit(Ipv4Proto::Udp, dst_ip, datagram, net_ns_id)
 }
 
 // ============================================================================
