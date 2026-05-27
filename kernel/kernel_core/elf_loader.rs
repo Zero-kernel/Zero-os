@@ -290,6 +290,21 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
         return Err(ElfLoadError::SegmentOutOfRange);
     }
 
+    // R162-23 FIX: Verify entry point falls within a loaded PT_LOAD segment.
+    // A crafted ELF could set e_entry to an unmapped gap between segments,
+    // causing the process to fault immediately on execution.
+    let entry_in_segment = loaded_ranges.iter().any(|&(start, end)| {
+        (entry as usize) >= start && (entry as usize) < end
+    });
+    if !entry_in_segment {
+        klog!(Error,
+            "ELF loader: entry point 0x{:x} not within any loaded segment",
+            entry
+        );
+        rollback_all_mappings(&mut all_mappings, cgroup_id);
+        return Err(ElfLoadError::SegmentOutOfRange);
+    }
+
     // 【修复】初始 RSP 必须在已映射的栈页内
     // 栈分配从 (USER_STACK_TOP - USER_STACK_SIZE) 到 USER_STACK_TOP
     // 但 USER_STACK_TOP 所在的页边界不在映射范围内

@@ -1794,6 +1794,7 @@ fn socket_error_to_syscall(err: net::SocketError) -> SyscallError {
         // R107-5 FIX: Socket ID counter overflow (u64 exhaustion) maps to ENOSPC
         net::SocketError::IdExhausted => SyscallError::ENOSPC,
         net::SocketError::Lsm(e) => lsm_error_to_syscall(e),
+        net::SocketError::NoMemory => SyscallError::ENOMEM,
     }
 }
 
@@ -2838,11 +2839,6 @@ fn sys_clone(
         parent_tgid,
         parent_thread_group_exiting, // R153-3 FIX: shared exiting flag
         parent_mm_arc,  // D3-ARC-MM-SHARED: shared mm Arc for CLONE_VM
-        _parent_mmap,    // Unused: CLONE_VM shares mm Arc; fork path returns early
-        _parent_next_mmap,
-        _parent_brk_start,
-        _parent_brk,
-        _parent_elf_charged_bytes,
         parent_name,
         parent_priority,
         parent_cgroup_id,     // R123-2 FIX: for cgroup attachment after create_process
@@ -2906,30 +2902,12 @@ fn sys_clone(
             Arc::new(parent.cap_table.try_clone_for_fork().map_err(|_| SyscallError::ENOMEM)?)
         };
 
-        // R157-3 FIX: Fallible mmap_regions snapshot. BTreeMap::collect()
-        // uses infallible allocation; 65536 entries can exhaust 1 MiB heap.
-        // Pre-allocate Vec (single large alloc, fallible), then build BTreeMap
-        // from it (many small ~512B node allocs, much less likely to fail).
         // D3-ARC-MM-SHARED: Clone mm Arc for CLONE_VM sharing.
-        // Also snapshot mm fields for the non-CLONE_VM (fork) path.
+        // R162-5 FIX: Removed dead mmap_snapshot code. Under D3-ARC-MM-SHARED,
+        // CLONE_VM shares the Arc directly and fork returns early from sys_clone.
+        // The mmap_snapshot BTreeMap was never used but performed up to 65536
+        // infallible BTreeMap node allocations under the parent lock.
         let parent_mm_arc_clone = Arc::clone(&parent.mm);
-        let parent_mm = parent.mm.lock();
-        let mmap_snapshot: alloc::collections::BTreeMap<usize, usize> = {
-            let count = parent_mm.mmap_regions.len();
-            let mut snap: Vec<(usize, usize)> = Vec::new();
-            if snap.try_reserve_exact(count).is_err() {
-                return Err(SyscallError::ENOMEM);
-            }
-            snap.extend(parent_mm.mmap_regions.iter().map(|(&base, &len_with_flags)| {
-                (base, len_with_flags & !MMAP_REGION_FLAG_TRANSIENT_MASK)
-            }));
-            snap.into_iter().collect()
-        };
-        let parent_next_mmap_snap = parent_mm.next_mmap_addr;
-        let parent_brk_start_snap = parent_mm.brk_start;
-        let parent_brk_snap = parent_mm.brk;
-        let parent_elf_charged_snap = parent_mm.elf_charged_bytes;
-        drop(parent_mm);
 
         (
             parent.memory_space,
@@ -2937,11 +2915,6 @@ fn sys_clone(
             parent.tgid,
             parent.thread_group_exiting.clone(), // R153-3 FIX
             parent_mm_arc_clone, // D3-ARC-MM-SHARED
-            mmap_snapshot,
-            parent_next_mmap_snap,
-            parent_brk_start_snap,
-            parent_brk_snap,
-            parent_elf_charged_snap,
             parent.name.clone(),
             parent.priority,
             parent.cgroup_id,     // R123-2 FIX
@@ -4413,10 +4386,15 @@ fn sys_exec(
 
     // 释放旧地址空间
     // H.3 KPTI: Free old user PML4 before old kernel PML4 (shared sub-tables).
-    if old_user_space != 0 {
-        crate::fork::free_kpti_user_pml4(old_user_space);
-    }
-    if old_space != 0 {
+    // R162-4 FIX: Re-verify that no CLONE_VM sibling was created during the
+    // lock-free exec window (ELF loading, CR3 switch). If a concurrent
+    // sys_clone(CLONE_VM) created a new sibling referencing old_space after
+    // the initial share_count check at line ~3848, freeing old_space here
+    // would cause UAF of the sibling's page tables.
+    if old_space != 0 && address_space_share_count(old_space) == 0 {
+        if old_user_space != 0 {
+            crate::fork::free_kpti_user_pml4(old_user_space);
+        }
         free_address_space(old_space);
     }
 
@@ -5395,11 +5373,28 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
     // R158-I9 FIX: Accept non-UTF-8 bytes (POSIX write(2) is byte-oriented).
     // Display valid UTF-8 as text; replace invalid sequences with U+FFFD.
     if fd == 1 || fd == 2 {
+        // R162-17 FIX: Avoid infallible from_utf8_lossy which can allocate ~3x
+        // input size on all-invalid bytes. Print in chunks using from_utf8
+        // on valid spans and individual replacement chars for invalid bytes.
         match core::str::from_utf8(&tmp) {
             Ok(s) => print!("{}", s),
             Err(_) => {
-                let s = alloc::string::String::from_utf8_lossy(&tmp);
-                print!("{}", s);
+                let mut i = 0;
+                while i < tmp.len() {
+                    match core::str::from_utf8(&tmp[i..]) {
+                        Ok(s) => { print!("{}", s); break; }
+                        Err(e) => {
+                            let valid_end = e.valid_up_to();
+                            if valid_end > 0 {
+                                if let Ok(valid) = core::str::from_utf8(&tmp[i..i + valid_end]) {
+                                    print!("{}", valid);
+                                }
+                            }
+                            print!("\u{FFFD}");
+                            i += valid_end + e.error_len().unwrap_or(1);
+                        }
+                    }
+                }
             }
         }
         Ok(tmp.len())
@@ -6054,7 +6049,9 @@ fn sys_brk(addr: usize) -> SyscallResult {
         }
 
         // F.2 Cgroup: Charge memory before heap expansion.
-        // Uses CAS-based try_charge_memory() to atomically check limit and update usage.
+        // R162-12 FIX: Re-read cgroup_id fresh — the cached value from line ~5993
+        // may be stale if cgroup migration occurred during mm lock drops.
+        let cgroup_id = process.lock().cgroup_id;
         if cgroup::try_charge_memory(cgroup_id, grow_size as u64).is_err() {
             return Ok(old_brk); // Quota exceeded, return current brk
         }
@@ -6210,12 +6207,22 @@ fn sys_brk(addr: usize) -> SyscallResult {
         }
 
         // D3-ARC-MM-SHARED: Update brk and charge counters in shared MmState.
+        // R162-2 FIX: Re-verify mm.brk == old_brk at commit. If a concurrent
+        // CLONE_VM thread called sys_brk while our lock was dropped for PT ops,
+        // mm.brk may have advanced. In that case, uncharge the stale growth
+        // and return current brk — our mapped pages overlap with the other
+        // thread's and will be reused (translate_addr skips already-mapped).
         {
             let mut mm = mm_arc.lock();
+            if mm.brk != old_brk {
+                mm.brk_pending_growth = 0;
+                drop(mm);
+                let rollback_cgroup_id = process.lock().cgroup_id;
+                cgroup::uncharge_memory(rollback_cgroup_id, grow_size as u64);
+                return Ok(mm_arc.lock().brk);
+            }
             mm.brk = addr;
-            // R144-1 FIX: brk is now updated — clear pending growth.
             mm.brk_pending_growth = 0;
-            // R131-6 FIX: Track brk growth in per-address-space charge counter.
             mm.vm_charged_bytes = mm
                 .vm_charged_bytes
                 .saturating_add(grow_size as u64);
@@ -7057,7 +7064,10 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                     return Err(SyscallError::ENOMEM);
                 }
                 let mut mm = mm_arc.lock();
-                mm.mprotect_pending_bytes = region_len as u64;
+                // R162-3 FIX: Accumulate instead of overwrite to prevent concurrent
+                // mprotect operations from clobbering each other's pending charge.
+                mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
+                    .saturating_add(region_len as u64);
                 // R149-6 FIX: Set transient flag so concurrent munmap sees
                 // the in-flight mprotect and returns EBUSY.
                 if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
@@ -7065,7 +7075,10 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 } else {
                     // Region vanished between Phase 0 classification and here;
                     // roll back the charge and fail.
-                    mm.mprotect_pending_bytes = 0;
+                    // R162-3 FIX: Decrement instead of zeroing to preserve
+                    // other concurrent mprotect operations' pending charges.
+                    mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
+                        .saturating_sub(region_len as u64);
                     drop(mm);
                     drop(proc);
                     cgroup::uncharge_memory(cgroup_id, region_len as u64);
@@ -7194,7 +7207,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 let rollback_cgroup_id = {
                     let proc = process.lock();
                     let mut mm = mm_arc.lock();
-                    mm.mprotect_pending_bytes = 0;
+                    mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
+                        .saturating_sub(region_len as u64);
                     // R149-6 FIX: Clear the transient mprotect flag on rollback.
                     if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
                         *entry &= !MMAP_REGION_FLAG_PENDING_MPROTECT;
@@ -7228,13 +7242,15 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                             .vm_charged_bytes
                             .saturating_add(region_len as u64);
                         // R147-1 FIX: Charge is now reflected in mmap_regions.
-                        mm.mprotect_pending_bytes = 0;
+                        mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
+                            .saturating_sub(region_len as u64);
                         Ok(new_entry)
                     }
                     _ => {
                         // Entry gone or flag cleared — concurrent munmap removed it.
                         // Roll back: uncharge the cgroup to prevent permanent leak.
-                        mm.mprotect_pending_bytes = 0;
+                        mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
+                            .saturating_sub(region_len as u64);
                         Err(())
                     }
                 }
@@ -7323,14 +7339,16 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
             // D3-ARC-MM-SHARED: Commit bookkeeping directly in shared MmState.
             // atomic_mprotect_prot_none_transition is no longer needed — all
             // CLONE_VM siblings share the same MmState via Arc<Mutex<MmState>>.
+            // R162-1 FIX: Condition was inverted — when PROT_NONE flag is ABSENT
+            // (region is real), we SHOULD transition it; when flag is PRESENT
+            // (already PROT_NONE), a concurrent mprotect already transitioned it.
             let did_transition = {
                 let mut mm = mm_arc.lock();
                 if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
                     let old = *entry;
-                    if (old & MMAP_REGION_FLAG_PROT_NONE) == 0 {
-                        false // Already not PROT_NONE; someone else transitioned it.
+                    if (old & MMAP_REGION_FLAG_PROT_NONE) != 0 {
+                        false // Already PROT_NONE; concurrent mprotect transitioned it.
                     } else {
-                        // Set PROT_NONE flag, clear prot bits, update prot display bits
                         *entry = region_len | MMAP_REGION_FLAG_PROT_NONE;
                         mm.vm_charged_bytes = mm
                             .vm_charged_bytes
@@ -9824,23 +9842,23 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
     }
 
     // Fill optional peer address
+    // R162-11 FIX: addr copy failure is non-fatal — the connection is already
+    // established and the child fd is valid. Destroying the child socket on
+    // EFAULT during addr copy allows a malicious process to silently kill
+    // incoming connections by providing invalid addr pointers. Instead, skip
+    // the addr copy on validation failure (Linux behavior).
     if !addr.is_null() && !addrlen.is_null() {
         if let (Some(rip), Some(rport)) = (child.remote_ip(), child.remote_port()) {
             let mut out = SockAddrIn::default();
             out.sin_family = AF_INET as u16;
             out.sin_port = rport.to_be();
-            // R152-7 FIX: Use from_be_bytes directly instead of from_le_bytes().swap_bytes()
             out.sin_addr = u32::from_be_bytes(rip);
 
-            if let Err(e) = validate_user_ptr(addr as *const u8, core::mem::size_of::<SockAddrIn>())
-            {
-                cleanup_child(&child);
-                return Err(e);
-            }
-            if let Err(e) = validate_user_ptr(addrlen as *const u8, core::mem::size_of::<u32>()) {
-                cleanup_child(&child);
-                return Err(e);
-            }
+            let addr_valid = validate_user_ptr(addr as *const u8, core::mem::size_of::<SockAddrIn>()).is_ok()
+                && validate_user_ptr(addrlen as *const u8, core::mem::size_of::<u32>()).is_ok();
+            if !addr_valid {
+                // Skip addr copy but don't destroy the child — proceed to return fd.
+            } else {
 
             // Convert struct to bytes for copy_to_user
             // lint-repr-c-copy: allow (no-padding: SockAddrIn {u16,u16,u32,[u8;8]} = 16 bytes)
@@ -9850,15 +9868,10 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
                     core::mem::size_of::<SockAddrIn>(),
                 )
             };
-            if let Err(e) = copy_to_user(addr as *mut u8, out_bytes) {
-                cleanup_child(&child);
-                return Err(e);
-            }
-
+            // R162-11 FIX: copy_to_user failure is also non-fatal for addr fill.
+            let _ = copy_to_user(addr as *mut u8, out_bytes);
             let len_val = core::mem::size_of::<SockAddrIn>() as u32;
-            if let Err(e) = copy_to_user(addrlen as *mut u8, &len_val.to_ne_bytes()) {
-                cleanup_child(&child);
-                return Err(e);
+            let _ = copy_to_user(addrlen as *mut u8, &len_val.to_ne_bytes());
             }
         }
     }
@@ -10188,9 +10201,13 @@ fn sys_sendto(
             .tcp_send(&socket, &ctx, cap_id, &data)
             .map_err(socket_error_to_syscall)?;
 
-        // Transmit all TCP segments via network device
+        // Transmit all TCP segments via network device.
+        // R162-10 FIX: Ignore transmit failures — data is already committed
+        // to the TCP send buffer with snd_nxt advanced. The retransmission
+        // timer will re-send on failure. Returning an error here would cause
+        // the caller to re-send, creating duplicate data in the TCP stream.
         for segment in segments {
-            net::transmit_tcp_segment(remote_ip, &segment, socket.net_ns_id.0).map_err(tx_error_to_syscall)?;
+            let _ = net::transmit_tcp_segment(remote_ip, &segment, socket.net_ns_id.0);
         }
 
         return Ok(bytes_sent);
@@ -10934,14 +10951,12 @@ fn sys_cgroup_set_limit(cgroup_id: u64, limit_type: u32, value: u64) -> Result<u
 /// * On success: 0
 /// * On error: Negative errno
 fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usize, SyscallError> {
-    // Validate user pointer
+    // R162-13 FIX: Use validate_user_ptr_mut for full range check (start + size).
+    // Previously only checked start address, not that the entire struct fits.
     if buf.is_null() {
         return Err(SyscallError::EFAULT);
     }
-    let buf_addr = buf as usize;
-    if buf_addr < crate::usercopy::MMAP_MIN_ADDR || buf_addr >= USER_SPACE_TOP {
-        return Err(SyscallError::EFAULT);
-    }
+    validate_user_ptr_mut(buf as *mut u8, core::mem::size_of::<CgroupStatsBuf>())?;
 
     // P1-3: Stats access should respect delegation boundaries.
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.

@@ -912,8 +912,9 @@ fn resolve_dst_mac(dst_ip: Ipv4Addr, cfg: &NetConfigSnapshot) -> EthAddr {
     let state = net_state();
     let mut cache = state.arp.lock();
 
-    // Static timestamp (proper implementation would use kernel time)
-    let now_ms = 0;
+    // R162-20 FIX: Use actual kernel time for ARP cache TTL checks.
+    // Previously hardcoded to 0, causing dynamic entries to never expire.
+    let now_ms = crate::socket::socket_wait_hooks_get_ticks().unwrap_or(0);
 
     // Ensure gateway is always in cache
     let _ = cache.insert(
@@ -962,11 +963,29 @@ fn build_frame_and_transmit(
             (None, None)
         };
         let cfg_pre = network_config();
-        // R162-7-1 FIX: Pass Established for egress. All kernel-generated
-        // outbound packets originate from flows already seeded in conntrack
-        // (sys_connect/sys_sendto seed before TX). Passing None caused the
-        // default ESTABLISHED|RELATED ACCEPT rule to not match, triggering
-        // default-DROP on all egress.
+        // R162-18 FIX: Derive ct_state from actual conntrack lookup instead of
+        // hardcoding Established. The old hardcoded value caused egress rules
+        // that match on NEW state to never fire for outbound packets.
+        let ct_decision = {
+            let sp = src_port.unwrap_or(0);
+            let dp = dst_port.unwrap_or(0);
+            let proto_u8 = match proto {
+                Ipv4Proto::Tcp => 6u8,
+                Ipv4Proto::Udp => 17u8,
+                Ipv4Proto::Icmp => 1u8,
+                _ => 0u8,
+            };
+            let (key, _) = crate::conntrack::FlowKey::from_packet(
+                net_ns_id, proto_u8, cfg_pre.our_ip, dst_ip, sp, dp,
+            );
+            crate::conntrack::conntrack_table()
+                .lookup(&key)
+                .map(|e| if e.seen_reply {
+                    crate::conntrack::CtDecision::Established
+                } else {
+                    crate::conntrack::CtDecision::New
+                })
+        };
         let fw_pkt = FirewallPacket {
             net_ns_id,
             src_ip: cfg_pre.our_ip,
@@ -974,7 +993,7 @@ fn build_frame_and_transmit(
             proto,
             src_port,
             dst_port,
-            ct_state: Some(crate::conntrack::CtDecision::Established),
+            ct_state: ct_decision,
         };
         let fw_table = firewall_table_for_ns(net_ns_id);
         let fw_verdict = fw_table.evaluate(&fw_pkt);

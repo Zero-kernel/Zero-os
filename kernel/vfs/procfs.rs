@@ -1398,24 +1398,35 @@ fn generate_status(pid: u32) -> String {
         return String::new();
     }
 
-    let table = PROCESS_TABLE.lock();
+    // R162-I1 FIX: Snapshot all data under PROCESS_TABLE lock, then drop
+    // the lock before namespace PID translation and string formatting.
+    // Previously held PROCESS_TABLE across pid_in_namespace + format!.
+    struct StatusSnap {
+        name: alloc::string::String,
+        umask: u16,
+        state_char: char,
+        state_name: &'static str,
+        tgid: usize,
+        pid_val: usize,
+        ppid: usize,
+        uid: u32,
+        euid: u32,
+        gid: u32,
+        egid: u32,
+        pid_ns_chain: alloc::vec::Vec<kernel_core::PidNamespaceMembership>,
+    }
 
-    // R140-7 FIX: Resolve the caller's owning PID namespace so that PIDs
-    // emitted in /proc/[pid]/status are namespace-local, not global kernel PIDs.
-    let caller_ns = process::current_pid()
-        .and_then(|cur_pid| table.get(cur_pid))
-        .and_then(|slot| slot.as_ref())
-        .and_then(|proc_arc| {
+    let (snap, caller_chain): (Option<StatusSnap>, alloc::vec::Vec<kernel_core::PidNamespaceMembership>) = {
+        let table = PROCESS_TABLE.lock();
+        let caller_chain = process::current_pid()
+            .and_then(|cur_pid| table.get(cur_pid))
+            .and_then(|slot| slot.as_ref())
+            .map(|proc_arc| proc_arc.lock().pid_ns_chain.clone())
+            .unwrap_or_default();
+
+        let s = table.get(pid as usize).and_then(|slot| slot.as_ref()).map(|proc_arc| {
             let p = proc_arc.lock();
-            kernel_core::owning_namespace(&p.pid_ns_chain)
-        });
-
-    match table.get(pid as usize) {
-        Some(Some(proc)) => {
-            let p = proc.lock();
-            // R98-1 FIX: Check orthogonal stopped flag before scheduler state.
-            // Zombie/Terminated take priority, then stopped flag, then scheduler state.
-            let (state_char, state_name) = match p.state {
+            let (sc, sn) = match p.state {
                 ProcessState::Zombie => ('Z', "zombie"),
                 ProcessState::Terminated => ('X', "dead"),
                 ProcessState::Stopped => ('T', "stopped"),
@@ -1423,20 +1434,37 @@ fn generate_status(pid: u32) -> String {
                 ProcessState::Ready | ProcessState::Running => ('R', "running"),
                 ProcessState::Blocked | ProcessState::Sleeping => ('S', "sleeping"),
             };
-            // R39-3 FIX: 使用共享凭证读取 uid/gid/euid/egid
             let creds = p.credentials.read();
+            StatusSnap {
+                name: p.name.clone(),
+                umask: p.umask,
+                state_char: sc,
+                state_name: sn,
+                tgid: p.tgid,
+                pid_val: p.pid,
+                ppid: p.ppid,
+                uid: creds.uid,
+                euid: creds.euid,
+                gid: creds.gid,
+                egid: creds.egid,
+                pid_ns_chain: p.pid_ns_chain.clone(),
+            }
+        });
+        (s, caller_chain)
+    };
+    // PROCESS_TABLE lock dropped here
 
-            // R140-7 FIX: Emit namespace-local PIDs as seen from the caller's
-            // owning PID namespace.  Cross-namespace parents are shown as 0.
+    match snap {
+        Some(s) => {
+            let caller_ns = kernel_core::owning_namespace(&caller_chain);
             let (ns_tgid, ns_pid, ns_ppid) = if let Some(ref ns) = caller_ns {
                 (
-                    kernel_core::pid_in_namespace(ns, p.tgid).unwrap_or(0),
-                    kernel_core::pid_in_namespace(ns, p.pid).unwrap_or(0),
-                    kernel_core::pid_in_namespace(ns, p.ppid).unwrap_or(0),
+                    kernel_core::pid_in_namespace(ns, s.tgid).unwrap_or(0),
+                    kernel_core::pid_in_namespace(ns, s.pid_val).unwrap_or(0),
+                    kernel_core::pid_in_namespace(ns, s.ppid).unwrap_or(0),
                 )
             } else {
-                // Kernel context (no namespace): global view.
-                (p.tgid, p.pid, p.ppid)
+                (s.tgid, s.pid_val, s.ppid)
             };
 
             format!(
@@ -1449,21 +1477,10 @@ fn generate_status(pid: u32) -> String {
                  Uid:\t{}\t{}\t{}\t{}\n\
                  Gid:\t{}\t{}\t{}\t{}\n\
                  Threads:\t1\n",
-                p.name,
-                p.umask,
-                state_char,
-                state_name,
-                ns_tgid,
-                ns_pid,
-                ns_ppid,
-                creds.uid,
-                creds.euid,
-                creds.uid,
-                creds.uid, // real, effective, saved, fs
-                creds.gid,
-                creds.egid,
-                creds.gid,
-                creds.gid,
+                s.name, s.umask, s.state_char, s.state_name,
+                ns_tgid, ns_pid, ns_ppid,
+                s.uid, s.euid, s.uid, s.uid,
+                s.gid, s.egid, s.gid, s.gid,
             )
         }
         _ => String::new(),
@@ -1545,28 +1562,38 @@ const MAX_MAPS_OUTPUT: usize = 64 * 1024;
 /// to prevent kernel OOM from processes with many mmap regions. When the
 /// budget is exceeded, a `... (truncated)\n` marker is appended.
 fn generate_maps(pid: u32) -> String {
-    let table = PROCESS_TABLE.lock();
-    if let Some(Some(proc)) = table.get(pid as usize) {
-        let proc = proc.lock();
+    // R162-I2 FIX: Snapshot mmap_regions and user_stack under locks, then drop
+    // all locks before string formatting. This eliminates triple-nested lock
+    // hold (PROCESS_TABLE → Process → MmState) during format! calls.
+    let snapshot: Option<(Vec<(usize, usize)>, Option<u64>)> = {
+        let table = PROCESS_TABLE.lock();
+        if let Some(Some(proc_arc)) = table.get(pid as usize) {
+            let proc = proc_arc.lock();
+            let mm = proc.mm.lock();
+            let regions: Vec<(usize, usize)> = mm.mmap_regions.iter()
+                .take(MAX_MAPS_ENTRIES)
+                .map(|(&start, &size)| (start, size))
+                .collect();
+            let stack = proc.user_stack.map(|s| s.as_u64());
+            Some((regions, stack))
+        } else {
+            None
+        }
+    };
+
+    if let Some((regions, user_stack)) = snapshot {
         let mut result = String::new();
         let mut entries = 0usize;
         let mut truncated = false;
 
-        // Output mmap regions
-        // R36-FIX: Use 16 hex digits for 64-bit addresses
-        let mm = proc.mm.lock();
-        for (&start, &size) in &mm.mmap_regions {
+        for &(start, size) in &regions {
             if entries >= MAX_MAPS_ENTRIES || result.len() > MAX_MAPS_OUTPUT {
                 truncated = true;
                 break;
             }
-            // R121-4 FIX: Strip pending-map/unmap flags from the stored length.
-            // Page-aligned lengths use bits [12..] so mask off low 12 bits.
             let end = start.saturating_add(size & !0xfff);
-            // R144-2 FIX: Decode stored protection bits instead of hardcoding "rw-p".
             let perms = kernel_core::mmap_flags_to_perms(size & 0xfff);
             let perms_str = core::str::from_utf8(&perms).unwrap_or("rw-p");
-            // Format: start-end perms offset dev:inode pathname
             let line = format!(
                 "{:016x}-{:016x} {} 00000000 00:00 0    [anon]\n",
                 start, end, perms_str
@@ -1578,14 +1605,11 @@ fn generate_maps(pid: u32) -> String {
             result.push_str(&line);
             entries += 1;
         }
-        drop(mm);
 
-        // Add stack mapping if present (only if budget allows)
         if !truncated {
-            if let Some(user_stack) = proc.user_stack {
+            if let Some(stack_top) = user_stack {
                 if entries < MAX_MAPS_ENTRIES {
-                    let stack_top = user_stack.as_u64();
-                    let stack_bottom = stack_top.saturating_sub(0x10000); // 64KB stack
+                    let stack_bottom = stack_top.saturating_sub(0x10000);
                     let line = format!(
                         "{:016x}-{:016x} rw-p 00000000 00:00 0    [stack]\n",
                         stack_bottom, stack_top
@@ -1602,7 +1626,6 @@ fn generate_maps(pid: u32) -> String {
         }
 
         if result.is_empty() && !truncated {
-            // Fallback if no mappings
             result.push_str("0000000000400000-0000000000401000 r-xp 00000000 00:00 0    [code]\n");
         }
 

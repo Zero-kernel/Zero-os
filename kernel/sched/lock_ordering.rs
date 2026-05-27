@@ -35,6 +35,7 @@
 //! Level 5 (Process/Thread)
 //! ├── PROCESS_TABLE
 //! ├── Process::inner (per-process mutex)
+//! ├── MmState (Arc<Mutex<MmState>>) - D3-ARC-MM-SHARED: Process → MmState (never reverse)
 //! │
 //! Level 6 (VFS)
 //! ├── VFS root lock

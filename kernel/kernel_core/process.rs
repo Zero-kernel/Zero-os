@@ -3663,7 +3663,9 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTree
     } else if (keep_address_space || mm_shared) && proc.memory_space != 0 {
         // Non-last CLONE_VM exit keeps the shared address space and MmState.
         // Do NOT uncharge — pages remain mapped in the shared page tables.
-        mm.vm_charged_bytes = 0;
+        // R162-16 FIX: Do NOT zero vm_charged_bytes on shared MmState —
+        // surviving siblings still own those charges. The field is a running
+        // counter used by compute_cgroup_charged_bytes() for diagnostics.
     }
 
     // 清理 mmap 区域跟踪 (only clear if we are the last holder)

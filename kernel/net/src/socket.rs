@@ -207,6 +207,11 @@ fn socket_wait_hooks() -> Option<&'static dyn SocketWaitHooks> {
     SOCKET_WAIT_HOOKS.get().copied()
 }
 
+/// R162-20 FIX: Public helper for stack.rs to get kernel ticks via hooks.
+pub fn socket_wait_hooks_get_ticks() -> Option<u64> {
+    socket_wait_hooks().map(|h| h.get_ticks())
+}
+
 /// Simple wait queue with optional scheduler integration.
 ///
 /// When SocketWaitHooks are registered, this queue supports true blocking
@@ -1485,6 +1490,8 @@ pub enum SocketError {
     Udp(UdpError),
     /// LSM policy denial
     Lsm(LsmError),
+    /// R162-9 FIX: Allocation failed
+    NoMemory,
 }
 
 impl From<UdpError> for SocketError {
@@ -2653,9 +2660,15 @@ impl SocketTable {
 
             // Buffer segment for potential retransmission
             // This enables reliable delivery: segments are kept until ACKed
+            // R162-9 FIX: Fallible allocation for retransmission buffer copy.
+            let mut retrans_data = Vec::new();
+            if retrans_data.try_reserve_exact(seg_payload.len()).is_err() {
+                break; // Stop sending more segments; already-buffered ones will be retransmitted
+            }
+            retrans_data.extend_from_slice(seg_payload);
             tcp_state.control.send_buffer.push_back(TcpSegment {
                 seq,
-                data: seg_payload.to_vec(),
+                data: retrans_data,
                 sent_at: now_ms,
                 retrans_count: 0,
                 sacked: false,
@@ -2882,7 +2895,12 @@ impl SocketTable {
                         drop(guard);
                         continue;
                     }
+                    // R162-9 FIX: Fallible allocation for tcp_recv drain buffer.
                     let mut data = Vec::new();
+                    if data.try_reserve_exact(actual_take).is_err() {
+                        drop(guard);
+                        return Err(SocketError::NoMemory);
+                    }
                     for _ in 0..actual_take {
                         if let Some(b) = tcp_state.control.recv_buffer.pop_front() {
                             data.push(b);
@@ -4622,6 +4640,10 @@ impl SocketTable {
                             return Some(win_ack);
                         }
 
+                        // R162-9 FIX: Fallible recv_buffer growth
+                        if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
+                            return None;
+                        }
                         tcp_state.control.recv_buffer.extend(payload.iter().copied());
                         tcp_state.control.rcv_nxt =
                             tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
@@ -4945,6 +4967,10 @@ impl SocketTable {
                             return Some(win_ack);
                         }
 
+                        // R162-9 FIX: Fallible recv_buffer growth
+                        if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
+                            return None;
+                        }
                         tcp_state.control.recv_buffer.extend(payload.iter().copied());
                         tcp_state.control.rcv_nxt =
                             tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
@@ -5226,6 +5252,10 @@ impl SocketTable {
                             return Some(win_ack);
                         }
 
+                        // R162-9 FIX: Fallible recv_buffer growth
+                        if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
+                            return None;
+                        }
                         tcp_state.control.recv_buffer.extend(payload.iter().copied());
                         tcp_state.control.rcv_nxt =
                             tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
@@ -5867,6 +5897,10 @@ impl SocketTable {
                     let consumed = tcp_state.control.recv_buffer.len() as u32;
                     let available = tcp_state.control.rcv_wnd.saturating_sub(consumed);
                     if (payload.len() as u32) <= available {
+                        // R162-9 FIX: Fallible recv_buffer growth
+                        if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
+                            return None;
+                        }
                         tcp_state.control.recv_buffer.extend(payload.iter().copied());
                         tcp_state.control.rcv_nxt = tcp_state
                             .control

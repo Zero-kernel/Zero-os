@@ -1345,7 +1345,9 @@ impl Inode for Ext2Inode {
                 return Err(FsError::Invalid);
             }
 
-            if head.inode != 0 && head.name_len > 0 {
+            // R162-24 FIX: Also validate inode against inodes_count to reject
+            // crafted images with out-of-range inode numbers early.
+            if head.inode != 0 && head.inode <= fs.superblock.read().inodes_count && head.name_len > 0 {
                 // Validate name_len before accessing
                 if (head.name_len as usize) > rec_len.saturating_sub(min_rec) {
                     return Err(FsError::Invalid);

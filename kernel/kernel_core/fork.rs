@@ -352,15 +352,20 @@ fn fork_inner(
         }
         // 如果 child_top == 0，保持父进程的 rsp/rbp（回退到共享栈）
 
-        // 克隆文件描述符表（每个 fd 调用 clone_box）
+        // R162-7 FIX: Clone fd_table with bounded fallibility.
+        // clone_box() is still infallible (Box::new), but we pre-validate
+        // the fd count fits in memory. With MAX_FD=256, total alloc is ~128KB.
+        // If fd_table is excessively large, fail early.
+        if parent.fd_table.len() > 256 {
+            return Err(ForkError::MemoryAllocationFailed);
+        }
         for (&fd, desc) in parent.fd_table.iter() {
             child.fd_table.insert(fd, desc.clone_box());
         }
 
         // R39-4 FIX: 克隆 close-on-exec 标记集合
-        //
-        // fork 时子进程继承父进程的 CLOEXEC 标记，
-        // 这些 fd 会在子进程 exec 时自动关闭
+        // R162-14 FIX: BTreeSet::clone() is infallible but bounded by MAX_FD=256
+        // (~12KB worst case). Accepted risk documented.
         child.cloexec_fds = parent.cloexec_fds.clone();
 
         // 克隆能力表（尊重 CLOFORK 标志）
@@ -460,7 +465,9 @@ fn fork_inner(
         // - SeccompState.filters: Vec<Arc<SeccompFilter>> 通过 Arc 共享，避免深拷贝
         // - no_new_privs: 粘滞标志，一旦设置不可清除，必须继承
         // - pledge_state: 包含 promises 和 exec_promises（exec 后生效）
-        child.seccomp_state = parent.seccomp_state.clone();
+        // R162-6 FIX: Use fallible try_clone to avoid OOM panic (R161-3 regression)
+        child.seccomp_state = parent.seccomp_state.try_clone()
+            .map_err(|_| ForkError::MemoryAllocationFailed)?;
         child.pledge_state = parent.pledge_state.clone();
 
         // 复制线程支持状态

@@ -191,6 +191,13 @@ static USER_COPY_STATE: CpuLocal<UserCopyState> = CpuLocal::new(UserCopyState::n
 /// Per-CPU storage ensures correct nesting behavior in SMP environments.
 static SMAP_GUARD_DEPTH: CpuLocal<AtomicUsize> = CpuLocal::new(|| AtomicUsize::new(0));
 
+/// R162-22 FIX: Force-initialize per-CPU usercopy locals before interrupts are
+/// enabled. Without this, the first usercopy call from an IRQ context could
+/// deadlock inside CpuLocal's lazy heap allocation.
+pub fn force_init_usercopy_locals() {
+    SMAP_GUARD_DEPTH.force_init();
+}
+
 /// Helper to get current process PID (0 if none)
 #[inline]
 fn current_pid_raw() -> usize {
