@@ -480,6 +480,19 @@ pub struct MmState {
     /// Transient: bytes charged by sys_exec (ELF loader) not yet reflected
     /// in `elf_charged_bytes`. Non-zero between load_elf() and exec commit.
     pub exec_pending_bytes: u64,
+
+    /// R165-1/R165-2 FIX (D2-MM-BRK-RESV): Single-owner reservation that
+    /// serializes concurrent `brk()` operations on a shared MmState
+    /// (CLONE_VM / CLONE_THREAD siblings). `sys_brk` drops the MmState lock
+    /// across irreversible page-table work; without a reservation a sibling
+    /// `brk()` could move `mm.brk` in that window, leaving the just-freed
+    /// shrink range as an unmapped hole inside the grown heap (self-SIGSEGV)
+    /// or the just-mapped grow range leaked above the logical heap (cgroup
+    /// under-count). While `true`, any other `brk()` returns the current break
+    /// unchanged, so the lock-dropped PT work stays consistent with the commit.
+    /// `fork()` is rejected while this is set (mirrors the mmap transient-state
+    /// guard) so a child cannot inherit a half-applied heap.
+    pub brk_in_progress: bool,
 }
 
 impl MmState {
@@ -494,6 +507,7 @@ impl MmState {
             brk_pending_growth: 0,
             mprotect_pending_bytes: 0,
             exec_pending_bytes: 0,
+            brk_in_progress: false,
         }
     }
 
@@ -506,6 +520,9 @@ impl MmState {
         child.brk_pending_growth = 0;
         child.mprotect_pending_bytes = 0;
         child.exec_pending_bytes = 0;
+        // R165-1 FIX: A child never inherits an in-flight brk reservation; fork
+        // is already rejected while a brk is in progress, but reset defensively.
+        child.brk_in_progress = false;
         child
     }
 }
@@ -1945,21 +1962,24 @@ pub fn non_thread_group_vm_share_count(memory_space: usize, caller_tgid: Process
 
 /// R101-9 FIX: Get a snapshot of all active PIDs from the process table.
 ///
-/// Returns a Vec of all PIDs that have live process entries. Used by
-/// exit_group to find sibling threads in the same thread group.
-pub fn process_table_snapshot() -> alloc::vec::Vec<ProcessId> {
+/// Returns a Vec of all PIDs that have live process entries.
+///
+/// R165-15 FIX: Build the snapshot with a fallible allocation (`try_reserve_exact`)
+/// instead of an infallible `.collect()`, which would abort the kernel on OOM.
+/// Returns `None` when the snapshot allocation fails so callers can degrade
+/// gracefully rather than panic. The reservation is exact (sized to the live
+/// slot count) and bounded by the process table length (≤ MAX_PID slots).
+pub fn process_table_snapshot() -> Option<alloc::vec::Vec<ProcessId>> {
     let table = PROCESS_TABLE.lock();
-    table
-        .iter()
-        .enumerate()
-        .filter_map(|(i, slot)| {
-            if slot.is_some() {
-                Some(i)
-            } else {
-                None
-            }
-        })
-        .collect()
+    let live = table.iter().filter(|slot| slot.is_some()).count();
+    let mut pids: alloc::vec::Vec<ProcessId> = alloc::vec::Vec::new();
+    pids.try_reserve_exact(live).ok()?;
+    for (i, slot) in table.iter().enumerate() {
+        if slot.is_some() {
+            pids.push(i);
+        }
+    }
+    Some(pids)
 }
 
 /// R152-10 FIX: Atomically mark all threads in a thread group for exit.

@@ -247,6 +247,15 @@ fn fork_inner(
         {
             return Err(ForkError::MmapTransientState);
         }
+        // R165-1 FIX: brk also has a transient reservation now (brk_in_progress).
+        // A sibling thread mid-brk has dropped the MmState lock for page-table
+        // work, so the parent's page tables and `brk` may be momentarily
+        // inconsistent. Copying that into the child would produce a heap whose
+        // record disagrees with its mappings — same hazard the mmap guard above
+        // covers. Fail-closed with EAGAIN so userspace retries.
+        if parent_mm.brk_in_progress {
+            return Err(ForkError::MmapTransientState);
+        }
     }
 
     if let Some(child_process) = get_process(child_pid) {
@@ -420,6 +429,13 @@ fn fork_inner(
             let parent_mm = parent.mm.lock();
 
             let region_count = parent_mm.mmap_regions.len();
+            // R165-14: Re-assert the MAX_MAP_COUNT bound before cloning. mmap()
+            // already enforces it on insert, but checking here keeps the child's
+            // infallible BTreeMap build (below) bounded even if a future path
+            // grows mmap_regions past the limit.
+            if region_count > crate::syscall::MAX_MAP_COUNT {
+                return Err(ForkError::MemoryAllocationFailed);
+            }
             let mut snap: Vec<(usize, usize)> = Vec::new();
             if snap.try_reserve_exact(region_count).is_err() {
                 return Err(ForkError::MemoryAllocationFailed);
@@ -429,6 +445,15 @@ fn fork_inner(
             }));
 
             let child_mm = crate::process::MmState {
+                // R165-14 (tracked tech-debt, AD-02): stable no_std
+                // `alloc::collections::BTreeMap` exposes NO fallible
+                // construction/insertion API (`try_insert` only reports key
+                // collisions, not allocation failure), so this `.collect()` can
+                // still abort under OOM. Mitigations: (1) the `snap` Vec above is
+                // a fallible OOM probe sized to the same entry count, and (2) the
+                // count is bounded by MAX_MAP_COUNT (asserted above). A complete
+                // fix requires replacing `mmap_regions` with a genuinely fallible
+                // ordered map — tracked as design debt, not closed here.
                 mmap_regions: snap.into_iter().collect(),
                 brk_start: parent_mm.brk_start,
                 brk: parent_mm.brk,
@@ -440,6 +465,9 @@ fn fork_inner(
                 brk_pending_growth: 0,
                 mprotect_pending_bytes: 0,
                 exec_pending_bytes: 0,
+                // R165-1 FIX: child starts with no brk reservation (fork is
+                // rejected above while a brk is in flight).
+                brk_in_progress: false,
             };
             child.mm = Arc::new(Mutex::new(child_mm));
         }

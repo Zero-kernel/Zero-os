@@ -39,6 +39,11 @@ struct TimedWaiter {
     pid: ProcessId,
     /// 超时截止时间（tick）
     deadline_tick: u64,
+    /// R165-4 FIX: The exact `wait_with_timeout` generation this timer belongs to.
+    /// Carried through to `timeout_wake` so the recorded timeout flag is tagged
+    /// with the waiter's OWN generation (not a global snapshot), letting
+    /// `consume_timeout_flag` match it exactly and reject stale flags.
+    generation: u64,
 }
 
 /// R39-6 FIX: 全局定时等待者列表
@@ -63,7 +68,12 @@ static WAITQUEUE_TIMER_INIT: AtomicBool = AtomicBool::new(false);
 /// 用于区分正常唤醒与超时唤醒。
 pub struct WaitQueue {
     /// 等待的进程ID列表
-    waiters: Mutex<VecDeque<ProcessId>>,
+    /// R165-4 FIX: Each waiter is tagged with the `wait_with_timeout` generation
+    /// that enqueued it (or a fresh generation for the condvar prepare_to_wait
+    /// path). `timeout_wake` only acts on an exact (pid, generation) match, so a
+    /// stale/re-inserted timer cannot wake a different, later wait by the same
+    /// PID — including one blocked on a *different* queue.
+    waiters: Mutex<VecDeque<(ProcessId, u64)>>,
     /// 当为 true 时不再接受新的等待者（用于端点销毁时取消阻塞）
     closed: AtomicBool,
     /// R164-10 FIX: Timeout entries tagged with (PID, generation) to prevent
@@ -151,8 +161,24 @@ impl WaitQueue {
             // other waiters (Semaphore/CondVar/socket recv all affected).
             {
                 let mut waiters = self.waiters.lock();
-                if !waiters.iter().any(|&p| p == pid) {
-                    waiters.push_back(pid);
+                // R165-4 FIX: The queued membership and the timer record must
+                // advance together. If this PID is already queued (a prior wait
+                // whose entry lingered after a non-WaitQueue wake — e.g. a signal
+                // setting the task Ready directly), REFRESH its generation to this
+                // wait's my_gen. Otherwise register_timed_wait would make the new
+                // generation authoritative while the deque still held the old one,
+                // and timeout_wake's exact (pid, generation) check would drop this
+                // wait's timer — a missed legitimate timeout.
+                let mut refreshed = false;
+                for entry in waiters.iter_mut() {
+                    if entry.0 == pid {
+                        entry.1 = my_gen;
+                        refreshed = true;
+                        break;
+                    }
+                }
+                if !refreshed {
+                    waiters.push_back((pid, my_gen));
                 }
             }
 
@@ -175,7 +201,9 @@ impl WaitQueue {
         if let Some(deadline) = deadline_tick {
             ensure_waitqueue_timer_registered();
             interrupts::without_interrupts(|| {
-                register_timed_wait(self as *const _ as usize, pid, deadline);
+                // R165-4 FIX: Record this wait's own generation in the timer so a
+                // fired timeout is attributed to this exact wait instance.
+                register_timed_wait(self as *const _ as usize, pid, deadline, my_gen);
             });
         }
 
@@ -202,56 +230,70 @@ impl WaitQueue {
     ///
     /// Returns true if the wake completed, false if Process lock was contended
     /// (caller should retry on next tick).
-    fn timeout_wake(&self, pid: ProcessId) -> bool {
+    fn timeout_wake(&self, pid: ProcessId, generation: u64) -> bool {
         interrupts::without_interrupts(|| {
+            // R165-4 FIX: Act only if THIS exact (pid, generation) is still queued
+            // on THIS WaitQueue. A stale timer — re-inserted by a retry that raced
+            // a normal wake, or left over from a finished wait — will not match and
+            // must not wake an unrelated later wait by the same PID (possibly even
+            // one blocked on a different queue). Hold the waiters lock across the
+            // try_lock(proc): try_lock can never deadlock, and waiters->proc is the
+            // same order wake_all uses.
+            let mut waiters = self.waiters.lock();
+            let pos = match waiters
+                .iter()
+                .position(|&(p, g)| p == pid && g == generation)
+            {
+                Some(pos) => pos,
+                None => return true, // not our waiter — let the timer be dropped
+            };
+
             // R155-2 FIX: try_lock() to avoid deadlock in IRQ context.
-            // Only remove from queue if state transition succeeds.
             if let Some(proc_arc) = process::get_process(pid) {
                 if let Some(mut proc) = proc_arc.try_lock() {
-                    if proc.state == ProcessState::Blocked {
+                    // R165-4 FIX: Record the timeout only when THIS call performs
+                    // the Blocked->Ready transition. If the task was already Ready
+                    // (a normal wake beat us), recording a timeout flag would be a
+                    // stale entry.
+                    let was_blocked = proc.state == ProcessState::Blocked;
+                    if was_blocked {
                         proc.state = ProcessState::Ready;
                     }
+                    drop(proc);
+                    waiters.remove(pos);
+                    drop(waiters);
+                    if was_blocked {
+                        // Tag with the waiter's OWN generation (from the timer
+                        // record); consume_timeout_flag requires an exact match.
+                        self.timed_out.lock().insert(pid, generation);
+                    }
+                    true
                 } else {
-                    return false;
+                    // Contended (e.g. a concurrent wake holds the process lock).
+                    // Keep membership and retry on the next tick.
+                    false
                 }
             } else {
-                // R155-12 FIX: Process no longer exists (killed).
-                // Remove from waiters to avoid leak, but do NOT insert
-                // into timed_out — no one will consume the flag, causing
-                // an unbounded leak and PID-reuse misclassification.
-                let mut waiters = self.waiters.lock();
-                if let Some(pos) = waiters.iter().position(|&p| p == pid) {
-                    waiters.remove(pos);
-                }
-                return true;
-            }
-
-            let mut waiters = self.waiters.lock();
-            if let Some(pos) = waiters.iter().position(|&p| p == pid) {
+                // R155-12 FIX: Process no longer exists (killed). Drop membership;
+                // do NOT insert a timeout flag (no one would consume it).
                 waiters.remove(pos);
+                true
             }
-            drop(waiters);
-
-            // R164-10 FIX: Store generation from the wait_generation counter.
-            // The timeout_wake doesn't know which specific generation this PID
-            // was waiting under, so we store the current counter value as a
-            // snapshot. consume_timeout_flag will accept any generation >= the
-            // wait call's my_gen (monotonic, so a higher gen means a later wait).
-            let gen = self.wait_generation.load(Ordering::Relaxed);
-            self.timed_out.lock().insert(pid, gen);
-            true
         })
     }
 
-    // R164-10 FIX: Only consume timeout flag if the stored generation matches
-    // or exceeds the wait call's generation. A stale entry from a prior wait
-    // (by a different process that reused this PID) will have a lower generation.
+    // R165-4 FIX: Consume the timeout flag only on an EXACT generation match.
+    // A stored generation strictly less than `expected_gen` is a stale leftover
+    // from an earlier wait by this PID (its consumer raced a normal wake); drop
+    // it without reporting a timeout. A stored generation greater than expected
+    // is impossible (a single PID cannot have two concurrent waits). Tightening
+    // R164-10's `>=` to `==` closes the spurious-ETIMEDOUT path.
     fn consume_timeout_flag(&self, pid: ProcessId, expected_gen: u64) -> bool {
         let mut set = self.timed_out.lock();
         if let Some(&stored_gen) = set.get(&pid) {
-            if stored_gen >= expected_gen {
+            if stored_gen <= expected_gen {
                 set.remove(&pid);
-                return true;
+                return stored_gen == expected_gen;
             }
         }
         false
@@ -261,7 +303,7 @@ impl WaitQueue {
     pub fn cleanup_for_pid(&self, pid: ProcessId) {
         interrupts::without_interrupts(|| {
             let mut waiters = self.waiters.lock();
-            waiters.retain(|&p| p != pid);
+            waiters.retain(|&(p, _)| p != pid);
             drop(waiters);
             self.timed_out.lock().remove(&pid);
         });
@@ -272,7 +314,7 @@ impl WaitQueue {
     /// 返回被唤醒的进程ID，如果队列为空返回None
     pub fn wake_one(&self) -> Option<ProcessId> {
         interrupts::without_interrupts(|| {
-            let pid = self.waiters.lock().pop_front()?;
+            let pid = self.waiters.lock().pop_front()?.0;
             // R39-6 FIX: 取消该进程的定时等待
             cancel_timed_wait(self as *const _ as usize, pid);
 
@@ -296,7 +338,7 @@ impl WaitQueue {
             let mut waiters = self.waiters.lock();
             let count = waiters.len();
 
-            while let Some(pid) = waiters.pop_front() {
+            while let Some((pid, _gen)) = waiters.pop_front() {
                 // R39-6 FIX: 取消该进程的定时等待
                 cancel_timed_wait(self as *const _ as usize, pid);
                 if let Some(proc_arc) = process::get_process(pid) {
@@ -332,7 +374,7 @@ impl WaitQueue {
             let mut woken = 0;
 
             while woken < n {
-                if let Some(pid) = waiters.pop_front() {
+                if let Some((pid, _gen)) = waiters.pop_front() {
                     // R39-6 FIX: 取消该进程的定时等待
                     cancel_timed_wait(self as *const _ as usize, pid);
                     if let Some(proc_arc) = process::get_process(pid) {
@@ -365,7 +407,7 @@ impl WaitQueue {
     pub fn wake_specific(&self, pid: ProcessId) -> bool {
         interrupts::without_interrupts(|| {
             let mut waiters = self.waiters.lock();
-            if let Some(pos) = waiters.iter().position(|&p| p == pid) {
+            if let Some(pos) = waiters.iter().position(|&(p, _)| p == pid) {
                 waiters.remove(pos);
                 // 取消该进程的定时等待
                 cancel_timed_wait(self as *const _ as usize, pid);
@@ -423,12 +465,16 @@ impl WaitQueue {
             // to accumulate in the deque, consuming wake signals meant for
             // other waiters.
             let mut waiters = self.waiters.lock();
-            if waiters.iter().any(|&p| p == pid) {
+            if waiters.iter().any(|&(p, _)| p == pid) {
                 return true; // Already enqueued — no duplicate
             }
 
             // 将当前进程加入等待队列
-            waiters.push_back(pid);
+            // R165-4 FIX: the condvar prepare_to_wait path never registers a
+            // timer, so its generation only needs to be unique; snapshot one so
+            // the entry shape matches the timed path and wake/cancel stay uniform.
+            let gen = self.wait_generation.fetch_add(1, Ordering::Relaxed);
+            waiters.push_back((pid, gen));
 
             // 将进程状态设为阻塞
             if let Some(proc_arc) = process::get_process(pid) {
@@ -467,7 +513,7 @@ impl WaitQueue {
             let mut waiters = self.waiters.lock();
 
             // 从队列中移除当前进程
-            if let Some(pos) = waiters.iter().position(|&p| p == pid) {
+            if let Some(pos) = waiters.iter().position(|&(p, _)| p == pid) {
                 waiters.remove(pos);
                 // R39-6 FIX: 取消定时等待
                 cancel_timed_wait(self as *const _ as usize, pid);
@@ -820,7 +866,7 @@ fn ensure_waitqueue_timer_registered() {
 }
 
 /// 注册定时等待
-fn register_timed_wait(queue: usize, pid: ProcessId, deadline_tick: u64) {
+fn register_timed_wait(queue: usize, pid: ProcessId, deadline_tick: u64, generation: u64) {
     // R143-5 FIX: All WaitQueue instances must be 'static (kernel BSS/data).
     // If a heap/stack WaitQueue were used with timed waits, the raw `usize`
     // address could dangle after the WaitQueue is dropped. This assert catches
@@ -836,14 +882,21 @@ fn register_timed_wait(queue: usize, pid: ProcessId, deadline_tick: u64) {
     // re-entrant wait path can call register_timed_wait() for the same
     // (queue, pid) pair, creating duplicate entries that consume extra
     // timeout slots and may cause double-wakeup.
+    // R165-4 FIX: REPLACE any pre-existing (queue, pid) entry rather than skip.
+    // A given (queue, pid) can have at most one active wait, so any prior entry
+    // is a stale leftover (e.g. a timer-retry that raced a normal wake). Skipping
+    // it (the old behavior) could leave the *new* wait with the *old* generation
+    // — or no timer at all. Replacing makes this wait's generation authoritative;
+    // any still-pending stale timer is harmless because timeout_wake now requires
+    // an exact (pid, generation) membership match.
     let mut waiters = TIMED_WAITERS.lock();
-    if !waiters.iter().any(|w| w.queue == queue && w.pid == pid) {
-        waiters.push(TimedWaiter {
-            queue,
-            pid,
-            deadline_tick,
-        });
-    }
+    waiters.retain(|w| !(w.queue == queue && w.pid == pid));
+    waiters.push(TimedWaiter {
+        queue,
+        pid,
+        deadline_tick,
+        generation,
+    });
 }
 
 /// 取消定时等待
@@ -886,7 +939,7 @@ fn process_waitqueue_timeouts(now_ticks: u64) {
     for waiter in expired.iter().take(count).flatten() {
         unsafe {
             if let Some(queue) = (waiter.queue as *const WaitQueue).as_ref() {
-                if !queue.timeout_wake(waiter.pid) {
+                if !queue.timeout_wake(waiter.pid, waiter.generation) {
                     if retry_count < MAX_TIMEOUTS_PER_TICK {
                         retry[retry_count] = Some(*waiter);
                         retry_count += 1;

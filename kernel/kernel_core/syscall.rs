@@ -540,44 +540,86 @@ pub fn drain_deferred_stdin_wakes() {
 // Socket Wait Hooks Implementation (scheduler integration for net crate)
 // ============================================================================
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 
 /// Per-queue waiter tracking for socket blocking operations.
 ///
 /// Uses the WaitQueue address as a unique identifier. Each queue maintains
 /// a FIFO list of waiting process IDs with optional timeout deadlines.
 struct SocketWaiters {
-    /// Map from queue address to list of (ProcessId, deadline_ticks)
-    /// Deadline is None for indefinite wait, Some(ticks) for timeout
-    waiters: BTreeMap<usize, VecDeque<(ProcessId, Option<u64>)>>,
+    /// Map from queue address to list of `(ProcessId, generation, deadline_ticks)`.
+    /// Deadline is None for indefinite wait, Some(ticks) for timeout.
+    ///
+    /// R165-9 FIX: each waiter carries the monotonic `generation` of the
+    /// `wait()` call that enqueued it (mirrors the IPC WaitQueue R165-4 fix).
+    waiters: BTreeMap<usize, VecDeque<(ProcessId, u64, Option<u64>)>>,
     /// Track timed-out waiters to report correct WaitOutcome.
     ///
-    /// When a waiter times out (via check_timeouts or inline check), we add
-    /// their PID here. When wait() returns, it consumes this marker to
-    /// distinguish TimedOut from Woken (fixes race between timer and wake).
-    timed_out: BTreeSet<ProcessId>,
+    /// When a waiter times out (via check_timeouts or inline check), we record
+    /// `(pid -> generation)` here. When wait() returns, it consumes this marker
+    /// to distinguish TimedOut from Woken.
+    ///
+    /// R165-9 FIX: keyed by `(pid, generation)` rather than PID alone. A PID
+    /// recycled to a different process within the ~tick window cannot consume a
+    /// stale timeout marker, because its `wait()` runs with a fresh generation
+    /// that will not match the old marker.
+    timed_out: BTreeMap<ProcessId, u64>,
+    /// Monotonic generation counter, advanced on each `wait()` registration.
+    /// All access is under the `SOCKET_WAITERS` lock, so a plain counter
+    /// suffices (no atomics needed).
+    next_generation: u64,
 }
 
 impl SocketWaiters {
     const fn new() -> Self {
         SocketWaiters {
             waiters: BTreeMap::new(),
-            timed_out: BTreeSet::new(),
+            timed_out: BTreeMap::new(),
+            next_generation: 1,
         }
     }
 
-    /// Add current process to wait queue.
-    fn add_waiter(&mut self, queue_addr: usize, pid: ProcessId, deadline: Option<u64>) {
-        self.waiters
-            .entry(queue_addr)
-            .or_insert_with(VecDeque::new)
-            .push_back((pid, deadline));
+    /// R165-9 FIX: Allocate a fresh, unique generation for a `wait()` call.
+    fn alloc_generation(&mut self) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        generation
+    }
+
+    /// Add the current process to a wait queue, or refresh its generation and
+    /// deadline if it is already queued.
+    ///
+    /// R165-9 FIX: on a duplicate (spurious re-entry of `wait()` for the same
+    /// PID) we REFRESH the existing entry's generation/deadline to this wait's
+    /// values, so a subsequent timeout is attributed to the current wait and a
+    /// legitimate timeout is never dropped (mirrors sync.rs R165-4).
+    fn add_or_refresh_waiter(
+        &mut self,
+        queue_addr: usize,
+        pid: ProcessId,
+        generation: u64,
+        deadline: Option<u64>,
+    ) {
+        let queue = self.waiters.entry(queue_addr).or_insert_with(VecDeque::new);
+        if let Some(entry) = queue.iter_mut().find(|(p, _, _)| *p == pid) {
+            entry.1 = generation;
+            entry.2 = deadline;
+        } else {
+            queue.push_back((pid, generation, deadline));
+        }
     }
 
     /// Remove a specific process from a queue (on wakeup or timeout).
-    fn remove_waiter(&mut self, queue_addr: usize, pid: ProcessId) -> bool {
+    ///
+    /// R165-9 FIX: when `expected` is `Some(gen)`, only the entry whose
+    /// generation matches is removed — a newer wait by the same PID is left
+    /// intact. Returns true iff an entry was removed.
+    fn remove_waiter(&mut self, queue_addr: usize, pid: ProcessId, expected: Option<u64>) -> bool {
         if let Some(queue) = self.waiters.get_mut(&queue_addr) {
-            if let Some(pos) = queue.iter().position(|(p, _)| *p == pid) {
+            if let Some(pos) = queue
+                .iter()
+                .position(|(p, g, _)| *p == pid && expected.map_or(true, |e| *g == e))
+            {
                 queue.remove(pos);
                 // Clean up empty queue entries
                 if queue.is_empty() {
@@ -590,21 +632,30 @@ impl SocketWaiters {
     }
 
     /// Mark a process as timed out (for correct WaitOutcome reporting).
-    fn mark_timed_out(&mut self, pid: ProcessId) {
-        self.timed_out.insert(pid);
+    fn mark_timed_out(&mut self, pid: ProcessId, generation: u64) {
+        self.timed_out.insert(pid, generation);
     }
 
-    /// Consume the timeout marker for a process.
+    /// Consume the timeout marker for a process on an EXACT generation match.
     ///
-    /// Returns true if the process was marked as timed out (and removes the mark).
-    fn consume_timeout(&mut self, pid: ProcessId) -> bool {
-        self.timed_out.remove(&pid)
+    /// R165-9 FIX: a stored generation strictly less than `expected` is a stale
+    /// leftover from an earlier wait by this PID — drop it without reporting a
+    /// timeout. A greater stored generation is impossible (one PID cannot have
+    /// two concurrent waits). Returns true only on an exact `(pid, gen)` match.
+    fn consume_timeout(&mut self, pid: ProcessId, expected: u64) -> bool {
+        if let Some(&stored) = self.timed_out.get(&pid) {
+            if stored <= expected {
+                self.timed_out.remove(&pid);
+                return stored == expected;
+            }
+        }
+        false
     }
 
     /// Wake one waiter from a queue (FIFO order).
     fn wake_one(&mut self, queue_addr: usize) -> Option<ProcessId> {
         if let Some(queue) = self.waiters.get_mut(&queue_addr) {
-            while let Some((pid, _)) = queue.pop_front() {
+            while let Some((pid, _, _)) = queue.pop_front() {
                 // Verify process still exists and is blocked
                 if let Some(proc_arc) = get_process(pid) {
                     let mut proc = proc_arc.lock();
@@ -629,7 +680,7 @@ impl SocketWaiters {
     fn wake_all(&mut self, queue_addr: usize) -> usize {
         let mut woken = 0;
         if let Some(mut queue) = self.waiters.remove(&queue_addr) {
-            while let Some((pid, _)) = queue.pop_front() {
+            while let Some((pid, _, _)) = queue.pop_front() {
                 if let Some(proc_arc) = get_process(pid) {
                     let mut proc = proc_arc.lock();
                     if proc.state == ProcessState::Blocked {
@@ -653,21 +704,21 @@ impl SocketWaiters {
         const MAX_TIMEOUTS_PER_TICK: usize = 16;
 
         // Use stack array instead of Vec to avoid IRQ-context allocation
-        // Each entry: (queue_addr, pid, is_timeout vs is_exited)
-        let mut expired: [Option<(usize, ProcessId, bool)>; MAX_TIMEOUTS_PER_TICK] =
+        // Each entry: (queue_addr, pid, generation, is_timeout vs is_exited)
+        let mut expired: [Option<(usize, ProcessId, u64, bool)>; MAX_TIMEOUTS_PER_TICK] =
             [None; MAX_TIMEOUTS_PER_TICK];
         let mut count = 0;
 
         // Collect expired or exited waiters
         for (&queue_addr, queue) in self.waiters.iter() {
-            for &(pid, deadline) in queue.iter() {
+            for &(pid, generation, deadline) in queue.iter() {
                 if count >= MAX_TIMEOUTS_PER_TICK {
                     break; // Will catch remaining on next tick
                 }
                 let is_timeout = deadline.map(|dl| current_ticks >= dl).unwrap_or(false);
                 let is_exited = get_process(pid).is_none();
                 if is_timeout || is_exited {
-                    expired[count] = Some((queue_addr, pid, is_timeout));
+                    expired[count] = Some((queue_addr, pid, generation, is_timeout));
                     count += 1;
                 }
             }
@@ -679,30 +730,42 @@ impl SocketWaiters {
         let mut clean_count = 0;
 
         for entry in expired.iter().take(count).flatten() {
-            let (queue_addr, pid, is_timeout) = *entry;
+            let (queue_addr, pid, generation, is_timeout) = *entry;
 
             if let Some(queue) = self.waiters.get_mut(&queue_addr) {
-                if queue.iter().any(|(p, _)| *p == pid) {
+                // R165-9 FIX: act only on the EXACT (pid, generation) we recorded
+                // above, so a newer wait by the same PID is left undisturbed.
+                if queue.iter().any(|(p, g, _)| *p == pid && *g == generation) {
                     // R155-2 FIX: try_lock BEFORE removing from queue.
                     // If contended, skip — the entry stays with its original
                     // deadline and will be retried on the next tick.
+                    //
+                    // R165-9 FIX: only record a timeout when THIS call performs the
+                    // Blocked->Ready transition. If the process exited, its lock is
+                    // contended, or a normal wake already readied it, we must not
+                    // leave a stale timeout marker (mirrors sync.rs timeout_wake).
+                    let mut record_timeout = false;
                     if let Some(proc_arc) = get_process(pid) {
                         if let Some(mut proc) = proc_arc.try_lock() {
                             if proc.state == ProcessState::Blocked {
                                 proc.state = ProcessState::Ready;
+                                record_timeout = is_timeout;
                             }
                         } else {
                             continue;
                         }
                     }
 
-                    // Lock succeeded (or process gone) — now remove
-                    if let Some(pos) = queue.iter().position(|(p, _)| *p == pid) {
+                    // Lock succeeded (or process gone) — now remove our exact entry
+                    if let Some(pos) = queue
+                        .iter()
+                        .position(|(p, g, _)| *p == pid && *g == generation)
+                    {
                         queue.remove(pos);
                     }
 
-                    if is_timeout {
-                        self.timed_out.insert(pid);
+                    if record_timeout {
+                        self.timed_out.insert(pid, generation);
                     }
 
                     // Track queues that may need cleanup
@@ -726,7 +789,7 @@ impl SocketWaiters {
         // Clean up stale timeout markers for exited processes (prevents PID reuse issues)
         // Only do this periodically to avoid overhead on every tick
         if current_ticks % 100 == 0 {
-            self.timed_out.retain(|pid| get_process(*pid).is_some());
+            self.timed_out.retain(|pid, _| get_process(*pid).is_some());
         }
     }
 }
@@ -767,24 +830,21 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
         // while interrupts are disabled and SOCKET_WAITERS is locked.
         // This closes the missed-wakeup race where wake_one() can run between
         // a pre-check and waiter registration.
-        let immediate = x86_64::instructions::interrupts::without_interrupts(|| {
+        let (my_gen, immediate) = x86_64::instructions::interrupts::without_interrupts(|| {
             let mut waiters = SOCKET_WAITERS.lock();
 
-            // Avoid duplicate entries
-            if let Some(q) = waiters.waiters.get(&queue_addr) {
-                if q.iter().any(|(p, _)| *p == pid) {
-                    return None; // Already waiting
-                }
-            }
-
-            waiters.add_waiter(queue_addr, pid, deadline);
+            // R165-9 FIX: allocate this wait's unique generation under the lock,
+            // then register (or, on spurious re-entry for the same PID, refresh
+            // the existing entry's generation + deadline to this wait's values).
+            let my_gen = waiters.alloc_generation();
+            waiters.add_or_refresh_waiter(queue_addr, pid, my_gen, deadline);
 
             // R152-2 FIX: Check for pending wake AFTER registration.
             // If a wake arrived before we registered, consume the token and
             // remove ourselves — no need to block.
             if queue.try_consume_wakeup() {
-                waiters.remove_waiter(queue_addr, pid);
-                return Some(net::WaitOutcome::Woken);
+                waiters.remove_waiter(queue_addr, pid, Some(my_gen));
+                return (my_gen, Some(net::WaitOutcome::Woken));
             }
 
             // Mark process as blocked
@@ -792,7 +852,7 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                 let mut proc = proc_arc.lock();
                 proc.state = ProcessState::Blocked;
             }
-            None
+            (my_gen, None)
         });
 
         if let Some(outcome) = immediate {
@@ -816,8 +876,8 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
 
                 // Check if closed
                 if queue.is_closed() {
-                    // Remove from wait queue
-                    SOCKET_WAITERS.lock().remove_waiter(queue_addr, pid);
+                    // Remove from wait queue (R165-9: our exact generation)
+                    SOCKET_WAITERS.lock().remove_waiter(queue_addr, pid, Some(my_gen));
                     // Mark ready so we can return
                     if let Some(proc_arc) = get_process(pid) {
                         proc_arc.lock().state = ProcessState::Ready;
@@ -828,10 +888,14 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                 // Check timeout
                 if let Some(dl) = deadline {
                     if crate::get_ticks() >= dl {
-                        // Timeout expired - mark and remove
+                        // Timeout expired - mark and remove.
+                        // R165-9 FIX: only record the timeout if we actually
+                        // removed OUR (pid, generation) entry, so we never stamp a
+                        // timeout over a concurrent wake/refresh of a newer wait.
                         let mut waiters = SOCKET_WAITERS.lock();
-                        waiters.remove_waiter(queue_addr, pid);
-                        waiters.mark_timed_out(pid);
+                        if waiters.remove_waiter(queue_addr, pid, Some(my_gen)) {
+                            waiters.mark_timed_out(pid, my_gen);
+                        }
                         if let Some(proc_arc) = get_process(pid) {
                             proc_arc.lock().state = ProcessState::Ready;
                         }
@@ -852,13 +916,13 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
 
         // Determine outcome using timeout marker (fixes race between timer and wake)
         if queue.is_closed() {
-            // Consume any stale timeout marker
-            SOCKET_WAITERS.lock().consume_timeout(pid);
+            // Consume any stale timeout marker for THIS wait (R165-9: exact gen)
+            SOCKET_WAITERS.lock().consume_timeout(pid, my_gen);
             return net::WaitOutcome::Closed;
         }
 
         // Check if we were marked as timed out (by timer callback or inline check)
-        if SOCKET_WAITERS.lock().consume_timeout(pid) {
+        if SOCKET_WAITERS.lock().consume_timeout(pid, my_gen) {
             return net::WaitOutcome::TimedOut;
         }
 
@@ -927,7 +991,10 @@ const MAX_RW_SIZE: usize = 1 * 1024 * 1024;
 /// Bounds the per-process `mmap_regions` BTreeMap to prevent unbounded kernel
 /// heap growth from unprivileged syscalls (e.g., millions of PROT_NONE mmaps).
 /// Matches Linux's default `/proc/sys/vm/max_map_count` (65536).
-const MAX_MAP_COUNT: usize = 65536;
+///
+/// R165-14: `pub(crate)` so fork.rs can re-assert the bound before cloning the
+/// parent's region map into the child (see fork::fork_inner).
+pub(crate) const MAX_MAP_COUNT: usize = 65536;
 
 /// 系统调用号定义（参考Linux系统调用表）
 #[repr(u64)]
@@ -2464,21 +2531,27 @@ fn sys_fork() -> SyscallResult {
 
         // Only check if process is part of a thread group (tgid matches a leader)
         if parent_is_thread_leader {
-            let table = crate::process::process_table_snapshot();
-            let sibling_count = table
-                .iter()
-                .filter(|&&p| p != parent_pid)
-                .filter(|&&p| {
-                    if let Some(proc_arc) = get_process(p) {
-                        let proc = proc_arc.lock();
-                        proc.tgid == parent_tgid
-                            && proc.is_thread
-                            && proc.state != crate::process::ProcessState::Terminated
-                    } else {
-                        false
-                    }
+            // R165-15 FIX: process_table_snapshot() is now fallible (returns None
+            // on OOM instead of aborting). This is a best-effort diagnostic, so on
+            // allocation failure we simply skip the warning (sibling_count = 0).
+            let sibling_count = crate::process::process_table_snapshot()
+                .map(|table| {
+                    table
+                        .iter()
+                        .filter(|&&p| p != parent_pid)
+                        .filter(|&&p| {
+                            if let Some(proc_arc) = get_process(p) {
+                                let proc = proc_arc.lock();
+                                proc.tgid == parent_tgid
+                                    && proc.is_thread
+                                    && proc.state != crate::process::ProcessState::Terminated
+                            } else {
+                                false
+                            }
+                        })
+                        .count()
                 })
-                .count();
+                .unwrap_or(0);
 
             if sibling_count > 0 {
                 kprintln!(
@@ -4326,6 +4399,10 @@ fn sys_exec(
             // were fully uncharged above; new ELF image starts with a clean slate.
             mm.vm_charged_bytes = 0;
             mm.brk_pending_growth = 0; // R144-1 FIX: Clear pending brk growth on exec
+            // R165-1 FIX: clear any brk reservation on exec image replacement.
+            // exec already rejects multithreaded/shared-VM callers, so no sibling
+            // brk can be in flight here; reset defensively for a clean slate.
+            mm.brk_in_progress = false;
             mm.mprotect_pending_bytes = 0; // R147-1 FIX: Clear pending mprotect charges on exec
             mm.exec_pending_bytes = 0; // R149-3 FIX: Charge now reflected in elf_charged_bytes
             // R137-1 FIX: Record the new ELF image's cgroup charges (segments + stack)
@@ -4951,6 +5028,21 @@ fn sys_unshare(flags: u64) -> SyscallResult {
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
     let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
+    // R165-17 FIX: Invoke the dedicated task-level LSM hook for namespace
+    // creation. Previously sys_unshare had only DAC cap/root gates and no MAC
+    // mediation point. Evaluate after flag validation, before any cap check or
+    // namespace mutation; deny => EPERM. Build ctx from the locked proc and drop
+    // the lock before calling the hook (Process-mutex re-entrancy, R131-1 pattern).
+    {
+        let ctx = {
+            let proc = proc_arc.lock();
+            lsm_process_ctx_from(&proc)
+        };
+        if lsm::hook_task_unshare(&ctx, flags).is_err() {
+            return Err(SyscallError::EPERM);
+        }
+    }
+
     // R156-2 FIX: CLONE_NEWPID in unshare requires CAP_ADMIN or root,
     // matching clone() and the gates on CLONE_NEWNS/NEWIPC/NEWNET.
     if flags & CLONE_NEWPID != 0 {
@@ -5169,6 +5261,21 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
             return Err(SyscallError::EINVAL);
         }
     };
+
+    // R165-17 FIX: Invoke the dedicated task-level LSM hook for joining a
+    // namespace. Previously sys_setns had only DAC cap/root gates and no MAC
+    // mediation point. Evaluate after the cap + thread-group checks and target
+    // resolution, before the namespace switch; deny => EPERM. Build ctx from the
+    // locked proc and drop the lock before the hook (R131-1 re-entrancy pattern).
+    {
+        let ctx = {
+            let proc = proc_arc.lock();
+            lsm_process_ctx_from(&proc)
+        };
+        if lsm::hook_task_setns(&ctx, CLONE_NEWNS as u64, target_ns.id().raw()).is_err() {
+            return Err(SyscallError::EPERM);
+        }
+    }
 
     klog!(Info,
         "[sys_setns] Process {} switching to mount namespace id={}, level={}",
@@ -6018,6 +6125,38 @@ pub fn mmap_flags_to_perms(flags: usize) -> [u8; 4] {
     ]
 }
 
+/// R165-1/R165-2 FIX (D2-MM-BRK-RESV): RAII reservation that serializes
+/// concurrent `brk()` operations on a shared `MmState`.
+///
+/// `sys_brk` drops the `MmState` lock across irreversible page-table work
+/// (frame alloc/free, map/unmap) because that work acquires the page-table
+/// manager and frame-allocator locks — never `MmState` — so holding `MmState`
+/// across it would invert the established lock order. The previous post-hoc
+/// `mm.brk == old_brk` re-check could only *detect* a racing sibling `brk()`,
+/// not undo the page-table side effects already committed. This guard instead
+/// *prevents* the race: while held, `brk_in_progress` is set and every other
+/// `brk()` on the shared address space returns the current break unchanged, so
+/// `mm.brk` cannot move and the lock-dropped PT work stays consistent with the
+/// eventual commit.
+///
+/// The flag is cleared on `Drop`, which covers every early-return / error path.
+/// The normal commit path clears it under the same `MmState` lock it already
+/// holds and then disarms the guard. `Drop` only ever runs at `sys_brk` scope
+/// exit — after every inner `mm_arc.lock()` scope has ended — so re-locking
+/// `MmState` here cannot self-deadlock.
+struct BrkReservation {
+    mm: Arc<spin::Mutex<crate::process::MmState>>,
+    armed: bool,
+}
+
+impl Drop for BrkReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.mm.lock().brk_in_progress = false;
+        }
+    }
+}
+
 /// sys_brk - 改变数据段大小（堆管理）
 ///
 /// # Arguments
@@ -6065,8 +6204,13 @@ fn sys_brk(addr: usize) -> SyscallResult {
     }
 
     // D3-ARC-MM-SHARED: Lock mm once for validation + setup phase.
-    let (old_brk, old_top, new_top) = {
-        let mm = mm_arc.lock();
+    // R165-1/R165-2 FIX: Read old_brk AND acquire the brk reservation under the
+    // SAME lock acquisition, so no sibling brk() can change mm.brk between the
+    // read and the reservation. While `brk_resv` is held (brk_in_progress=true),
+    // mm.brk is pinned to old_brk until this call commits, making the existing
+    // post-PT re-checks provably true rather than best-effort recovery.
+    let (old_brk, old_top, new_top, mut brk_resv) = {
+        let mut mm = mm_arc.lock();
         // 拒绝缩小到 brk_start 以下
         if addr < mm.brk_start {
             return Ok(mm.brk);
@@ -6075,7 +6219,22 @@ fn sys_brk(addr: usize) -> SyscallResult {
         if addr >= USER_SPACE_TOP {
             return Ok(mm.brk);
         }
-        (mm.brk, page_align_up(mm.brk), page_align_up(addr))
+        // A sibling brk() on this shared MmState is mid-flight. Linux brk()
+        // returns the current break on failure, so report it unchanged and let
+        // the caller retry instead of racing the page tables.
+        if mm.brk_in_progress {
+            return Ok(mm.brk);
+        }
+        mm.brk_in_progress = true;
+        (
+            mm.brk,
+            page_align_up(mm.brk),
+            page_align_up(addr),
+            BrkReservation {
+                mm: Arc::clone(&mm_arc),
+                armed: true,
+            },
+        )
     };
 
     // 堆扩展
@@ -6282,6 +6441,10 @@ fn sys_brk(addr: usize) -> SyscallResult {
             mm.vm_charged_bytes = mm
                 .vm_charged_bytes
                 .saturating_add(grow_size as u64);
+            // R165-1/R165-2 FIX: release the brk reservation under the commit
+            // lock and disarm the guard so Drop does not re-clear it.
+            mm.brk_in_progress = false;
+            brk_resv.armed = false;
         }
 
         // D3-ARC-MM-SHARED: sync_vm_siblings_brk is no longer needed — all
@@ -6371,6 +6534,9 @@ fn sys_brk(addr: usize) -> SyscallResult {
             mm.vm_charged_bytes = mm
                 .vm_charged_bytes
                 .saturating_sub(shrink_size as u64);
+            // R165-1 FIX: release the brk reservation under the commit lock.
+            mm.brk_in_progress = false;
+            brk_resv.armed = false;
         }
 
         // R145-1 FIX: Re-read cgroup_id under lock immediately before uncharge.
@@ -6381,7 +6547,11 @@ fn sys_brk(addr: usize) -> SyscallResult {
     }
     // 同一页内调整，只更新 brk 值
     else {
-        mm_arc.lock().brk = addr;
+        let mut mm = mm_arc.lock();
+        mm.brk = addr;
+        // R165-1 FIX: release the brk reservation under the same lock.
+        mm.brk_in_progress = false;
+        brk_resv.armed = false;
         Ok(addr)
     }
 }
@@ -7891,6 +8061,23 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
 /// * `option` - prctl operation code
 /// * `arg2-arg5` - Operation-specific arguments
 fn sys_prctl(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> SyscallResult {
+    // R165-16 FIX: Invoke the dedicated task-level LSM hook for prctl. It was
+    // defined (lsm::hook_task_prctl) but never called from this syscall, so an
+    // LSM policy could not mediate security-relevant prctl options (NO_NEW_PRIVS,
+    // SET_SECCOMP, …). Evaluate up front, before any state change; deny -> EPERM.
+    // R131-1 FIX pattern: build the ctx from the locked proc and drop it before
+    // calling the hook to avoid Process-mutex re-entrancy.
+    {
+        let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+        let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+        let ctx = {
+            let proc = proc_arc.lock();
+            lsm_process_ctx_from(&proc)
+        };
+        if lsm::hook_task_prctl(&ctx, option, arg2).is_err() {
+            return Err(SyscallError::EPERM);
+        }
+    }
     match option {
         PR_SET_NO_NEW_PRIVS => {
             // arg2 must be 1 to set, 0 is invalid (can't unset)
@@ -8962,8 +9149,12 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     // R65-22 FIX: Handle dirfd for relative paths
     // Resolve relative paths against the directory referenced by dirfd
     // R164-3 FIX: Use fallible allocation for resolved path construction.
+    // R165-5 FIX: Move (not clone) path_str on the absolute-path arm. The prior
+    // `path_str.clone()` was an infallible String allocation of up to
+    // MAX_ARG_STRLEN+1 = 4097 user-controlled bytes — an OOM-time kernel panic.
+    // path_str is not used after this if/else, so the move is sound.
     let resolved_path = if path_str.starts_with('/') {
-        path_str.clone()
+        path_str
     } else if dirfd == AT_FDCWD {
         if path_str.is_empty() {
             try_str_to_string("/")?
