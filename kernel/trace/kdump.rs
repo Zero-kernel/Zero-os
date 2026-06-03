@@ -466,7 +466,18 @@ pub fn emit_encrypted_dump(dump: &CrashDump) {
     // constructing ChaCha20Rng directly, respecting the FIPS boundary.
     // Key is passed by value (copied into the function), so we zero our
     // local copy immediately after the call.
-    chacha20_xor_keystream(key, nonce, &mut out[..len]);
+    //
+    // R165-10 FIX: chacha20_xor_keystream now enforces the FIPS gate itself and
+    // returns Err under FIPS Enabled/Failed. Route that into the same
+    // dump-suppression path used for an RNG failure: never emit a plaintext (or
+    // partially-XORed) dump, scrub all key/output material, and abort.
+    if chacha20_xor_keystream(key, nonce, &mut out[..len]).is_err() {
+        secure_bzero(&mut key);
+        secure_bzero(&mut out[..len]);
+        scrub_kdump_storage_if_captured();
+        serial_write_str("\n[kdump] Encryption unavailable (FIPS) - dump suppressed for security\n");
+        return;
+    }
     // R92-4 FIX: Zero key material after use to minimize exposure.
     secure_bzero(&mut key);
 

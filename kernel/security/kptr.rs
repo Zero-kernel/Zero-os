@@ -169,6 +169,12 @@ pub fn reseed_with(secret: u64) -> u64 {
     let counter = KPTR_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mixed = mix64(secret ^ counter);
     KPTR_SECRET.store(mixed, Ordering::SeqCst);
+    // R165-11 FIX: Any reseed installs a NEW secret of unknown strength, so the
+    // strong-seeded flag must not stay sticky-true from a prior strong reseed
+    // (e.g. a later TSC-fallback or arbitrary reseed would otherwise leave
+    // kptr_strongly_seeded() reporting true for a now-weak secret). Default to
+    // weak here; reseed_from_entropy re-asserts strong only on the RNG path.
+    KPTR_STRONG_SEEDED.store(false, Ordering::SeqCst);
     mixed
 }
 
@@ -177,15 +183,28 @@ pub fn reseed_with(secret: u64) -> u64 {
 /// This should be called after the RNG subsystem is initialized
 /// to get cryptographically strong entropy.
 pub fn reseed_from_entropy() -> u64 {
-    // Try hardware RNG first
-    let result = if let Ok(val) = super::rng::random_u64() {
-        reseed_with(val)
+    // R165-11 FIX: Only mark KPTR_STRONG_SEEDED on the actual hardware-RNG path.
+    // The previous code set it true unconditionally — including the TSC fallback,
+    // which is NOT cryptographically strong — so the flag did not reflect reality.
+    // Setting it only on the RNG branch makes the flag truthful for any future
+    // consumer (e.g. a strength assertion before exposing hashed kernel pointers).
+    if let Ok(val) = super::rng::random_u64() {
+        let result = reseed_with(val);
+        KPTR_STRONG_SEEDED.store(true, Ordering::SeqCst);
+        result
     } else {
+        // TSC fallback: reseed, but leave KPTR_STRONG_SEEDED false.
         reseed_with(tsc_entropy())
-    };
-    // R163-35 FIX: Mark as strongly seeded after RNG-based reseed.
-    KPTR_STRONG_SEEDED.store(true, Ordering::SeqCst);
-    result
+    }
+}
+
+/// R165-11 FIX: Query whether the kptr secret has been seeded from the hardware
+/// CSPRNG (strong) rather than the TSC fallback (weak). Turns KPTR_STRONG_SEEDED
+/// from a write-only flag into a readable property so a caller that must not
+/// expose hashed kernel pointers under weak seeding can gate on it.
+#[allow(dead_code)] // Public query API; consumers wired as KASLR-leak gating lands.
+pub fn kptr_strongly_seeded() -> bool {
+    KPTR_STRONG_SEEDED.load(Ordering::SeqCst)
 }
 
 /// Initialize kptr guard with TSC-based entropy.

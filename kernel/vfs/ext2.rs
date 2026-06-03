@@ -1304,27 +1304,54 @@ impl Inode for Ext2Inode {
         let fs = self.fs.upgrade().ok_or(FsError::Invalid)?;
         let file_size = self.size.load(Ordering::Acquire);
         let raw = *self.raw.read();
+        let block_size = fs.block_size as u64;
         let mut block_buf = alloc::vec![0u8; fs.block_size as usize];
+        let min_rec = size_of::<Ext2DirEntryHead>();
 
-        let mut current_offset = 0u64;
-        let mut entry_index = 0usize;
+        // R165-21 FIX: read the inode count ONCE here instead of re-acquiring the
+        // superblock read lock for every candidate entry (previously O(N) lock
+        // acquisitions per call, O(N^2) across a full enumeration).
+        let inodes_count = fs.superblock.read().inodes_count;
+
+        // R165-21 FIX: `offset` is now an OPAQUE BYTE OFFSET into the directory
+        // file (the resume cookie), not a logical entry index. Each call resumes
+        // near `target` instead of rescanning from byte 0, turning a full
+        // enumeration from O(N^2) into O(N) (bounded per call by one block's
+        // worth of records). The cookie stays internal: `sys_getdents64` writes
+        // `d_off` as the in-buffer position and persists this cookie as the dir
+        // fd offset, so no userspace ABI changes.
+        let target = offset as u64;
+        if target >= file_size {
+            return Ok(None);
+        }
+
+        // Begin parsing at the START of the block CONTAINING `target` and walk
+        // records forward. ext2 directory records never cross block boundaries,
+        // so the first record of every block sits at offset 0. Walking from the
+        // block boundary lets us (a) reject a malicious `lseek` to a mid-record
+        // offset (it will not coincide with any record boundary -> Invalid)
+        // rather than misparsing arbitrary bytes as a directory entry, and
+        // (b) keep the per-call cost bounded to a single block.
+        let mut current_offset = target - (target % block_size);
+        let mut loaded_block: Option<u32> = None;
 
         while current_offset < file_size {
-            let file_block_u64 = current_offset / fs.block_size as u64;
+            let file_block_u64 = current_offset / block_size;
             // R97-3 FIX: Use try_from instead of truncating cast
-            let file_block =
-                u32::try_from(file_block_u64).map_err(|_| FsError::Invalid)?;
-            let offset_in_block = current_offset % fs.block_size as u64;
+            let file_block = u32::try_from(file_block_u64).map_err(|_| FsError::Invalid)?;
+            let offset_in_block = (current_offset % block_size) as usize;
 
-            let phys_block = fs.map_file_block(&raw, file_block)?;
-            if let Some(phys) = phys_block {
-                fs.read_block(phys, &mut block_buf)?;
-            } else {
-                block_buf.fill(0);
+            // (Re)load the block only when we enter a new one.
+            if loaded_block != Some(file_block) {
+                match fs.map_file_block(&raw, file_block)? {
+                    Some(phys) => fs.read_block(phys, &mut block_buf)?,
+                    None => block_buf.fill(0),
+                }
+                loaded_block = Some(file_block);
             }
 
-            let data = &block_buf[offset_in_block as usize..];
-            if data.len() < size_of::<Ext2DirEntryHead>() {
+            let data = &block_buf[offset_in_block..];
+            if data.len() < min_rec {
                 break;
             }
 
@@ -1334,72 +1361,92 @@ impl Inode for Ext2Inode {
             let head: Ext2DirEntryHead =
                 unsafe { core::ptr::read_unaligned(data.as_ptr() as *const _) };
 
+            // R165-21 FIX: a zero rec_len inside file_size is malformed (a
+            // well-formed ext2 directory pads the last record of each block to
+            // the block end, so current_offset reaches file_size exactly). With
+            // byte-offset cookies, treating it as silent EOF would let a crafted
+            // image / malicious lseek into a zero-filled block truncate the
+            // enumeration; reject it instead. Only `target >= file_size`
+            // (checked above) legitimately ends iteration.
             if head.rec_len == 0 {
-                break;
-            }
-
-            // R28-4 Fix: Validate rec_len and name_len against buffer boundaries
-            let rec_len = head.rec_len as usize;
-            let min_rec = size_of::<Ext2DirEntryHead>();
-            if rec_len < min_rec || (offset_in_block as usize) + rec_len > block_buf.len() {
                 return Err(FsError::Invalid);
             }
 
-            // R162-24 FIX: Also validate inode against inodes_count to reject
-            // crafted images with out-of-range inode numbers early.
-            if head.inode != 0 && head.inode <= fs.superblock.read().inodes_count && head.name_len > 0 {
+            // R28-4 Fix: Validate rec_len against buffer boundaries
+            let rec_len = head.rec_len as usize;
+            if rec_len < min_rec || offset_in_block + rec_len > block_buf.len() {
+                return Err(FsError::Invalid);
+            }
+
+            let next_offset = current_offset + head.rec_len as u64;
+
+            // R165-21 FIX: records before the resume point are only walked to
+            // validate that `target` lands on a real record boundary. If `target`
+            // falls strictly inside this record, the cookie is mid-record (e.g. a
+            // crafted lseek) and is rejected rather than misparsed.
+            if current_offset < target {
+                if next_offset > target {
+                    return Err(FsError::Invalid);
+                }
+                current_offset = next_offset;
+                continue;
+            }
+
+            // R162-24 FIX: validate inode against inodes_count to reject crafted
+            // images with out-of-range inode numbers. inode==0 marks a deleted
+            // slot; both cases are skipped (advance to the next record).
+            if head.inode != 0 && head.inode <= inodes_count && head.name_len > 0 {
                 // Validate name_len before accessing
                 if (head.name_len as usize) > rec_len.saturating_sub(min_rec) {
                     return Err(FsError::Invalid);
                 }
-                if entry_index == offset {
-                    let name_bytes = &data[min_rec..min_rec + head.name_len as usize];
-                    let name = String::from_utf8_lossy(name_bytes).into_owned();
+                let name_bytes = &data[min_rec..min_rec + head.name_len as usize];
+                let name = String::from_utf8_lossy(name_bytes).into_owned();
 
-                    let file_type = match head.file_type {
-                        // R134-6 FIX: EXT2_FT_UNKNOWN — fall back to inode mode
-                        // when the filetype feature is absent.  Without this,
-                        // legacy ext2 images report everything as Regular.
-                        0 => {
-                            match fs.read_inode_raw(head.inode) {
-                                Ok(raw_inode) => match raw_inode.mode & EXT2_S_IFMT {
-                                    EXT2_S_IFREG => FileType::Regular,
-                                    EXT2_S_IFDIR => FileType::Directory,
-                                    EXT2_S_IFLNK => FileType::Symlink,
-                                    0x2000 => FileType::CharDevice,  // S_IFCHR
-                                    0x6000 => FileType::BlockDevice,  // S_IFBLK
-                                    0x1000 => FileType::Fifo,         // S_IFIFO
-                                    0xC000 => FileType::Socket,       // S_IFSOCK
-                                    _ => FileType::Regular,
-                                },
-                                Err(_) => FileType::Regular,
-                            }
+                let file_type = match head.file_type {
+                    // R134-6 FIX: EXT2_FT_UNKNOWN — fall back to inode mode
+                    // when the filetype feature is absent.  Without this,
+                    // legacy ext2 images report everything as Regular.
+                    0 => {
+                        match fs.read_inode_raw(head.inode) {
+                            Ok(raw_inode) => match raw_inode.mode & EXT2_S_IFMT {
+                                EXT2_S_IFREG => FileType::Regular,
+                                EXT2_S_IFDIR => FileType::Directory,
+                                EXT2_S_IFLNK => FileType::Symlink,
+                                0x2000 => FileType::CharDevice,  // S_IFCHR
+                                0x6000 => FileType::BlockDevice,  // S_IFBLK
+                                0x1000 => FileType::Fifo,         // S_IFIFO
+                                0xC000 => FileType::Socket,       // S_IFSOCK
+                                _ => FileType::Regular,
+                            },
+                            Err(_) => FileType::Regular,
                         }
-                        EXT2_FT_REG_FILE => FileType::Regular,
-                        EXT2_FT_DIR => FileType::Directory,
-                        EXT2_FT_SYMLINK => FileType::Symlink,
-                        EXT2_FT_CHRDEV => FileType::CharDevice,
-                        EXT2_FT_BLKDEV => FileType::BlockDevice,
-                        // R133-7 FIX: Map FIFO/SOCK to correct FileType variants
-                        // instead of silently defaulting to Regular.
-                        EXT2_FT_FIFO => FileType::Fifo,
-                        EXT2_FT_SOCK => FileType::Socket,
-                        _ => return Err(FsError::Invalid),
-                    };
+                    }
+                    EXT2_FT_REG_FILE => FileType::Regular,
+                    EXT2_FT_DIR => FileType::Directory,
+                    EXT2_FT_SYMLINK => FileType::Symlink,
+                    EXT2_FT_CHRDEV => FileType::CharDevice,
+                    EXT2_FT_BLKDEV => FileType::BlockDevice,
+                    // R133-7 FIX: Map FIFO/SOCK to correct FileType variants
+                    // instead of silently defaulting to Regular.
+                    EXT2_FT_FIFO => FileType::Fifo,
+                    EXT2_FT_SOCK => FileType::Socket,
+                    _ => return Err(FsError::Invalid),
+                };
 
-                    return Ok(Some((
-                        offset + 1,
-                        DirEntry {
-                            name,
-                            ino: head.inode as u64,
-                            file_type,
-                        },
-                    )));
-                }
-                entry_index += 1;
+                // R165-21 FIX: return the byte offset of the NEXT record as the
+                // resume cookie; the next call starts exactly here.
+                return Ok(Some((
+                    usize::try_from(next_offset).map_err(|_| FsError::Invalid)?,
+                    DirEntry {
+                        name,
+                        ino: head.inode as u64,
+                        file_type,
+                    },
+                )));
             }
 
-            current_offset += head.rec_len as u64;
+            current_offset = next_offset;
         }
 
         Ok(None)

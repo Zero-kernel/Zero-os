@@ -4,7 +4,11 @@
 
 use alloc::vec::Vec;
 use core::arch::asm;
-use iommu::{attach_device, PciDeviceId};
+// R165-20 FIX: Share the IOMMU's PCI config lock so this module's CF8/CFC
+// accesses are serialized against the IOMMU isolation code (the only other
+// PCI config-space user). Without it, an RMW here could interleave with an
+// IOMMU config access on another CPU and corrupt the CF8 address latch.
+use iommu::{attach_device, PciDeviceId, PCI_CONFIG_LOCK};
 use virtio::VirtioPciAddrs;
 
 // ============================================================================
@@ -157,8 +161,9 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
                 }
 
                 // Enable memory space and bus mastering
-                let cmd = pci_read16(bus, dev, func, PCI_COMMAND);
-                pci_write16(bus, dev, func, PCI_COMMAND, cmd | 0x06);
+                // R165-20 FIX: atomic RMW so a concurrent IOMMU config write
+                // cannot be lost between the read and the write-back.
+                pci_update16(bus, dev, func, PCI_COMMAND, |cmd| cmd | 0x06);
 
                 // Try to read modern capabilities
                 if let Some(mut addrs) = read_virtio_caps(bus, dev, func) {
@@ -183,8 +188,8 @@ pub fn probe_virtio_net() -> Vec<VirtioNetPciDevice> {
                 } else {
                     // R82-1 FIX: Disable bus mastering if device lacks modern caps
                     // to prevent orphaned DMA-capable device
-                    let cmd = pci_read16(bus, dev, func, PCI_COMMAND);
-                    pci_write16(bus, dev, func, PCI_COMMAND, cmd & !0x04);
+                    // R165-20 FIX: atomic RMW (see pci_update16).
+                    pci_update16(bus, dev, func, PCI_COMMAND, |cmd| cmd & !0x04);
                     klog!(Info, 
                         "    ! virtio-net @ {:02x}:{:02x}.{} lacks modern capabilities (bus master disabled)",
                         bus,
@@ -301,8 +306,16 @@ fn read_bar(bus: u8, dev: u8, func: u8, bar: u8) -> Option<u64> {
 // PCI Config Space Access
 // ============================================================================
 
+/// Raw (non-locking) 32-bit PCI config read.
+///
+/// R165-20 FIX: This performs the CF8/CFC port pair WITHOUT taking
+/// `PCI_CONFIG_LOCK`. It must only be called by a public helper that already
+/// holds the lock (otherwise the address/data pair is not atomic). Keeping the
+/// raw form separate lets `pci_update16`'s read-modify-write run entirely under
+/// a single lock acquisition — `spin::Mutex` is non-reentrant, so a public
+/// helper calling another public helper while holding the lock would deadlock.
 #[inline]
-fn pci_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
+fn raw_pci_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     let aligned = (offset & 0xFC) as u32;
     let address = 0x8000_0000u32
         | ((bus as u32) << 16)
@@ -317,24 +330,47 @@ fn pci_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
 }
 
 #[inline]
+fn pci_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
+    let _guard = PCI_CONFIG_LOCK.lock();
+    raw_pci_read32(bus, dev, func, offset)
+}
+
+#[inline]
 fn pci_read16(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
+    let _guard = PCI_CONFIG_LOCK.lock();
     let shift = (offset & 2) * 8;
-    (pci_read32(bus, dev, func, offset & 0xFC) >> shift) as u16
+    (raw_pci_read32(bus, dev, func, offset & 0xFC) >> shift) as u16
 }
 
 #[inline]
 fn pci_read8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
+    let _guard = PCI_CONFIG_LOCK.lock();
     let shift = (offset & 3) * 8;
-    (pci_read32(bus, dev, func, offset & 0xFC) >> shift) as u8
+    (raw_pci_read32(bus, dev, func, offset & 0xFC) >> shift) as u8
 }
 
+/// Atomically read-modify-write a 16-bit PCI config register under a single
+/// lock acquisition.
+///
+/// R165-20 FIX: callers enable/disable bus mastering and memory space by
+/// read-modify-writing PCI_COMMAND. Doing that as a separate `pci_read16`
+/// followed by a 16-bit write would release `PCI_CONFIG_LOCK` between the read
+/// and the write, so the IOMMU isolation path on another CPU could change the
+/// register in the gap and then be clobbered by our stale value. This helper
+/// performs the whole read-modify-write while holding the lock, eliminating the
+/// command-register RMW race at the API level (there is intentionally no
+/// stale-value `pci_write16`, which invited that footgun).
+///
+/// `f` receives the current 16-bit value and returns the new value to store.
 #[inline]
-fn pci_write16(bus: u8, dev: u8, func: u8, offset: u8, val: u16) {
+fn pci_update16(bus: u8, dev: u8, func: u8, offset: u8, f: impl FnOnce(u16) -> u16) {
+    let _guard = PCI_CONFIG_LOCK.lock();
     let aligned = offset & 0xFC;
     let shift = ((offset & 2) * 8) as u32;
-    let mut dword = pci_read32(bus, dev, func, aligned);
-    let mask = !(0xFFFFu32 << shift);
-    dword = (dword & mask) | ((val as u32) << shift);
+    let cur = raw_pci_read32(bus, dev, func, aligned);
+    let old = ((cur >> shift) & 0xFFFF) as u16;
+    let new = f(old);
+    let dword = (cur & !(0xFFFFu32 << shift)) | ((new as u32) << shift);
 
     let address = 0x8000_0000u32
         | ((bus as u32) << 16)
@@ -365,6 +401,6 @@ unsafe fn inl(port: u16) -> u32 {
 /// This should be called when a device fails to initialize properly after
 /// bus mastering was enabled, to prevent orphaned DMA-capable devices.
 pub fn disable_bus_master(slot: &PciSlot) {
-    let cmd = pci_read16(slot.bus, slot.device, slot.function, PCI_COMMAND);
-    pci_write16(slot.bus, slot.device, slot.function, PCI_COMMAND, cmd & !0x04);
+    // R165-20 FIX: atomic RMW (see pci_update16).
+    pci_update16(slot.bus, slot.device, slot.function, PCI_COMMAND, |cmd| cmd & !0x04);
 }

@@ -613,6 +613,13 @@ pub fn build_arp_reply(
     };
 
     let arp_payload = serialize_arp(&arp_pkt);
+    // R165-19 FIX: serialize_arp returns an empty Vec on OOM. Building an Ethernet
+    // frame over an empty payload would emit a runt 14-byte (header-only) frame.
+    // Propagate the empty-Vec sentinel so the caller drops the reply instead of
+    // transmitting a malformed frame.
+    if arp_payload.is_empty() {
+        return Vec::new();
+    }
     build_ethernet_frame(target_mac, our_mac, ETHERTYPE_ARP, &arp_payload)
 }
 
@@ -865,6 +872,11 @@ pub fn process_arp(
 
             // Build and return reply
             let reply = build_arp_reply(our_mac, our_ip, pkt.sender_hw, pkt.sender_ip);
+            // R165-19 FIX: build_arp_reply returns an empty Vec on OOM (sentinel).
+            // Drop silently rather than emitting a runt frame; the peer will retry.
+            if reply.is_empty() {
+                return ArpResult::Handled;
+            }
             stats.inc_tx_replies();
             ArpResult::Reply(reply)
         }

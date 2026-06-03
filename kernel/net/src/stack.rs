@@ -54,7 +54,7 @@ use crate::fragment::{
 use crate::get_device;
 use crate::icmp::{
     build_dest_unreachable, build_echo_reply, parse_icmp, IcmpError, ICMP_CODE_PORT_UNREACHABLE,
-    ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REPLY, ICMP_TYPE_ECHO_REQUEST,
+    ICMP_RATE_LIMITER, ICMP_TYPE_ECHO_REQUEST,
 };
 use crate::ipv4::{
     build_ipv4_header, compute_checksum, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
@@ -387,7 +387,17 @@ fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bo
         (None, None)
     };
 
-    // Derive conntrack state from the tracking table.
+    // R165-7 FIX: This hook only evaluates kernel-generated reply frames
+    // (ProcessResult::Reply — ICMP echo replies, TCP RSTs, REJECT responses),
+    // i.e. responses to a just-received ingress packet. Such a frame must never
+    // be classified `New`. In particular an ICMP echo reply cannot share a
+    // FlowKey with its request (the type/code pseudo-ports differ: request 0x800
+    // vs reply 0x000) and this lookup does not reconstruct ICMP pseudo-ports, so
+    // the naive lookup returns `New` and the default ruleset silently drops the
+    // host's own ping reply. Treat any found flow as Established, and floor an
+    // unmatched reply to Related, so the default accept-ESTABLISHED/RELATED rule
+    // permits legitimate replies. Operators can still drop these with an explicit
+    // higher-priority egress rule (evaluated before the default accept rule).
     let ct_decision = {
         let sp = src_port.unwrap_or(0);
         let dp = dst_port.unwrap_or(0);
@@ -400,13 +410,10 @@ fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bo
         let (key, _) = FlowKey::from_packet(
             net_ns_id, proto_u8, ip_hdr.src, ip_hdr.dst, sp, dp,
         );
-        conntrack_table()
-            .lookup(&key)
-            .map(|e| if e.seen_reply {
-                crate::conntrack::CtDecision::Established
-            } else {
-                crate::conntrack::CtDecision::New
-            })
+        Some(match conntrack_table().lookup(&key) {
+            Some(_) => crate::conntrack::CtDecision::Established,
+            None => crate::conntrack::CtDecision::Related,
+        })
     };
 
     let fw_pkt = FirewallPacket {
@@ -425,13 +432,66 @@ fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bo
     matches!(fw_verdict.action, FirewallAction::Accept)
 }
 
-/// R163-7 FIX (non-conntrack build): Without conntrack the egress firewall
-/// cannot evaluate stateful rules; pass all reply frames through so we do not
-/// break the non-conntrack configuration.
+/// R165-6 FIX: Evaluate STATELESS egress rules on reply frames in non-conntrack
+/// builds instead of bypassing the firewall entirely.
+///
+/// The previous non-conntrack variant returned `true` unconditionally, so a
+/// stateless egress DROP/REJECT rule (src/dst IP, port, proto — all evaluable
+/// without conntrack since `CtStateMask::matches(None)` is true for ANY-masked
+/// rules) was enforced on the TX path (R164-7) but silently bypassed for every
+/// locally-generated reply frame (ICMP echo replies, TCP RSTs, REJECT responses).
+/// This mirrors the conntrack variant's parse+evaluate path with `ct_state: None`,
+/// closing the asymmetric-enforcement gap.
+///
+/// Non-IPv4 (ARP, etc.) and unparseable frames pass through (fail-open), matching
+/// the conntrack variant's behavior for kernel-generated replies.
 #[cfg(not(feature = "conntrack"))]
-#[inline(always)]
-fn egress_firewall_allows_reply(_frame: &[u8], _net_ns_id: u64, _now_ms: u64) -> bool {
-    true
+fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bool {
+    let (eth_hdr, ip_payload) = match parse_ethernet(frame) {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    if eth_hdr.ethertype != ETHERTYPE_IPV4 {
+        return true;
+    }
+
+    let (ip_hdr, _opts, l4_bytes) = match parse_ipv4(ip_payload) {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+
+    let proto = match ip_hdr.proto() {
+        Some(p) => p,
+        None => return true,
+    };
+
+    // Extract transport-layer ports for TCP/UDP (same as the conntrack variant).
+    let (src_port, dst_port) = if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp)
+        && l4_bytes.len() >= 4
+    {
+        (
+            Some(u16::from_be_bytes([l4_bytes[0], l4_bytes[1]])),
+            Some(u16::from_be_bytes([l4_bytes[2], l4_bytes[3]])),
+        )
+    } else {
+        (None, None)
+    };
+
+    // No conntrack: only stateless rules can match (ct_state = None).
+    let fw_pkt = FirewallPacket {
+        net_ns_id,
+        src_ip: ip_hdr.src,
+        dst_ip: ip_hdr.dst,
+        proto,
+        src_port,
+        dst_port,
+        ct_state: None,
+    };
+
+    let fw_verdict = firewall_table_for_ns(net_ns_id).evaluate(&fw_pkt);
+    crate::firewall::log_match(&fw_verdict, &fw_pkt, now_ms);
+
+    matches!(fw_verdict.action, FirewallAction::Accept)
 }
 
 /// Process an IPv4 packet.
@@ -771,21 +831,14 @@ fn process_icmp(
             return ProcessResult::Dropped(DropReason::EthParseError);
         }
 
-        // R159-14 FIX: Seed conntrack for the outbound echo reply so egress
-        // firewall rules requiring ESTABLISHED state can match it.
-        #[cfg(feature = "conntrack")]
-        {
-            use crate::conntrack::ct_process_icmp;
-            let _ = ct_process_icmp(
-                net_ns_id.0,
-                our_ip,
-                ip_hdr.src,
-                ICMP_TYPE_ECHO_REPLY,
-                0,
-                icmp_reply.len(),
-                now_ms,
-            );
-        }
+        // R165-7 FIX: Removed the R159-14 outbound echo-reply conntrack seeding.
+        // It created a SEPARATE flow (echo-reply pseudo-port 0x000) that never
+        // matched the request flow (0x800) and always carried seen_reply=false,
+        // so the egress reply firewall still saw it as `New`. The reply path now
+        // floors kernel-generated replies to Related/Established in
+        // egress_firewall_allows_reply, which is what actually lets the default
+        // ESTABLISHED/RELATED accept rule pass legitimate ping replies. Seeding a
+        // bogus half-open flow served no purpose and only polluted the table.
 
         stats.inc_icmp_echo_tx();
         return ProcessResult::Reply(frame);
@@ -944,6 +997,11 @@ fn process_tcp(
             ETHERTYPE_IPV4,
             &ip_packet,
         );
+        // R165-18 FIX: build_ethernet_frame returns an empty Vec on OOM. Drop
+        // rather than emit a runt header-only frame (the peer retransmits).
+        if frame.is_empty() {
+            return ProcessResult::Handled;
+        }
 
         return ProcessResult::Reply(frame);
     }
@@ -1406,6 +1464,11 @@ fn apply_firewall_verdict(
                             ETHERTYPE_IPV4,
                             &ip_packet,
                         );
+                        // R165-18 FIX: drop on empty-OOM frame instead of emitting
+                        // a runt RST frame.
+                        if frame.is_empty() {
+                            return None;
+                        }
 
                         return Some(ProcessResult::Reply(frame));
                     }
@@ -1431,6 +1494,11 @@ fn apply_firewall_verdict(
             }
 
             let frame = build_ethernet_frame(eth_hdr.src, eth_hdr.dst, ETHERTYPE_IPV4, &ip_packet);
+            // R165-18 FIX: drop on empty-OOM frame instead of emitting a runt
+            // ICMP-reject frame.
+            if frame.is_empty() {
+                return None;
+            }
 
             Some(ProcessResult::Reply(frame))
         }

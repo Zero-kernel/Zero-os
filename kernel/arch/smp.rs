@@ -1001,6 +1001,10 @@ pub extern "C" fn ap_rust_entry(
     // are enabled on this AP. Prevents deadlock on first IRQ if heap lock is held.
     interrupts::force_init_irq_cpu_locals();
     kernel_core::force_init_resched_locals();
+    // R165-3 FIX: Force-init usercopy CpuLocal statics (SMAP_GUARD_DEPTH +
+    // USER_COPY_STATE) on this AP before interrupts are enabled — same lazy-alloc
+    // deadlock hazard as the IRQ/resched locals (R163-6 was never wired in).
+    kernel_core::force_init_usercopy_locals();
 
     // R67-8 FIX: Initialize per-CPU syscall metadata and GS base for this AP
     unsafe {

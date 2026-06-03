@@ -186,7 +186,12 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
                 let segment_end = match vaddr.checked_add(memsz) {
                     Some(end) => end,
                     None => {
-                        klog!(Error,
+                        // R165-12 FIX: Debug, not Error — these messages echo
+                        // attacker-controlled ELF virtual addresses; emitting them
+                        // at Error level leaks address-layout info (and lets an
+                        // unprivileged user flood the log) in Balanced/Performance
+                        // profiles. The syscall still returns the error to userspace.
+                        klog!(Debug,
                             "ELF loader: PT_LOAD segment vaddr {:#x} + memsz {:#x} overflows",
                             vaddr, memsz
                         );
@@ -201,12 +206,17 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
                 // to page boundaries catches this at validation time.
                 let page_mask: usize = 0xFFF;
                 let page_start = vaddr & !page_mask;
-                let page_end = (segment_end + page_mask) & !page_mask;
+                // R165-13 FIX: saturating_add for the page-align-up. segment_end
+                // (= vaddr + memsz) is already overflow-checked above, but a VA at
+                // the very top of the address space could still overflow when
+                // adding page_mask, panicking in debug builds on a crafted ELF.
+                let page_end = segment_end.saturating_add(page_mask) & !page_mask;
                 for &(prev_start, prev_end) in loaded_ranges.iter() {
                     let prev_page_start = prev_start & !page_mask;
-                    let prev_page_end = (prev_end + page_mask) & !page_mask;
+                    let prev_page_end = prev_end.saturating_add(page_mask) & !page_mask;
                     if page_start < prev_page_end && prev_page_start < page_end {
-                        klog!(Error,
+                        // R165-12 FIX: Debug, not Error — attacker-controlled VAs.
+                        klog!(Debug,
                             "ELF loader: PT_LOAD segment [{:#x}, {:#x}) overlaps with [{:#x}, {:#x}) at page level",
                             vaddr, segment_end, prev_start, prev_end
                         );
@@ -254,7 +264,9 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
     // 栈区域：[USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_TOP)
     let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
     if brk_start >= stack_base {
-        klog!(Error,
+        // R165-12 FIX: Debug, not Error — `stack_base` is a KASLR-randomized VA;
+        // leaking it at production log level weakens user-space ASLR.
+        klog!(Debug,
             "ELF loader: brk_start 0x{:x} overlaps with stack at 0x{:x}",
             brk_start, stack_base
         );
@@ -275,7 +287,8 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
     // 防止恶意 ELF 设置内核地址或非法地址导致 #GP 或代码执行到错误位置
     let entry = elf.header.pt2.entry_point();
     if entry < USER_BASE as u64 || entry >= USER_STACK_TOP {
-        klog!(Error,
+        // R165-12 FIX: Debug, not Error — echoes an attacker-controlled VA.
+        klog!(Debug,
             "ELF loader: invalid entry point 0x{:x} (valid range: 0x{:x}-0x{:x})",
             entry, USER_BASE, USER_STACK_TOP
         );
@@ -299,7 +312,8 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
         (entry as usize) >= start && (entry as usize) < end
     });
     if !entry_in_segment {
-        klog!(Error,
+        // R165-12 FIX: Debug, not Error — echoes an attacker-controlled VA.
+        klog!(Debug,
             "ELF loader: entry point 0x{:x} not within any loaded segment",
             entry
         );
@@ -496,7 +510,8 @@ fn load_segment_tracked(
                     .ok_or(ElfLoadError::OutOfMemory)?;
 
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
-                    klog!(Error,
+                    // R165-12 FIX: Debug, not Error — leaks the loaded segment VA.
+                    klog!(Debug,
                         "ELF loader: map_page FAILED for va=0x{:x}: {:?}",
                         va.as_u64(),
                         e
@@ -621,7 +636,8 @@ fn allocate_user_stack_tracked(
                 }
 
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
-                    klog!(Error,
+                    // R165-12 FIX: Debug, not Error — leaks the KASLR stack VA.
+                    klog!(Debug,
                         "ELF loader: map_page FAILED for stack va=0x{:x}: {:?}",
                         va.as_u64(),
                         e

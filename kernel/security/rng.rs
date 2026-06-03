@@ -275,7 +275,33 @@ pub(crate) fn random_range(max: u64) -> Result<u64, RngError> {
 /// * `key` - 256-bit encryption key (consumed and zeroed internally)
 /// * `nonce` - 96-bit nonce
 /// * `buf` - Buffer to XOR with keystream (encrypted in-place)
-pub fn chacha20_xor_keystream(mut key: [u8; 32], nonce: [u8; 12], buf: &mut [u8]) {
+///
+/// # Errors
+///
+/// R165-10 FIX: Enforce the FIPS boundary INSIDE this public API rather than
+/// relying on every caller to gate externally (INV-FIPS-01). ChaCha20 is NOT
+/// a FIPS 140-2/140-3 approved algorithm, so it must be blocked whenever FIPS
+/// mode is `Enabled` *or* `Failed` (fail-closed). Only `Disabled` proceeds.
+/// On the blocked path the caller's `key` copy is zeroized and `buf` is left
+/// untouched (it still holds the caller's plaintext, which the caller is
+/// responsible for handling). Returns `Err(RngError::FipsBlocked)` so callers
+/// cannot silently emit ChaCha-"encrypted" output under FIPS.
+pub fn chacha20_xor_keystream(
+    mut key: [u8; 32],
+    nonce: [u8; 12],
+    buf: &mut [u8],
+) -> Result<(), RngError> {
+    // R165-10 FIX: Fail-closed FIPS gate. Unlike fill_random() (which can fall
+    // back to the FIPS-validated hardware entropy path when Enabled), ChaCha20
+    // has no approved path at all — block it under both Enabled and Failed.
+    match fips_state() {
+        FipsState::Enabled | FipsState::Failed => {
+            explicit_bzero(&mut key);
+            return Err(RngError::FipsBlocked);
+        }
+        FipsState::Disabled => {}
+    }
+
     let mut cipher = ChaCha20Rng::new(key, nonce);
     // Wipe the stack copy of the key now that it's been expanded into cipher state.
     explicit_bzero(&mut key);
@@ -294,6 +320,7 @@ pub fn chacha20_xor_keystream(mut key: [u8; 32], nonce: [u8; 12], buf: &mut [u8]
     // Defense-in-depth: wipe keystream buffer using write_volatile to
     // prevent the compiler from optimizing away the zeroing.
     explicit_bzero(&mut keystream);
+    Ok(())
 }
 
 // ============================================================================

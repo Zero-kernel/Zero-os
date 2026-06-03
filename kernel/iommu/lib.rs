@@ -151,7 +151,13 @@ static IOMMU_UNITS: Lazy<RwLock<Vec<Arc<VtdUnit>>>> = Lazy::new(|| RwLock::new(V
 /// Registry of domains.
 static DOMAINS: Lazy<RwLock<Vec<Arc<Domain>>>> = Lazy::new(|| RwLock::new(Vec::new()));
 // R163-I8 FIX: Monotonic domain ID counter independent of Vec length.
-static NEXT_DOMAIN_ID: AtomicU32 = AtomicU32::new(0);
+// R165-8 FIX: Start at 1, not 0. KERNEL_DOMAIN_ID = 0 is registered at init()
+// WITHOUT advancing this counter, so a base of 0 made the first create_domain()/
+// create_vm_domain() return id 0 — aliasing the kernel DMA isolation domain
+// (first-match lookups would then resolve a VM passthrough domain to the kernel
+// domain, breaking DMA isolation). Reserving 0 for the kernel domain closes the
+// regression; create_*_domain() also rejects any id that aliases a live domain.
+static NEXT_DOMAIN_ID: AtomicU32 = AtomicU32::new(1);
 
 /// VM domain registry: maps domain ID to VM identifier.
 /// Used to distinguish VM passthrough domains from kernel domains.
@@ -812,7 +818,14 @@ pub fn create_domain(domain_type: DomainType) -> IommuResult<DomainId> {
         return Err(IommuError::TooManyDomains);
     }
 
+    // R165-8 FIX: Reject an ID that aliases the kernel DMA domain (id 0) or any
+    // live domain. With NEXT_DOMAIN_ID based at 1 this only triggers on a
+    // theoretical u32 wrap, but the check is fail-closed against DMA-isolation
+    // breakage rather than silently returning a colliding ID.
     let id = NEXT_DOMAIN_ID.fetch_add(1, Ordering::SeqCst) as DomainId;
+    if id == KERNEL_DOMAIN_ID || domains.iter().any(|d| d.id() == id) {
+        return Err(IommuError::TooManyDomains);
+    }
     let domain = match domain_type {
         DomainType::Identity => {
             // R94-13 FIX: Identity domains are only allowed when the
@@ -946,7 +959,11 @@ pub fn create_vm_domain(vm_id: u64) -> IommuResult<DomainId> {
         return Err(IommuError::TooManyDomains);
     }
 
+    // R165-8 FIX: Same kernel-domain / live-domain alias guard as create_domain().
     let id = NEXT_DOMAIN_ID.fetch_add(1, Ordering::SeqCst) as DomainId;
+    if id == KERNEL_DOMAIN_ID || domains.iter().any(|d| d.id() == id) {
+        return Err(IommuError::TooManyDomains);
+    }
     let domain = Domain::new_paged(id)?;
     domains.push(Arc::new(domain));
 

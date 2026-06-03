@@ -691,6 +691,13 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         // deadlock if Once::call_once() heap-allocates while the heap lock is held.
         arch::interrupts::force_init_irq_cpu_locals();
         kernel_core::force_init_resched_locals();
+        // R165-3 FIX: Force-init the usercopy CpuLocal statics (SMAP_GUARD_DEPTH +
+        // USER_COPY_STATE) before interrupts are enabled. R163-6 added this helper
+        // but never wired it into either boot path (falsely "verified" in R164), so
+        // the page-fault handler's first USER_COPY_STATE.with() could lazily heap-
+        // allocate in IRQ/fault context and deadlock against the heap lock. Must run
+        // here in process context, mirroring force_init_irq_cpu_locals (R151-5).
+        kernel_core::force_init_usercopy_locals();
         klog_always!("      ✓ BSP per-CPU data initialized");
 
         // R67-8 FIX: Initialize per-CPU syscall metadata and GS base for BSP
