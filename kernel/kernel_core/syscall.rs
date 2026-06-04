@@ -4369,7 +4369,7 @@ fn sys_exec(
             let cgroup_id = proc.cgroup_id;
             let mut mm = proc.mm.lock();
             for (&_base, &len_with_flags) in mm.mmap_regions.iter() {
-                if (len_with_flags & MMAP_REGION_FLAG_PROT_NONE) != 0 {
+                if len_with_flags.is_prot_none() {
                     continue;
                 }
                 let len = mmap_region_len(len_with_flags) as u64;
@@ -6063,36 +6063,204 @@ const MMAP_REGION_FLAG_PENDING_MPROTECT: usize = 1 << 6;
 pub(crate) const MMAP_REGION_FLAG_TRANSIENT_MASK: usize =
     MMAP_REGION_FLAG_PENDING_MAP | MMAP_REGION_FLAG_PENDING_UNMAP | MMAP_REGION_FLAG_PENDING_MPROTECT;
 
-/// Extract the actual page-aligned length from an mmap_regions entry,
-/// stripping any in-flight state flags.
-#[inline]
-pub(crate) fn mmap_region_len(len_with_flags: usize) -> usize {
-    len_with_flags & !MMAP_REGION_FLAG_MASK
+/// D2-MMAP-LIFECYCLE Phase 2: typed newtype for `mmap_regions` VALUES.
+///
+/// A `#[repr(transparent)]` newtype over the packed `usize` (bits [63:12] =
+/// page-aligned length, bits [11:0] = flags — see the encoding contract on
+/// `MmState::mmap_regions`). `Copy` + `repr(transparent)` guarantees that
+/// `BTreeMap<usize, MmapEntry>` and `MmState`'s `derive(Clone)` copy values
+/// VERBATIM — bit-identical to the previous `BTreeMap<usize, usize>`. Every
+/// method body is written in terms of the existing `MMAP_REGION_FLAG_*`
+/// constants, so it is provably bit-equivalent to the prior inline bit-ops.
+///
+/// This formalizes the transient-state encoding contract (Phase 2): the magic
+/// low-bit arithmetic is replaced by named, intention-revealing accessors and
+/// constructors, while the on-the-wire representation is unchanged.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::len_without_is_empty)]
+pub struct MmapEntry(usize);
+
+#[allow(clippy::len_without_is_empty)]
+impl MmapEntry {
+    /// Wrap a raw packed word (migration / escape hatch). Identity, bit-identical.
+    #[inline]
+    pub const fn from_raw(raw: usize) -> Self {
+        MmapEntry(raw)
+    }
+
+    /// Pack a page-aligned length with a precomputed flag word.
+    /// Precondition (same as the prior code): `len` is page-aligned (low 12 bits
+    /// zero) and `flags` ⊆ `MMAP_REGION_FLAG_MASK`, so the OR is non-overlapping.
+    #[inline]
+    pub const fn from_len_flags(len: usize, flags: usize) -> Self {
+        MmapEntry(len | flags)
+    }
+
+    /// Pure PROT_NONE reservation — `len | PROT_NONE`, NO other flags retained.
+    /// Caller MUST pass an already-extracted length (`entry.len()` / `region_len`),
+    /// never a raw packed word, or stale flag/length bits would leak in.
+    #[inline]
+    pub const fn prot_none(len: usize) -> Self {
+        MmapEntry(len | MMAP_REGION_FLAG_PROT_NONE)
+    }
+
+    /// The raw packed word.
+    #[inline]
+    pub const fn raw(self) -> usize {
+        self.0
+    }
+
+    /// Page-aligned length (all flag bits stripped). Equals the old `mmap_region_len`.
+    #[inline]
+    pub const fn len(self) -> usize {
+        self.0 & !MMAP_REGION_FLAG_MASK
+    }
+
+    /// Low-12 flag bits — the FULL `& 0xfff` committed-flags capture (NOT a
+    /// transient-stripped or persistent-only subset).
+    #[inline]
+    pub const fn flags(self) -> usize {
+        self.0 & MMAP_REGION_FLAG_MASK
+    }
+
+    /// PROT_NONE (bit 2): pure reservation, no physical frames charged.
+    #[inline]
+    pub const fn is_prot_none(self) -> bool {
+        self.0 & MMAP_REGION_FLAG_PROT_NONE != 0
+    }
+
+    /// Individual POSIX prot-bit accessors (bits 3/4/5).
+    #[inline]
+    pub const fn prot_read(self) -> bool {
+        self.0 & MMAP_REGION_FLAG_PROT_READ != 0
+    }
+    #[inline]
+    pub const fn prot_write(self) -> bool {
+        self.0 & MMAP_REGION_FLAG_PROT_WRITE != 0
+    }
+    #[inline]
+    pub const fn prot_exec(self) -> bool {
+        self.0 & MMAP_REGION_FLAG_PROT_EXEC != 0
+    }
+
+    /// 4-char Linux-style "rwxp" permission string for /proc/[pid]/maps.
+    /// All Zero-OS mappings are private, so the 4th char is always 'p'.
+    #[inline]
+    pub fn perms(self) -> [u8; 4] {
+        [
+            if self.prot_read() { b'r' } else { b'-' },
+            if self.prot_write() { b'w' } else { b'-' },
+            if self.prot_exec() { b'x' } else { b'-' },
+            b'p',
+        ]
+    }
+
+    /// Any transient in-flight flag (PENDING_MAP|PENDING_UNMAP|PENDING_MPROTECT) set.
+    #[inline]
+    pub const fn has_transient(self) -> bool {
+        self.0 & MMAP_REGION_FLAG_TRANSIENT_MASK != 0
+    }
+
+    /// Raw transient subset (for debug validation).
+    #[inline]
+    pub const fn transient_flags(self) -> usize {
+        self.0 & MMAP_REGION_FLAG_TRANSIENT_MASK
+    }
+
+    /// PENDING_MPROTECT (bit 6) ownership-token test (R149-6 / R164-2 race guard).
+    #[inline]
+    pub const fn is_pending_mprotect(self) -> bool {
+        self.0 & MMAP_REGION_FLAG_PENDING_MPROTECT != 0
+    }
+
+    /// Set PENDING_MPROTECT in place. FAITHFUL to the prior bare
+    /// `*entry |= MMAP_REGION_FLAG_PENDING_MPROTECT` (no pre-clear of other
+    /// transient bits) — bit-identical regardless of preconditions.
+    #[inline]
+    pub fn set_pending_mprotect(&mut self) {
+        self.0 |= MMAP_REGION_FLAG_PENDING_MPROTECT;
+    }
+
+    /// Clear PENDING_MPROTECT in place, preserving every other bit.
+    #[inline]
+    pub fn clear_pending_mprotect(&mut self) {
+        self.0 &= !MMAP_REGION_FLAG_PENDING_MPROTECT;
+    }
+
+    /// Arm PENDING_UNMAP (munmap Phase-1 marker). FAITHFUL literal OR — matches
+    /// `recorded_length | committed_flags | PENDING_UNMAP` (committed_flags is
+    /// transient-free at the only call site, guarded by `has_transient`).
+    #[inline]
+    pub const fn with_pending_unmap(self) -> Self {
+        MmapEntry(self.0 | MMAP_REGION_FLAG_PENDING_UNMAP)
+    }
+
+    /// mprotect Path A "preserved" flags: committed flags minus
+    /// PROT_NONE | PROT_RWX | PENDING_MPROTECT (mask `!0x7c`).
+    #[inline]
+    pub const fn committed_flags_excluding_prot(self) -> usize {
+        (self.0 & MMAP_REGION_FLAG_MASK)
+            & !(MMAP_REGION_FLAG_PROT_NONE
+                | MMAP_REGION_FLAG_PROT_READ
+                | MMAP_REGION_FLAG_PROT_WRITE
+                | MMAP_REGION_FLAG_PROT_EXEC
+                | MMAP_REGION_FLAG_PENDING_MPROTECT)
+    }
+
+    /// mprotect Path D in-place display-bit sync: clear exactly R|W|X (0x38),
+    /// OR the new prot bits, leaving length + PROT_NONE + transient bits untouched.
+    #[inline]
+    pub fn rewrite_prot_bits(&mut self, new_prot_flags: usize) {
+        let prot_mask = MMAP_REGION_FLAG_PROT_READ
+            | MMAP_REGION_FLAG_PROT_WRITE
+            | MMAP_REGION_FLAG_PROT_EXEC;
+        self.0 = (self.0 & !prot_mask) | new_prot_flags;
+    }
+
+    /// Fork transient-strip: clear PENDING_* (bits 0,1,6), preserve PROT_* + length.
+    /// PRESERVING PROT_NONE (bit 2) is load-bearing for the child's cgroup-charge skip.
+    #[inline]
+    pub const fn fork_stripped(self) -> Self {
+        MmapEntry(self.0 & !MMAP_REGION_FLAG_TRANSIENT_MASK)
+    }
+
+    /// Debug invariant check: page-aligned length + at most one transient flag.
+    #[inline]
+    pub fn debug_validate(self) {
+        if cfg!(debug_assertions) {
+            let length = self.len();
+            debug_assert!(
+                length & (PAGE_SIZE - 1) == 0,
+                "mmap_regions: length {:#x} is not page-aligned",
+                length,
+            );
+            let transient = self.transient_flags();
+            debug_assert!(
+                transient == 0
+                    || transient == MMAP_REGION_FLAG_PENDING_MAP
+                    || transient == MMAP_REGION_FLAG_PENDING_UNMAP
+                    || transient == MMAP_REGION_FLAG_PENDING_MPROTECT,
+                "mmap_regions: multiple transient flags set: {:#x}",
+                transient,
+            );
+        }
+    }
 }
 
-// D2-MMAP-LIFECYCLE: Validation helper for mmap_regions entries.
-// Verifies invariants at insert time in debug builds:
-// 1. Length is page-aligned
-// 2. At most one transient flag is set
+/// Extract the actual page-aligned length from an mmap_regions entry.
+/// Thin shim over [`MmapEntry::len`] (retained so existing call sites that pass
+/// the entry value compile unchanged after the newtype migration).
 #[inline]
-pub(crate) fn debug_validate_mmap_entry(len_with_flags: usize) {
-    if cfg!(debug_assertions) {
-        let length = len_with_flags & !MMAP_REGION_FLAG_MASK;
-        debug_assert!(
-            length & (PAGE_SIZE - 1) == 0,
-            "mmap_regions: length {:#x} is not page-aligned",
-            length,
-        );
-        let transient = len_with_flags & MMAP_REGION_FLAG_TRANSIENT_MASK;
-        debug_assert!(
-            transient == 0
-                || transient == MMAP_REGION_FLAG_PENDING_MAP
-                || transient == MMAP_REGION_FLAG_PENDING_UNMAP
-                || transient == MMAP_REGION_FLAG_PENDING_MPROTECT,
-            "mmap_regions: multiple transient flags set: {:#x}",
-            transient,
-        );
-    }
+pub(crate) fn mmap_region_len(entry: MmapEntry) -> usize {
+    entry.len()
+}
+
+// D2-MMAP-LIFECYCLE: Validation helper for mmap_regions entries (debug builds).
+// Thin shim over [`MmapEntry::debug_validate`].
+#[inline]
+pub(crate) fn debug_validate_mmap_entry(entry: MmapEntry) {
+    entry.debug_validate();
 }
 
 /// R144-2 FIX: Encode POSIX prot bits (PROT_READ/WRITE/EXEC) into mmap region
@@ -6711,7 +6879,7 @@ fn sys_mmap(
         let phase1_flags = MMAP_REGION_FLAG_PENDING_MAP
             | if is_prot_none { MMAP_REGION_FLAG_PROT_NONE } else { 0 };
         mm.mmap_regions
-            .insert(base, length_aligned | phase1_flags);
+            .insert(base, MmapEntry::from_len_flags(length_aligned, phase1_flags));
 
         // Advance next_mmap_addr early so concurrent auto-mmaps don't collide.
         let old_next_mmap_addr = mm.next_mmap_addr;
@@ -6730,7 +6898,7 @@ fn sys_mmap(
     // demand allocation. The mmap_regions entry is committed with the
     // PROT_NONE flag so munmap/exit know not to uncharge or free frames.
     if is_prot_none {
-        let len_with_flags = length_aligned | MMAP_REGION_FLAG_PROT_NONE;
+        let len_with_flags = MmapEntry::prot_none(length_aligned);
         {
             let mut mm = mm_arc.lock();
             debug_validate_mmap_entry(len_with_flags);
@@ -6887,7 +7055,7 @@ fn sys_mmap(
     // The entry transitions from (length | PENDING_MAP) to (length | prot flags).
     // R144-2 FIX: Store protection bits so procfs /proc/[pid]/maps shows accurate perms.
     let prot_flags = mmap_prot_to_flags(prot);
-    let committed_len_with_flags = length_aligned | prot_flags;
+    let committed_len_with_flags = MmapEntry::from_len_flags(length_aligned, prot_flags);
     {
         let mut mm = mm_arc.lock();
         mm.mmap_regions.insert(base, committed_len_with_flags);
@@ -6957,14 +7125,14 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         let recorded_len_with_flags = *mm.mmap_regions.get(&addr).ok_or(SyscallError::EINVAL)?;
 
         // Reject if another operation is already in progress on this region.
-        if (recorded_len_with_flags & MMAP_REGION_FLAG_TRANSIENT_MASK) != 0 {
+        if recorded_len_with_flags.has_transient() {
             return Err(SyscallError::EBUSY);
         }
 
         let recorded_length = mmap_region_len(recorded_len_with_flags);
         // R123-1 FIX: Capture committed per-region flags (e.g. PROT_NONE) so
         // we can skip cgroup uncharge for regions that were never charged.
-        let committed_flags = recorded_len_with_flags & MMAP_REGION_FLAG_MASK;
+        let committed_flags = recorded_len_with_flags.flags();
 
         // 验证长度匹配
         if recorded_length != length_aligned {
@@ -6981,7 +7149,7 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
         // Mark as pending-unmap so concurrent mmap/munmap can't race the PT ops.
         // Preserve committed per-region flags (e.g. PROT_NONE) through the operation.
         mm.mmap_regions
-            .insert(addr, recorded_length | committed_flags | MMAP_REGION_FLAG_PENDING_UNMAP);
+            .insert(addr, MmapEntry::from_len_flags(recorded_length, committed_flags).with_pending_unmap());
 
         // R145-1 FIX: Do NOT capture cgroup_id here — it may change during
         // the lock-drop window (migration).  Re-read under lock in Phase 3.
@@ -7052,7 +7220,7 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     if let Err(e) = unmap_result {
         // Roll back the PENDING_UNMAP marker so the region remains usable.
         // Preserve committed per-region flags (e.g. PROT_NONE).
-        mm_arc.lock().mmap_regions.insert(addr, recorded_length | committed_flags);
+        mm_arc.lock().mmap_regions.insert(addr, MmapEntry::from_len_flags(recorded_length, committed_flags));
         return Err(e);
     }
 
@@ -7172,18 +7340,18 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
             let prev_len = mmap_region_len(prev_lf);
             let prev_end = prev_base.saturating_add(prev_len);
             if prev_end > addr && prev_len > 0 {
-                if (prev_lf & MMAP_REGION_FLAG_TRANSIENT_MASK) != 0 {
+                if prev_lf.has_transient() {
                     return Err(SyscallError::EBUSY);
                 }
-                let prev_flags = prev_lf & MMAP_REGION_FLAG_MASK;
+                let prev_flags = prev_lf.flags();
                 let left_len = addr - prev_base;
-                mm.mmap_regions.insert(prev_base, left_len | prev_flags);
+                mm.mmap_regions.insert(prev_base, MmapEntry::from_len_flags(left_len, prev_flags));
                 let tail_end = prev_end.min(end);
                 let tail_len = tail_end - addr;
-                mm.mmap_regions.insert(addr, tail_len | prev_flags);
+                mm.mmap_regions.insert(addr, MmapEntry::from_len_flags(tail_len, prev_flags));
                 if prev_end > end {
                     let right_len = prev_end - end;
-                    mm.mmap_regions.insert(end, right_len | prev_flags);
+                    mm.mmap_regions.insert(end, MmapEntry::from_len_flags(right_len, prev_flags));
                 }
             }
         }
@@ -7193,14 +7361,14 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
             let last_len = mmap_region_len(last_lf);
             let last_end = last_base.saturating_add(last_len);
             if last_end > end && last_len > 0 {
-                if (last_lf & MMAP_REGION_FLAG_TRANSIENT_MASK) != 0 {
+                if last_lf.has_transient() {
                     return Err(SyscallError::EBUSY);
                 }
-                let last_flags = last_lf & MMAP_REGION_FLAG_MASK;
+                let last_flags = last_lf.flags();
                 let in_range_len = end - last_base;
                 let right_len = last_end - end;
-                mm.mmap_regions.insert(last_base, in_range_len | last_flags);
-                mm.mmap_regions.insert(end, right_len | last_flags);
+                mm.mmap_regions.insert(last_base, MmapEntry::from_len_flags(in_range_len, last_flags));
+                mm.mmap_regions.insert(end, MmapEntry::from_len_flags(right_len, last_flags));
             }
         }
 
@@ -7223,7 +7391,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 return Err(SyscallError::ENOMEM);
             }
 
-            if (len_with_flags & MMAP_REGION_FLAG_TRANSIENT_MASK) != 0 {
+            if len_with_flags.has_transient() {
                 return Err(SyscallError::EBUSY);
             }
 
@@ -7236,7 +7404,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 coverage = region_end;
             }
 
-            if (len_with_flags & MMAP_REGION_FLAG_PROT_NONE) != 0 {
+            if len_with_flags.is_prot_none() {
                 prot_none_regions.push((region_base, region_len));
             } else {
                 real_regions.push((region_base, region_len));
@@ -7273,9 +7441,6 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     };
 
     let new_prot_flags = mmap_prot_to_flags(prot);
-    let prot_mask = MMAP_REGION_FLAG_PROT_READ
-        | MMAP_REGION_FLAG_PROT_WRITE
-        | MMAP_REGION_FLAG_PROT_EXEC;
 
     // ---------------------------------------------------------------
     // Path A — PROT_NONE → real permissions:
@@ -7315,7 +7480,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 // ops, then one's rollback clears the flag, causing the
                 // other's commit check to fail — leaking frames.
                 if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
-                    if (*entry & MMAP_REGION_FLAG_PENDING_MPROTECT) != 0 {
+                    if entry.is_pending_mprotect() {
                         mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
                             .saturating_sub(region_len as u64);
                         drop(mm);
@@ -7324,7 +7489,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         cgroup::uncharge_memory(cgroup_id, region_len as u64);
                         return Err(SyscallError::EBUSY);
                     }
-                    *entry |= MMAP_REGION_FLAG_PENDING_MPROTECT;
+                    entry.set_pending_mprotect();
                 } else {
                     // Region vanished between Phase 0 classification and here;
                     // roll back the charge and fail.
@@ -7464,7 +7629,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         .saturating_sub(region_len as u64);
                     // R149-6 FIX: Clear the transient mprotect flag on rollback.
                     if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
-                        *entry &= !MMAP_REGION_FLAG_PENDING_MPROTECT;
+                        entry.clear_pending_mprotect();
                     }
                     proc.cgroup_id
                 };
@@ -7481,15 +7646,14 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
             // impossible with the flag, but defensive), roll back the charge
             // instead of silently re-inserting a ghost entry.
             let region_end = region_base.saturating_add(region_len);
-            let commit_result: Result<usize, ()> = {
+            let commit_result: Result<MmapEntry, ()> = {
                 let mut mm = mm_arc.lock();
                 match mm.mmap_regions.get(&region_base).copied() {
-                    Some(old) if (old & MMAP_REGION_FLAG_PENDING_MPROTECT) != 0 => {
+                    Some(old) if old.is_pending_mprotect() => {
                         // Entry present with our transient flag — commit.
                         // Clear PROT_NONE + old prot bits + transient mprotect flag.
-                        let preserved = (old & MMAP_REGION_FLAG_MASK)
-                            & !(MMAP_REGION_FLAG_PROT_NONE | prot_mask | MMAP_REGION_FLAG_PENDING_MPROTECT);
-                        let new_entry = region_len | preserved | new_prot_flags;
+                        let preserved = old.committed_flags_excluding_prot();
+                        let new_entry = MmapEntry::from_len_flags(region_len, preserved | new_prot_flags);
                         mm.mmap_regions.insert(region_base, new_entry);
                         mm.vm_charged_bytes = mm
                             .vm_charged_bytes
@@ -7599,10 +7763,10 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 let mut mm = mm_arc.lock();
                 if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
                     let old = *entry;
-                    if (old & MMAP_REGION_FLAG_PROT_NONE) != 0 {
+                    if old.is_prot_none() {
                         false // Already PROT_NONE; concurrent mprotect transitioned it.
                     } else {
-                        *entry = region_len | MMAP_REGION_FLAG_PROT_NONE;
+                        *entry = MmapEntry::prot_none(region_len);
                         mm.vm_charged_bytes = mm
                             .vm_charged_bytes
                             .saturating_sub(region_len as u64);
@@ -7678,7 +7842,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     {
         let mut mm = mm_arc.lock();
         for (&_region_base, len_with_flags) in mm.mmap_regions.range_mut(addr..end) {
-            *len_with_flags = (*len_with_flags & !prot_mask) | new_prot_flags;
+            len_with_flags.rewrite_prot_bits(new_prot_flags);
         }
     }
 

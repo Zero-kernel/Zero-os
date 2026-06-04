@@ -448,7 +448,11 @@ pub struct MmState {
     /// 4. Fork MUST strip transient flags via `& !MMAP_REGION_FLAG_TRANSIENT_MASK`
     /// 5. `compute_cgroup_charged_bytes()` MUST skip PROT_NONE entries
     /// 6. Concurrent mprotect MUST check PENDING_MPROTECT before setting (R164-2)
-    pub mmap_regions: BTreeMap<usize, usize>,
+    ///
+    /// D2-MMAP-LIFECYCLE Phase 2: values are the typed `MmapEntry` newtype
+    /// (a `#[repr(transparent)]` wrapper over the same packed word) so the magic
+    /// bit-arithmetic above is accessed through named, contract-enforcing methods.
+    pub mmap_regions: BTreeMap<usize, crate::syscall::MmapEntry>,
 
     /// Heap start address (page-aligned end of ELF BSS)
     pub brk_start: usize,
@@ -3677,7 +3681,7 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTree
     if !keep_address_space && !mm_shared && proc.memory_space != 0 {
         let cgroup_id = proc.cgroup_id;
         for (&_base, &len_with_flags) in mm.mmap_regions.iter() {
-            if (len_with_flags & crate::syscall::MMAP_REGION_FLAG_PROT_NONE) != 0 {
+            if len_with_flags.is_prot_none() {
                 continue;
             }
             let len = crate::syscall::mmap_region_len(len_with_flags) as u64;
@@ -4066,7 +4070,7 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
         .mmap_regions
         .iter()
         .filter_map(|(&_base, &len_with_flags)| {
-            if (len_with_flags & crate::syscall::MMAP_REGION_FLAG_PROT_NONE) != 0 {
+            if len_with_flags.is_prot_none() {
                 return None;
             }
             let len = crate::syscall::mmap_region_len(len_with_flags) as u64;

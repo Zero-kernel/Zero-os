@@ -172,7 +172,7 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
 
             // Sum non-PROT_NONE mmap regions (inherited verbatim from parent)
             for (&_base, &len_with_flags) in parent_mm.mmap_regions.iter() {
-                if (len_with_flags & crate::syscall::MMAP_REGION_FLAG_PROT_NONE) != 0 {
+                if len_with_flags.is_prot_none() {
                     continue;
                 }
                 let len = crate::syscall::mmap_region_len(len_with_flags) as u64;
@@ -243,7 +243,7 @@ fn fork_inner(
         if parent_mm
             .mmap_regions
             .values()
-            .any(|&len_with_flags| len_with_flags & crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK != 0)
+            .any(|&len_with_flags| len_with_flags.has_transient())
         {
             return Err(ForkError::MmapTransientState);
         }
@@ -436,12 +436,15 @@ fn fork_inner(
             if region_count > crate::syscall::MAX_MAP_COUNT {
                 return Err(ForkError::MemoryAllocationFailed);
             }
-            let mut snap: Vec<(usize, usize)> = Vec::new();
+            let mut snap: Vec<(usize, crate::syscall::MmapEntry)> = Vec::new();
             if snap.try_reserve_exact(region_count).is_err() {
                 return Err(ForkError::MemoryAllocationFailed);
             }
+            // D2 Phase 2: strip transient flags via the typed accessor (clears
+            // PENDING_*, preserves PROT_NONE + prot bits — load-bearing for the
+            // child's cgroup-charge skip).
             snap.extend(parent_mm.mmap_regions.iter().map(|(&base, &len_with_flags)| {
-                (base, len_with_flags & !crate::syscall::MMAP_REGION_FLAG_TRANSIENT_MASK)
+                (base, len_with_flags.fork_stripped())
             }));
 
             let child_mm = crate::process::MmState {

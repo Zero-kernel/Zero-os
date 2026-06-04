@@ -276,6 +276,21 @@ pub fn enforce_nx_for_kernel(
         &bss_end as *const u8 as u64
     });
 
+    // R166 D1-BOOT-NX-KASLR-LAYOUT — defense in depth (alternate root cause).
+    // The single-pass walk below defaults every leaf NOT inside a kernel section
+    // to NO_EXECUTE. Under static-PIE text-KASLR the linker `.text` symbols and
+    // live code addresses are slid together by the bootloader's R_X86_64_RELATIVE
+    // relocations; if they ever diverged, this very code path would lie outside
+    // [text.start, text.end) and the walk would mark it NX, bricking the boot with
+    // an instruction-fetch #PF storm. Verify the running enforcement code actually
+    // falls inside the reported .text range and fail closed otherwise.
+    let self_code_addr = apply_wxorx_single_pass as usize as u64;
+    if !in_section(self_code_addr, &text) {
+        return Err(HardeningError::UnsafeOperation(
+            "NX enforcement code lies outside the linker .text range",
+        ));
+    }
+
     // Demote huge pages to 4KB granularity across all sections
     unsafe {
         ensure_pte_range(VirtAddr::new(text.start), text.size(), frame_allocator)
@@ -313,68 +328,19 @@ pub fn enforce_nx_for_kernel(
 
             let pd = get_table_from_entry(pdpt_entry, phys_offset)?;
 
-            // 【W^X 修复】基线处理：先将内核 PD 下所有页面标记为 NX
+            // R166 D1-BOOT-NX-KASLR-LAYOUT FIX: single-pass W^X enforcement.
             //
-            // 当 ensure_pte_range 将 2MB 内核 huge page 拆分为 4KB 页面时，
-            // 新创建的 PTE 会继承原始的 RWX 标志。apply_section 只修改落在
-            // text/rodata/data/bss 范围内的 ~74 个页面，剩余 512-74 ≈ 438 个
-            // 页面仍保持 RWX，导致 W^X 违规。
-            //
-            // 解决方案：先对所有内核映射页面添加 NX，然后由 text 段处理器
-            // 仅对需要执行的代码页清除 NX。这确保所有非代码页都是 NX 的。
-            mark_all_nx(pd, phys_offset)?;
-
-            // Apply text section: R-X (executable, read-only)
-            apply_section(
-                pd,
-                phys_offset,
-                &text,
-                |mut flags| {
-                    flags.remove(PageTableFlags::WRITABLE);
-                    flags.remove(PageTableFlags::NO_EXECUTE);
-                    flags
-                },
-                &mut summary.text_rx_pages,
-            )?;
-
-            // Apply rodata section: R-- (read-only, non-executable)
-            apply_section(
-                pd,
-                phys_offset,
-                &rodata,
-                |mut flags| {
-                    flags.remove(PageTableFlags::WRITABLE);
-                    flags.insert(PageTableFlags::NO_EXECUTE);
-                    flags
-                },
-                &mut summary.ro_pages,
-            )?;
-
-            // Apply data section: RW-NX (read-write, non-executable)
-            apply_section(
-                pd,
-                phys_offset,
-                &data,
-                |mut flags| {
-                    flags.insert(PageTableFlags::WRITABLE);
-                    flags.insert(PageTableFlags::NO_EXECUTE);
-                    flags
-                },
-                &mut summary.data_nx_pages,
-            )?;
-
-            // Apply bss section: RW-NX (read-write, non-executable)
-            apply_section(
-                pd,
-                phys_offset,
-                &bss,
-                |mut flags| {
-                    flags.insert(PageTableFlags::WRITABLE);
-                    flags.insert(PageTableFlags::NO_EXECUTE);
-                    flags
-                },
-                &mut summary.data_nx_pages,
-            )?;
+            // Apply each leaf's FINAL permission in ONE walk of the kernel PD,
+            // classifying by virtual address. Crucially, .text leaves are taken
+            // directly RWX -> R-X: NO_EXECUTE is never written to a code page, not
+            // even transiently. The previous two-phase code (mark_all_nx set NX on
+            // every leaf — including live .text — then re-cleared NX on .text) left
+            // a window where the executing code was NX in the page table but not in
+            // the stale TLB; a cold instruction fetch or microarchitectural TLB
+            // eviction in that window faulted on the kernel's own code (NX i-fetch,
+            // CR2==RIP), a layout x KASLR-slide Heisenbug. Single-pass eliminates
+            // the window entirely and is also cheaper (one walk instead of five).
+            apply_wxorx_single_pass(pd, phys_offset, &text, &rodata, &data, &bss, &mut summary)?;
 
             // R115-4 FIX: Use PCID-aware flush instead of raw tlb::flush_all()
             mm::tlb_shootdown::flush_all_local();
@@ -395,58 +361,6 @@ unsafe fn get_table_from_entry(
     let phys = entry.addr();
     let virt = phys_offset + phys.as_u64();
     Ok(&mut *(virt.as_u64() as *mut PageTable))
-}
-
-/// 为 PD 下的所有叶子页面添加 NX 位
-///
-/// 处理 2MB huge page（PD 级叶子）和 4KB 页面（PT 级叶子）。
-/// 这是 W^X 策略的基线保护：默认所有页面不可执行，
-/// 然后由各段处理器仅对代码页（.text）清除 NX。
-///
-/// # Safety
-///
-/// 调用者必须确保 `pd` 指向有效的 Page Directory，
-/// 且 `phys_offset` 是正确的物理内存偏移量。
-fn mark_all_nx(pd: &mut PageTable, phys_offset: VirtAddr) -> Result<(), HardeningError> {
-    for pd_entry in pd.iter_mut() {
-        if pd_entry.is_unused() {
-            continue;
-        }
-
-        let flags = pd_entry.flags();
-
-        // 处理 2MB huge page（PD 级别的叶子节点）
-        if flags.contains(PageTableFlags::HUGE_PAGE) {
-            if !flags.contains(PageTableFlags::NO_EXECUTE) {
-                let mut new_flags = flags;
-                new_flags.insert(PageTableFlags::NO_EXECUTE);
-                pd_entry.set_addr(pd_entry.addr(), new_flags);
-            }
-            continue;
-        }
-
-        // 4KB 页面：遍历 PT 条目
-        let pt = unsafe { get_table_from_entry(pd_entry, phys_offset)? };
-        for pt_entry in pt.iter_mut() {
-            if pt_entry.is_unused() {
-                continue;
-            }
-
-            let mut new_flags = pt_entry.flags();
-            if !new_flags.contains(PageTableFlags::NO_EXECUTE) {
-                new_flags.insert(PageTableFlags::NO_EXECUTE);
-                pt_entry.set_addr(pt_entry.addr(), new_flags);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Calculate PD index for a virtual address
-#[inline]
-fn pd_index(vaddr: u64) -> usize {
-    ((vaddr >> 21) & 0x1FF) as usize
 }
 
 /// Calculate base virtual address for a PD index (in high half)
@@ -479,37 +393,98 @@ impl SectionRange {
     }
 }
 
-/// Apply protection flags to a kernel section
-fn apply_section<F>(
+/// Single-pass W^X enforcement over the kernel Page Directory (PDPT[510]).
+///
+/// Walks every present leaf under `pd` exactly once and writes each page's
+/// FINAL permission based on the section it belongs to:
+///
+/// - `.text`          -> R-X  (clear WRITABLE, clear NO_EXECUTE)
+/// - `.rodata`        -> R--  (clear WRITABLE, set NO_EXECUTE)
+/// - `.data` / `.bss` -> RW- + NX (set WRITABLE, set NO_EXECUTE)
+/// - everything else  -> NX, WRITABLE preserved (gaps, page-table frames, heap,
+///                       stack — default deny-execute)
+///
+/// # Why this cannot self-NX the running kernel (the D1 fix)
+///
+/// This code executes from `.text`. Because `.text` leaves are taken DIRECTLY
+/// from RWX to R-X, the `NO_EXECUTE` bit is never asserted on a code page at any
+/// instant of the walk. The previous two-phase approach first set `NO_EXECUTE`
+/// on every kernel leaf (including live `.text`) and only re-cleared it
+/// afterwards; in the window between the two phases the executing code had
+/// `NO_EXECUTE=1` in the page table but `=0` in the (stale) TLB. x86 does not
+/// invalidate the TLB on a page-table write, so execution survived on the cached
+/// entry — until a cold instruction fetch (a call into a not-yet-executed page,
+/// or a microarchitectural TLB eviction) forced a hardware walk that observed
+/// `NO_EXECUTE=1` and raised an i-fetch `#PF` on the kernel's own code
+/// (CR2==RIP, error 0x11), storming to a triple fault. Whether the window was
+/// hit depended on `.text` layout and the per-boot KASLR slide, making it a
+/// layout-fragile Heisenbug (D1-BOOT-NX-KASLR-LAYOUT). Single-pass removes the
+/// window: a `.text` leaf is never `NO_EXECUTE`, so no instruction fetch can
+/// fault regardless of TLB state or slide. It is also strictly cheaper (one walk
+/// of the kernel PD, not five).
+///
+/// `.text`/`.rodata`/`.data`/`.bss` were demoted to 4 KiB by `ensure_pte_range`
+/// before this runs, so any 2 MiB huge leaf still present here must be a
+/// non-section (gap/identity) region. A preflight pass verifies that and refuses
+/// (returns `Err` before mutating any PTE) if a section is somehow still mapped
+/// by a huge page — NX-ing a whole 2 MiB block could disable execution on live
+/// code.
+///
+/// # Safety
+///
+/// Must run pre-SMP (single CPU); `pd` must point at the active kernel Page
+/// Directory and `phys_offset` must be the correct high-half direct-map offset.
+fn apply_wxorx_single_pass(
     pd: &mut PageTable,
     phys_offset: VirtAddr,
-    range: &SectionRange,
-    mut adjust: F,
-    counter: &mut usize,
-) -> Result<(), HardeningError>
-where
-    F: FnMut(PageTableFlags) -> PageTableFlags,
-{
-    if range.size() == 0 {
-        return Ok(());
+    text: &SectionRange,
+    rodata: &SectionRange,
+    data: &SectionRange,
+    bss: &SectionRange,
+    summary: &mut NxEnforcementSummary,
+) -> Result<(), HardeningError> {
+    // Preflight: a remaining 2 MiB huge leaf overlapping a kernel section means
+    // demotion failed. Detect it BEFORE writing any PTE so an error path never
+    // leaves the kernel mapping half-rewritten.
+    for (pd_idx, pd_entry) in pd.iter().enumerate() {
+        if pd_entry.is_unused() {
+            continue;
+        }
+        if pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            let huge_start = pd_base_vaddr(pd_idx);
+            let huge_end = huge_start + 0x20_0000;
+            if section_overlaps(huge_start, huge_end, text)
+                || section_overlaps(huge_start, huge_end, rodata)
+                || section_overlaps(huge_start, huge_end, data)
+                || section_overlaps(huge_start, huge_end, bss)
+            {
+                return Err(HardeningError::UnsafeOperation(
+                    "Kernel section still mapped by a 2 MiB huge page after demotion",
+                ));
+            }
+        }
     }
 
-    let pd_start = pd_index(range.start);
-    let pd_end = pd_index(range.end.saturating_sub(1));
-
-    for pd_idx in pd_start..=pd_end {
-        let pd_entry = &mut pd[pd_idx];
+    for (pd_idx, pd_entry) in pd.iter_mut().enumerate() {
         if pd_entry.is_unused() {
             continue;
         }
 
         let flags = pd_entry.flags();
+
+        // 2 MiB huge leaf (preflight proved it is a non-section gap): deny
+        // execute, preserve every other flag.
         if flags.contains(PageTableFlags::HUGE_PAGE) {
-            return Err(HardeningError::UnsafeOperation(
-                "Expected 4KB pages after demotion",
-            ));
+            if !flags.contains(PageTableFlags::NO_EXECUTE) {
+                let mut new_flags = flags;
+                new_flags.insert(PageTableFlags::NO_EXECUTE);
+                pd_entry.set_addr(pd_entry.addr(), new_flags);
+            }
+            continue;
         }
 
+        // 4 KiB leaves: classify each present PTE by its virtual address and
+        // commit its final flags in a single store.
         let pt = unsafe { get_table_from_entry(pd_entry, phys_offset)? };
         let pd_base = pd_base_vaddr(pd_idx);
 
@@ -518,18 +493,54 @@ where
                 continue;
             }
 
-            let page_vaddr = pd_base + (pt_idx as u64 * 4096);
-            if page_vaddr < range.start || page_vaddr >= range.end {
-                continue;
+            let page_vaddr = pd_base + (pt_idx as u64) * 4096;
+            let old_flags = pt_entry.flags();
+            let mut new_flags = old_flags;
+
+            // Kernel sections are disjoint and page-aligned (linker script), so a
+            // page matches at most one range.
+            if in_section(page_vaddr, text) {
+                // R-X: NO_EXECUTE is CLEARED here and never set — the invariant
+                // that makes this walk safe to run from `.text`.
+                new_flags.remove(PageTableFlags::WRITABLE);
+                new_flags.remove(PageTableFlags::NO_EXECUTE);
+                summary.text_rx_pages += 1;
+            } else if in_section(page_vaddr, rodata) {
+                // R--: read-only, non-executable.
+                new_flags.remove(PageTableFlags::WRITABLE);
+                new_flags.insert(PageTableFlags::NO_EXECUTE);
+                summary.ro_pages += 1;
+            } else if in_section(page_vaddr, data) || in_section(page_vaddr, bss) {
+                // RW-NX: read-write, non-executable.
+                new_flags.insert(PageTableFlags::WRITABLE);
+                new_flags.insert(PageTableFlags::NO_EXECUTE);
+                summary.data_nx_pages += 1;
+            } else {
+                // Gap / page-table frame / heap / stack: deny execute, keep
+                // WRITABLE so kernel page tables remain mutable.
+                new_flags.insert(PageTableFlags::NO_EXECUTE);
             }
 
-            let new_flags = adjust(pt_entry.flags());
-            pt_entry.set_addr(pt_entry.addr(), new_flags);
-            *counter += 1;
+            if new_flags != old_flags {
+                pt_entry.set_addr(pt_entry.addr(), new_flags);
+            }
         }
     }
 
     Ok(())
+}
+
+/// True if page-aligned `vaddr` lies within `[range.start, range.end)`.
+#[inline]
+fn in_section(vaddr: u64, range: &SectionRange) -> bool {
+    range.start < range.end && vaddr >= range.start && vaddr < range.end
+}
+
+/// True if the non-empty interval `[start, end)` overlaps the non-empty `range`.
+/// Empty intervals (on either side) never overlap.
+#[inline]
+fn section_overlaps(start: u64, end: u64, range: &SectionRange) -> bool {
+    start < end && range.start < range.end && start < range.end && range.start < end
 }
 
 // ============================================================================

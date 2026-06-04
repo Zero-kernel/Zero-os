@@ -203,6 +203,17 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         (FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE)
     });
 
+    // R166 FIX: carve the kernel heap's physical frames out of the buddy region so
+    // the linked-list heap and the buddy frame allocator never manage the same
+    // physical memory. The heap base is KASLR-randomized within conventional
+    // memory and previously could land inside the buddy region; the buddy then
+    // handed out a live heap frame whose consumer (DMA / page-zeroing via a
+    // physical-address mapping that bypasses the CPU MMU) overwrote live heap
+    // objects, intermittently zeroing the TIMER_CBS callback buffer and faulting
+    // the kernel to RIP=0. Excluding the heap range eliminates the double-ownership.
+    let heap_phys = (heap_base as u64).wrapping_sub(PHYSICAL_MEMORY_OFFSET);
+    let (pmm_base, pmm_size) = carve_region_around_heap(pmm_base, pmm_size, heap_phys, HEAP_SIZE);
+
     // R148-8 FIX: Physical memory region bounds also leak information.
     #[cfg(debug_assertions)]
     klog!(
@@ -258,10 +269,15 @@ pub fn init() {
 
     // 使用硬编码区域
     klog!(Warn, "  Warning: No BootInfo, using hardcoded memory region");
-    buddy_allocator::init_buddy_allocator(
-        PhysAddr::new(FALLBACK_PHYS_MEM_START),
+    // R166 FIX: same heap/buddy physical-overlap exclusion as the BootInfo path.
+    let heap_phys = (heap_base as u64).wrapping_sub(PHYSICAL_MEMORY_OFFSET);
+    let (pmm_base, pmm_size) = carve_region_around_heap(
+        FALLBACK_PHYS_MEM_START,
         FALLBACK_PHYS_MEM_SIZE,
+        heap_phys,
+        HEAP_SIZE,
     );
+    buddy_allocator::init_buddy_allocator(PhysAddr::new(pmm_base), pmm_size);
 
     // 运行自测（可选）
     #[cfg(debug_assertions)]
@@ -554,6 +570,56 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
         let capped_size = size.min(256 * 1024 * 1024) as usize; // 最大 256MB
         (base, capped_size)
     })
+}
+
+/// R166 FIX: carve the kernel heap's physical range out of the buddy allocator's
+/// managed region so the two physical-memory allocators never own the same frames.
+///
+/// The linked-list kernel heap is placed at a KASLR-randomized high-half virtual
+/// address (physical = VA − PHYSICAL_MEMORY_OFFSET), and the buddy frame allocator
+/// is given the largest UEFI conventional-memory region. Neither excluded the
+/// other, so when the heap landed inside the buddy region both managed the same
+/// frames: the buddy handed out a live heap frame and a consumer that writes via
+/// the frame's physical address (DMA, or page-zeroing through a mapping that
+/// bypasses the CPU MMU) overwrote live heap data — intermittently zeroing the
+/// `TIMER_CBS` callback buffer and faulting the kernel to RIP=0.
+///
+/// Returns the largest contiguous sub-region of `[region_base, +region_size)` that
+/// does NOT intersect the heap `[heap_phys, +heap_size)`. If the heap splits the
+/// region, only the larger half is kept (Safety > Efficiency: the other half is
+/// left unmanaged rather than risk a shared frame; the buddy still receives tens
+/// of MiB, far above kernel frame demand). A future improvement is a
+/// reservation-aware multi-region PMM that reclaims both gaps.
+fn carve_region_around_heap(
+    region_base: u64,
+    region_size: usize,
+    heap_phys: u64,
+    heap_size: usize,
+) -> (u64, usize) {
+    let region_end = region_base.saturating_add(region_size as u64);
+    let heap_end = heap_phys.saturating_add(heap_size as u64);
+
+    // No intersection: region is already safe.
+    if heap_end <= region_base || heap_phys >= region_end {
+        return (region_base, region_size);
+    }
+
+    // Intersection: keep the larger gap entirely below or entirely above the heap.
+    let below_len = heap_phys.saturating_sub(region_base);
+    let above_len = region_end.saturating_sub(heap_end);
+    let (base, size) = if below_len >= above_len {
+        (region_base, below_len as usize)
+    } else {
+        (heap_end, above_len as usize)
+    };
+    // The returned sub-region must never intersect the heap.
+    debug_assert!(
+        size == 0
+            || base.saturating_add(size as u64) <= heap_phys
+            || base >= heap_end,
+        "carve_region_around_heap produced a region overlapping the heap"
+    );
+    (base, size)
 }
 
 /// 对齐到页边界（向上取整）

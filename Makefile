@@ -318,6 +318,13 @@ test: build
 	timeout 10 $(QEMU) $(QEMU_COMMON) \
 		-nographic || true
 
+# CI boot-health gate — exit code reflects REAL boot health (unlike `test`,
+# which runs `... || true` and always exits 0). Boots under QEMU and asserts the
+# kernel reaches userspace with zero NX-violation #PF. See scripts/boot_check.sh
+# and the D1-BOOT-NX-KASLR-LAYOUT process lesson in docs/next-phase-plan.md.
+boot-check: build
+	@OVMF_PATH="$(OVMF_PATH)" bash scripts/boot_check.sh esp
+
 # SMP测试模式 - 启用多核支持
 # 使用 -smp 指定CPU数量（默认2个）
 # ACPI MADT表会自动生成，使内核能够发现多核

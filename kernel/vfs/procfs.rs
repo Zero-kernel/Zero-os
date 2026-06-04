@@ -1604,9 +1604,12 @@ fn generate_maps(pid: u32) -> String {
         if let Some(Some(proc_arc)) = table.get(pid as usize) {
             let proc = proc_arc.lock();
             let mm = proc.mm.lock();
+            // D2 Phase 2: mmap_regions values are MmapEntry; snapshot the raw
+            // packed word so the downstream formatting (len/flags decode) is
+            // unchanged.
             let regions: Vec<(usize, usize)> = mm.mmap_regions.iter()
                 .take(MAX_MAPS_ENTRIES)
-                .map(|(&start, &size)| (start, size))
+                .map(|(&start, &entry)| (start, entry.raw()))
                 .collect();
             let stack = proc.user_stack.map(|s| s.as_u64());
             Some((regions, stack))

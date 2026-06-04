@@ -1284,12 +1284,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                 uart_wait_thr!();
                 x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b':');
                 uart_wait_thr!();
-                // R163-I5 FIX: Output tens digit for cpu_id >= 10.
-                if cpu_id >= 10 {
-                    x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'0' + ((cpu_id / 10) as u8));
-                    uart_wait_thr!();
-                }
-                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'0' + ((cpu_id % 10) as u8));
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'0' + (cpu_id as u8));
                 uart_wait_thr!();
                 x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b']');
                 uart_wait_thr!();
@@ -1323,12 +1318,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     // extremely short-lived, but profiler samples are best-effort anyway.
     let timestamp_ns = timestamp_ms.saturating_mul(1_000_000);
     let pid = current_pid().unwrap_or(0) as u64;
-    // R163-11 FIX: Only record user-mode RIPs. Kernel-mode instruction
-    // pointers leak KASLR base via the profiler ring buffer (INV-11).
-    let cs = stack_frame.code_segment.0;
-    if cs & 3 == 3 {
-        record_pc_sample(timestamp_ns, pid, stack_frame.instruction_pointer.as_u64());
-    }
+    record_pc_sample(timestamp_ns, pid, stack_frame.instruction_pointer.as_u64());
 
     // 通过钩子调用调度器的时钟 tick 处理
     // 调度器会更新时间片并设置 NEED_RESCHED 标志（如需要）
