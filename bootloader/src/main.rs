@@ -27,6 +27,10 @@ const KERNEL_PHYS_BASE: u64 = 0x100000;
 /// Used to filter out non-kernel LOAD segments (e.g., `.rela.dyn` metadata at VA 0).
 const KERNEL_VIRT_BASE: u64 = 0xffffffff80000000;
 
+/// R167-C: BootInfo ABI version. MUST match `BOOT_INFO_VERSION` in
+/// `kernel/mm/memory.rs`. Bump on any change to the `BootInfo` layout.
+const BOOT_INFO_VERSION: u64 = 1;
+
 /// Maximum KASLR slide (512 MiB, within the 1GB high-half mapping)
 const KASLR_MAX_SLIDE: u64 = 512 * 1024 * 1024;
 
@@ -351,6 +355,13 @@ pub struct BootInfo {
     pub cmdline_len: usize,
     /// P1-1: UEFI boot command line buffer (ASCII, NUL-padded).
     pub cmdline: [u8; 256],
+    /// R167-C: physical base where the kernel image was loaded
+    /// (`KERNEL_PHYS_BASE + kaslr_slide`).
+    pub kernel_phys_base: u64,
+    /// R167-C: in-memory size of the kernel image in bytes.
+    pub kernel_phys_size: u64,
+    /// R167-C: BootInfo ABI version (see `BOOT_INFO_VERSION`).
+    pub version: u64,
 }
 
 #[entry]
@@ -701,6 +712,13 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                 1,
             )
             .expect("Failed to allocate boot info page");
+        // R167-C: zero the page so every byte not explicitly written (struct tail,
+        // any future appended field) is deterministic. This makes the kernel's
+        // `BootInfo.version` guard meaningful — a kernel paired with an older
+        // bootloader that never wrote `version` would read 0, not stale garbage.
+        unsafe {
+            core::ptr::write_bytes(boot_info_page as *mut u8, 0, 4096);
+        }
         boot_info_page as *mut BootInfo
     };
 
@@ -969,6 +987,11 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             rsdp_address, // ACPI RSDP for SMP CPU enumeration
             cmdline_len,  // P1-1: Boot command line
             cmdline,
+            // R167-C: kernel image physical range, for the kernel's reservation-
+            // aware buddy allocator. kaslr_slide==0 on the fallback (no-KASLR) path.
+            kernel_phys_base: KERNEL_PHYS_BASE + kaslr_slide,
+            kernel_phys_size: kernel_size as u64,
+            version: BOOT_INFO_VERSION,
         };
         // 阻止 memory_map 被释放，因为内核需要访问它
         core::mem::forget(memory_map);

@@ -66,6 +66,17 @@ pub struct BootInfo {
     pub cmdline_len: usize,
     /// P1-1: UEFI boot command line buffer (ASCII, NUL-padded).
     pub cmdline: [u8; 256],
+    /// R167-C: physical base where the bootloader loaded the kernel image
+    /// (`KERNEL_PHYS_BASE + kaslr_slide`). Used to reserve the kernel image out
+    /// of the buddy pool defensively, even if a mis-typed UEFI map reported it
+    /// as conventional memory.
+    pub kernel_phys_base: u64,
+    /// R167-C: in-memory size of the kernel image in bytes.
+    pub kernel_phys_size: u64,
+    /// R167-C: BootInfo ABI version (must equal `BOOT_INFO_VERSION`). A mismatch
+    /// means a stale bootloader; the kernel then ignores the version-gated image
+    /// fields above and still applies the always-valid heap + UEFI reservations.
+    pub version: u64,
 }
 
 /// UEFI 内存描述符（按 UEFI 规范布局）
@@ -81,9 +92,22 @@ struct EfiMemoryDescriptor {
 }
 
 /// UEFI 内存类型常量
+///
+/// R167-A: Only `EFI_CONVENTIONAL_MEMORY` is admitted to the buddy frame
+/// allocator. Boot-Services Code/Data (types 3/4) are NOT admitted: although
+/// nominally free after `ExitBootServices`, firmware commonly leaves
+/// runtime-needed data in those regions, so handing them to the buddy risks
+/// corrupting live firmware memory. Only type 7 is reliably ownable.
 const EFI_CONVENTIONAL_MEMORY: u32 = 7;
-const EFI_BOOT_SERVICES_CODE: u32 = 3;
-const EFI_BOOT_SERVICES_DATA: u32 = 4;
+
+/// R167-C: BootInfo ABI version shared with the bootloader mirror. Bump on any
+/// layout change to `BootInfo`.
+const BOOT_INFO_VERSION: u64 = 1;
+
+/// R167-C: Upper bound on the number of physical reservations passed to the
+/// buddy allocator at init. Bounded to avoid heap allocation during early MM
+/// bring-up; overflow is logged (never silently truncated).
+const MAX_RESERVED_RANGES: usize = 64;
 
 // ============================================================================
 // 内存配置
@@ -203,16 +227,18 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         (FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE)
     });
 
-    // R166 FIX: carve the kernel heap's physical frames out of the buddy region so
-    // the linked-list heap and the buddy frame allocator never manage the same
-    // physical memory. The heap base is KASLR-randomized within conventional
-    // memory and previously could land inside the buddy region; the buddy then
-    // handed out a live heap frame whose consumer (DMA / page-zeroing via a
-    // physical-address mapping that bypasses the CPU MMU) overwrote live heap
-    // objects, intermittently zeroing the TIMER_CBS callback buffer and faulting
-    // the kernel to RIP=0. Excluding the heap range eliminates the double-ownership.
+    // R167-B/C: build the buddy allocator's permanent reservation set instead of
+    // R166's "carve the larger half" heuristic. The buddy now manages the FULL
+    // selected region minus precise per-page holes, reclaiming the memory the
+    // carve discarded. The heap reservation preserves R166's core guarantee — the
+    // KASLR-randomized linked-list heap and the buddy frame allocator never share
+    // a physical frame (which previously let the buddy hand out a live heap frame
+    // whose DMA/page-zeroing consumer corrupted the TIMER_CBS buffer → RIP=0).
     let heap_phys = (heap_base as u64).wrapping_sub(PHYSICAL_MEMORY_OFFSET);
-    let (pmm_base, pmm_size) = carve_region_around_heap(pmm_base, pmm_size, heap_phys, HEAP_SIZE);
+    let mut reserved_ranges = [(0u64, 0u64); MAX_RESERVED_RANGES];
+    let reserved_count =
+        build_buddy_reservations(boot_info, pmm_base, pmm_size, heap_phys, &mut reserved_ranges);
+    let reserved_ranges = &reserved_ranges[..reserved_count];
 
     // R148-8 FIX: Physical memory region bounds also leak information.
     #[cfg(debug_assertions)]
@@ -231,11 +257,14 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
     );
 
     // 初始化 Buddy 物理页分配器
-    buddy_allocator::init_buddy_allocator(PhysAddr::new(pmm_base), pmm_size);
+    buddy_allocator::init_buddy_allocator(PhysAddr::new(pmm_base), pmm_size, reserved_ranges);
 
     // 运行自测（可选）
     #[cfg(debug_assertions)]
-    buddy_allocator::run_self_test();
+    {
+        buddy_allocator::run_self_test();
+        buddy_allocator::run_reservation_self_test();
+    }
 
     klog_always!("Memory manager fully initialized (using BootInfo)");
 }
@@ -269,19 +298,24 @@ pub fn init() {
 
     // 使用硬编码区域
     klog!(Warn, "  Warning: No BootInfo, using hardcoded memory region");
-    // R166 FIX: same heap/buddy physical-overlap exclusion as the BootInfo path.
+    // R167-B: reserve the heap out of the buddy region (same physical-overlap
+    // exclusion as the BootInfo path, but via reservation so the full fallback
+    // region minus the heap hole is managed). No UEFI map here, so the heap is
+    // the only reservation.
     let heap_phys = (heap_base as u64).wrapping_sub(PHYSICAL_MEMORY_OFFSET);
-    let (pmm_base, pmm_size) = carve_region_around_heap(
-        FALLBACK_PHYS_MEM_START,
+    let reserved_ranges = [(heap_phys, HEAP_SIZE as u64)];
+    buddy_allocator::init_buddy_allocator(
+        PhysAddr::new(FALLBACK_PHYS_MEM_START),
         FALLBACK_PHYS_MEM_SIZE,
-        heap_phys,
-        HEAP_SIZE,
+        &reserved_ranges,
     );
-    buddy_allocator::init_buddy_allocator(PhysAddr::new(pmm_base), pmm_size);
 
     // 运行自测（可选）
     #[cfg(debug_assertions)]
-    buddy_allocator::run_self_test();
+    {
+        buddy_allocator::run_self_test();
+        buddy_allocator::run_reservation_self_test();
+    }
 
     klog_always!("Memory manager fully initialized (fallback mode)");
 }
@@ -401,7 +435,8 @@ fn select_heap_base_from_bootinfo(boot_info: &BootInfo) -> Option<(usize, bool)>
 /// A range is usable if:
 /// 1. It's within the bootloader's direct-map limit (1GB)
 /// 2. It's above MIN_SAFE_ADDRESS (1MB, protecting legacy hardware)
-/// 3. It's fully contained within an EFI_CONVENTIONAL_MEMORY or EFI_BOOT_SERVICES region
+/// 3. It's fully contained within an EFI_CONVENTIONAL_MEMORY region (R167-A:
+///    Boot-Services regions are no longer treated as usable)
 fn heap_range_usable(phys_base: u64, len: usize, map_info: &MemoryMapInfo) -> bool {
     let phys_end = phys_base.saturating_add(len as u64);
 
@@ -421,12 +456,8 @@ fn heap_range_usable(phys_base: u64, len: usize, map_info: &MemoryMapInfo) -> bo
         let addr = map_info.buffer + (i * map_info.descriptor_size) as u64;
         let desc = unsafe { &*(addr as *const EfiMemoryDescriptor) };
 
-        // Only consider usable memory types
-        let usable = matches!(
-            desc.typ,
-            EFI_CONVENTIONAL_MEMORY | EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA
-        );
-        if !usable || desc.page_count == 0 {
+        // R167-A: Only EFI_CONVENTIONAL_MEMORY is a safe home for the heap.
+        if desc.typ != EFI_CONVENTIONAL_MEMORY || desc.page_count == 0 {
             continue;
         }
 
@@ -522,13 +553,10 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
         let addr = map_info.buffer + (i * map_info.descriptor_size) as u64;
         let desc = unsafe { &*(addr as *const EfiMemoryDescriptor) };
 
-        // 只使用 Conventional Memory 和 Boot Services 区域（后者在 ExitBootServices 后可用）
-        let usable = matches!(
-            desc.typ,
-            EFI_CONVENTIONAL_MEMORY | EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA
-        );
-
-        if !usable || desc.page_count == 0 {
+        // R167-A: 只接纳 EFI_CONVENTIONAL_MEMORY 作为 buddy 分配器内存。
+        // Boot-Services Code/Data 在 ExitBootServices 后名义上可用，但固件常在
+        // 其中保留运行期数据，交给 buddy 会破坏存活固件内存——故不再接纳。
+        if desc.typ != EFI_CONVENTIONAL_MEMORY || desc.page_count == 0 {
             continue;
         }
 
@@ -572,54 +600,155 @@ fn select_region_from_bootinfo(boot_info: &BootInfo) -> Option<(u64, usize)> {
     })
 }
 
-/// R166 FIX: carve the kernel heap's physical range out of the buddy allocator's
-/// managed region so the two physical-memory allocators never own the same frames.
-///
-/// The linked-list kernel heap is placed at a KASLR-randomized high-half virtual
-/// address (physical = VA − PHYSICAL_MEMORY_OFFSET), and the buddy frame allocator
-/// is given the largest UEFI conventional-memory region. Neither excluded the
-/// other, so when the heap landed inside the buddy region both managed the same
-/// frames: the buddy handed out a live heap frame and a consumer that writes via
-/// the frame's physical address (DMA, or page-zeroing through a mapping that
-/// bypasses the CPU MMU) overwrote live heap data — intermittently zeroing the
-/// `TIMER_CBS` callback buffer and faulting the kernel to RIP=0.
-///
-/// Returns the largest contiguous sub-region of `[region_base, +region_size)` that
-/// does NOT intersect the heap `[heap_phys, +heap_size)`. If the heap splits the
-/// region, only the larger half is kept (Safety > Efficiency: the other half is
-/// left unmanaged rather than risk a shared frame; the buddy still receives tens
-/// of MiB, far above kernel frame demand). A future improvement is a
-/// reservation-aware multi-region PMM that reclaims both gaps.
-fn carve_region_around_heap(
-    region_base: u64,
-    region_size: usize,
-    heap_phys: u64,
-    heap_size: usize,
-) -> (u64, usize) {
-    let region_end = region_base.saturating_add(region_size as u64);
-    let heap_end = heap_phys.saturating_add(heap_size as u64);
+/// R167-C: Bounded accumulator for the buddy allocator's physical reservation
+/// set. Ranges that do not intersect the managed window `[pmm_base, pmm_end)`
+/// are dropped early (they would be clamped away by the buddy anyway), keeping
+/// the bounded array focused on relevant reservations. On overflow it logs once
+/// and drops further ranges — never silently, so a truncated reservation set is
+/// always visible in the boot log.
+struct ReservedRangeBuilder<'a> {
+    ranges: &'a mut [(u64, u64); MAX_RESERVED_RANGES],
+    count: usize,
+    /// Set if any window-intersecting range could not be recorded (cap hit). The
+    /// caller MUST then fail closed — see `build_buddy_reservations`.
+    overflowed: bool,
+    window_start: u64,
+    window_end: u64,
+}
 
-    // No intersection: region is already safe.
-    if heap_end <= region_base || heap_phys >= region_end {
-        return (region_base, region_size);
+impl<'a> ReservedRangeBuilder<'a> {
+    fn new(
+        ranges: &'a mut [(u64, u64); MAX_RESERVED_RANGES],
+        pmm_base: u64,
+        pmm_size: usize,
+    ) -> Self {
+        Self {
+            ranges,
+            count: 0,
+            overflowed: false,
+            window_start: pmm_base,
+            window_end: pmm_base.saturating_add(pmm_size as u64),
+        }
     }
 
-    // Intersection: keep the larger gap entirely below or entirely above the heap.
-    let below_len = heap_phys.saturating_sub(region_base);
-    let above_len = region_end.saturating_sub(heap_end);
-    let (base, size) = if below_len >= above_len {
-        (region_base, below_len as usize)
-    } else {
-        (heap_end, above_len as usize)
+    /// Record `[phys_start, phys_start + len_bytes)` if it is non-empty and
+    /// intersects the managed window. If the bounded array is full, flag
+    /// `overflowed` so the caller can fail closed instead of silently dropping a
+    /// range that might be live.
+    fn push(&mut self, phys_start: u64, len_bytes: u64) {
+        if len_bytes == 0 || self.window_end <= self.window_start {
+            return;
+        }
+        let phys_end = phys_start.saturating_add(len_bytes);
+        if phys_end <= self.window_start || phys_start >= self.window_end {
+            return; // disjoint from the buddy window
+        }
+
+        if self.count >= MAX_RESERVED_RANGES {
+            self.overflowed = true;
+            return;
+        }
+
+        self.ranges[self.count] = (phys_start, len_bytes);
+        self.count += 1;
+    }
+}
+
+/// R167-B/C: Build the buddy allocator's permanent reservation set.
+///
+/// Replaces R166's `carve_region_around_heap`. Reserves, within the selected
+/// buddy window `[pmm_base, pmm_base + pmm_size)`:
+///   1. the kernel heap `[heap_phys, HEAP_SIZE)` — kernel-computed, ALWAYS valid;
+///   2. the framebuffer `[base, size)` — an existing BootInfo field, always valid;
+///   3. the kernel image `[kernel_phys_base, kernel_phys_size)` — only when the
+///      BootInfo version matches (the field is otherwise from a stale bootloader);
+///   4. every non-`CONVENTIONAL` UEFI descriptor that intersects the window —
+///      defends against a mis-typed UEFI map and covers boot-services / loader /
+///      ACPI / framebuffer-MMIO / page-table frames implicitly.
+///
+/// On a correctly-typed map the window is a single conventional region, so #2–#4
+/// are clamped away and only the heap is actually reserved — but the protection
+/// is robust if any live range is mis-reported as conventional.
+fn build_buddy_reservations(
+    boot_info: &BootInfo,
+    pmm_base: u64,
+    pmm_size: usize,
+    heap_phys: u64,
+    out: &mut [(u64, u64); MAX_RESERVED_RANGES],
+) -> usize {
+    let version_ok = boot_info.version == BOOT_INFO_VERSION;
+    if !version_ok {
+        klog!(
+            Warn,
+            "  Warning: BootInfo version {} != expected {}; ignoring kernel-image reservation",
+            boot_info.version,
+            BOOT_INFO_VERSION
+        );
+    }
+
+    // Build the reservation set inside a scope so the builder's borrow of `out`
+    // ends before the fail-closed path may overwrite `out`.
+    let (count, overflowed) = {
+        let mut builder = ReservedRangeBuilder::new(out, pmm_base, pmm_size);
+
+        // (1) Heap — always valid (kernel-computed); the core R166 guarantee.
+        builder.push(heap_phys, HEAP_SIZE as u64);
+        // (2) Framebuffer — pre-existing field, valid even with a stale bootloader.
+        builder.push(boot_info.framebuffer.base, boot_info.framebuffer.size as u64);
+        // (3) Kernel image — only trust the new fields when the ABI version matches.
+        if version_ok {
+            builder.push(boot_info.kernel_phys_base, boot_info.kernel_phys_size);
+        }
+        // (4) Every non-conventional UEFI range intersecting the window.
+        add_non_conventional_uefi_reservations(&mut builder, &boot_info.memory_map);
+
+        (builder.count, builder.overflowed)
     };
-    // The returned sub-region must never intersect the heap.
-    debug_assert!(
-        size == 0
-            || base.saturating_add(size as u64) <= heap_phys
-            || base >= heap_end,
-        "carve_region_around_heap produced a region overlapping the heap"
-    );
-    (base, size)
+
+    // FAIL-CLOSED (R167 Codex review): if more than MAX_RESERVED_RANGES live
+    // ranges intersect the window, we cannot prove every live frame is withheld.
+    // Rather than silently drop a range (which could let the buddy hand out live
+    // firmware/kernel memory — the exact class R167 closes), withhold the ENTIRE
+    // window. Unreachable on a well-formed UEFI map (a single conventional window
+    // is intersected by ~0 non-conventional ranges), so this only triggers on a
+    // malformed/adversarial map, where refusing the window beats corruption.
+    if overflowed {
+        klog!(
+            Warn,
+            "  Warning: buddy reservation list exceeded {} entries; withholding the ENTIRE window (fail-closed)",
+            MAX_RESERVED_RANGES
+        );
+        out[0] = (pmm_base, pmm_size as u64);
+        return 1;
+    }
+
+    count
+}
+
+/// R167-C: Reserve every non-`EFI_CONVENTIONAL_MEMORY` descriptor that intersects
+/// the buddy window. The builder's `push` discards disjoint ranges, so this only
+/// adds entries when a live/firmware range actually overlaps the managed region.
+fn add_non_conventional_uefi_reservations(
+    builder: &mut ReservedRangeBuilder<'_>,
+    map_info: &MemoryMapInfo,
+) {
+    if map_info.buffer == 0
+        || map_info.size == 0
+        || map_info.descriptor_size < core::mem::size_of::<EfiMemoryDescriptor>()
+    {
+        return;
+    }
+
+    let desc_count = map_info.size / map_info.descriptor_size;
+    for i in 0..desc_count {
+        let addr = map_info.buffer + (i * map_info.descriptor_size) as u64;
+        let desc = unsafe { &*(addr as *const EfiMemoryDescriptor) };
+
+        if desc.typ == EFI_CONVENTIONAL_MEMORY || desc.page_count == 0 {
+            continue;
+        }
+        builder.push(desc.phys_start, desc.page_count.saturating_mul(PAGE_SIZE));
+    }
 }
 
 /// 对齐到页边界（向上取整）
@@ -668,6 +797,7 @@ impl FrameAllocator {
             buddy_allocator::get_allocator_stats().unwrap_or(buddy_allocator::AllocatorStats {
                 total_pages: 0,
                 free_pages: 0,
+                reserved_pages: 0,
                 used_pages: 0,
                 fragmentation: 0.0,
             });

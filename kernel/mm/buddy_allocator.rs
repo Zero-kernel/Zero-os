@@ -45,6 +45,16 @@ pub struct BuddyAllocator {
     /// 空闲页数
     free_pages: usize,
 
+    /// R167-B: pages permanently reserved out of the allocator.
+    ///
+    /// Reserved pages are marked allocated in `bitmap` with `alloc_order == 0`,
+    /// so they are never placed in a free list, never handed out by
+    /// `alloc_pages`, and never accepted by `free_pages`. They model physical
+    /// frames owned by another subsystem (the kernel heap, the kernel image,
+    /// the framebuffer, firmware/boot-services ranges) that must never enter
+    /// the buddy free pool. `free_pages == total_pages - reserved_pages` at init.
+    reserved_pages: usize,
+
     /// 用于跟踪块的分割状态
     /// split_bitmap[i] 表示块是否被分割成更小的块
     split_bitmap: BitVec,
@@ -57,6 +67,25 @@ impl BuddyAllocator {
     /// * `base_addr` - 管理的内存区域起始地址
     /// * `size` - 管理的内存区域大小（字节）
     pub fn new(base_addr: PhysAddr, size: usize) -> Self {
+        // An allocator with no reservations manages the whole region.
+        Self::new_with_reservations(base_addr, size, &[])
+    }
+
+    /// R167-B: Create a Buddy allocator with permanent physical reservations.
+    ///
+    /// Each `reserved` entry is `(absolute_phys_start, len_bytes)`. Reserved
+    /// ranges are clamped to the managed window `[base_addr, base_addr + size)`
+    /// and rounded **outward** to whole pages, so any 4 KiB frame even partially
+    /// overlapping a reservation is withheld from the allocator. This replaces
+    /// the R166 "carve the larger half" heuristic: the buddy keeps the entire
+    /// region minus precise per-page holes, reclaiming the memory the carve
+    /// discarded while still guaranteeing the two physical-memory owners (heap
+    /// and buddy) never share a frame.
+    pub fn new_with_reservations(
+        base_addr: PhysAddr,
+        size: usize,
+        reserved: &[(u64, u64)],
+    ) -> Self {
         let total_pages = size / PAGE_SIZE;
         let bitmap_size = total_pages * 2; // 需要额外空间存储分割信息
 
@@ -66,28 +95,115 @@ impl BuddyAllocator {
             alloc_order: vec![0u8; total_pages],  // R74-4: Initialize all as free (0)
             base_addr,
             total_pages,
-            free_pages: total_pages,
+            // Set to the true free count after reservations are marked below.
+            free_pages: 0,
+            reserved_pages: 0,
             split_bitmap: BitVec::from_elem(bitmap_size, false),
         };
 
-        // 初始化：将整个内存区域作为最大的块加入空闲链表
+        // Mark reserved pages BEFORE building the free lists so the free-list
+        // construction skips them entirely.
+        allocator.mark_reserved_ranges(reserved);
+        allocator.free_pages = total_pages.saturating_sub(allocator.reserved_pages);
+        debug_assert!(
+            allocator.reserved_pages <= total_pages,
+            "reserved pages exceed total pages"
+        );
+
+        // 初始化：仅用未保留的连续区段构建空闲链表
         allocator.init_memory_region();
         allocator
     }
 
-    /// 初始化内存区域
-    fn init_memory_region(&mut self) {
-        let mut current_pages = self.total_pages;
-        let mut current_addr = 0;
+    /// R167-B: Permanently withhold reserved physical ranges from the allocator.
+    ///
+    /// Marks each reserved page allocated in `bitmap` while leaving its
+    /// `alloc_order` at 0. The combination means a reserved page is (a) never
+    /// added to a free list by `init_memory_region`, (b) never the buddy of a
+    /// mergeable block (`is_buddy_free` rejects any page with `bitmap == true`),
+    /// and (c) rejected by `free_pages` (which requires `alloc_order != 0`). The
+    /// page is therefore unreachable by allocation for the allocator's lifetime.
+    fn mark_reserved_ranges(&mut self, reserved: &[(u64, u64)]) {
+        let region_start = self.base_addr.as_u64();
+        // Multiply in u64 space so the byte count cannot wrap in usize for a
+        // pathological total_pages (R167 review hardening). total_pages is bounded
+        // by the selected region size in practice, but this keeps the public
+        // constructor robust for any caller.
+        let region_bytes = self.total_pages as u64 * PAGE_SIZE as u64;
+        let region_end = region_start.saturating_add(region_bytes);
+        let page = PAGE_SIZE as u64;
 
-        // 将内存分割成尽可能大的块
-        for order in (0..MAX_ORDER).rev() {
-            let block_pages = 1 << order;
-            while current_pages >= block_pages {
-                self.free_lists[order].push(current_addr);
-                current_addr += block_pages;
-                current_pages -= block_pages;
+        for &(phys_start, len_bytes) in reserved {
+            if len_bytes == 0 {
+                continue;
             }
+            let phys_end = phys_start.saturating_add(len_bytes);
+
+            // Skip ranges that do not intersect the managed window.
+            if phys_end <= region_start || phys_start >= region_end {
+                continue;
+            }
+
+            // Intersect with the window and convert to in-window byte OFFSETS.
+            // Both offsets lie in [0, region_bytes], so the page math below is
+            // overflow-free and avoids the absolute-address `align_up` saturation
+            // edge near u64::MAX (R167 Codex review). The intersection is
+            // non-empty, so rel_start < rel_end.
+            let rel_start = phys_start.max(region_start) - region_start;
+            let rel_end = phys_end.min(region_end) - region_start;
+
+            // Round OUTWARD to whole pages: floor(start), ceil(end), so any frame
+            // even partially covered by the reservation is fully withheld. The
+            // ceil is written as div + remainder-bump (not `rel_end + page - 1`)
+            // so it cannot wrap even if rel_end were near u64::MAX (R167 review).
+            let start_idx = (rel_start / page) as usize;
+            let end_idx = ((rel_end / page) as usize + usize::from(rel_end % page != 0))
+                .min(self.total_pages);
+
+            for page_idx in start_idx..end_idx {
+                // De-duplicate overlapping reservations. Bounds are guaranteed by
+                // construction: start_idx < total_pages and end_idx <= total_pages.
+                if !self.bitmap[page_idx] {
+                    self.bitmap.set(page_idx, true);
+                    self.reserved_pages += 1;
+                }
+            }
+        }
+    }
+
+    /// 初始化内存区域
+    ///
+    /// R167-B: builds the free lists from the maximal runs of **non-reserved**
+    /// pages. Each run is decomposed into buddy-aligned power-of-two blocks, so
+    /// no free block ever spans a reserved page. With no reservations this
+    /// reproduces the original greedy decomposition exactly.
+    fn init_memory_region(&mut self) {
+        let mut run_start: Option<usize> = None;
+
+        for page_idx in 0..self.total_pages {
+            if self.bitmap[page_idx] {
+                // Reserved/allocated page: close any open free run before it.
+                if let Some(start) = run_start.take() {
+                    self.add_free_run(start, page_idx);
+                }
+            } else if run_start.is_none() {
+                run_start = Some(page_idx);
+            }
+        }
+
+        if let Some(start) = run_start {
+            self.add_free_run(start, self.total_pages);
+        }
+    }
+
+    /// R167-B: decompose a non-reserved page run `[start_idx, end_idx)` into
+    /// buddy-aligned power-of-two blocks and push them onto the free lists.
+    fn add_free_run(&mut self, mut start_idx: usize, end_idx: usize) {
+        while start_idx < end_idx {
+            let remaining = end_idx - start_idx;
+            let order = largest_aligned_order(start_idx, remaining);
+            self.free_lists[order].push(start_idx);
+            start_idx += 1 << order;
         }
     }
 
@@ -341,6 +457,11 @@ impl BuddyAllocator {
         AllocatorStats {
             total_pages: self.total_pages,
             free_pages: self.free_pages,
+            // R167-B: reserved pages are unavailable, so they count as "used"
+            // (used_pages == total - free). Consumers reading used/free as
+            // capacity therefore see reserved frames as occupied, which is
+            // accurate — they can never be allocated.
+            reserved_pages: self.reserved_pages,
             used_pages: self.total_pages - self.free_pages,
             fragmentation: self.calculate_fragmentation(),
         }
@@ -367,11 +488,29 @@ impl BuddyAllocator {
     }
 }
 
+/// R167-B: largest buddy order whose block both fits in `remaining` pages and
+/// is aligned at `start_idx`. Caps at `MAX_ORDER - 1`. Always returns a valid
+/// order (0 fits because `remaining >= 1` and every index is 1-aligned).
+fn largest_aligned_order(start_idx: usize, remaining: usize) -> usize {
+    let mut order = MAX_ORDER - 1;
+    while order > 0 {
+        let block_pages = 1usize << order;
+        if block_pages <= remaining && (start_idx & (block_pages - 1)) == 0 {
+            return order;
+        }
+        order -= 1;
+    }
+    0
+}
+
 /// 分配器统计信息
 #[derive(Debug, Clone, Copy)]
 pub struct AllocatorStats {
     pub total_pages: usize,
     pub free_pages: usize,
+    /// R167-B: pages permanently withheld from allocation (heap, kernel image,
+    /// framebuffer, firmware ranges). Included in `used_pages`.
+    pub reserved_pages: usize,
     pub used_pages: usize,
     pub fragmentation: f32,
 }
@@ -384,8 +523,15 @@ static BUDDY_ALLOCATOR: Mutex<Option<BuddyAllocator>> = Mutex::new(None);
 /// # 参数
 /// * `base_addr` - 物理内存起始地址
 /// * `size` - 管理的内存大小
-pub fn init_buddy_allocator(base_addr: PhysAddr, size: usize) {
-    let allocator = BuddyAllocator::new(base_addr, size);
+/// * `reserved` - R167-B: permanent physical reservations `(phys_start, len_bytes)`
+///   to withhold from the free pool (kernel heap, kernel image, framebuffer,
+///   firmware/boot-services ranges that fall inside the managed window).
+pub fn init_buddy_allocator(base_addr: PhysAddr, size: usize, reserved: &[(u64, u64)]) {
+    let allocator = BuddyAllocator::new_with_reservations(base_addr, size, reserved);
+    // Snapshot stats before the allocator is moved under the lock.
+    let total_pages = allocator.total_pages;
+    let reserved_pages = allocator.reserved_pages;
+    let free_pages = allocator.free_pages;
     *BUDDY_ALLOCATOR.lock() = Some(allocator);
 
     klog_always!("Buddy allocator initialized:");
@@ -393,7 +539,11 @@ pub fn init_buddy_allocator(base_addr: PhysAddr, size: usize) {
     // address in release builds. Same kptr-safety policy as R130-5 and R131-8.
     kprintln!("  Base address: 0x{:x}", base_addr);
     klog_always!("  Size: {} MB", size / (1024 * 1024));
-    klog_always!("  Total pages: {}", size / PAGE_SIZE);
+    klog_always!("  Total pages: {}", total_pages);
+    // R167-B: surface the reservation accounting so a misconfigured reservation
+    // (e.g. the whole region withheld) is visible in the boot log.
+    klog_always!("  Reserved pages: {}", reserved_pages);
+    klog_always!("  Free pages: {}", free_pages);
 }
 
 /// 分配物理页面
@@ -520,6 +670,74 @@ pub fn run_self_test() {
     kprintln!("  Test 3 passed: Buddy merge");
 
     kprintln!("All Buddy allocator tests passed!");
+}
+
+/// R167-B: Self-test for reservation-aware construction.
+///
+/// Builds an allocator over a 1 MiB region with a 256 KiB reserved hole in the
+/// middle, then drains every allocatable single page. Verifies, order-
+/// independently (no assumption about which block is handed out first):
+///   1. `reserved_pages` and `free_pages` accounting is exact;
+///   2. no allocated frame ever falls inside the reserved hole;
+///   3. the number of allocatable pages equals `total - reserved`.
+/// This proves reserved frames are never placed in a free list nor split out of
+/// a larger block.
+pub fn run_reservation_self_test() {
+    kprintln!("Running Buddy reservation self-test...");
+
+    let base_u64: u64 = 0x2000_0000; // 512 MiB, distinct from run_self_test's region
+    let base = PhysAddr::new(base_u64);
+    let size = 1024 * 1024; // 1 MiB = 256 pages
+    let total_pages = size / PAGE_SIZE;
+
+    // Reserve pages [64, 128) of the region: a 256 KiB hole in the middle.
+    let resv_pages = 64usize;
+    let resv_phys = base_u64 + (64 * PAGE_SIZE) as u64;
+    let resv_len = (resv_pages * PAGE_SIZE) as u64;
+
+    let mut allocator =
+        BuddyAllocator::new_with_reservations(base, size, &[(resv_phys, resv_len)]);
+
+    assert!(
+        allocator.reserved_pages == resv_pages,
+        "Reservation test failed: wrong reserved_pages count"
+    );
+    assert!(
+        allocator.free_pages == total_pages - resv_pages,
+        "Reservation test failed: wrong free_pages count"
+    );
+
+    // Drain all single-page allocations; none may land in the reserved hole.
+    let resv_lo = resv_phys;
+    let resv_hi = resv_phys + resv_len;
+    let region_hi = base_u64 + size as u64;
+    let mut allocated = 0usize;
+    while let Some(frame) = allocator.alloc_pages(0) {
+        let a = frame.start_address().as_u64();
+        assert!(
+            a < resv_lo || a >= resv_hi,
+            "Reservation test failed: allocated a reserved frame"
+        );
+        assert!(
+            a >= base_u64 && a < region_hi,
+            "Reservation test failed: allocated frame outside region"
+        );
+        allocated += 1;
+        assert!(
+            allocated <= total_pages,
+            "Reservation test failed: allocator overran region"
+        );
+    }
+    assert!(
+        allocated == total_pages - resv_pages,
+        "Reservation test failed: allocatable count != total - reserved"
+    );
+
+    kprintln!(
+        "  Reservation self-test passed: {} pages allocatable, {} reserved",
+        allocated,
+        resv_pages
+    );
 }
 
 /// 简单的断言宏（用于no_std环境）
