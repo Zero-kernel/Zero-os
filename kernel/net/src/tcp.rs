@@ -914,6 +914,20 @@ pub struct TcpControlBlock {
     /// Maintained by tcp_send() (increment) and handle_ack() (decrement).
     /// Bounded by `TCP_MAX_SEND_BUFFER_BYTES` to prevent OOM.
     pub send_buffer_bytes: usize,
+    /// J2-6 (Phase J.2 per-tenant quotas): per-TCB mirror of how many send bytes
+    /// THIS connection currently has charged to its namespace's aggregate
+    /// `per_ns_send_bytes` budget. Kept equal to `send_buffer_bytes` by the
+    /// socket layer's reconcile (charge at tcp_send, uncharge via handle_ack). The
+    /// teardown path uncharges exactly this amount, so an abruptly-freed TCB
+    /// cannot leak per-namespace TX accounting. Init 0; never mutated by tcp.rs.
+    pub ns_charged_send_bytes: usize,
+    /// J2-4 (Phase J.2 per-tenant quotas): per-TCB mirror of how many recv bytes
+    /// THIS connection currently has charged to its namespace's aggregate
+    /// `per_ns_recv_bytes` budget. The recv footprint is F = recv_buffer.len() +
+    /// ooo_bytes; this mirror is kept equal to F by the socket layer's
+    /// reconcile_ns_recv after every F-mutation, so teardown uncharges exactly this
+    /// amount. Init 0; never mutated by tcp.rs (only the socket layer).
+    pub ns_charged_recv_bytes: usize,
     /// Receive buffer (in-order data)
     pub recv_buffer: VecDeque<u8>,
     /// Out-of-order receive queue (sorted by sequence number)
@@ -1035,6 +1049,8 @@ impl TcpControlBlock {
             retries: 0,
             send_buffer: VecDeque::new(),
             send_buffer_bytes: 0,
+            ns_charged_send_bytes: 0,
+            ns_charged_recv_bytes: 0,
             recv_buffer: VecDeque::new(),
             ooo_queue: VecDeque::new(),
             fin_sent: false,

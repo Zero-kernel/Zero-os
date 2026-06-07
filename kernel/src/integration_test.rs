@@ -93,6 +93,25 @@ pub fn test_fallible_map() {
     klog_always!("    ✓ from_sorted_vec O(1) adopt + try_clone independence");
 }
 
+/// Test the Phase J.2 per-tenant (per-network-namespace) TCP resource budgets.
+///
+/// Runs real assertions over the per-namespace connection (J2-1), half-open /
+/// SYN-backlog (J2-2), and SEND-buffer-byte (J2-6) counters: cap enforcement
+/// (fail-closed), namespace isolation, root-namespace exemption, remove-at-0
+/// bookkeeping, the leak-via-stale-Weak regression (a pruned dead connection MUST
+/// uncharge its tenant), and for J2-6 the reserve->refund reconcile, multi-sibling
+/// aggregation, and the Drop/detach residual-uncharge regressions. Any failure
+/// panics, which `make test` / `make boot-check` detect via the serial log.
+pub fn test_per_ns_tcp_budgets() {
+    klog_always!("  [TEST] Per-Tenant TCP Budgets (J.2-1/2/4/6)...");
+    net::socket::SocketTable::run_per_ns_budget_self_test();
+    klog_always!("    ✓ per-netns connection cap (fail-closed) + isolation + root-exempt");
+    klog_always!("    ✓ per-netns SYN-backlog cap + batch drain + remove-at-0");
+    klog_always!("    ✓ stale-Weak reaper uncharges pruned tenants (leak regression)");
+    klog_always!("    ✓ per-netns send-byte budget: hard cap + reserve->refund + aggregation + Drop residual");
+    klog_always!("    ✓ per-netns recv-byte budget: decide-gate + reconcile-to-F + FIN-clear-no-overcount + Drop residual");
+}
+
 /// 运行所有集成测试
 pub fn run_all_tests() {
     klog_always!();
@@ -107,6 +126,7 @@ pub fn run_all_tests() {
     test_context_switch();
     test_memory_mapping();
     test_fallible_map();
+    test_per_ns_tcp_budgets();
     test_ext2_write();
 
     klog_always!();

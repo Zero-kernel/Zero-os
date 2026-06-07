@@ -906,7 +906,11 @@ impl TcpListenState {
     /// Enqueue a half-open connection.
     ///
     /// Returns false if SYN queue is full (silent drop for SYN flood mitigation).
-    fn queue_syn(&mut self, entry: PendingSyn) -> bool {
+    ///
+    /// J2-2: `table` is threaded in so the per-namespace half-open budget can be
+    /// charged in the same funnel as the global reservation (lock order
+    /// `listen.lock` > `per_ns_syn_counts`; the caller holds `listen.lock`).
+    fn queue_syn(&mut self, entry: PendingSyn, table: &SocketTable) -> bool {
         // Check local queue limit first (fast path)
         if self.syn_queue.len() >= self.syn_backlog {
             return false;
@@ -922,17 +926,30 @@ impl TcpListenState {
             return false;
         }
 
+        // J2-2: per-namespace half-open budget (a subset of the global limit). On
+        // over-quota, roll back the global reservation we just took and signal the
+        // caller to fall back to stateless SYN cookies (same as the global path).
+        if !table.try_inc_ns_syn(entry.key.0) {
+            dec_half_open();
+            return false;
+        }
+
         self.syn_queue.insert(entry.key, entry);
         true
     }
 
     /// Remove and return a half-open connection by key.
-    fn take_syn(&mut self, key: &TcpLookupKey) -> Option<PendingSyn> {
+    ///
+    /// J2-2: `table` is threaded in so the per-namespace half-open uncharge stays
+    /// in the same single funnel as the global decrement.
+    fn take_syn(&mut self, key: &TcpLookupKey, table: &SocketTable) -> Option<PendingSyn> {
         let result = self.syn_queue.remove(key);
 
         // R74-5 FIX: Decrement global half-open counter when removing
         if result.is_some() {
             dec_half_open();
+            // J2-2: uncharge the per-namespace half-open slot in the same funnel.
+            table.dec_ns_syn(key.0);
         }
 
         result
@@ -1435,6 +1452,41 @@ impl Drop for SocketState {
                 |current| Some(current.saturating_sub(queued_bytes)),
             );
         }
+
+        // J2-6: uncharge any residual per-namespace TCP send bytes for a connection
+        // whose TCB rode this Arc to its grave WITHOUT being nulled — the
+        // close-non-keep path (close() removes the socket from `sockets` without
+        // nulling the TCB). The strong Arc<SocketState> owners are `sockets` AND a
+        // listener's `accept_queue` (udp/tcp_bindings/tcp_conns hold only Weak);
+        // accept-queue children carry NO charged send bytes (not yet accept()ed, so
+        // never tcp_send'd: ns_charged_send_bytes == 0) and are uncharged via
+        // cleanup_tcp_connection at listener teardown — so for every charge-bearing
+        // socket `sockets` is the last strong ref and this Drop is the catch-all.
+        // get_mut() is exclusive purely from `&mut self` in drop (independent of
+        // strong_count). Paths that null the TCB first (detach_tcp_uncharged /
+        // cleanup_tcp_connection) zero the mirror, so Drop then reads None and
+        // uncharges 0 — each residual is uncharged EXACTLY once.
+        if self.net_ns_id != NamespaceId(0) {
+            if let Some(ts) = self.tcp.get_mut().as_mut() {
+                let charged = ts.control.ns_charged_send_bytes;
+                if charged > 0 {
+                    socket_table().uncharge_ns_send_residual(self.net_ns_id, charged);
+                    ts.control.ns_charged_send_bytes = 0;
+                }
+                // J2-4: symmetric recv-byte residual uncharge. NOTE (unlike send,
+                // where accept-queue children carry ns_charged_send_bytes == 0 since
+                // never tcp_send'd): an accept-queue child CAN carry
+                // ns_charged_recv_bytes > 0 from piggybacked SynReceived data — those
+                // children are torn down via cleanup_tcp_connection (which nulls the
+                // TCB first), so this Drop catch-all covers the normal-accept()
+                // ->sockets-owned path.
+                let rcharged = ts.control.ns_charged_recv_bytes;
+                if rcharged > 0 {
+                    socket_table().uncharge_ns_recv_residual(self.net_ns_id, rcharged);
+                    ts.control.ns_charged_recv_bytes = 0;
+                }
+            }
+        }
     }
 }
 
@@ -1549,6 +1601,34 @@ pub struct SocketTable {
     tcp_conns: Mutex<BTreeMap<TcpLookupKey, Weak<SocketState>>>,
     /// R76-3 FIX: Per-namespace socket count for quota enforcement
     per_ns_counts: Mutex<BTreeMap<NamespaceId, u64>>,
+    /// J2-1 FIX (Phase J.2 per-tenant quotas): Per-namespace live TCP connection
+    /// count. Bound to `tcp_conns` 4-tuple MEMBERSHIP (key.0 == net_ns_id), NOT a
+    /// per-socket flag, so the six stale-Weak reapers cannot leak it. A strict
+    /// subset of the global `TCP_MAX_ACTIVE_CONNECTIONS` cap; root (ns 0) is exempt.
+    /// Lock order: `tcp_conns` > `per_ns_conn_counts` (pure leaf, takes no further lock).
+    per_ns_conn_counts: Mutex<BTreeMap<NamespaceId, u32>>,
+    /// J2-2 FIX (Phase J.2 per-tenant quotas): Per-namespace half-open (SYN-queue)
+    /// count, summed across all listeners in the namespace. A strict subset of the
+    /// global half-open cap; root (ns 0) is exempt. Charged/uncharged through
+    /// `queue_syn`/`take_syn`. Lock order: `listen.lock` > `per_ns_syn_counts`.
+    per_ns_syn_counts: Mutex<BTreeMap<NamespaceId, u64>>,
+    /// J2-6 FIX (Phase J.2 per-tenant quotas): Per-namespace aggregate TCP send
+    /// buffer bytes, summed across all live connections in the namespace. A strict
+    /// additional layer over the per-connection `TCP_MAX_SEND_BUFFER_BYTES` (4 MiB)
+    /// cap; root (ns 0) is exempt. Charged at `tcp_send`, uncharged via the
+    /// `handle_ack` reconcile and at teardown (the per-TCB `ns_charged_send_bytes`
+    /// mirror records each connection's contribution). Lock order:
+    /// `sock.tcp` > `per_ns_send_bytes` (pure leaf, takes no further lock).
+    per_ns_send_bytes: Mutex<BTreeMap<NamespaceId, usize>>,
+    /// J2-4 FIX (Phase J.2 per-tenant quotas): Per-namespace aggregate TCP RECV
+    /// footprint F = recv_buffer.len() + ooo_bytes, summed across all live
+    /// connections in the namespace. A strict additional layer over the per-conn
+    /// `TCP_MAX_RECV_BUFFER_BYTES` cap; root (ns 0) is exempt. Charged via a
+    /// decide-only gate + reconciled to live F under `sock.tcp`
+    /// (`try_charge_ns_recv_gate` / `reconcile_ns_recv`). SOFT cap (bounded,
+    /// self-correcting overshoot — never under-counts, no isolation bypass). Lock
+    /// order: `sock.tcp` > `per_ns_recv_bytes` (pure leaf, takes no further lock).
+    per_ns_recv_bytes: Mutex<BTreeMap<NamespaceId, usize>>,
     /// Last observed timestamp (ms) used for TIME_WAIT bookkeeping.
     /// Updated by sweep_time_wait() and used by RX path when transitioning to TIME_WAIT.
     time_wait_clock: AtomicU64,
@@ -1641,6 +1721,10 @@ impl SocketTable {
             tcp_bindings: Mutex::new(BTreeMap::new()),
             tcp_conns: Mutex::new(BTreeMap::new()),
             per_ns_counts: Mutex::new(BTreeMap::new()), // R76-3 FIX
+            per_ns_conn_counts: Mutex::new(BTreeMap::new()), // J2-1 FIX
+            per_ns_syn_counts: Mutex::new(BTreeMap::new()), // J2-2 FIX
+            per_ns_send_bytes: Mutex::new(BTreeMap::new()), // J2-6 FIX
+            per_ns_recv_bytes: Mutex::new(BTreeMap::new()), // J2-4 FIX
             time_wait_clock: AtomicU64::new(0),
             timer_sweeps_skipped: AtomicU64::new(0),
             created: AtomicU64::new(0),
@@ -1674,6 +1758,944 @@ impl SocketTable {
                 *count -= 1;
             }
         }
+    }
+
+    // ========================================================================
+    // Phase J.2: Per-Tenant (Per-Network-Namespace) TCP Resource Budgets
+    // ========================================================================
+    //
+    // J2-1 (connection budget) and J2-2 (SYN-backlog budget) bound, per network
+    // namespace, the two count-class TCP resources that a single tenant could
+    // otherwise use to monopolize the GLOBAL pools (`TCP_MAX_ACTIVE_CONNECTIONS`
+    // and the global half-open limit). Both per-ns caps are strict SUBSETS of the
+    // corresponding global caps, so both gates must pass (fail-closed) — the
+    // per-ns budget never weakens the existing global protection, only refines it.
+    //
+    // The ROOT namespace (`NamespaceId(0)`, the host) is EXEMPT: it is bounded
+    // only by the global caps. This is deliberate — quotas isolate untrusted
+    // tenants (CLONE_NEWNET, ns >= 1) without regressing host connection capacity
+    // (a per-ns cap below the global 4096 would otherwise cap a host-only system).
+    //
+    // `NamespaceId` is monotonic and never reused (net_namespace.rs: NEXT_NET_NS_ID
+    // is allocated via `fetch_update` + `checked_add`; Drop does not recycle), so a
+    // dead namespace's stale TCP state cannot bleed accounting into a new tenant.
+
+    /// J2-1: maximum live TCP connections per NON-root namespace (subset of the
+    /// global `TCP_MAX_ACTIVE_CONNECTIONS`).
+    pub const MAX_CONNS_PER_NS: u32 = 1024;
+    /// J2-2: maximum half-open (SYN-queue) entries per NON-root namespace, summed
+    /// across all listeners (subset of the global half-open limit).
+    pub const MAX_HALF_OPEN_PER_NS: u64 = 256;
+    /// J2-6: maximum aggregate buffered TCP send bytes per NON-root namespace,
+    /// summed across all live connections. A strict ADDITIONAL layer on top of the
+    /// per-connection `TCP_MAX_SEND_BUFFER_BYTES` (4 MiB) cap — and necessarily
+    /// `>=` it so a single connection can still fill its own send buffer. 64 MiB
+    /// caps a tenant at ~16 fully-buffered connections' worth of TX backlog,
+    /// bounding the aggregate kernel-heap DoS a single CLONE_NEWNET tenant can
+    /// inflict while leaving generous headroom for real multi-connection workloads.
+    pub const MAX_SEND_BYTES_PER_NS: usize = 64 * 1024 * 1024;
+    /// J2-4: maximum aggregate TCP recv footprint (recv_buffer.len() + ooo_bytes)
+    /// per NON-root namespace, summed across all live connections. 64x the per-conn
+    /// `TCP_MAX_RECV_BUFFER_BYTES` (256 KiB) = 16 MiB — and necessarily `>=` it so a
+    /// single connection can still fill its own recv buffer. 1/4 of the 64 MiB send
+    /// cap, matching the 4:1 per-conn send:recv buffer ratio. SOFT cap: the
+    /// decide-only `try_charge_ns_recv_gate` releases its leaf before the buffer
+    /// mutation + `reconcile_ns_recv`, so concurrent same-ns siblings may transiently
+    /// overshoot by at most (concurrent admissions) x one segment payload
+    /// (<= num_cpus x snd_mss), bounded overall by MAX_CONNS_PER_NS x
+    /// TCP_MAX_RECV_BUFFER_BYTES; it self-corrects on the next gate and NEVER
+    /// under-counts (no isolation bypass). A hard reserve-at-gate is deliberately
+    /// avoided — it would reintroduce the OOO pre-charge-refund leak class.
+    pub const MAX_RECV_BYTES_PER_NS: usize = 16 * 1024 * 1024;
+
+    /// J2-1: charge one per-namespace TCP connection. Fails closed
+    /// (`QuotaExceeded` -> EAGAIN) when the tenant is at its cap. Root (ns 0) is
+    /// never charged. The count is bound to `tcp_conns` MEMBERSHIP — every charge
+    /// here is matched by an uncharge at the corresponding `tcp_conns` removal
+    /// (`dec_ns_conn`) or stale-Weak prune (`conns_retain_accounted`), so it is
+    /// exactly the live key count per namespace by construction (no flag to leak).
+    /// Caller holds the `tcp_conns` guard; this nests `per_ns_conn_counts` under it.
+    fn try_inc_ns_conn(&self, ns_id: NamespaceId) -> Result<(), SocketError> {
+        if ns_id == NamespaceId(0) {
+            return Ok(());
+        }
+        let mut counts = self.per_ns_conn_counts.lock();
+        let count = counts.entry(ns_id).or_insert(0);
+        if *count >= Self::MAX_CONNS_PER_NS {
+            return Err(SocketError::QuotaExceeded);
+        }
+        *count += 1;
+        Ok(())
+    }
+
+    /// J2-1: uncharge one per-namespace TCP connection. `saturating_sub` +
+    /// remove-at-0 keeps the map bounded (mirrors conntrack `dec_ns_entry_count`).
+    /// No-op for root and for any namespace without a live charge.
+    fn dec_ns_conn(&self, ns_id: NamespaceId) {
+        if ns_id == NamespaceId(0) {
+            return;
+        }
+        let mut counts = self.per_ns_conn_counts.lock();
+        let now_zero = match counts.get_mut(&ns_id) {
+            Some(c) => {
+                *c = c.saturating_sub(1);
+                *c == 0
+            }
+            None => false,
+        };
+        if now_zero {
+            counts.remove(&ns_id);
+        }
+    }
+
+    /// J2-1: prune dead-Weak `tcp_conns` entries AND uncharge their per-namespace
+    /// connection count in a single pass, under the caller's held `tcp_conns`
+    /// guard. This is the load-bearing leak fix: the dominant `tcp_conns` teardown
+    /// is the six stale-Weak reapers (a freed `Arc` can never run
+    /// `cleanup_tcp_connection`), so binding the count to map membership HERE is
+    /// the only way to keep it leak-free. Replaces the bare
+    /// `conns.retain(|_, w| w.strong_count() > 0)`.
+    fn conns_retain_accounted(
+        &self,
+        conns: &mut BTreeMap<TcpLookupKey, Weak<SocketState>>,
+    ) {
+        let mut counts = self.per_ns_conn_counts.lock();
+        conns.retain(|key, weak| {
+            let keep = weak.strong_count() > 0;
+            if !keep && key.0 != NamespaceId(0) {
+                if let Some(c) = counts.get_mut(&key.0) {
+                    *c = c.saturating_sub(1);
+                }
+            }
+            keep
+        });
+        // Drop any namespace entries that reached zero (keep the map bounded).
+        counts.retain(|_, v| *v != 0);
+    }
+
+    /// J2-2: charge one per-namespace half-open (SYN-queue) slot. Returns false
+    /// (caller falls back to stateless SYN cookies) when the tenant is at its cap.
+    /// Root (ns 0) is never charged. Charged in `queue_syn`, uncharged in
+    /// `take_syn` / the listener-close drain.
+    fn try_inc_ns_syn(&self, ns_id: NamespaceId) -> bool {
+        if ns_id == NamespaceId(0) {
+            return true;
+        }
+        let mut counts = self.per_ns_syn_counts.lock();
+        let count = counts.entry(ns_id).or_insert(0);
+        if *count >= Self::MAX_HALF_OPEN_PER_NS {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// J2-2: uncharge one per-namespace half-open slot.
+    fn dec_ns_syn(&self, ns_id: NamespaceId) {
+        self.dec_ns_syn_by(ns_id, 1);
+    }
+
+    /// J2-2: uncharge `n` per-namespace half-open slots at once. Used by the
+    /// listener-close drain, which removes the whole SYN queue under `listen.lock`
+    /// and defers the per-ns decrement to the proven `dec_ns_count` safe context.
+    fn dec_ns_syn_by(&self, ns_id: NamespaceId, n: u64) {
+        if n == 0 || ns_id == NamespaceId(0) {
+            return;
+        }
+        let mut counts = self.per_ns_syn_counts.lock();
+        let now_zero = match counts.get_mut(&ns_id) {
+            Some(c) => {
+                *c = c.saturating_sub(n);
+                *c == 0
+            }
+            None => false,
+        };
+        if now_zero {
+            counts.remove(&ns_id);
+        }
+    }
+
+    /// J2-6: charge `additional` aggregate send bytes to the namespace's TX-memory
+    /// budget, RESERVING headroom atomically under the leaf lock so the cap is HARD
+    /// even across sibling sockets in the same namespace (no read-then-commit
+    /// TOCTOU). On success the per-TCB mirror is advanced by the SAME amount so the
+    /// invariant `per_ns_send_bytes[ns] == Σ live tcb.ns_charged_send_bytes` holds.
+    /// Fails closed (`WouldBlock` -> caller retries after ACKs drain) at the cap;
+    /// the reservation is all-or-nothing (never partially applied on failure).
+    /// Root (ns 0) / zero are no-ops. Caller holds `sock.tcp.lock()`; nests
+    /// `per_ns_send_bytes` as a pure leaf.
+    fn try_charge_ns_send(
+        &self,
+        ns_id: NamespaceId,
+        tcb: &mut TcpControlBlock,
+        additional: usize,
+    ) -> Result<(), SocketError> {
+        if ns_id == NamespaceId(0) || additional == 0 {
+            return Ok(());
+        }
+        let mut counts = self.per_ns_send_bytes.lock();
+        let e = counts.entry(ns_id).or_insert(0);
+        let projected = match e.checked_add(additional) {
+            Some(p) if p <= Self::MAX_SEND_BYTES_PER_NS => p,
+            _ => {
+                // Reservation rejected: leave the counter untouched. Drop a freshly
+                // inserted zero entry so a denied charge cannot pin a stale key.
+                if *e == 0 {
+                    counts.remove(&ns_id);
+                }
+                return Err(SocketError::WouldBlock);
+            }
+        };
+        *e = projected;
+        tcb.ns_charged_send_bytes = tcb.ns_charged_send_bytes.saturating_add(additional);
+        Ok(())
+    }
+
+    /// J2-6: reconcile the namespace TX-memory counter toward this TCB's LIVE
+    /// `send_buffer_bytes`, applying the signed delta vs the per-TCB mirror
+    /// (`ns_charged_send_bytes`). REFUNDS an over-reservation after partial
+    /// buffering and UNCHARGES bytes freed by `handle_ack`. Never enforces the cap
+    /// (the charge path already did) — it only trues the counter toward the real
+    /// footprint, so it can never reject. Saturating + remove-at-0. Root (ns 0):
+    /// just keep the mirror in lockstep. Caller holds `sock.tcp.lock()`; pure leaf.
+    fn reconcile_ns_send(&self, ns_id: NamespaceId, tcb: &mut TcpControlBlock) {
+        if ns_id == NamespaceId(0) {
+            tcb.ns_charged_send_bytes = tcb.send_buffer_bytes;
+            return;
+        }
+        let live = tcb.send_buffer_bytes;
+        let charged = tcb.ns_charged_send_bytes;
+        if live == charged {
+            return;
+        }
+        let mut counts = self.per_ns_send_bytes.lock();
+        if live > charged {
+            let e = counts.entry(ns_id).or_insert(0);
+            *e = e.saturating_add(live - charged);
+        } else if let Some(c) = counts.get_mut(&ns_id) {
+            let now = c.saturating_sub(charged - live);
+            if now == 0 {
+                counts.remove(&ns_id);
+            } else {
+                *c = now;
+            }
+        }
+        tcb.ns_charged_send_bytes = live;
+    }
+
+    /// J2-6: uncharge `n` residual send bytes at connection teardown (the caller
+    /// reads the per-TCB mirror and zeroes it). Saturating + remove-at-0; mirrors
+    /// `dec_ns_conn`. Root (ns 0) / zero are no-ops.
+    fn uncharge_ns_send_residual(&self, ns_id: NamespaceId, n: usize) {
+        if n == 0 || ns_id == NamespaceId(0) {
+            return;
+        }
+        let mut counts = self.per_ns_send_bytes.lock();
+        if let Some(c) = counts.get_mut(&ns_id) {
+            let now = c.saturating_sub(n);
+            if now == 0 {
+                counts.remove(&ns_id);
+            } else {
+                *c = now;
+            }
+        }
+    }
+
+    /// J2-6: run `handle_ack` then reconcile the per-namespace send-byte counter
+    /// down by the bytes the ACK freed from `send_buffer`. The thin wrapper exists
+    /// because `handle_ack` (tcp.rs) has no `net_ns_id` in scope; the socket-layer
+    /// caller holds `sock` and the `sock.tcp` guard. Applied at the 7
+    /// ESTABLISHED/FIN-state ACK sites; the SYN-cookie path (detached TCB,
+    /// `send_buffer_bytes == 0`) and the `apply_ack_and_cc` hot path reconcile
+    /// separately. `handle_ack`'s `AckUpdate` is discarded at these sites, as
+    /// before.
+    fn handle_ack_reconciled(
+        &self,
+        sock: &Arc<SocketState>,
+        tcb: &mut TcpControlBlock,
+        ack_num: u32,
+        now_ms: u64,
+    ) {
+        handle_ack(tcb, ack_num, now_ms);
+        self.reconcile_ns_send(sock.net_ns_id, tcb);
+    }
+
+    /// J2-6: the SOLE helper allowed to null a connection's TCB (`*sock.tcp = None`)
+    /// from a context that does not already hold the guard. It first uncharges the
+    /// residual per-namespace send bytes and zeroes the mirror, closing the leak
+    /// class (a TCB dropped with bytes still charged) STRUCTURALLY. Used at the
+    /// SYN-SENT connect-timeout site; `cleanup_tcp_connection` inlines the same
+    /// sequence under its already-held guard. The last-ref `impl Drop for
+    /// SocketState` is the catch-all for the close-non-keep path that nulls nothing.
+    fn detach_tcp_uncharged(&self, sock: &Arc<SocketState>) {
+        let mut g = sock.tcp.lock();
+        if let Some(ts) = g.as_mut() {
+            let charged = ts.control.ns_charged_send_bytes;
+            if charged > 0 {
+                self.uncharge_ns_send_residual(sock.net_ns_id, charged);
+                ts.control.ns_charged_send_bytes = 0;
+            }
+            // J2-4: symmetric recv-byte residual uncharge.
+            let rcharged = ts.control.ns_charged_recv_bytes;
+            if rcharged > 0 {
+                self.uncharge_ns_recv_residual(sock.net_ns_id, rcharged);
+                ts.control.ns_charged_recv_bytes = 0;
+            }
+        }
+        *g = None;
+    }
+
+    /// J2-4: per-namespace RECV-memory budget PRE-GATE. DECIDE-only — takes NO
+    /// charge and mutates nothing (counter or mirror); it only decides whether
+    /// admitting `grow_by` more recv bytes for this connection would push the
+    /// namespace aggregate past the cap. Root (ns 0) / zero are admitted. The actual
+    /// counter move happens later in `reconcile_ns_recv` AFTER the buffer mutation,
+    /// because recv's true F-delta is unknown pre-mutation (ooo_insert returns a
+    /// merge-adjusted delta; ooo_drain is net-neutral-except-FIN-clear). `grow_by`
+    /// is the UPPER bound on F-growth (payload.len()/useful.len()), so the gate is
+    /// conservative-strict and never under-counts. SOFT cap — see MAX_RECV_BYTES_PER_NS.
+    /// Caller holds `sock.tcp.lock()`; nests `per_ns_recv_bytes` as a pure leaf.
+    fn try_charge_ns_recv_gate(
+        &self,
+        ns_id: NamespaceId,
+        tcb: &TcpControlBlock,
+        grow_by: usize,
+    ) -> Result<(), SocketError> {
+        if ns_id == NamespaceId(0) || grow_by == 0 {
+            return Ok(());
+        }
+        let counts = self.per_ns_recv_bytes.lock();
+        let live = counts.get(&ns_id).copied().unwrap_or(0);
+        let charged = tcb.ns_charged_recv_bytes;
+        // The namespace footprint EXCLUDING this connection's current contribution,
+        // plus this connection's projected footprint after the growth.
+        let other_conns = live.saturating_sub(charged);
+        let conn_after = charged.saturating_add(grow_by);
+        match other_conns.checked_add(conn_after) {
+            Some(projected) if projected <= Self::MAX_RECV_BYTES_PER_NS => Ok(()),
+            _ => Err(SocketError::WouldBlock),
+        }
+    }
+
+    /// J2-4: reconcile the namespace RECV counter toward this TCB's LIVE footprint
+    /// F = recv_buffer.len() + ooo_bytes, applying the signed delta vs the per-TCB
+    /// mirror (`ns_charged_recv_bytes`). This single primitive absorbs ooo_drain
+    /// neutrality, ooo_insert merge-absorption, and FIN-clear shrink. Saturating +
+    /// remove-at-0. NEVER rejects (the gate already enforced). Idempotent — a second
+    /// call with unchanged F is a no-op (safe to over-place). Root (ns 0): just keep
+    /// the mirror in lockstep. Caller holds `sock.tcp.lock()`; pure leaf.
+    fn reconcile_ns_recv(&self, ns_id: NamespaceId, tcb: &mut TcpControlBlock) {
+        let live = tcb.recv_buffer.len().saturating_add(tcb.ooo_bytes as usize);
+        if ns_id == NamespaceId(0) {
+            tcb.ns_charged_recv_bytes = live;
+            return;
+        }
+        let charged = tcb.ns_charged_recv_bytes;
+        if live == charged {
+            return;
+        }
+        let mut counts = self.per_ns_recv_bytes.lock();
+        if live > charged {
+            let e = counts.entry(ns_id).or_insert(0);
+            *e = e.saturating_add(live - charged);
+        } else if let Some(c) = counts.get_mut(&ns_id) {
+            let now = c.saturating_sub(charged - live);
+            if now == 0 {
+                counts.remove(&ns_id);
+            } else {
+                *c = now;
+            }
+        }
+        tcb.ns_charged_recv_bytes = live;
+    }
+
+    /// J2-4: uncharge `n` residual recv bytes at connection teardown (the caller
+    /// reads the per-TCB mirror and zeroes it). Saturating + remove-at-0; mirrors
+    /// `uncharge_ns_send_residual`. Root (ns 0) / zero are no-ops.
+    fn uncharge_ns_recv_residual(&self, ns_id: NamespaceId, n: usize) {
+        if n == 0 || ns_id == NamespaceId(0) {
+            return;
+        }
+        let mut counts = self.per_ns_recv_bytes.lock();
+        if let Some(c) = counts.get_mut(&ns_id) {
+            let now = c.saturating_sub(n);
+            if now == 0 {
+                counts.remove(&ns_id);
+            } else {
+                *c = now;
+            }
+        }
+    }
+
+    /// Remove a socket from the `sockets` map, returning the owned Arc with the
+    /// write guard ALREADY dropped (the guard is a temporary confined to this fn).
+    /// Callers can then run teardown — e.g. cleanup_tcp_connection(), which
+    /// re-acquires `sockets.write()` (R129-2) — WITHOUT self-deadlocking. In
+    /// edition 2021 a temporary in an `if let` scrutinee lives to the END of the
+    /// block, so `if let Some(s) = self.sockets.write().remove(..) { .. }` would
+    /// hold the write lock across the body; routing the removal through this helper
+    /// confines the guard to the call.
+    fn remove_socket(&self, socket_id: u64) -> Option<Arc<SocketState>> {
+        self.sockets.write().remove(&socket_id)
+    }
+
+    /// J2-1/J2-2 self-test (Phase J.2 per-tenant TCP budgets). Exercises the
+    /// per-namespace connection + half-open counters directly on a fresh
+    /// `SocketTable`: cap enforcement (fail-closed), namespace isolation, root
+    /// exemption, remove-at-0 bookkeeping, and — critically — that the stale-Weak
+    /// reaper (`conns_retain_accounted`) UNCHARGES pruned entries (the leak fix a
+    /// per-socket flag could not provide). Any failure panics; `make boot-check`
+    /// surfaces it via the serial log. Wired into the boot integration suite.
+    pub fn run_per_ns_budget_self_test() {
+        let table = SocketTable::new();
+        let ns_a = NamespaceId(1);
+        let ns_b = NamespaceId(2);
+        let root = NamespaceId(0);
+
+        // --- J2-1 connection budget: cap (fail-closed), isolation, root exemption ---
+        for _ in 0..SocketTable::MAX_CONNS_PER_NS {
+            table
+                .try_inc_ns_conn(ns_a)
+                .expect("J2-1: ns_a under cap should succeed");
+        }
+        assert!(
+            table.try_inc_ns_conn(ns_a).is_err(),
+            "J2-1: ns_a connection budget must fail closed at the cap"
+        );
+        table
+            .try_inc_ns_conn(ns_b)
+            .expect("J2-1: ns_b must be independent of ns_a");
+        table.dec_ns_conn(ns_b);
+        for _ in 0..(SocketTable::MAX_CONNS_PER_NS + 16) {
+            table
+                .try_inc_ns_conn(root)
+                .expect("J2-1: root namespace must be exempt");
+        }
+        assert!(
+            !table.per_ns_conn_counts.lock().contains_key(&root),
+            "J2-1: root must never be tracked in per_ns_conn_counts"
+        );
+        for _ in 0..SocketTable::MAX_CONNS_PER_NS {
+            table.dec_ns_conn(ns_a);
+        }
+        assert!(
+            !table.per_ns_conn_counts.lock().contains_key(&ns_a),
+            "J2-1: per_ns_conn_counts key must be removed at zero"
+        );
+        table.dec_ns_conn(ns_a); // saturating underflow guard (no panic, no underflow)
+
+        // --- J2-1 leak-via-retain regression (the load-bearing fix) ---
+        // A dead-Weak prune MUST uncharge the per-namespace count, else a tenant
+        // wedges at its cap forever (self-DoS). Build a tcp_conns map of dead Weaks
+        // and confirm conns_retain_accounted prunes AND uncharges exactly them,
+        // leaving an unrelated namespace's count untouched.
+        let ns_dead = NamespaceId(3);
+        let ns_other = NamespaceId(4);
+        const N_DEAD: u32 = 5;
+        for _ in 0..N_DEAD {
+            table.try_inc_ns_conn(ns_dead).unwrap();
+        }
+        table.try_inc_ns_conn(ns_other).unwrap(); // unrelated tenant, no map entry
+        let mut conns: BTreeMap<TcpLookupKey, Weak<SocketState>> = BTreeMap::new();
+        for i in 0..N_DEAD {
+            // Weak::new() never upgrades (strong_count() == 0) -> pruned.
+            conns.insert((ns_dead, i, 0u16, 0u32, 0u16), Weak::new());
+        }
+        table.conns_retain_accounted(&mut conns);
+        assert!(conns.is_empty(), "J2-1: all dead-Weak entries must be pruned");
+        assert!(
+            !table.per_ns_conn_counts.lock().contains_key(&ns_dead),
+            "J2-1 LEAK REGRESSION: pruned dead-Weak entries must uncharge to zero"
+        );
+        assert_eq!(
+            table.per_ns_conn_counts.lock().get(&ns_other).copied(),
+            Some(1u32),
+            "J2-1: an unrelated namespace must be untouched by the reaper"
+        );
+        table.dec_ns_conn(ns_other);
+
+        // --- J2-2 half-open (SYN) budget: cap, isolation, root exemption, batch drain ---
+        for _ in 0..SocketTable::MAX_HALF_OPEN_PER_NS {
+            assert!(
+                table.try_inc_ns_syn(ns_a),
+                "J2-2: ns_a under cap should succeed"
+            );
+        }
+        assert!(
+            !table.try_inc_ns_syn(ns_a),
+            "J2-2: ns_a half-open budget must fail closed at the cap"
+        );
+        assert!(
+            table.try_inc_ns_syn(ns_b),
+            "J2-2: ns_b must be independent of ns_a"
+        );
+        table.dec_ns_syn(ns_b);
+        for _ in 0..(SocketTable::MAX_HALF_OPEN_PER_NS + 8) {
+            assert!(
+                table.try_inc_ns_syn(root),
+                "J2-2: root namespace must be exempt"
+            );
+        }
+        assert!(
+            !table.per_ns_syn_counts.lock().contains_key(&root),
+            "J2-2: root must never be tracked in per_ns_syn_counts"
+        );
+        // Batch drain mirrors the listener-close path; key removed at zero.
+        table.dec_ns_syn_by(ns_a, SocketTable::MAX_HALF_OPEN_PER_NS);
+        assert!(
+            !table.per_ns_syn_counts.lock().contains_key(&ns_a),
+            "J2-2: per_ns_syn_counts key must be removed at zero after batch drain"
+        );
+        table.dec_ns_syn_by(ns_a, 100); // saturating underflow guard
+
+        // --- J2-6 send-byte budget: hard cap, isolation, root exemption,
+        //     reserve->refund reconcile, remove-at-0, and the load-bearing
+        //     Drop/detach residual regressions ---
+        let ns_s = NamespaceId(10);
+        let ns_t = NamespaceId(11);
+        let ns_u = NamespaceId(12);
+
+        // (1) HARD cap, fail-closed, atomic reservation (no partial-apply on reject).
+        let mut tcb_a =
+            TcpControlBlock::new_client(Ipv4Addr([10, 0, 0, 1]), 1, Ipv4Addr([10, 0, 0, 2]), 2, 0);
+        assert!(
+            table
+                .try_charge_ns_send(ns_s, &mut tcb_a, SocketTable::MAX_SEND_BYTES_PER_NS)
+                .is_ok(),
+            "J2-6: charge up to the cap must succeed"
+        );
+        assert_eq!(
+            tcb_a.ns_charged_send_bytes,
+            SocketTable::MAX_SEND_BYTES_PER_NS,
+            "J2-6: the per-TCB mirror must track the charged amount"
+        );
+        let mut tcb_b =
+            TcpControlBlock::new_client(Ipv4Addr([10, 0, 0, 3]), 3, Ipv4Addr([10, 0, 0, 4]), 4, 0);
+        assert!(
+            table.try_charge_ns_send(ns_s, &mut tcb_b, 1).is_err(),
+            "J2-6: one byte over the cap must fail closed"
+        );
+        assert_eq!(
+            tcb_b.ns_charged_send_bytes, 0,
+            "J2-6: a rejected reservation must not advance the mirror"
+        );
+        assert_eq!(
+            table.per_ns_send_bytes.lock().get(&ns_s).copied(),
+            Some(SocketTable::MAX_SEND_BYTES_PER_NS),
+            "J2-6: a rejected reservation must not partially apply to the counter"
+        );
+
+        // (2) Namespace isolation: ns_t independent of ns_s.
+        let mut tcb_c =
+            TcpControlBlock::new_client(Ipv4Addr([10, 0, 0, 5]), 5, Ipv4Addr([10, 0, 0, 6]), 6, 0);
+        assert!(
+            table.try_charge_ns_send(ns_t, &mut tcb_c, 4096).is_ok(),
+            "J2-6: ns_t must be independent of ns_s"
+        );
+
+        // (3) Root exemption: never charged, never tracked.
+        let mut tcb_root =
+            TcpControlBlock::new_client(Ipv4Addr([10, 0, 0, 7]), 7, Ipv4Addr([10, 0, 0, 8]), 8, 0);
+        assert!(
+            table
+                .try_charge_ns_send(root, &mut tcb_root, SocketTable::MAX_SEND_BYTES_PER_NS * 4)
+                .is_ok(),
+            "J2-6: root is exempt from the send-byte cap"
+        );
+        assert_eq!(
+            tcb_root.ns_charged_send_bytes, 0,
+            "J2-6: a root charge must not advance the mirror"
+        );
+        assert!(
+            !table.per_ns_send_bytes.lock().contains_key(&root),
+            "J2-6: root must never be tracked in per_ns_send_bytes"
+        );
+
+        // (4) Reserve->refund reconcile (the double-count fix): reserve a payload,
+        //     buffer fewer bytes (OOM truncation), reconcile -> counter trues DOWN.
+        let mut tcb_r =
+            TcpControlBlock::new_client(Ipv4Addr([10, 0, 0, 9]), 9, Ipv4Addr([10, 0, 0, 10]), 10, 0);
+        assert!(table.try_charge_ns_send(ns_u, &mut tcb_r, 8192).is_ok());
+        assert_eq!(table.per_ns_send_bytes.lock().get(&ns_u).copied(), Some(8192));
+        tcb_r.send_buffer_bytes = 5000; // only 5000 of the 8192 reserved were buffered
+        table.reconcile_ns_send(ns_u, &mut tcb_r);
+        assert_eq!(
+            tcb_r.ns_charged_send_bytes, 5000,
+            "J2-6: reconcile must true the mirror to the live send_buffer_bytes"
+        );
+        assert_eq!(
+            table.per_ns_send_bytes.lock().get(&ns_u).copied(),
+            Some(5000),
+            "J2-6: reconcile must refund the (reserved - buffered) shortfall (no double-count)"
+        );
+        tcb_r.send_buffer_bytes = 1000; // ACK drains 5000 -> 1000
+        table.reconcile_ns_send(ns_u, &mut tcb_r);
+        assert_eq!(table.per_ns_send_bytes.lock().get(&ns_u).copied(), Some(1000));
+        tcb_r.send_buffer_bytes = 0; // fully drained -> remove-at-0
+        table.reconcile_ns_send(ns_u, &mut tcb_r);
+        assert!(
+            !table.per_ns_send_bytes.lock().contains_key(&ns_u),
+            "J2-6: per_ns_send_bytes key must be removed at zero"
+        );
+        assert_eq!(tcb_r.ns_charged_send_bytes, 0);
+
+        // (5) Saturating-underflow guard on residual uncharge (absent key).
+        table.uncharge_ns_send_residual(ns_u, 999);
+        assert!(!table.per_ns_send_bytes.lock().contains_key(&ns_u));
+
+        // (6) DROP-RESIDUAL regression — the load-bearing Channel-A anchor. Build a
+        //     real Arc<SocketState> with an attached TCB, charge the GLOBAL table
+        //     (impl Drop uncharges via socket_table()), then drop the Arc and assert
+        //     the residual is gone. Unique high namespace ids avoid colliding with
+        //     any live boot socket.
+        let gtable = socket_table();
+        let drop_ns = NamespaceId(0x7000_0001);
+        {
+            let label = SocketLabel {
+                creator: ProcessCtx::new(1, 1, 0, 0, 0, 0),
+                secmark: 0,
+            };
+            let sock = Arc::new(SocketState::new(
+                u64::MAX,
+                SocketDomain::Inet4,
+                SocketType::Stream,
+                SocketProtocol::Tcp,
+                label,
+                drop_ns,
+            ));
+            let tcb = TcpControlBlock::new_client(
+                Ipv4Addr([10, 0, 0, 11]),
+                11,
+                Ipv4Addr([10, 0, 0, 12]),
+                12,
+                0,
+            );
+            sock.attach_tcp(tcb);
+            {
+                let mut g = sock.tcp.lock();
+                let ts = g.as_mut().expect("tcb attached");
+                gtable
+                    .try_charge_ns_send(drop_ns, &mut ts.control, 256 * 1024)
+                    .expect("charge under cap");
+            }
+            assert_eq!(
+                gtable.per_ns_send_bytes.lock().get(&drop_ns).copied(),
+                Some(256 * 1024),
+                "J2-6: global per-ns send bytes charged before drop"
+            );
+            // `sock` dropped here -> impl Drop uncharges the residual via the mirror.
+        }
+        assert!(
+            !gtable.per_ns_send_bytes.lock().contains_key(&drop_ns),
+            "J2-6: Drop must uncharge the residual per-ns send bytes (leak-class regression)"
+        );
+
+        // (7) detach_tcp_uncharged regression: nulling the TCB uncharges + zeroes the
+        //     mirror, and a subsequent Drop is a 0 no-op (no double-subtract).
+        let detach_ns = NamespaceId(0x7000_0002);
+        {
+            let label = SocketLabel {
+                creator: ProcessCtx::new(1, 1, 0, 0, 0, 0),
+                secmark: 0,
+            };
+            let sock = Arc::new(SocketState::new(
+                u64::MAX - 1,
+                SocketDomain::Inet4,
+                SocketType::Stream,
+                SocketProtocol::Tcp,
+                label,
+                detach_ns,
+            ));
+            let tcb = TcpControlBlock::new_client(
+                Ipv4Addr([10, 0, 0, 13]),
+                13,
+                Ipv4Addr([10, 0, 0, 14]),
+                14,
+                0,
+            );
+            sock.attach_tcp(tcb);
+            {
+                let mut g = sock.tcp.lock();
+                let ts = g.as_mut().expect("tcb attached");
+                gtable
+                    .try_charge_ns_send(detach_ns, &mut ts.control, 128 * 1024)
+                    .expect("charge under cap");
+            }
+            gtable.detach_tcp_uncharged(&sock);
+            assert!(
+                !gtable.per_ns_send_bytes.lock().contains_key(&detach_ns),
+                "J2-6: detach_tcp_uncharged must uncharge the residual"
+            );
+            // `sock` dropped here -> Drop finds the TCB nulled -> uncharges 0.
+        }
+        assert!(
+            !gtable.per_ns_send_bytes.lock().contains_key(&detach_ns),
+            "J2-6: a post-detach Drop must not double-subtract"
+        );
+
+        // (8) AGGREGATION invariant: per_ns_send_bytes[ns] == sum over MULTIPLE live
+        //     conns in the SAME ns. Charge TWO TCBs into one namespace, assert the
+        //     sum, tear ONE down, assert the counter drops to exactly the other's
+        //     mirror (not 0, not the sum). This is the only test that proves the
+        //     cross-sibling accumulation the whole budget exists to enforce.
+        let ns_agg = NamespaceId(13);
+        let mut tcb_x =
+            TcpControlBlock::new_client(Ipv4Addr([10, 0, 0, 15]), 15, Ipv4Addr([10, 0, 0, 16]), 16, 0);
+        let mut tcb_y =
+            TcpControlBlock::new_client(Ipv4Addr([10, 0, 0, 17]), 17, Ipv4Addr([10, 0, 0, 18]), 18, 0);
+        assert!(table.try_charge_ns_send(ns_agg, &mut tcb_x, 3000).is_ok());
+        assert!(table.try_charge_ns_send(ns_agg, &mut tcb_y, 5000).is_ok());
+        assert_eq!(
+            table.per_ns_send_bytes.lock().get(&ns_agg).copied(),
+            Some(8000),
+            "J2-6: the per-ns counter must be the SUM of sibling conns' charges"
+        );
+        // Tear down conn x (simulate its full drain): the counter must drop to
+        // exactly y's mirror, proving per-conn attribution within the sum.
+        tcb_x.send_buffer_bytes = 0;
+        table.reconcile_ns_send(ns_agg, &mut tcb_x);
+        assert_eq!(
+            table.per_ns_send_bytes.lock().get(&ns_agg).copied(),
+            Some(5000),
+            "J2-6: tearing down one sibling must leave exactly the other's charge"
+        );
+        assert_eq!(tcb_y.ns_charged_send_bytes, 5000);
+        tcb_y.send_buffer_bytes = 0;
+        table.reconcile_ns_send(ns_agg, &mut tcb_y);
+        assert!(
+            !table.per_ns_send_bytes.lock().contains_key(&ns_agg),
+            "J2-6: counter removed at zero after all siblings drain"
+        );
+
+        // ================= J2-4 recv-byte budget (10 cases) =================
+        // Drive the counter via a TCB's ooo_bytes (a plain field — no multi-MiB
+        // allocation) + reconcile_ns_recv; the gate is decide-only so it is tested
+        // separately. recv_buffer is exercised directly only in the FIN-clear case.
+        let ns_rs = NamespaceId(20);
+        let ns_rt = NamespaceId(21);
+        let ns_ru = NamespaceId(22);
+        let ns_ragg = NamespaceId(23);
+        let ns_rx = NamespaceId(24);
+
+        // (1) Aggregate cap (decide-only gate): drive ns_rs to the cap, assert a
+        //     sibling (charged==0) is rejected — proving it is an aggregate, not
+        //     per-conn, cap.
+        let mut rtcb_a =
+            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 1]), 1, Ipv4Addr([10, 1, 0, 2]), 2, 0);
+        rtcb_a.ooo_bytes = SocketTable::MAX_RECV_BYTES_PER_NS as u32;
+        table.reconcile_ns_recv(ns_rs, &mut rtcb_a);
+        assert_eq!(
+            table.per_ns_recv_bytes.lock().get(&ns_rs).copied(),
+            Some(SocketTable::MAX_RECV_BYTES_PER_NS),
+            "J2-recv: reconcile must charge the full footprint"
+        );
+        let rtcb_b =
+            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 3]), 3, Ipv4Addr([10, 1, 0, 4]), 4, 0);
+        assert!(
+            table.try_charge_ns_recv_gate(ns_rs, &rtcb_b, 1).is_err(),
+            "J2-recv: one byte over the aggregate cap must be rejected (sibling)"
+        );
+
+        // (2) Namespace isolation.
+        let rtcb_c =
+            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 5]), 5, Ipv4Addr([10, 1, 0, 6]), 6, 0);
+        assert!(
+            table.try_charge_ns_recv_gate(ns_rt, &rtcb_c, 4096).is_ok(),
+            "J2-recv: ns_rt must be independent of ns_rs"
+        );
+
+        // (3) Root exemption: gate always Ok; reconcile sets the mirror but no key.
+        let mut rtcb_root =
+            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 7]), 7, Ipv4Addr([10, 1, 0, 8]), 8, 0);
+        assert!(
+            table
+                .try_charge_ns_recv_gate(root, &rtcb_root, SocketTable::MAX_RECV_BYTES_PER_NS * 4)
+                .is_ok(),
+            "J2-recv: root is exempt from the recv cap"
+        );
+        rtcb_root.ooo_bytes = 9999;
+        table.reconcile_ns_recv(root, &mut rtcb_root);
+        assert!(
+            !table.per_ns_recv_bytes.lock().contains_key(&root),
+            "J2-recv: root must never be tracked in per_ns_recv_bytes"
+        );
+
+        // (4) Reconcile down-true + remove-at-0.
+        let mut rtcb_u =
+            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 9]), 9, Ipv4Addr([10, 1, 0, 10]), 10, 0);
+        rtcb_u.ooo_bytes = 8192;
+        table.reconcile_ns_recv(ns_ru, &mut rtcb_u);
+        assert_eq!(table.per_ns_recv_bytes.lock().get(&ns_ru).copied(), Some(8192));
+        rtcb_u.ooo_bytes = 5000;
+        table.reconcile_ns_recv(ns_ru, &mut rtcb_u);
+        assert_eq!(table.per_ns_recv_bytes.lock().get(&ns_ru).copied(), Some(5000));
+        rtcb_u.ooo_bytes = 0;
+        table.reconcile_ns_recv(ns_ru, &mut rtcb_u);
+        assert!(
+            !table.per_ns_recv_bytes.lock().contains_key(&ns_ru),
+            "J2-recv: counter removed at zero"
+        );
+
+        // (5) Saturating-underflow guard on residual uncharge (absent key).
+        table.uncharge_ns_recv_residual(ns_ru, 999);
+        assert!(!table.per_ns_recv_bytes.lock().contains_key(&ns_ru));
+
+        // (9) FIN-CLEAR-NO-OVERCOUNT (headline recv hazard): F = recv_buffer.len() +
+        //     ooo_bytes; clearing OOO must drop the counter to recv_buffer.len() only.
+        let mut rtcb_fin =
+            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 11]), 11, Ipv4Addr([10, 1, 0, 12]), 12, 0);
+        for _ in 0..1000 {
+            rtcb_fin.recv_buffer.push_back(0u8);
+        }
+        rtcb_fin.ooo_bytes = 4000;
+        table.reconcile_ns_recv(ns_ru, &mut rtcb_fin);
+        assert_eq!(table.per_ns_recv_bytes.lock().get(&ns_ru).copied(), Some(5000));
+        rtcb_fin.ooo_bytes = 0; // simulate the FIN-clear OOO purge
+        table.reconcile_ns_recv(ns_ru, &mut rtcb_fin);
+        assert_eq!(
+            table.per_ns_recv_bytes.lock().get(&ns_ru).copied(),
+            Some(1000),
+            "J2-recv: FIN-clear must drop the counter to recv_buffer.len() (no over-count)"
+        );
+        rtcb_fin.recv_buffer.clear();
+        table.reconcile_ns_recv(ns_ru, &mut rtcb_fin);
+        assert!(!table.per_ns_recv_bytes.lock().contains_key(&ns_ru));
+
+        // (8) AGGREGATION across two live siblings in one namespace.
+        let mut rtcb_x =
+            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 13]), 13, Ipv4Addr([10, 1, 0, 14]), 14, 0);
+        let mut rtcb_y =
+            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 15]), 15, Ipv4Addr([10, 1, 0, 16]), 16, 0);
+        rtcb_x.ooo_bytes = 3000;
+        rtcb_y.ooo_bytes = 5000;
+        table.reconcile_ns_recv(ns_ragg, &mut rtcb_x);
+        table.reconcile_ns_recv(ns_ragg, &mut rtcb_y);
+        assert_eq!(
+            table.per_ns_recv_bytes.lock().get(&ns_ragg).copied(),
+            Some(8000),
+            "J2-recv: per-ns counter must be the SUM of sibling footprints"
+        );
+        rtcb_x.ooo_bytes = 0;
+        table.reconcile_ns_recv(ns_ragg, &mut rtcb_x);
+        assert_eq!(
+            table.per_ns_recv_bytes.lock().get(&ns_ragg).copied(),
+            Some(5000),
+            "J2-recv: tearing down one sibling leaves exactly the other's footprint"
+        );
+        rtcb_y.ooo_bytes = 0;
+        table.reconcile_ns_recv(ns_ragg, &mut rtcb_y);
+        assert!(!table.per_ns_recv_bytes.lock().contains_key(&ns_ragg));
+
+        // (10) GATE-REARM + OOO-non-bypass: the post-mutation reconcile (not the
+        //      gate) is what re-arms enforcement; the gate is grow_by-agnostic, so an
+        //      OOO grow_by is admitted/rejected identically to an in-order one.
+        let mut rtcb_near =
+            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 17]), 17, Ipv4Addr([10, 1, 0, 18]), 18, 0);
+        rtcb_near.ooo_bytes = (SocketTable::MAX_RECV_BYTES_PER_NS - 1000) as u32;
+        table.reconcile_ns_recv(ns_rx, &mut rtcb_near);
+        let rtcb_probe =
+            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 19]), 19, Ipv4Addr([10, 1, 0, 20]), 20, 0);
+        assert!(
+            table.try_charge_ns_recv_gate(ns_rx, &rtcb_probe, 500).is_ok(),
+            "J2-recv: gate admits below the cap"
+        );
+        assert!(
+            table.try_charge_ns_recv_gate(ns_rx, &rtcb_probe, 2000).is_err(),
+            "J2-recv: gate rejects above the cap (same logic for OOO and in-order)"
+        );
+        let mut rtcb_push =
+            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 21]), 21, Ipv4Addr([10, 1, 0, 22]), 22, 0);
+        rtcb_push.ooo_bytes = 1500;
+        table.reconcile_ns_recv(ns_rx, &mut rtcb_push);
+        assert!(
+            table.try_charge_ns_recv_gate(ns_rx, &rtcb_probe, 1).is_err(),
+            "J2-recv: a reconcile that pushes the ns past the cap re-arms the gate"
+        );
+        rtcb_near.ooo_bytes = 0;
+        table.reconcile_ns_recv(ns_rx, &mut rtcb_near);
+        rtcb_push.ooo_bytes = 0;
+        table.reconcile_ns_recv(ns_rx, &mut rtcb_push);
+        assert!(!table.per_ns_recv_bytes.lock().contains_key(&ns_rx));
+
+        // (6) DROP-RESIDUAL + (7) detach regressions on a real Arc<SocketState>,
+        //     charging the GLOBAL socket_table() (impl Drop / detach uncharge it).
+        let rdrop_ns = NamespaceId(0x7000_0011);
+        {
+            let label = SocketLabel {
+                creator: ProcessCtx::new(1, 1, 0, 0, 0, 0),
+                secmark: 0,
+            };
+            let sock = Arc::new(SocketState::new(
+                u64::MAX - 2,
+                SocketDomain::Inet4,
+                SocketType::Stream,
+                SocketProtocol::Tcp,
+                label,
+                rdrop_ns,
+            ));
+            let mut tcb = TcpControlBlock::new_client(
+                Ipv4Addr([10, 1, 0, 23]),
+                23,
+                Ipv4Addr([10, 1, 0, 24]),
+                24,
+                0,
+            );
+            tcb.ooo_bytes = 256 * 1024;
+            sock.attach_tcp(tcb);
+            {
+                let mut g = sock.tcp.lock();
+                let ts = g.as_mut().expect("tcb attached");
+                gtable.reconcile_ns_recv(rdrop_ns, &mut ts.control);
+            }
+            assert_eq!(
+                gtable.per_ns_recv_bytes.lock().get(&rdrop_ns).copied(),
+                Some(256 * 1024),
+                "J2-recv: global per-ns recv bytes charged before drop"
+            );
+        }
+        assert!(
+            !gtable.per_ns_recv_bytes.lock().contains_key(&rdrop_ns),
+            "J2-recv: Drop must uncharge the residual recv bytes (leak-class regression)"
+        );
+
+        let rdetach_ns = NamespaceId(0x7000_0012);
+        {
+            let label = SocketLabel {
+                creator: ProcessCtx::new(1, 1, 0, 0, 0, 0),
+                secmark: 0,
+            };
+            let sock = Arc::new(SocketState::new(
+                u64::MAX - 3,
+                SocketDomain::Inet4,
+                SocketType::Stream,
+                SocketProtocol::Tcp,
+                label,
+                rdetach_ns,
+            ));
+            let mut tcb = TcpControlBlock::new_client(
+                Ipv4Addr([10, 1, 0, 25]),
+                25,
+                Ipv4Addr([10, 1, 0, 26]),
+                26,
+                0,
+            );
+            tcb.ooo_bytes = 128 * 1024;
+            sock.attach_tcp(tcb);
+            {
+                let mut g = sock.tcp.lock();
+                let ts = g.as_mut().expect("tcb attached");
+                gtable.reconcile_ns_recv(rdetach_ns, &mut ts.control);
+            }
+            gtable.detach_tcp_uncharged(&sock);
+            assert!(
+                !gtable.per_ns_recv_bytes.lock().contains_key(&rdetach_ns),
+                "J2-recv: detach_tcp_uncharged must uncharge the residual recv bytes"
+            );
+        }
+        assert!(
+            !gtable.per_ns_recv_bytes.lock().contains_key(&rdetach_ns),
+            "J2-recv: a post-detach Drop must not double-subtract"
+        );
     }
 
     /// Create a UDP socket.
@@ -2311,7 +3333,7 @@ impl SocketTable {
                 // R50-5 IMPROVEMENT: Prune stale Weak entries before counting
                 // This prevents false exhaustion when connections have been dropped
                 // but their Weak references haven't been cleaned up yet
-                conns.retain(|_, weak| weak.strong_count() > 0);
+                self.conns_retain_accounted(&mut conns);
 
                 // R50-5 FIX: Enforce global TCP connection limit to prevent resource exhaustion
                 if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
@@ -2321,6 +3343,11 @@ impl SocketTable {
                 if conns.get(&conn_key).and_then(|w| w.upgrade()).is_some() {
                     return Err(SocketError::PortInUse);
                 }
+                // J2-1: per-namespace connection budget (composes with the global
+                // cap checked above; both must pass). On over-quota this `?` exits
+                // the registration closure with QuotaExceeded -> EAGAIN, dropping
+                // the `conns` guard before the binding rollback below.
+                self.try_inc_ns_conn(conn_key.0)?;
                 conns.insert(conn_key, Arc::downgrade(sock));
                 conn_registered = true;
             }
@@ -2331,7 +3358,10 @@ impl SocketTable {
         // On registration failure, clean up any partial registrations
         if let Err(e) = registration_result {
             if conn_registered {
-                self.tcp_conns.lock().remove(&conn_key);
+                // J2-1: uncharge the per-namespace connection charged at insert.
+                if self.tcp_conns.lock().remove(&conn_key).is_some() {
+                    self.dec_ns_conn(conn_key.0);
+                }
             }
             if binding_registered {
                 // R75-1 FIX: Remove using namespace-scoped key
@@ -2418,7 +3448,10 @@ impl SocketTable {
                         // R75-1 FIX: Use namespace-scoped binding key
                         let binding_key = (sock.net_ns_id, local_port);
                         self.tcp_bindings.lock().remove(&binding_key);
-                        self.tcp_conns.lock().remove(&conn_key);
+                        // J2-1: uncharge the per-namespace connection.
+                        if self.tcp_conns.lock().remove(&conn_key).is_some() {
+                            self.dec_ns_conn(conn_key.0);
+                        }
                         return Err(SocketError::Closed);
                     }
                     // Still in SYN_SENT or other intermediate state
@@ -2430,22 +3463,31 @@ impl SocketTable {
                     // R75-1 FIX: Use namespace-scoped binding key
                     let binding_key = (sock.net_ns_id, local_port);
                     self.tcp_bindings.lock().remove(&binding_key);
-                    self.tcp_conns.lock().remove(&conn_key);
+                    // J2-1: uncharge the per-namespace connection.
+                    if self.tcp_conns.lock().remove(&conn_key).is_some() {
+                        self.dec_ns_conn(conn_key.0);
+                    }
                     // Reset socket metadata to allow retry after close
                     {
                         let mut meta = sock.meta.lock();
                         meta.remote_ip = None;
                         meta.remote_port = None;
                     }
-                    // Clear TCB
-                    *sock.tcp.lock() = None;
+                    // J2-6: clear the TCB through the unified helper, which first
+                    // uncharges any residual per-namespace send bytes (today 0 in
+                    // SYN-SENT since the socket can't send pre-ESTABLISHED, but
+                    // leak-proof for any future pre-ESTABLISHED data buffering).
+                    self.detach_tcp_uncharged(sock);
                     return Err(SocketError::Timeout);
                 }
                 WaitOutcome::Closed => {
                     // R75-1 FIX: Use namespace-scoped binding key
                     let binding_key = (sock.net_ns_id, local_port);
                     self.tcp_bindings.lock().remove(&binding_key);
-                    self.tcp_conns.lock().remove(&conn_key);
+                    // J2-1: uncharge the per-namespace connection.
+                    if self.tcp_conns.lock().remove(&conn_key).is_some() {
+                        self.dec_ns_conn(conn_key.0);
+                    }
                     return Err(SocketError::Closed);
                 }
                 WaitOutcome::NoProcess => return Err(SocketError::NoProcess),
@@ -2632,6 +3674,14 @@ impl SocketTable {
             return Err(SocketError::WouldBlock);
         }
 
+        // J2-6: per-namespace TX-memory budget — reserve `payload.len()` headroom
+        // atomically (HARD cap, fail-closed). The per-conn cap above is checked
+        // first (cheapest). On over-quota the caller retries after ACKs drain. The
+        // reservation advances the per-TCB mirror; the post-buffering reconcile
+        // below refunds the (payload.len() - offset) shortfall if OOM truncates the
+        // segmentation loop. Root (ns 0) is exempt.
+        self.try_charge_ns_send(sock.net_ns_id, &mut tcp_state.control, payload.len())?;
+
         // Get current sequence numbers
         let base_seq = tcp_state.control.snd_nxt;
         let ack = tcp_state.control.rcv_nxt;
@@ -2719,6 +3769,9 @@ impl SocketTable {
         // retransmission buffers. Advancing snd_nxt past unbuffered data
         // causes irrecoverable sequence number corruption on packet loss.
         if offset == 0 {
+            // J2-6: nothing was buffered — refund the full per-ns reservation
+            // (reconcile sees live == old send_buffer_bytes < mirror) before exit.
+            self.reconcile_ns_send(sock.net_ns_id, &mut tcp_state.control);
             drop(guard);
             return Err(SocketError::NoMemory);
         }
@@ -2727,6 +3780,10 @@ impl SocketTable {
             .control
             .send_buffer_bytes
             .saturating_add(offset);
+
+        // J2-6: true the per-ns counter to the bytes actually buffered, refunding
+        // the (payload.len() - offset) over-reservation when OOM truncated the loop.
+        self.reconcile_ns_send(sock.net_ns_id, &mut tcp_state.control);
 
         tcp_state.control.snd_nxt = base_seq.wrapping_add(offset as u32);
 
@@ -2956,6 +4013,11 @@ impl SocketTable {
                     // Without this, contiguous OOO data could sit undelivered until
                     // the next packet arrival, causing unnecessary read stalls.
                     tcp_state.control.ooo_drain_contiguous();
+
+                    // J2-4: the consumer drained recv_buffer (and ooo_drain may have
+                    // FIN-cleared OOO) — reconcile the per-ns recv counter DOWN to the
+                    // now-smaller true F (returns budget to the tenant as the app reads).
+                    self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
 
                     // R161-11 FIX: OOO drain in recv path may deliver buffered FIN,
                     // triggering FinWait2→TimeWait. Initialize time_wait_start.
@@ -3197,7 +4259,16 @@ impl SocketTable {
             sock.mark_closed();
             sock.wake_tcp_waiters();
             self.closed_count.fetch_add(1, Ordering::Relaxed);
-        } else if let Some(sock) = self.sockets.write().remove(&socket_id) {
+        } else if let Some(sock) = self.remove_socket(socket_id) {
+            // DEADLOCK FIX (found in J2-6 convergence audit, PE-06): the removal now
+            // goes through remove_socket() so the `sockets` write guard is dropped
+            // BEFORE this body. In edition 2021 a temporary in an `if let` scrutinee
+            // lives to the end of the block, so the prior inline
+            // `self.sockets.write().remove(..)` held the write lock across the child
+            // cleanup loop below — and cleanup_tcp_connection() re-acquires
+            // `sockets.write()` (R129-2), self-deadlocking on listener close with
+            // queued children. This makes the R52-2 "cleanup after releasing locks"
+            // intent actually hold.
             // R52-2 FIX: Clean up pending SYN/accept queues for listening sockets
             //
             // When a listening socket is closed, we must tear down all pending
@@ -3209,6 +4280,10 @@ impl SocketTable {
             // listen lock, then release it before calling cleanup_tcp_connection,
             // which may acquire sockets.write() lock internally.
             let mut children_to_cleanup: Vec<Arc<SocketState>> = Vec::new();
+            // J2-2: count the half-open SYNs drained below; the per-namespace
+            // half-open uncharge is deferred to the proven dec_ns_count safe
+            // context (all drained SYNs share this listener's namespace).
+            let mut drained_syn_count: u64 = 0;
             if sock.is_listening() {
                 let mut listen_guard = sock.listen.lock();
                 if let Some(mut listen_state) = listen_guard.take() {
@@ -3222,6 +4297,8 @@ impl SocketTable {
 
                             // R74-5 FIX: Decrement half-open counter when cleaning up SYN queue
                             dec_half_open();
+                            // J2-2: account the per-namespace half-open drain (deferred).
+                            drained_syn_count += 1;
                         }
                     }
                     // Collect established-but-not-accepted queue children.
@@ -3266,6 +4343,9 @@ impl SocketTable {
                 ) {
                     let key = tcp_map_key_from_parts(sock.net_ns_id, Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
                     if self.tcp_conns.lock().remove(&key).is_some() {
+                        // J2-1: uncharge the per-namespace connection (bound to
+                        // tcp_conns membership, independent of counted_in_active).
+                        self.dec_ns_conn(key.0);
                         // R121-3 FIX (Codex review): Only decrement if this socket
                         // was counted via try_inc_active_conn() in queue_accept().
                         // Client-initiated connections (sys_connect) are never
@@ -3291,6 +4371,9 @@ impl SocketTable {
             // R76-3 FIX: Decrement per-namespace socket count AFTER releasing sockets lock
             // to avoid deadlock (Codex review fix: lock ordering with per_ns_counts)
             self.dec_ns_count(sock.net_ns_id);
+            // J2-2: uncharge the per-namespace half-open SYNs drained above, in the
+            // SAME safe context as dec_ns_count (mirrors that proven lock ordering).
+            self.dec_ns_syn_by(sock.net_ns_id, drained_syn_count);
         }
 
         // Transmit FIN after releasing locks to avoid blocking critical sections.
@@ -3502,8 +4585,11 @@ impl SocketTable {
         match conns.get(&key).and_then(|w| w.upgrade()) {
             Some(sock) => Some(sock),
             None => {
-                // Clean up stale weak reference
-                conns.remove(&key);
+                // Clean up stale weak reference.
+                // J2-1: uncharge the per-namespace connection on lazy stale-Weak removal.
+                if conns.remove(&key).is_some() {
+                    self.dec_ns_conn(key.0);
+                }
                 None
             }
         }
@@ -3533,7 +4619,7 @@ impl SocketTable {
         // Phase 1: collect live socket Arcs while holding tcp_conns briefly.
         let candidates: Vec<Arc<SocketState>> = {
             let mut conns = self.tcp_conns.lock();
-            conns.retain(|_, weak| weak.strong_count() > 0);
+            self.conns_retain_accounted(&mut conns);
             if conns.len() < TCP_MAX_ACTIVE_CONNECTIONS {
                 return true; // stale-Weak pruning alone freed capacity
             }
@@ -3601,7 +4687,7 @@ impl SocketTable {
 
         // Phase 4: re-check capacity.
         let mut conns = self.tcp_conns.lock();
-        conns.retain(|_, weak| weak.strong_count() > 0);
+        self.conns_retain_accounted(&mut conns);
         conns.len() < TCP_MAX_ACTIVE_CONNECTIONS
     }
 
@@ -3760,7 +4846,7 @@ impl SocketTable {
                                         net_ns_id, dst_ip, header.dst_port,
                                         src_ip, header.src_port,
                                     );
-                                    listen_state.take_syn(&syn_key);
+                                    listen_state.take_syn(&syn_key, self);
                                 }
                             }
                         }
@@ -3814,7 +4900,7 @@ impl SocketTable {
                             let mut force_syn_cookie = false;
                             {
                                 let mut conns = self.tcp_conns.lock();
-                                conns.retain(|_, weak| weak.strong_count() > 0);
+                                self.conns_retain_accounted(&mut conns);
                                 if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
                                     // R106-2 FIX: Global active connection limit reached —
                                     // fall back to SYN cookies instead of dropping the SYN.
@@ -4037,57 +5123,85 @@ impl SocketTable {
                                 )
                             };
 
-                            // Register connection for demux
-                            {
+                            // Register connection for demux.
+                            // J2-1: charge the per-namespace connection budget bound
+                            // to this tcp_conns insertion. If the tenant is already at
+                            // its connection cap, skip the insert + SYN queue and fall
+                            // back to stateless SYN cookies (handled below), exactly
+                            // like the global half-open / queue_syn failure path.
+                            let ns_conn_charged = {
                                 let mut conns = self.tcp_conns.lock();
-                                conns.insert(syn_key, Arc::downgrade(&child));
-                            }
-
-                            // Queue half-open connection in SYN queue
-                            let pending = PendingSyn {
-                                key: syn_key,
-                                sock: child.clone(),
-                                syn_ack: syn_ack.clone(),
-                                syn_sent_at: now_ms,
+                                if self.try_inc_ns_conn(syn_key.0).is_ok() {
+                                    // Bind the charge to a genuine membership growth: the
+                                    // dup-check for this path ran under an earlier, separate
+                                    // tcp_conns lock (TOCTOU), so if the key raced in, insert
+                                    // would REPLACE without growing the map — undo the extra
+                                    // charge to keep count == live tcp_conns key count.
+                                    if conns.insert(syn_key, Arc::downgrade(&child)).is_some() {
+                                        self.dec_ns_conn(syn_key.0);
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
                             };
 
-                            // SYN cookie path handles the backlog-full case above,
-                            // but queue_syn can still fail due to global half-open limit.
-                            if listen_state.queue_syn(pending) {
-                                // R155-9 FIX: Seed conntrack for the inbound SYN +
-                                // outbound SYN-ACK so the final ACK transitions to
-                                // Established. Same pattern as the SYN cookie path.
-                                #[cfg(feature = "conntrack")]
-                                {
-                                    use crate::conntrack::ct_process_tcp;
-                                    let _ = ct_process_tcp(
-                                        listener.net_ns_id.0,
-                                        src_ip,
-                                        dst_ip,
-                                        header.src_port,
-                                        header.dst_port,
-                                        header.flags,
-                                        payload.len(),
-                                        now_ms,
-                                    );
-                                    let _ = ct_process_tcp(
-                                        listener.net_ns_id.0,
-                                        dst_ip,
-                                        src_ip,
-                                        header.dst_port,
-                                        header.src_port,
-                                        TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                        0,
-                                        now_ms,
-                                    );
+                            // Queue half-open connection in SYN queue (only if it was
+                            // charged + registered above).
+                            if ns_conn_charged {
+                                let pending = PendingSyn {
+                                    key: syn_key,
+                                    sock: child.clone(),
+                                    syn_ack: syn_ack.clone(),
+                                    syn_sent_at: now_ms,
+                                };
+
+                                // SYN cookie path handles the backlog-full case above,
+                                // but queue_syn can still fail due to the global/per-ns
+                                // half-open limit.
+                                if listen_state.queue_syn(pending, self) {
+                                    // R155-9 FIX: Seed conntrack for the inbound SYN +
+                                    // outbound SYN-ACK so the final ACK transitions to
+                                    // Established. Same pattern as the SYN cookie path.
+                                    #[cfg(feature = "conntrack")]
+                                    {
+                                        use crate::conntrack::ct_process_tcp;
+                                        let _ = ct_process_tcp(
+                                            listener.net_ns_id.0,
+                                            src_ip,
+                                            dst_ip,
+                                            header.src_port,
+                                            header.dst_port,
+                                            header.flags,
+                                            payload.len(),
+                                            now_ms,
+                                        );
+                                        let _ = ct_process_tcp(
+                                            listener.net_ns_id.0,
+                                            dst_ip,
+                                            src_ip,
+                                            header.dst_port,
+                                            header.src_port,
+                                            TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                            0,
+                                            now_ms,
+                                        );
+                                    }
+                                    return Some(syn_ack);
                                 }
-                                return Some(syn_ack);
+
+                                // R106-2 FIX: queue_syn failed. J2-1: uncharge the
+                                // per-namespace connection charged above and remove the
+                                // tcp_conns entry before falling back to SYN cookies.
+                                if self.tcp_conns.lock().remove(&syn_key).is_some() {
+                                    self.dec_ns_conn(syn_key.0);
+                                }
                             }
 
-                            // R106-2 FIX: queue_syn failed (global half-open limit).
-                            // Clean up allocated state and fall back to SYN cookies
-                            // instead of silently dropping the SYN.
-                            self.tcp_conns.lock().remove(&syn_key);
+                            // Clean up the child socket + fall back to SYN cookies.
+                            // Reached when queue_syn failed OR the per-namespace
+                            // connection budget was exceeded (ns_conn_charged == false,
+                            // in which case the child was never inserted into tcp_conns).
                             self.sockets.write().remove(&child_id);
                             // R77-4 FIX: Rollback quota on failure path
                             self.dec_ns_count(listener.net_ns_id);
@@ -4202,7 +5316,7 @@ impl SocketTable {
                             // dropped under sustained load.
                             {
                                 let mut conns = self.tcp_conns.lock();
-                                conns.retain(|_, weak| weak.strong_count() > 0);
+                                self.conns_retain_accounted(&mut conns);
                                 // Check for duplicate first (race condition guard)
                                 if conns.get(&syn_key).and_then(|w| w.upgrade()).is_some() {
                                     return None;
@@ -4217,7 +5331,7 @@ impl SocketTable {
                                     // Re-check under fresh lock: another core may have
                                     // consumed the freed slot or inserted a duplicate.
                                     let mut conns = self.tcp_conns.lock();
-                                    conns.retain(|_, weak| weak.strong_count() > 0);
+                                    self.conns_retain_accounted(&mut conns);
                                     if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
                                         return None;
                                     }
@@ -4324,10 +5438,27 @@ impl SocketTable {
 
                             child.attach_tcp(tcb);
 
-                            // Register connection
+                            // Register connection.
+                            // J2-1: charge the per-namespace connection budget bound
+                            // to this insertion. On over-quota, tear down the child
+                            // (cleanup_tcp_connection removes it from the sockets map +
+                            // dec_ns_count) and send RST — mirrors accept-queue-full.
+                            // The conns guard is dropped before cleanup_tcp_connection,
+                            // which re-locks tcp_conns (non-reentrant).
                             {
                                 let mut conns = self.tcp_conns.lock();
-                                conns.insert(syn_key, Arc::downgrade(&child));
+                                if self.try_inc_ns_conn(syn_key.0).is_err() {
+                                    drop(conns);
+                                    child.mark_closed();
+                                    self.cleanup_tcp_connection(&child);
+                                    return self.build_tcp_rst(dst_ip, src_ip, header, payload);
+                                }
+                                // Bind the charge to a genuine membership growth (TOCTOU:
+                                // the dup-check ran under an earlier, separate tcp_conns
+                                // lock; a raced-in key would make insert REPLACE).
+                                if conns.insert(syn_key, Arc::downgrade(&child)).is_some() {
+                                    self.dec_ns_conn(syn_key.0);
+                                }
                             }
 
                             // Add to accept queue
@@ -4492,7 +5623,7 @@ impl SocketTable {
                 let syn_len = 1u32;
                 tcp_state.control.rcv_nxt = header.seq_num.wrapping_add(syn_len);
                 // Update snd_una and refresh RTT estimates from ACK
-                handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
+                self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
 
                 // R58: RFC 7323 Window Scaling - process WSopt from SYN-ACK
                 // Window scaling is ONLY negotiated if we sent WSopt in our SYN
@@ -4636,6 +5767,12 @@ impl SocketTable {
                     );
                     fast_retransmit_seg = retransmit_seg;
 
+                    // J2-6: apply_ack_and_cc ran handle_ack internally (freeing acked
+                    // send bytes); reconcile the per-namespace send counter here at
+                    // the caller, which holds `sock` — keeping apply_ack_and_cc's
+                    // signature free of net_ns_id (no change to the hot CC path).
+                    self.reconcile_ns_send(sock.net_ns_id, &mut tcp_state.control);
+
                     // R56-1: RFC 3042 Limited Transmit — wake sender to push new data
                     if limited_transmit {
                         sock.wake_tcp_waiters();
@@ -4719,6 +5856,20 @@ impl SocketTable {
                             return Some(win_ack);
                         }
 
+                        // J2-4: per-namespace recv-memory gate (decide-only, fail-closed;
+                        // identical drop+window-ACK shape as the per-conn overrun above).
+                        if self
+                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .is_err()
+                        {
+                            let win_ack = Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                window_after_ack,
+                            );
+                            return Some(win_ack);
+                        }
+
                         // R162-9 FIX: Fallible recv_buffer growth
                         if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
                             return None;
@@ -4751,6 +5902,13 @@ impl SocketTable {
 
                         // Build ACK (plain — no SACK blocks needed for in-order data
                         // with empty OOO queue; includes SACK if OOO queue is non-empty)
+                        // J2-4: reconcile to true F after the in-order extend + drain,
+                        // GATED on !is_fin — the is_fin case is reconciled post-OOO-purge
+                        // in the FIN handler, avoiding a transiently-inflated publish to
+                        // concurrent same-ns siblings.
+                        if !is_fin {
+                            self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
+                        }
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         response = Some(Self::build_sack_ack(
                             &tcp_state.control,
@@ -4761,7 +5919,22 @@ impl SocketTable {
                     } else if seq_gt(header.seq_num, tcp_state.control.rcv_nxt) {
                         // Out-of-order: buffer in OOO queue and send SACK-bearing ACK
                         // R133-3 FIX: Pass FIN flag to preserve it during OOO buffering.
+                        // J2-4: gate before buffering OOO (so OOO is not a budget bypass);
+                        // on reject drop the segment + SACK-ACK (peer/SACK retransmits).
+                        if self
+                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .is_err()
+                        {
+                            let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                            let sack_ack = Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                ack_wnd,
+                            );
+                            return Some(sack_ack);
+                        }
                         tcp_state.control.ooo_insert(header.seq_num, payload, is_fin);
+                        self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
 
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let sack_ack = Self::build_sack_ack(
@@ -4781,10 +5954,27 @@ impl SocketTable {
                                 .wrapping_sub(header.seq_num) as usize;
                             let useful = &payload[skip..];
                             let pass_fin = is_fin;
+                            // J2-4: gate the in-window overlap tail before buffering; on
+                            // reject drop it and dup-ACK (peer/SACK retransmits).
+                            if self
+                                .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, useful.len())
+                                .is_err()
+                            {
+                                let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                                let dup_ack = Self::build_sack_ack(
+                                    &tcp_state.control,
+                                    dst_ip, src_ip, header.dst_port, header.src_port,
+                                    ack_wnd,
+                                );
+                                return Some(dup_ack);
+                            }
                             tcp_state.control.ooo_insert(
                                 tcp_state.control.rcv_nxt, useful, pass_fin,
                             );
                             tcp_state.control.ooo_drain_contiguous();
+                            // J2-4: reconcile to true F after the drain — covers BOTH the
+                            // FIN early-return and the dup_ack fall-through.
+                            self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
                             data_received = true;
                             if tcp_state.control.fin_received {
                                 if tcp_state.control.state == TcpState::TimeWait
@@ -4857,6 +6047,11 @@ impl SocketTable {
                             .ooo_bytes
                             .saturating_sub(stale.data.len() as u32);
                     }
+                    // J2-4: reconcile to post-purge true F (the FIN cleared the OOO queue,
+                    // shrinking F). Dominates the fin-ack return. The combined in-order
+                    // data+FIN case reaches here with the in-order reconcile skipped
+                    // (is_fin), so this is its sole reconcile — no over-count of cleared OOO.
+                    self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
 
                     let window_after = tcp_state
                         .control
@@ -4968,7 +6163,7 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
+                    self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -5046,6 +6241,20 @@ impl SocketTable {
                             return Some(win_ack);
                         }
 
+                        // J2-4: per-namespace recv-memory gate (decide-only, fail-closed;
+                        // identical drop+window-ACK shape as the per-conn overrun above).
+                        if self
+                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .is_err()
+                        {
+                            let win_ack = Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                window_after_ack,
+                            );
+                            return Some(win_ack);
+                        }
+
                         // R162-9 FIX: Fallible recv_buffer growth
                         if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
                             return None;
@@ -5071,6 +6280,13 @@ impl SocketTable {
                             }
                         }
 
+                        // J2-4: reconcile to true F after the in-order extend + drain,
+                        // GATED on !is_fin — the is_fin case is reconciled post-OOO-purge
+                        // in the FIN handler, avoiding a transiently-inflated publish to
+                        // concurrent same-ns siblings.
+                        if !is_fin {
+                            self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
+                        }
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         response = Some(Self::build_sack_ack(
                             &tcp_state.control,
@@ -5080,7 +6296,22 @@ impl SocketTable {
                         data_received = true;
                     } else if seq_gt(header.seq_num, tcp_state.control.rcv_nxt) {
                         // R133-3 FIX: Pass FIN flag to preserve it during OOO buffering.
+                        // J2-4: gate before buffering OOO (so OOO is not a budget bypass);
+                        // on reject drop the segment + SACK-ACK (peer/SACK retransmits).
+                        if self
+                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .is_err()
+                        {
+                            let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                            let sack_ack = Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                ack_wnd,
+                            );
+                            return Some(sack_ack);
+                        }
                         tcp_state.control.ooo_insert(header.seq_num, payload, is_fin);
+                        self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let sack_ack = Self::build_sack_ack(
                             &tcp_state.control,
@@ -5097,10 +6328,27 @@ impl SocketTable {
                                 .wrapping_sub(header.seq_num) as usize;
                             let useful = &payload[skip..];
                             let pass_fin = is_fin;
+                            // J2-4: gate the in-window overlap tail before buffering; on
+                            // reject drop it and dup-ACK (peer/SACK retransmits).
+                            if self
+                                .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, useful.len())
+                                .is_err()
+                            {
+                                let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                                let dup_ack = Self::build_sack_ack(
+                                    &tcp_state.control,
+                                    dst_ip, src_ip, header.dst_port, header.src_port,
+                                    ack_wnd,
+                                );
+                                return Some(dup_ack);
+                            }
                             tcp_state.control.ooo_insert(
                                 tcp_state.control.rcv_nxt, useful, pass_fin,
                             );
                             tcp_state.control.ooo_drain_contiguous();
+                            // J2-4: reconcile to true F after the drain — covers BOTH the
+                            // FIN early-return and the dup_ack fall-through.
+                            self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
                             data_received = true;
                             if tcp_state.control.fin_received {
                                 if tcp_state.control.state == TcpState::TimeWait
@@ -5161,6 +6409,11 @@ impl SocketTable {
                             .ooo_bytes
                             .saturating_sub(stale.data.len() as u32);
                     }
+                    // J2-4: reconcile to post-purge true F (the FIN cleared the OOO queue,
+                    // shrinking F). Dominates the fin-ack return. The combined in-order
+                    // data+FIN case reaches here with the in-order reconcile skipped
+                    // (is_fin), so this is its sole reconcile — no over-count of cleared OOO.
+                    self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
 
                     let window_after = tcp_state
                         .control
@@ -5265,7 +6518,7 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
+                    self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -5331,6 +6584,20 @@ impl SocketTable {
                             return Some(win_ack);
                         }
 
+                        // J2-4: per-namespace recv-memory gate (decide-only, fail-closed;
+                        // identical drop+window-ACK shape as the per-conn overrun above).
+                        if self
+                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .is_err()
+                        {
+                            let win_ack = Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                window_after_ack,
+                            );
+                            return Some(win_ack);
+                        }
+
                         // R162-9 FIX: Fallible recv_buffer growth
                         if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
                             return None;
@@ -5356,6 +6623,13 @@ impl SocketTable {
                             }
                         }
 
+                        // J2-4: reconcile to true F after the in-order extend + drain,
+                        // GATED on !is_fin — the is_fin case is reconciled post-OOO-purge
+                        // in the FIN handler, avoiding a transiently-inflated publish to
+                        // concurrent same-ns siblings.
+                        if !is_fin {
+                            self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
+                        }
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         response = Some(Self::build_sack_ack(
                             &tcp_state.control,
@@ -5365,7 +6639,22 @@ impl SocketTable {
                         data_received = true;
                     } else if seq_gt(header.seq_num, tcp_state.control.rcv_nxt) {
                         // R133-3 FIX: Pass FIN flag to preserve it during OOO buffering.
+                        // J2-4: gate before buffering OOO (so OOO is not a budget bypass);
+                        // on reject drop the segment + SACK-ACK (peer/SACK retransmits).
+                        if self
+                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .is_err()
+                        {
+                            let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                            let sack_ack = Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                ack_wnd,
+                            );
+                            return Some(sack_ack);
+                        }
                         tcp_state.control.ooo_insert(header.seq_num, payload, is_fin);
+                        self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let sack_ack = Self::build_sack_ack(
                             &tcp_state.control,
@@ -5382,10 +6671,27 @@ impl SocketTable {
                                 .wrapping_sub(header.seq_num) as usize;
                             let useful = &payload[skip..];
                             let pass_fin = is_fin;
+                            // J2-4: gate the in-window overlap tail before buffering; on
+                            // reject drop it and dup-ACK (peer/SACK retransmits).
+                            if self
+                                .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, useful.len())
+                                .is_err()
+                            {
+                                let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                                let dup_ack = Self::build_sack_ack(
+                                    &tcp_state.control,
+                                    dst_ip, src_ip, header.dst_port, header.src_port,
+                                    ack_wnd,
+                                );
+                                return Some(dup_ack);
+                            }
                             tcp_state.control.ooo_insert(
                                 tcp_state.control.rcv_nxt, useful, pass_fin,
                             );
                             tcp_state.control.ooo_drain_contiguous();
+                            // J2-4: reconcile to true F after the drain — covers BOTH the
+                            // FIN early-return and the dup_ack fall-through.
+                            self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
                             data_received = true;
                             if tcp_state.control.fin_received {
                                 if tcp_state.control.state == TcpState::TimeWait
@@ -5446,6 +6752,11 @@ impl SocketTable {
                             .ooo_bytes
                             .saturating_sub(stale.data.len() as u32);
                     }
+                    // J2-4: reconcile to post-purge true F (the FIN cleared the OOO queue,
+                    // shrinking F). Dominates the fin-ack return. The combined in-order
+                    // data+FIN case reaches here with the in-order reconcile skipped
+                    // (is_fin), so this is its sole reconcile — no over-count of cleared OOO.
+                    self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
 
                     let window_after = tcp_state
                         .control
@@ -5530,7 +6841,7 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
+                    self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -5627,7 +6938,7 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
+                    self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -5736,7 +7047,7 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
+                    self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -5916,7 +7227,7 @@ impl SocketTable {
                     if let Some(listener) = self.lookup_tcp_listener(net_ns_id, header.dst_port) {
                         let mut listen_guard = listener.listen.lock();
                         if let Some(listen_state) = listen_guard.as_mut() {
-                            listen_state.take_syn(&syn_key);
+                            listen_state.take_syn(&syn_key, self);
                         }
                     }
 
@@ -5928,7 +7239,7 @@ impl SocketTable {
                 }
 
                 // Handshake complete - transition to Established
-                handle_ack(&mut tcp_state.control, header.ack_num, self.time_wait_now());
+                self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
                 // R58: Apply window scaling when updating send window
                 tcp_state.control.snd_wnd =
                     decode_window(header.window, tcp_state.control.effective_snd_wscale());
@@ -5978,21 +7289,41 @@ impl SocketTable {
                     let consumed = tcp_state.control.recv_buffer.len() as u32;
                     let available = tcp_state.control.rcv_wnd.saturating_sub(consumed);
                     if (payload.len() as u32) <= available {
-                        // R162-9 FIX: Fallible recv_buffer growth
-                        if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
-                            return None;
+                        // J2-4: per-namespace recv gate. On reject send a window ACK and
+                        // do NOT extend / advance rcv_nxt (fail-closed; peer retransmits).
+                        // rcv_nxt is advanced ONLY in the else-branch extend, so a
+                        // data+FIN segment whose data is budget-rejected also fails the
+                        // FIN check at the piggyback block below -> no half-accept.
+                        if self
+                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .is_err()
+                        {
+                            let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                            ack_response = Some(Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                ack_wnd,
+                            ));
+                        } else {
+                            // R162-9 FIX: Fallible recv_buffer growth
+                            if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
+                                return None;
+                            }
+                            tcp_state.control.recv_buffer.extend(payload.iter().copied());
+                            tcp_state.control.rcv_nxt = tcp_state
+                                .control
+                                .rcv_nxt
+                                .wrapping_add(payload.len() as u32);
+                            // J2-4: reconcile to true F (== recv_buffer.len(); ooo_bytes==0
+                            // here per the debug_assert above). Runs before drop(guard).
+                            self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
+                            let ack_wnd = Self::current_adv_window(&tcp_state.control);
+                            ack_response = Some(Self::build_sack_ack(
+                                &tcp_state.control,
+                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                ack_wnd,
+                            ));
                         }
-                        tcp_state.control.recv_buffer.extend(payload.iter().copied());
-                        tcp_state.control.rcv_nxt = tcp_state
-                            .control
-                            .rcv_nxt
-                            .wrapping_add(payload.len() as u32);
-                        let ack_wnd = Self::current_adv_window(&tcp_state.control);
-                        ack_response = Some(Self::build_sack_ack(
-                            &tcp_state.control,
-                            dst_ip, src_ip, header.dst_port, header.src_port,
-                            ack_wnd,
-                        ));
                     }
                 }
 
@@ -6030,7 +7361,7 @@ impl SocketTable {
                     let mut listen_guard = listener.listen.lock();
                     if let Some(listen_state) = listen_guard.as_mut() {
                         // Remove from SYN queue
-                        listen_state.take_syn(&syn_key);
+                        listen_state.take_syn(&syn_key, self);
                     }
                     drop(listen_guard);
 
@@ -6995,7 +8326,7 @@ impl SocketTable {
                     }
 
                     for key in expired_keys {
-                        if let Some(pending) = listen_state.take_syn(&key) {
+                        if let Some(pending) = listen_state.take_syn(&key, self) {
                             let rst_seg = {
                                 let mut tcb_guard = pending.sock.tcp.lock();
                                 if let Some(tcb) = tcb_guard.as_mut() {
@@ -7130,6 +8461,9 @@ impl SocketTable {
         ) {
             let key = tcp_map_key_from_parts(sock.net_ns_id, Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
             if self.tcp_conns.lock().remove(&key).is_some() {
+                // J2-1: uncharge the per-namespace connection (bound to tcp_conns
+                // membership, independent of counted_in_active).
+                self.dec_ns_conn(key.0);
                 // R121-3 FIX: Only decrement the global active connection counter
                 // if this socket was previously counted via try_inc_active_conn()
                 // in queue_accept(). Client-initiated connections (sys_connect)
@@ -7150,11 +8484,31 @@ impl SocketTable {
 
         // Close and wake TCP waiters before dropping the TCB
         let mut tcp_guard = sock.tcp.lock();
-        if let Some(tcp_state) = tcp_guard.as_ref() {
+        if let Some(tcp_state) = tcp_guard.as_mut() {
             tcp_state.state_waiters.close();
             tcp_state.state_waiters.wake_all();
             tcp_state.data_waiters.close();
             tcp_state.data_waiters.wake_all();
+            // J2-6: uncharge the residual per-namespace send bytes before the TCB is
+            // dropped. LOAD-BEARING for the path where is_closed() is false below
+            // (the Arc lives on with the TCB nulled, so impl Drop would find None
+            // and uncharge 0 — this is then the only uncharge that runs). Mirrors
+            // detach_tcp_uncharged under the already-held guard (no re-lock). Only
+            // sock.tcp is held here (tcp_bindings/tcp_conns released above), so
+            // per_ns_send_bytes stays a pure leaf.
+            let charged = tcp_state.control.ns_charged_send_bytes;
+            if charged > 0 {
+                self.uncharge_ns_send_residual(sock.net_ns_id, charged);
+                tcp_state.control.ns_charged_send_bytes = 0;
+            }
+            // J2-4: symmetric recv-byte residual uncharge (LOAD-BEARING on the
+            // is_closed()==false path: the Arc lives on with the TCB nulled, so Drop
+            // later finds None and this is the only recv uncharge that runs).
+            let rcharged = tcp_state.control.ns_charged_recv_bytes;
+            if rcharged > 0 {
+                self.uncharge_ns_recv_residual(sock.net_ns_id, rcharged);
+                tcp_state.control.ns_charged_recv_bytes = 0;
+            }
         }
         *tcp_guard = None;
         drop(tcp_guard);

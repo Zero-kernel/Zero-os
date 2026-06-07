@@ -130,6 +130,62 @@
 //! 2. **Always acquire COW_FAULT_LOCK before PT_LOCK if both needed**
 //! 3. **COW_FAULT_LOCK is only needed in handle_cow_page_fault()**
 //!
+//! # Phase J.2: Per-Tenant (Per-Network-Namespace) TCP Budget Leaves
+//!
+//! The network stack's per-namespace TCP resource budgets (net/src/socket.rs) add
+//! two Level-8 (Device) **leaf** mutexes, charged/uncharged strictly nested under
+//! an already-held parent lock and themselves acquiring NO further lock:
+//!
+//! ```text
+//! tcp_conns (SocketTable)       > per_ns_conn_counts   (J2-1 connection budget)
+//! listen.lock (TcpListenState)  > per_ns_syn_counts     (J2-2 SYN-backlog budget)
+//! sock.tcp (SocketState)        > per_ns_send_bytes     (J2-6 TX-memory budget)
+//! sock.tcp (SocketState)        > per_ns_recv_bytes     (J2-4 RX-memory budget)
+//! ```
+//!
+//! Rules (enforced by construction in socket.rs):
+//! - `per_ns_conn_counts` is ONLY taken while the `tcp_conns` guard is held (the
+//!   3 inserts + `conns_retain_accounted` + the membership removes), so the count
+//!   equals the live `tcp_conns` key count per namespace and can never leak via
+//!   the six stale-Weak reapers. Pure leaf: never acquire `tcp_conns` (or any
+//!   lock) while holding it, and never call `cleanup_tcp_connection` (which
+//!   re-locks the non-reentrant `tcp_conns`) from an over-quota rollback without
+//!   first dropping the `conns` guard.
+//! - `per_ns_syn_counts` is ONLY taken while `listen.lock` is held (queue_syn /
+//!   take_syn) OR in the listener-close drain's deferred `dec_ns_syn_by`, placed
+//!   in the same proven safe context as `dec_ns_count` (R76-3). Pure leaf.
+//! - The root namespace (`NamespaceId(0)`, the host) is exempt from all three
+//!   budgets; only non-root tenants are charged.
+//! - `per_ns_send_bytes` (J2-6) is taken ONLY while `sock.tcp` is held (the
+//!   tcp_send reserve + the 7 ESTABLISHED/FIN-state ACK reconciles + the
+//!   apply_ack_and_cc caller reconcile + the cleanup_tcp_connection pre-null
+//!   uncharge), OR in `impl Drop for SocketState` via `self.tcp.get_mut()` with
+//!   NO other socket lock held (the close-non-keep catch-all). It acquires NO
+//!   further lock. It transitively sits under `sockets` when a reconcile-bearing
+//!   path runs while `sockets` is held (Drop of a last strong Arc removed under
+//!   `sockets.write()`), so it must NEVER be acquired before `sock.tcp` or any
+//!   `sockets`/`tcp_conns`/`listen.lock`. The per-TCB `ns_charged_send_bytes`
+//!   mirror lets teardown uncharge the exact outstanding amount even though the
+//!   byte total is a VARIABLE quantity, so no per-ns bytes leak when a TCB is
+//!   freed without passing through `handle_ack`.
+//! - `per_ns_recv_bytes` (J2-4) follows the SAME leaf discipline, taken only under
+//!   `sock.tcp` (the RX gate/reconcile sites + the tcp_recv drain) or lock-free in
+//!   `impl Drop`. It is a SOFT cap: the decide-only `try_charge_ns_recv_gate`
+//!   releases the leaf before the buffer mutation + `reconcile_ns_recv`, so the
+//!   per-ns aggregate may transiently overshoot by a bounded, self-correcting
+//!   amount; it never under-counts (no isolation bypass). The send and recv leaves
+//!   are independent siblings under `sock.tcp` — a path may take both, but only
+//!   ever `sock.tcp > {send|recv}` leaf, never leaf > leaf, so no new cycle.
+//! - The strong `Arc<SocketState>` owners are `sockets` AND a listener's
+//!   `accept_queue` (udp_bindings/tcp_bindings/tcp_conns hold only Weak).
+//!   Accept-queue children carry no charged send bytes (not yet accept()ed, so
+//!   never tcp_send'd) and are uncharged via cleanup_tcp_connection at listener
+//!   teardown; for every charge-bearing socket `sockets` is the last strong ref,
+//!   so `impl Drop for SocketState` is the catch-all that uncharges the residual.
+//!   `Drop`'s `self.tcp.get_mut()` is exclusive from `&mut self` regardless of
+//!   strong_count. Do NOT introduce a long-lived strong owner that could carry a
+//!   charge-bearing TCB past the close path.
+//!
 //! # SMP Migration Notes
 //!
 //! When enabling SMP, the following changes are required:
