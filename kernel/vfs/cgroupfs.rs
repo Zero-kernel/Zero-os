@@ -40,9 +40,15 @@ static NEXT_FS_ID: AtomicU64 = AtomicU64::new(300);
 
 /// R154-2 FIX: Deterministic inode computation replaces unstable NEXT_INO counter.
 /// Inode = (cgroup_id + 1) * STRIDE + file_offset.
-/// STRIDE = 16 (1 dir + 12 control files + 3 spare). Root cgroup (id=0) → dir ino=16.
-/// file_offset: 0 = directory, 1..12 = control files (matching CtrlKind::all() index + 1).
-const CGROUPFS_INO_STRIDE: u64 = 16;
+/// J2-SHARED-CORE: STRIDE widened 16 → 64 (1 dir + up to 63 control files). The
+/// previous 16 left only 3 spare slots; the J.2 items 7-10 add per-cgroup control
+/// files (files.max/current, net.ports.max/current, vfs_dir.max/current, …) which
+/// would push ctrl_index+1 ≥ 16 and ALIAS (cgroup_id+2)*16 = the next cgroup's dir
+/// inode. The arithmetic below is stride-parametric, so widening before any file is
+/// appended preserves R154-2 determinism and keeps inodes for files at the same
+/// CtrlKind index stable.
+/// file_offset: 0 = directory, 1..=63 = control files (CtrlKind::all() index + 1).
+const CGROUPFS_INO_STRIDE: u64 = 64;
 
 /// Compute deterministic inode for a cgroup directory.
 fn cgroup_dir_ino(cgroup_id: CgroupId) -> u64 {
@@ -691,15 +697,28 @@ impl CgroupCtrlInode {
                 let total_charged_bytes =
                     process::compute_cgroup_charged_bytes(&proc_guard);
 
+                // J2-7: combined cgroup migration with a HOLE-FREE rollback (same
+                // protocol as the sys_cgroup_attach path). Charge the FD count to
+                // the DESTINATION first, then migrate memory (charge-dest-first),
+                // then complete the FD move by uncharging the SOURCE. Every reverse
+                // is a saturating uncharge (never fails) or the best-effort
+                // migrate_task reverse — no fallible reverse-charge can strand a
+                // charge in the destination.
+                let fd_count = proc_guard.fds_charged_count;
+                if let Err(_e) = cgroup::try_charge_fds(self.cgroup_id, fd_count) {
+                    let _ = cgroup::migrate_task(pid_num, self.cgroup_id, old_cgroup_id);
+                    drop(proc_guard);
+                    return Err(FsError::NoSpace);
+                }
                 if let Err(e) = cgroup::migrate_memory_charges(
                     total_charged_bytes,
                     old_cgroup_id,
                     self.cgroup_id,
                 ) {
                     // R157-2 FIX: Keep Process lock held during rollback.
-                    // Previously drop(proc_guard) before migrate_task created
-                    // a window where PCB.cgroup_id = old but membership = new.
-                    // Exit in that window leaks the task (same class as R156-5).
+                    // Memory dest-charge failed → source memory untouched (R148-1);
+                    // undo the FD dest-charge (never fails) and revert the task.
+                    cgroup::uncharge_fds(self.cgroup_id, fd_count);
                     let _ = cgroup::migrate_task(pid_num, self.cgroup_id, old_cgroup_id);
                     drop(proc_guard);
                     return Err(match e {
@@ -708,6 +727,8 @@ impl CgroupCtrlInode {
                         _ => FsError::Invalid,
                     });
                 }
+                // Complete the FD migration: uncharge the source (never fails).
+                cgroup::uncharge_fds(old_cgroup_id, fd_count);
 
                 // Update process's cgroup_id in PCB to keep state synchronized.
                 // Still under process lock — no window for concurrent memory ops

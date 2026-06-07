@@ -86,7 +86,24 @@
 //! | BUDDY_ALLOCATOR | mm/buddy_allocator.rs | 4 | Mutex | Global |
 //! | ALLOCATOR | mm/memory.rs | 4 | LockedHeap | Global |
 //! | PROCESS_TABLE | kernel_core/process.rs | 5 | Array<Option<Arc<Mutex>>> | Global |
+//! | CGROUP_REGISTRY | kernel_core/cgroup.rs | 5 | spin::RwLock<BTreeMap> | Global; NON-reentrant, take-and-drop only |
+//! | CgroupNode.limits | kernel_core/cgroup.rs | 5 | Mutex<CgroupLimits> | Per-node leaf; snapshot-then-drop, never 2 held |
 //! | VFS_ROOT | vfs/lib.rs | 6 | Arc<dyn Fs> | Global |
+//!
+//! ## J2-SHARED-CORE: cgroup charge/uncharge lock invariant
+//!
+//! The cgroup charge primitives (`try_charge_memory`/`uncharge_memory`,
+//! `try_charge_fds`/`uncharge_fds`/`migrate_fd_charges`, and the future
+//! ports/kmem/vfs_dir analogs) acquire CGROUP_REGISTRY (Level 5, via
+//! `lookup_cgroup`) and CgroupNode.limits (Level 5). They are called with the
+//! Process lock (Level 5) held — the established order Process → cgroup
+//! (e.g. `allocate_fd`/`remove_fd`, and fork.rs charging memory under the parent
+//! lock). They MUST NOT be called while holding PT_LOCK (4b) / COW_FAULT_LOCK
+//! (4a) or any net-binding lock (Level 8): resolve the cgroup and charge BEFORE
+//! entering, and uncharge AFTER leaving, those critical sections. CGROUP_REGISTRY
+//! is a non-reentrant `spin::RwLock`, so a charge primitive must never be invoked
+//! while the registry read lock is already held on the same CPU (migration helpers
+//! keep the target `Arc`s alive instead of holding the registry across calls).
 //! | ENDPOINT_REGISTRY | ipc/ipc.rs | 7 | Mutex<HashMap> | Global |
 //! | VGA_BUFFER | drivers/vga_buffer.rs | 8 | Mutex | Global |
 //! | SERIAL_PORT | drivers/serial.rs | 8 | Mutex | Global |

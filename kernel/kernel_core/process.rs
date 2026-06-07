@@ -664,6 +664,17 @@ pub struct Process {
     /// exec 时会关闭这些 fd，防止敏感句柄泄漏到新程序
     pub cloexec_fds: BTreeSet<i32>,
 
+    /// J2-7: Running count of open file descriptors this process has charged to
+    /// its cgroup's `files.max` budget. Maintained in LOCKSTEP with every
+    /// fd_table mutation (allocate_fd +1, remove_fd −1, apply_fd_cloexec −N,
+    /// fork/clone batch = N, dup2/dup3 net delta) so it is the AUTHORITATIVE
+    /// amount to uncharge at exit — independent of `fd_table.len()`, which can
+    /// diverge on a clone-error child that copied fds but failed before the
+    /// batch charge. INV-CG-FD: `fds_charged_count == fds this process holds
+    /// charged to `cgroup_id``; fd_table is per-process (deep-copied, never
+    /// Arc-shared even under CLONE_FILES) so exit-uncharge is unconditional.
+    pub fds_charged_count: u64,
+
     /// 能力表（Capability Table，管理进程持有的能力）
     ///
     /// 每个进程拥有独立的能力表。能力表中的条目（CapEntry）包含：
@@ -904,6 +915,8 @@ impl Process {
             mm: Arc::new(Mutex::new(MmState::new(security::randomized_mmap_base(DEFAULT_MMAP_BASE)))),
             fd_table: BTreeMap::new(),
             cloexec_fds: BTreeSet::new(),
+            fds_charged_count: 0, // J2-7: no fds charged at construction
+
             cap_table: Arc::new(CapTable::new()),
             exit_code: None,
             thread_group_exiting: Arc::new(AtomicBool::new(false)),
@@ -984,6 +997,14 @@ impl Process {
     /// 成功返回分配的 fd，失败（达到上限）返回 None
     pub fn allocate_fd(&mut self, desc: FileDescriptor) -> Option<i32> {
         let fd = self.next_available_fd()?;
+        // J2-7: charge the per-cgroup FD budget BEFORE installing (fail-closed:
+        // returns None, which every caller surfaces as EMFILE). The Process lock
+        // is held (&mut self); "Process lock → cgroup charge" is the established
+        // order (fork.rs charges memory under the parent lock at ~line 200).
+        if crate::cgroup::try_charge_fds(self.cgroup_id, 1).is_err() {
+            return None;
+        }
+        self.fds_charged_count = self.fds_charged_count.saturating_add(1);
         self.fd_table.insert(fd, desc);
         Some(fd)
     }
@@ -1005,7 +1026,14 @@ impl Process {
             return None;
         }
         self.cloexec_fds.remove(&fd);
-        self.fd_table.remove(&fd)
+        let removed = self.fd_table.remove(&fd);
+        if removed.is_some() {
+            // J2-7: every fd_table entry corresponds to exactly one charge (fds
+            // 0/1/2 are virtual — allocate_fd starts at 3), so uncharge exactly 1.
+            crate::cgroup::uncharge_fds(self.cgroup_id, 1);
+            self.fds_charged_count = self.fds_charged_count.saturating_sub(1);
+        }
+        removed
     }
 
     /// R39-4 FIX: 设置或清除指定 fd 的 FD_CLOEXEC 标记
@@ -1027,10 +1055,49 @@ impl Process {
     /// 这是 POSIX close-on-exec 语义的实现。
     pub fn apply_fd_cloexec(&mut self) {
         let to_close: Vec<i32> = self.cloexec_fds.iter().copied().collect();
+        let mut closed: u64 = 0;
         for fd in to_close {
-            self.fd_table.remove(&fd);
+            if self.fd_table.remove(&fd).is_some() {
+                closed += 1;
+            }
+        }
+        if closed > 0 {
+            // J2-7: uncharge the per-cgroup FD budget for descriptors ACTUALLY
+            // closed (count removals, not cloexec_fds.len(), so a stale cloexec
+            // entry for an already-closed fd cannot over-uncharge → under-count).
+            crate::cgroup::uncharge_fds(self.cgroup_id, closed);
+            self.fds_charged_count = self.fds_charged_count.saturating_sub(closed);
         }
         self.cloexec_fds.clear();
+    }
+
+    /// J2-7: Install `desc` at a caller-chosen `fd` (dup2/dup3 semantics),
+    /// replacing any existing entry, with NET-AWARE, FAIL-CLOSED per-cgroup FD
+    /// accounting:
+    /// - Empty slot → net +1: charge the budget BEFORE mutating; on over-budget
+    ///   return `Err(())` (caller surfaces EMFILE) leaving the table UNCHANGED.
+    /// - Occupied slot → net 0: the replaced entry's existing charge is reused,
+    ///   so no charge/uncharge occurs and the operation can never fail on budget.
+    ///
+    /// Returns the displaced `FileDescriptor` (if any) so the caller can drop it
+    /// OUTSIDE the Process lock (R155-3: socket destructors re-lock other PCBs).
+    /// CLOEXEC on the target fd is cleared (the dup copy is not close-on-exec
+    /// unless dup3's O_CLOEXEC sets it afterwards).
+    pub fn replace_fd_charged(
+        &mut self,
+        fd: i32,
+        desc: FileDescriptor,
+    ) -> Result<Option<FileDescriptor>, ()> {
+        let occupied = self.fd_table.contains_key(&fd);
+        if !occupied {
+            // Net +1 — charge fail-closed BEFORE any mutation.
+            crate::cgroup::try_charge_fds(self.cgroup_id, 1).map_err(|_| ())?;
+            self.fds_charged_count = self.fds_charged_count.saturating_add(1);
+        }
+        self.cloexec_fds.remove(&fd);
+        // Occupied → insert returns the old entry (its charge is reused, count
+        // unchanged); empty → returns None.
+        Ok(self.fd_table.insert(fd, desc))
     }
 
     /// 查找下一个可用的 fd（从 3 开始）
@@ -3726,6 +3793,18 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTree
     let fd_count = proc.fd_table.len();
     let extracted_fds = core::mem::take(&mut proc.fd_table);
     proc.cloexec_fds.clear();
+
+    // J2-7: uncharge the per-cgroup FD budget. fd_table is PER-PROCESS (deep-
+    // copied, never Arc-shared even under CLONE_FILES), so this is UNGATED by
+    // keep_address_space/mm_shared (unlike the memory uncharge above). Uncharge
+    // exactly the running charged count — authoritative, and may differ from
+    // fd_count for a clone-error child that copied fds but failed before the
+    // batch charge (fds_charged_count == 0 there → uncharge nothing). Idempotent:
+    // zero after, so a second teardown call uncharges nothing.
+    if proc.fds_charged_count > 0 {
+        crate::cgroup::uncharge_fds(proc.cgroup_id, proc.fds_charged_count);
+        proc.fds_charged_count = 0;
+    }
     // R104-2 FIX: Gate all resource-cleanup diagnostics behind debug_assertions
     // to prevent leaking fd count, page table root addresses, and PID in release.
     if fd_count > 0 {

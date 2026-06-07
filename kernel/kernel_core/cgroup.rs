@@ -93,6 +93,11 @@ bitflags! {
         const PIDS   = 0x04;
         /// IO controller: bandwidth and IOPS limits.
         const IO     = 0x08;
+        /// J2-7: FILES controller — per-cgroup open file-descriptor count limit.
+        const FILES  = 0x10;
+        /// J2-8: NET controller — per-cgroup ephemeral-port count limit.
+        /// (Bit reserved here so FILES/NET never alias; wired in J.2 item 8.)
+        const NET    = 0x20;
     }
 }
 
@@ -148,6 +153,19 @@ pub struct CgroupLimits {
     /// Uses token bucket algorithm with 4-second burst window.
     /// Maps to `io.max` (iops) in cgroup v2.
     pub io_max_iops_per_sec: Option<u64>,
+
+    /// J2-7: Maximum number of open file descriptors in the cgroup (FILES controller).
+    /// Hierarchical, in addition to per-process `RLIMIT_NOFILE`. `None` = unlimited.
+    pub fds_max: Option<u64>,
+
+    /// J2-8: Maximum number of ephemeral ports reserved in the cgroup (NET controller).
+    /// `None` = unlimited. (Field reserved here; charge wiring lands in J.2 item 8.)
+    pub ports_max: Option<u64>,
+
+    /// J2-10: Maximum bytes of kernel memory for per-tenant VFS directory enumeration
+    /// (MEMORY controller). `None` = unlimited. (Field reserved here; charge wiring
+    /// lands in J.2 item 10.)
+    pub vfs_dir_max: Option<u64>,
 }
 
 // ============================================================================
@@ -189,6 +207,20 @@ pub struct CgroupStats {
     pub io_write_ios: AtomicU64,
     /// Number of times I/O was throttled due to io.max limit.
     pub io_throttle_events: AtomicU64,
+
+    /// J2-7: Current number of open file descriptors charged to this cgroup.
+    pub fds_current: AtomicU64,
+    /// J2-7: Number of times fds.max was hit (EMFILE / fork-EAGAIN events).
+    pub fds_events_max: AtomicU32,
+    /// J2-8: Current number of ephemeral ports charged to this cgroup.
+    pub ports_current: AtomicU64,
+    /// J2-8: Number of times ports.max was hit.
+    pub ports_events_max: AtomicU32,
+    /// J2-10: Current bytes of VFS directory-enumeration memory charged to this cgroup.
+    pub vfs_dir_current: AtomicU64,
+    /// J2-9: Current bytes of kernel memory charged to this cgroup (observability;
+    /// hard enforcement remains via `memory_current`).
+    pub kmem_current: AtomicU64,
 }
 
 impl CgroupStats {
@@ -206,6 +238,13 @@ impl CgroupStats {
             io_read_ios: AtomicU64::new(0),
             io_write_ios: AtomicU64::new(0),
             io_throttle_events: AtomicU64::new(0),
+            // J2-7/8/9/10: per-cgroup FD / port / VFS-dir / kmem counters.
+            fds_current: AtomicU64::new(0),
+            fds_events_max: AtomicU32::new(0),
+            ports_current: AtomicU64::new(0),
+            ports_events_max: AtomicU32::new(0),
+            vfs_dir_current: AtomicU64::new(0),
+            kmem_current: AtomicU64::new(0),
         }
     }
 
@@ -223,6 +262,12 @@ impl CgroupStats {
             io_read_ios: self.io_read_ios.load(Ordering::Relaxed),
             io_write_ios: self.io_write_ios.load(Ordering::Relaxed),
             io_throttle_events: self.io_throttle_events.load(Ordering::Relaxed),
+            fds_current: self.fds_current.load(Ordering::Relaxed),
+            fds_events_max: self.fds_events_max.load(Ordering::Relaxed),
+            ports_current: self.ports_current.load(Ordering::Relaxed),
+            ports_events_max: self.ports_events_max.load(Ordering::Relaxed),
+            vfs_dir_current: self.vfs_dir_current.load(Ordering::Relaxed),
+            kmem_current: self.kmem_current.load(Ordering::Relaxed),
         }
     }
 
@@ -289,6 +334,24 @@ impl CgroupStats {
     fn record_pids_max_event(&self) {
         self.pids_events_max.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
     }
+
+    /// J2-7: Decrements the FD count (saturating at zero), mirroring
+    /// `decrement_pids` (R110-1) so a double-uncharge / migration race can never
+    /// wrap `fds_current` to `u64::MAX`.
+    #[inline]
+    fn decrement_fds(&self, n: u64) {
+        let _ = self.fds_current.fetch_update(
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(n)),
+        );
+    }
+
+    /// J2-7: Records an fds.max exceeded event.
+    #[inline]
+    fn record_fds_max_event(&self) {
+        self.fds_events_max.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
+    }
 }
 
 /// Point-in-time copy of `CgroupStats`.
@@ -308,6 +371,12 @@ pub struct CgroupStatsSnapshot {
     pub io_read_ios: u64,
     pub io_write_ios: u64,
     pub io_throttle_events: u64,
+    pub fds_current: u64,
+    pub fds_events_max: u32,
+    pub ports_current: u64,
+    pub ports_events_max: u32,
+    pub vfs_dir_current: u64,
+    pub kmem_current: u64,
 }
 
 // ============================================================================
@@ -685,6 +754,10 @@ pub enum CgroupError {
     PermissionDenied,
     /// Cannot delete non-empty cgroup (has children or tasks).
     NotEmpty,
+    /// J2-7: FD limit exceeded - cannot open/install more file descriptors.
+    FdsLimitExceeded,
+    /// J2-8: Ephemeral-port limit exceeded - cannot reserve more ports.
+    PortsLimitExceeded,
 }
 
 impl fmt::Display for CgroupError {
@@ -701,6 +774,8 @@ impl fmt::Display for CgroupError {
             CgroupError::MemoryLimitExceeded => write!(f, "memory.max limit exceeded"),
             CgroupError::PermissionDenied => write!(f, "permission denied"),
             CgroupError::NotEmpty => write!(f, "cgroup has children or attached tasks"),
+            CgroupError::FdsLimitExceeded => write!(f, "files.max limit exceeded"),
+            CgroupError::PortsLimitExceeded => write!(f, "net.ports.max limit exceeded"),
         }
     }
 }
@@ -871,6 +946,9 @@ impl CgroupNode {
         let mut eff_pids_max: Option<u64> = None;
         let mut eff_io_bps: Option<u64> = None;
         let mut eff_io_iops: Option<u64> = None;
+        let mut eff_fds_max: Option<u64> = None;
+        let mut eff_ports_max: Option<u64> = None;
+        let mut eff_vfs_dir_max: Option<u64> = None;
 
         let mut cursor = self.parent();
         while let Some(ancestor) = cursor {
@@ -917,6 +995,21 @@ impl CgroupNode {
             }
             if let Some(v) = al.io_max_iops_per_sec {
                 eff_io_iops = Some(eff_io_iops.map_or(v, |e: u64| e.min(v)));
+            }
+            if let Some(v) = al.fds_max {
+                if v != u64::MAX {
+                    eff_fds_max = Some(eff_fds_max.map_or(v, |e: u64| e.min(v)));
+                }
+            }
+            if let Some(v) = al.ports_max {
+                if v != u64::MAX {
+                    eff_ports_max = Some(eff_ports_max.map_or(v, |e: u64| e.min(v)));
+                }
+            }
+            if let Some(v) = al.vfs_dir_max {
+                if v != u64::MAX {
+                    eff_vfs_dir_max = Some(eff_vfs_dir_max.map_or(v, |e: u64| e.min(v)));
+                }
             }
 
             cursor = ancestor.parent();
@@ -983,6 +1076,30 @@ impl CgroupNode {
         if let Some(iops) = updated.io_max_iops_per_sec {
             if let Some(eiops) = eff_io_iops {
                 if iops > eiops {
+                    return Err(CgroupError::PermissionDenied);
+                }
+            }
+        }
+
+        // J2-7 files.max / J2-8 net.ports.max / J2-10 vfs_dir.max: a delegated
+        // child cannot exceed (or be unlimited beyond) the tightest ancestor cap.
+        if let Some(max) = updated.fds_max {
+            if let Some(emax) = eff_fds_max {
+                if max == u64::MAX || max > emax {
+                    return Err(CgroupError::PermissionDenied);
+                }
+            }
+        }
+        if let Some(max) = updated.ports_max {
+            if let Some(emax) = eff_ports_max {
+                if max == u64::MAX || max > emax {
+                    return Err(CgroupError::PermissionDenied);
+                }
+            }
+        }
+        if let Some(max) = updated.vfs_dir_max {
+            if let Some(emax) = eff_vfs_dir_max {
+                if max == u64::MAX || max > emax {
                     return Err(CgroupError::PermissionDenied);
                 }
             }
@@ -1270,6 +1387,22 @@ impl CgroupNode {
                 return Err(CgroupError::ControllerDisabled);
             }
         }
+        // J2-7/8/10: new resource limits require their controllers to be enabled.
+        if updated.fds_max.is_some() {
+            if !self.controllers.contains(CgroupControllers::FILES) {
+                return Err(CgroupError::ControllerDisabled);
+            }
+        }
+        if updated.ports_max.is_some() {
+            if !self.controllers.contains(CgroupControllers::NET) {
+                return Err(CgroupError::ControllerDisabled);
+            }
+        }
+        if updated.vfs_dir_max.is_some() {
+            if !self.controllers.contains(CgroupControllers::MEMORY) {
+                return Err(CgroupError::ControllerDisabled);
+            }
+        }
 
         // Validate CPU weight (1-10000)
         if let Some(weight) = updated.cpu_weight {
@@ -1329,6 +1462,15 @@ impl CgroupNode {
         }
         if let Some(v) = updated.io_max_iops_per_sec {
             limits.io_max_iops_per_sec = Some(v);
+        }
+        if let Some(v) = updated.fds_max {
+            limits.fds_max = Some(v);
+        }
+        if let Some(v) = updated.ports_max {
+            limits.ports_max = Some(v);
+        }
+        if let Some(v) = updated.vfs_dir_max {
+            limits.vfs_dir_max = Some(v);
         }
 
         Ok(())
@@ -1871,6 +2013,135 @@ pub fn migrate_memory_charges(
 }
 
 // ============================================================================
+// J2-7: FILES Controller Integration (files.max enforcement)
+// ============================================================================
+
+/// Atomically charges `count` open file descriptors to a cgroup, enforcing
+/// `files.max` hierarchically (target cgroup + every ancestor with the FILES
+/// controller), mirroring `try_charge_memory` (CAS + ancestor rollback).
+///
+/// Root cgroup (id 0) is EXEMPT via the canonical id-based rule: root is created
+/// with `CgroupControllers::all()`, so a controller-based exemption would NOT
+/// skip it; the `cgroup_id == 0` short-circuit keeps root counters at 0
+/// uniformly across all per-cgroup quota controllers.
+///
+/// # Errors
+/// * `FdsLimitExceeded` - charging `count` would exceed `files.max` at this
+///   cgroup or any ancestor. Nothing is charged: every partial charge is rolled
+///   back before returning (fail-closed).
+pub fn try_charge_fds(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupError> {
+    if count == 0 || cgroup_id == 0 {
+        return Ok(());
+    }
+
+    // Collect the chain: target cgroup + ancestors with the FILES controller.
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
+    let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
+    while let Some(cgroup) = cursor {
+        if cgroup.controllers.contains(CgroupControllers::FILES) {
+            chain.push(cgroup.clone());
+        }
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = cgroup.parent();
+    }
+
+    if chain.is_empty() {
+        return Ok(()); // No FILES controller anywhere in the chain.
+    }
+
+    // Snapshot per-node limits (lock each briefly; never hold two at once).
+    let limits_snapshot: Vec<Option<u64>> =
+        chain.iter().map(|c| c.limits.lock().fds_max).collect();
+
+    // Track charged indices for rollback on rejection at a deeper level.
+    let mut charged: Vec<usize> = Vec::new();
+    for (idx, cgroup) in chain.iter().enumerate() {
+        let max = limits_snapshot[idx];
+        match cgroup.stats.fds_current.fetch_update(
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+            |current| {
+                let new = current.saturating_add(count);
+                if let Some(max) = max {
+                    if new > max {
+                        return None; // would exceed files.max
+                    }
+                }
+                Some(new)
+            },
+        ) {
+            Ok(_) => charged.push(idx),
+            Err(_) => {
+                cgroup.stats.record_fds_max_event();
+                // R110-1 pattern: rollback previously charged levels (saturating).
+                for &j in &charged {
+                    chain[j].stats.decrement_fds(count);
+                }
+                return Err(CgroupError::FdsLimitExceeded);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Atomically uncharges `count` file descriptors from a cgroup (saturating at
+/// zero), walking the same ancestor chain as `try_charge_fds`. Root (id 0) is
+/// exempt. Called on fd close / cloexec / exec / process exit / migration.
+pub fn uncharge_fds(cgroup_id: CgroupId, count: u64) {
+    if count == 0 || cgroup_id == 0 {
+        return;
+    }
+
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
+    while let Some(cgroup) = cursor {
+        if cgroup.controllers.contains(CgroupControllers::FILES) {
+            cgroup.stats.decrement_fds(count);
+        }
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = cgroup.parent();
+    }
+}
+
+/// Transfers `count` FD charges from one cgroup to another on task migration.
+///
+/// Charge-destination-first protocol (mirrors `migrate_memory_charges`, R148-1):
+/// a failed destination charge leaves the source intact, so no charge is ever
+/// lost. Shared ancestors are transiently over-counted but never under-counted
+/// (over-count is safe; under-count would enable a `files.max` bypass).
+///
+/// The returned `Arc`s keep both nodes alive without holding `CGROUP_REGISTRY`
+/// across the inner `try_charge_fds`/`uncharge_fds` calls (which re-`lookup`),
+/// since `spin::RwLock` is not re-entrant on the same CPU.
+///
+/// # Errors
+/// * `NotFound` - source or destination cgroup doesn't exist.
+/// * `FdsLimitExceeded` - destination (or ancestor) would exceed `files.max`.
+pub fn migrate_fd_charges(
+    count: u64,
+    from_id: CgroupId,
+    to_id: CgroupId,
+) -> Result<(), CgroupError> {
+    if count == 0 || from_id == to_id {
+        return Ok(());
+    }
+    let _from_arc = lookup_cgroup(from_id).ok_or(CgroupError::NotFound)?;
+    let _to_arc = lookup_cgroup(to_id).ok_or(CgroupError::NotFound)?;
+
+    try_charge_fds(to_id, count)?; // destination first
+    uncharge_fds(from_id, count); // source (saturating, cannot fail)
+    Ok(())
+}
+
+// ============================================================================
 // F.2: IO Controller Integration (io.max enforcement)
 // ============================================================================
 
@@ -2284,6 +2555,368 @@ pub fn cpu_quota_is_throttled(cgroup_id: CgroupId, now_ns: u64) -> Option<u64> {
     }
 
     if overall_until != 0 { Some(overall_until) } else { None }
+}
+
+// ============================================================================
+// J2-7: FILES Controller Self-Test (wired into the boot integration suite)
+// ============================================================================
+
+/// In-kernel assertions for the per-cgroup FD budget (`files.max`). Panics on any
+/// failure, which `make test` / `make boot-check` detect via the serial log.
+///
+/// Covers: hierarchical cap enforcement (fail-closed) + ancestor rollback on a
+/// deep-level rejection, ancestor propagation, the root `id==0` short-circuit
+/// (a root-TARGETED charge is a no-op — note descendant charges still aggregate
+/// at root per cgroup-v2 semantics), `migrate_fd_charges` balance across chains,
+/// and saturating uncharge. Exercises `try_charge_fds`/`uncharge_fds` directly
+/// (no real fd_table) so the engine is validated independently of syscall wiring.
+pub fn run_cgroup_fd_budget_self_test() {
+    let fds = |n: &Arc<CgroupNode>| n.stats.fds_current.load(Ordering::SeqCst);
+
+    // Fresh, empty, task-less cgroups under root: A(fds_max=10) ⊃ B(fds_max=4),
+    // plus sibling C(fds_max=20). Their counters start at 0 (isolated from any
+    // real boot processes in root).
+    let a = create_cgroup(0, CgroupControllers::FILES).expect("create A");
+    let a_id = a.id();
+    a.set_limit(CgroupLimits { fds_max: Some(10), ..Default::default() })
+        .expect("set A.files.max");
+    let b = create_cgroup(a_id, CgroupControllers::FILES).expect("create B");
+    let b_id = b.id();
+    b.set_limit(CgroupLimits { fds_max: Some(4), ..Default::default() })
+        .expect("set B.files.max");
+    let c = create_cgroup(0, CgroupControllers::FILES).expect("create C");
+    let c_id = c.id();
+    c.set_limit(CgroupLimits { fds_max: Some(20), ..Default::default() })
+        .expect("set C.files.max");
+
+    // 1) Charge 3 under B (within B's cap): B and ancestor A both increment.
+    try_charge_fds(b_id, 3).expect("charge 3 under B");
+    assert_eq!(fds(&b), 3, "B after charge 3");
+    assert_eq!(fds(&a), 3, "A (ancestor) after charge 3 under B");
+
+    // 2) Over B's cap (3+2 > 4) → FdsLimitExceeded, and A is NOT left over-charged
+    //    (deep-level rejection rolls back the already-charged ancestor).
+    assert_eq!(
+        try_charge_fds(b_id, 2),
+        Err(CgroupError::FdsLimitExceeded),
+        "B over-cap must fail-closed"
+    );
+    assert_eq!(fds(&b), 3, "B unchanged after rejected charge");
+    assert_eq!(fds(&a), 3, "A rolled back after B rejection");
+
+    // 3) Charge exactly to B's cap.
+    try_charge_fds(b_id, 1).expect("charge 1 to B's cap");
+    assert_eq!(fds(&b), 4, "B at cap");
+    assert_eq!(fds(&a), 4, "A after B at cap");
+
+    // 4) Root id==0 short-circuit: a root-TARGETED charge changes nothing.
+    let root = lookup_cgroup(0).expect("root");
+    let root_before = root.stats.fds_current.load(Ordering::SeqCst);
+    try_charge_fds(0, 100).expect("root-targeted charge is Ok");
+    uncharge_fds(0, 100);
+    assert_eq!(
+        root.stats.fds_current.load(Ordering::SeqCst),
+        root_before,
+        "root id=0 charge/uncharge are no-ops"
+    );
+
+    // 5) migrate_fd_charges B -> C: move the 4 fds. B's chain (B, A) drops by 4;
+    //    C's chain (C) gains 4. (Both chains share root, so root nets 0.)
+    migrate_fd_charges(4, b_id, c_id).expect("migrate B->C");
+    assert_eq!(fds(&b), 0, "B drained after migrate");
+    assert_eq!(fds(&a), 0, "A (B's ancestor) drained after migrate");
+    assert_eq!(fds(&c), 4, "C charged after migrate");
+
+    // 6) Saturating uncharge: uncharging more than charged floors at 0.
+    uncharge_fds(c_id, 999);
+    assert_eq!(fds(&c), 0, "C saturates at 0");
+
+    // Cleanup: delete children before parents (no tasks attached).
+    let _ = delete_cgroup(b_id);
+    let _ = delete_cgroup(a_id);
+    let _ = delete_cgroup(c_id);
+}
+
+// ============================================================================
+// J2-10: VFS Directory-Enumeration Budget (vfs_dir.max, MEMORY controller)
+// ============================================================================
+
+/// Minimum bytes a single directory-enumeration syscall is granted even when the
+/// cgroup's `vfs_dir.max` headroom is below it, so enumeration always makes
+/// forward progress (never a false end-of-directory). The resulting over-count
+/// is bounded by (concurrent getdents in the cgroup) × this value — safe, since
+/// over-count restricts further, it never bypasses (Safety > Efficiency).
+pub const MIN_VFS_DIR_BUDGET: usize = 4096;
+
+/// RAII budget for ONE directory-enumeration syscall (`getdents64`). Charges
+/// `vfs_dir_current` on the target cgroup + every MEMORY-controller ancestor at
+/// construction, and uncharges the SAME held `Arc<CgroupNode>` set on drop —
+/// NEVER re-resolving the registry. Because the held Arcs keep each charged node
+/// alive past `delete_cgroup` (which only removes the node from the registry and
+/// its parent's child list — the object survives while an Arc exists, see
+/// `migrate_memory_charges`), the uncharge-set == charge-set BY CONSTRUCTION:
+/// migration- AND deletion-safe with no transfer needed (J2-10 mustFix A). The
+/// cap is HARD (per-node CAS reservation, not a read-then-add soft cap, so
+/// concurrent chargers cannot overshoot `vfs_dir.max`); it still degrades
+/// gracefully by GRANTING the largest amount that fits (a getdents64 short read)
+/// instead of failing the syscall. The only bounded over-count is a small
+/// progress `floor` granted when the cgroup is already at its cap, so enumeration
+/// never deadlocks — over-count restricts further, it never bypasses.
+///
+/// SCOPE: this bounds the per-tenant ACCUMULATED getdents64 kernel buffer (the
+/// `entries` Vec + per-entry serialization, held across the syscall) — the
+/// dominant, sustained, tenant-controllable allocation. A backend's TRANSIENT
+/// per-`readdir(offset)` internal scratch (e.g. procfs rebuilding a PID listing)
+/// is freed each call, is pre-existing, and is a separate cross-filesystem
+/// concern not addressed here.
+#[must_use = "the guard must outlive the directory enumeration it bounds"]
+pub struct VfsDirBudgetGuard {
+    chain: Vec<Arc<CgroupNode>>,
+    bytes: u64,
+    granted: usize,
+}
+
+impl VfsDirBudgetGuard {
+    /// Charge up to `want` bytes, clamped to the tightest `vfs_dir.max` headroom
+    /// in the chain but never below `min(MIN_VFS_DIR_BUDGET, want)` (bounded
+    /// over-count for forward progress) and never above `want`. Root cgroup
+    /// (id 0) is EXEMPT: no charge, full `want` granted. MUST be called with NO
+    /// Process lock held — it acquires CGROUP_REGISTRY (Level 5).
+    pub fn charge(cgroup_id: CgroupId, want: usize) -> Self {
+        if cgroup_id == 0 || want == 0 {
+            return Self { chain: Vec::new(), bytes: 0, granted: want };
+        }
+        // Collect target + ancestors with the MEMORY controller.
+        let mut depth: u32 = 0;
+        let mut cursor = lookup_cgroup(cgroup_id);
+        let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
+        while let Some(cgroup) = cursor {
+            if cgroup.controllers.contains(CgroupControllers::MEMORY) {
+                chain.push(cgroup.clone());
+            }
+            if depth >= MAX_CGROUP_DEPTH {
+                break;
+            }
+            depth = depth.saturating_add(1);
+            cursor = cgroup.parent();
+        }
+        if chain.is_empty() {
+            return Self { chain, bytes: 0, granted: want };
+        }
+        let want_u = want as u64;
+        let floor = (MIN_VFS_DIR_BUDGET as u64).min(want_u);
+        // Snapshot each node's vfs_dir.max once (None = unlimited).
+        let caps: Vec<Option<u64>> = chain.iter().map(|n| n.limits.lock().vfs_dir_max).collect();
+
+        // HARD reservation (NOT a soft read-then-add): grant the largest amount in
+        // [floor, want] that fits EVERY node's vfs_dir.max right now, charged
+        // atomically per node via CAS so concurrent chargers cannot all observe the
+        // same headroom and overshoot (that would make the cap advisory, defeating
+        // the memory bound). On a per-node CAS rejection (a concurrent charger
+        // shrank the headroom between read and commit) roll back and retry a bounded
+        // number of times. Fallback: when not even `floor` fits, force `floor` so
+        // enumeration still makes forward progress — a BOUNDED over-count (≤ floor
+        // per concurrent call) that restricts further, never bypasses.
+        for _attempt in 0..4 {
+            let mut headroom: u64 = u64::MAX;
+            for (i, node) in chain.iter().enumerate() {
+                if let Some(max) = caps[i] {
+                    let cur = node.stats.vfs_dir_current.load(Ordering::Acquire);
+                    headroom = headroom.min(max.saturating_sub(cur));
+                }
+            }
+            if headroom < floor {
+                for node in &chain {
+                    node.stats.vfs_dir_current.fetch_add(floor, Ordering::SeqCst); // lint-fetch-add: allow (statistics counter)
+                }
+                return Self { chain, bytes: floor, granted: floor as usize };
+            }
+            let grant = want_u.min(headroom); // in [floor, want]
+            let mut charged: Vec<usize> = Vec::new();
+            let mut committed = true;
+            for (i, node) in chain.iter().enumerate() {
+                let max = caps[i];
+                let res = node.stats.vfs_dir_current.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                    |cur| {
+                        let new = cur.saturating_add(grant);
+                        if let Some(m) = max {
+                            if new > m {
+                                return None; // would exceed vfs_dir.max
+                            }
+                        }
+                        Some(new)
+                    },
+                );
+                if res.is_ok() {
+                    charged.push(i);
+                } else {
+                    committed = false;
+                    break;
+                }
+            }
+            if committed {
+                return Self { chain, bytes: grant, granted: grant as usize };
+            }
+            // Roll back the partial reservation (saturating) and retry.
+            for &i in &charged {
+                let _ = chain[i].stats.vfs_dir_current.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                    |c| Some(c.saturating_sub(grant)),
+                );
+            }
+        }
+        // Retries exhausted under pathological contention. One FINAL attempt to
+        // reserve exactly `floor` honoring the cap (CAS) — so the forced path
+        // below is taken ONLY when not even `floor` fits, matching the design.
+        let mut charged: Vec<usize> = Vec::new();
+        let mut committed = true;
+        for (i, node) in chain.iter().enumerate() {
+            let max = caps[i];
+            let res = node.stats.vfs_dir_current.fetch_update(
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+                |cur| {
+                    let new = cur.saturating_add(floor);
+                    if let Some(m) = max {
+                        if new > m {
+                            return None;
+                        }
+                    }
+                    Some(new)
+                },
+            );
+            if res.is_ok() {
+                charged.push(i);
+            } else {
+                committed = false;
+                break;
+            }
+        }
+        if committed {
+            return Self { chain, bytes: floor, granted: floor as usize };
+        }
+        for &i in &charged {
+            let _ = chain[i].stats.vfs_dir_current.fetch_update(
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+                |c| Some(c.saturating_sub(floor)),
+            );
+        }
+        // Even `floor` does not fit under the cap → force it (bounded over-count
+        // ≤ floor per concurrent call) so enumeration still makes forward progress.
+        for node in &chain {
+            node.stats.vfs_dir_current.fetch_add(floor, Ordering::SeqCst); // lint-fetch-add: allow (statistics counter)
+        }
+        Self { chain, bytes: floor, granted: floor as usize }
+    }
+
+    /// The byte budget granted to the caller (use as the readdir allocation cap).
+    #[inline]
+    pub fn granted(&self) -> usize {
+        self.granted
+    }
+
+    /// Idempotently uncharge the held chain (saturating). Safe to call repeatedly
+    /// — a second call (or Drop after an explicit release) uncharges nothing.
+    pub fn release(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        let bytes = self.bytes;
+        self.bytes = 0;
+        for node in &self.chain {
+            let _ = node.stats.vfs_dir_current.fetch_update(
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+                |cur| Some(cur.saturating_sub(bytes)),
+            );
+        }
+    }
+}
+
+impl Drop for VfsDirBudgetGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// In-kernel assertions for the per-cgroup VFS dir-enumeration budget. Panics on
+/// failure; detected by `make test` / `make boot-check` via the serial log.
+///
+/// Covers: cap clamping (granted reduced to headroom, short read), ancestor
+/// propagation, the headline DELETION-SAFETY property (charge under a leaf, then
+/// delete the leaf, then drop the guard → the ancestor counter still returns to
+/// 0 because the guard uncharges the held Arcs, not a re-resolved id), root
+/// id==0 exemption, and release idempotency.
+pub fn run_cgroup_vfs_dir_budget_self_test() {
+    let vdir = |n: &Arc<CgroupNode>| n.stats.vfs_dir_current.load(Ordering::SeqCst);
+
+    // P(vfs_dir_max=10000) ⊃ A(vfs_dir_max unlimited): fresh, task-less.
+    let p = create_cgroup(0, CgroupControllers::MEMORY).expect("create P");
+    let p_id = p.id();
+    p.set_limit(CgroupLimits { vfs_dir_max: Some(10_000), ..Default::default() })
+        .expect("set P.vfs_dir_max");
+    let a = create_cgroup(p_id, CgroupControllers::MEMORY).expect("create A");
+    let a_id = a.id();
+
+    // 1) Charge 3000 under A: A and ancestor P both reflect it; granted == want.
+    {
+        let g = VfsDirBudgetGuard::charge(a_id, 3000);
+        assert_eq!(g.granted(), 3000, "full grant within headroom");
+        assert_eq!(vdir(&a), 3000, "A vfs_dir_current");
+        assert_eq!(vdir(&p), 3000, "P (ancestor) vfs_dir_current");
+    } // guard drops → uncharge
+    assert_eq!(vdir(&a), 0, "A uncharged on drop");
+    assert_eq!(vdir(&p), 0, "P uncharged on drop");
+
+    // 2) Cap clamping: want 50000 but P.headroom is 10000 → granted 10000 (short read).
+    {
+        let g = VfsDirBudgetGuard::charge(a_id, 50_000);
+        assert_eq!(g.granted(), 10_000, "granted clamped to P's headroom");
+        assert_eq!(vdir(&p), 10_000, "P at cap");
+    }
+    assert_eq!(vdir(&p), 0, "P back to 0 after clamped guard drop");
+
+    // 3) DELETION SAFETY: charge under A, delete A, then drop the guard — the
+    //    ancestor P counter MUST still return to 0 (guard uncharges held Arcs).
+    {
+        let g = VfsDirBudgetGuard::charge(a_id, 2000);
+        assert_eq!(vdir(&p), 2000, "P charged via A");
+        // Delete A out from under the live guard (no tasks/children on A).
+        let _ = delete_cgroup(a_id);
+        assert!(lookup_cgroup(a_id).is_none(), "A removed from registry");
+        // g drops here → uncharges the HELD [A_arc, P_arc], not lookup(a_id).
+    }
+    assert_eq!(vdir(&p), 0, "P uncharged despite A deletion (Arc-pinned uncharge)");
+
+    // 4) Root id==0 exemption: no charge, full grant.
+    {
+        let root = lookup_cgroup(0).expect("root");
+        let before = root.stats.vfs_dir_current.load(Ordering::SeqCst);
+        let g = VfsDirBudgetGuard::charge(0, 1234);
+        assert_eq!(g.granted(), 1234, "root grants full want");
+        assert_eq!(
+            root.stats.vfs_dir_current.load(Ordering::SeqCst),
+            before,
+            "root id=0 not charged"
+        );
+    }
+
+    // 5) Release idempotency: explicit release then Drop uncharges only once.
+    {
+        let mut g = VfsDirBudgetGuard::charge(p_id, 1000);
+        assert_eq!(vdir(&p), 1000);
+        g.release();
+        assert_eq!(vdir(&p), 0, "released");
+        g.release(); // no-op
+        assert_eq!(vdir(&p), 0, "double release is a no-op");
+    } // Drop after release → also a no-op
+    assert_eq!(vdir(&p), 0, "no underflow after release+drop");
+
+    let _ = delete_cgroup(p_id);
 }
 
 // ============================================================================

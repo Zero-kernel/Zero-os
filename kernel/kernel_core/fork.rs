@@ -48,6 +48,10 @@ pub enum ForkError {
     ProcessCreationFailed,
     /// F.2: Cgroup pids.max limit exceeded
     CgroupPidsLimitExceeded,
+    /// J2-7: Cgroup files.max limit exceeded — the child's inherited fd count
+    /// would exceed the cgroup's FD budget. Mapped to EAGAIN (fork(2) must never
+    /// return EMFILE), matching the pids.max behavior.
+    CgroupFilesLimitExceeded,
     /// R122-1 FIX: mmap_regions contains in-flight PENDING_MAP/PENDING_UNMAP entries;
     /// fork must be retried after the concurrent mmap/munmap completes.
     MmapTransientState,
@@ -144,6 +148,28 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
         cleanup_partial_child(child_pid);
     } else {
 
+        // J2-7: per-cgroup FD budget — batch-charge the child's inherited fds.
+        // fork_inner deep-copied the parent's fd_table into the child, so the
+        // child's count == parent.fd_table.len() (read here under the held parent
+        // lock; the child PCB is referenced only by pid at this point). Charge to
+        // parent_cgroup_id, which equals the child's FINAL cgroup (assigned in
+        // fork_inner) — child.cgroup_id is not readable here. Charge fds BEFORE
+        // memory so rollback stays symmetric: an fd-charge failure has no memory
+        // to undo, and the memory-charge failure below explicitly uncharges fds.
+        let child_fd_count = parent.fd_table.len() as u64;
+        if child_fd_count > 0
+            && crate::cgroup::try_charge_fds(parent_cgroup_id, child_fd_count).is_err()
+        {
+            parent.children.retain(|&pid| pid != child_pid);
+            if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+                let _ = cg.detach_task(child_pid as u64);
+            }
+            crate::process::notify_cpuset_task_left(parent_cpuset_id);
+            drop(parent);
+            cleanup_partial_child(child_pid);
+            return Err(ForkError::CgroupFilesLimitExceeded);
+        }
+
         // R138-1 FIX: Worst-case COW cgroup memory charging.
         //
         // COW fork shares physical frames but gives the child a full copy of
@@ -200,6 +226,13 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
             && crate::cgroup::try_charge_memory(parent_cgroup_id, fork_charge_bytes).is_err()
         {
             // Cgroup memory.max would be exceeded — roll back the entire fork.
+            // J2-7: also uncharge the fds charged above (multi-controller rollback).
+            // cleanup_partial_child does NOT call free_process_resources, and
+            // child.fds_charged_count has NOT been set yet, so this manual uncharge
+            // is the sole rollback for the FD charge.
+            if child_fd_count > 0 {
+                crate::cgroup::uncharge_fds(parent_cgroup_id, child_fd_count);
+            }
             parent.children.retain(|&pid| pid != child_pid);
             if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
                 let _ = cg.detach_task(child_pid as u64);
@@ -208,6 +241,17 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
             drop(parent);
             cleanup_partial_child(child_pid);
             return Err(ForkError::MemoryAllocationFailed);
+        }
+
+        // J2-7: both charges succeeded — record the child's running FD charge so
+        // its eventual exit (free_process_resources) uncharges exactly this amount.
+        // Set it LAST: any earlier failure path leaves it 0, and cleanup_partial_child
+        // (which does not uncharge) is then correct. Locking the child here is safe
+        // (parent→child order, established by fork_inner, which has since released it).
+        if child_fd_count > 0 {
+            if let Some(child_arc) = get_process(child_pid) {
+                child_arc.lock().fds_charged_count = child_fd_count;
+            }
         }
     }
 

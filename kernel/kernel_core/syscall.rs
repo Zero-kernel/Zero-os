@@ -2652,9 +2652,9 @@ fn sys_fork() -> SyscallResult {
             // F.2: Map ForkError to appropriate syscall error
             use crate::fork::ForkError;
             match e {
-                ForkError::CgroupPidsLimitExceeded | ForkError::MmapTransientState => {
-                    Err(SyscallError::EAGAIN)
-                }
+                ForkError::CgroupPidsLimitExceeded
+                | ForkError::CgroupFilesLimitExceeded
+                | ForkError::MmapTransientState => Err(SyscallError::EAGAIN),
                 _ => Err(SyscallError::ENOMEM),
             }
         }
@@ -3105,9 +3105,9 @@ fn sys_clone(
                 // to keep behavior consistent with the sys_fork() path.
                 use crate::fork::ForkError;
                 return Err(match e {
-                    ForkError::CgroupPidsLimitExceeded | ForkError::MmapTransientState => {
-                        SyscallError::EAGAIN
-                    }
+                    ForkError::CgroupPidsLimitExceeded
+                    | ForkError::CgroupFilesLimitExceeded
+                    | ForkError::MmapTransientState => SyscallError::EAGAIN,
                     _ => SyscallError::ENOMEM,
                 });
             }
@@ -3780,6 +3780,31 @@ fn sys_clone(
 
     // E.5 Cpuset: update task count after successful cgroup attach.
     crate::process::notify_cpuset_task_joined(parent_cpuset_id);
+
+    // J2-7: per-cgroup FD budget — batch-charge the child's copied fds. Only
+    // CLONE_FILES populates the child fd_table (deep copy); otherwise it is empty
+    // (count 0, a no-op). Charge to the child's now-attached cgroup. On failure,
+    // mirror the cgroup-attach rollback exactly (detach cgroup + cpuset, drop the
+    // child); later copy_to_user arms route through cleanup_unscheduled_process →
+    // free_process_resources, which uncharges fds_charged_count (set below).
+    let child_fd_count = {
+        let child = child_arc.lock();
+        child.fd_table.len() as u64
+    };
+    if child_fd_count > 0 {
+        if crate::cgroup::try_charge_fds(parent_cgroup_id, child_fd_count).is_err() {
+            if let Some(cg) = crate::cgroup::lookup_cgroup(parent_cgroup_id) {
+                let _ = cg.detach_task(child_pid as u64);
+            }
+            crate::process::notify_cpuset_task_left(parent_cpuset_id);
+            if let Some(parent) = get_process(parent_pid) {
+                parent.lock().children.retain(|&p| p != child_pid);
+            }
+            cleanup_unscheduled_process(child_pid);
+            return Err(SyscallError::EAGAIN);
+        }
+        child_arc.lock().fds_charged_count = child_fd_count;
+    }
 
     // 写入 parent_tid (F.1: use parent's view of child's PID)
     if flags & CLONE_PARENT_SETTID != 0 {
@@ -9648,9 +9673,11 @@ fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
         let mut proc = proc_arc.lock();
         let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
         let cloned = src.clone_box();
-        let removed = proc.remove_fd(newfd);
-        proc.fd_table.insert(newfd, cloned);
-        removed
+        // J2-7: net-aware, fail-closed FD accounting (replaces remove_fd+insert):
+        // empty newfd → charge +1 (EMFILE on over-budget, table untouched);
+        // occupied newfd → net 0, reuses the replaced entry's charge.
+        proc.replace_fd_charged(newfd, cloned)
+            .map_err(|_| SyscallError::EMFILE)?
     };
     drop(old_fd_entry);
 
@@ -9689,8 +9716,11 @@ fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
         let mut proc = proc_arc.lock();
         let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
         let cloned = src.clone_box();
-        let removed = proc.remove_fd(newfd);
-        proc.fd_table.insert(newfd, cloned);
+        // J2-7: net-aware, fail-closed FD accounting (replaces remove_fd+insert).
+        // replace_fd_charged clears CLOEXEC on newfd; re-set it below if requested.
+        let removed = proc
+            .replace_fd_charged(newfd, cloned)
+            .map_err(|_| SyscallError::EMFILE)?;
 
         if flags & O_CLOEXEC != 0 {
             proc.set_fd_cloexec(newfd, true);
@@ -9760,6 +9790,21 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
     // even with large user buffers. This matches Linux's practical limit for readdir.
     const MAX_RW_SIZE: usize = 1024 * 1024; // 1 MB
     let budget = count.min(MAX_RW_SIZE);
+
+    // J2-10: per-cgroup VFS dir-enumeration budget (vfs_dir.max). Resolve the
+    // cgroup id FIRST (current_cgroup_id releases the Process lock before we
+    // charge — INV-2: cgroup charges never run under the Process lock). The RAII
+    // guard charges at construction and uncharges on Ok and every early `?` Err
+    // return through Drop, covering the lifetime of both the `entries` Vec and the
+    // per-entry serialization buffers below. (The kernel is built panic=abort, so
+    // Drop does not run on panic — but a panic halts the kernel, making the
+    // transient charge moot.) When the
+    // tenant's budget is tight it grants a SMALLER amount → a graceful getdents64
+    // short read (the next call resumes from the advanced offset); it never fails
+    // the syscall or returns a false EOD. Root id==0 is exempt (full budget).
+    let vfs_cg = crate::process::current_cgroup_id().unwrap_or(0);
+    let vfs_guard = crate::cgroup::VfsDirBudgetGuard::charge(vfs_cg, budget);
+    let budget = vfs_guard.granted();
 
     // 通过回调读取目录项，passing byte budget to limit kernel-side allocation
     let readdir_fn = VFS_READDIR_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
@@ -11414,18 +11459,37 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
             let total_charged_bytes =
                 crate::process::compute_cgroup_charged_bytes(&proc);
 
+            // J2-7: combined cgroup migration with a HOLE-FREE rollback. The two
+            // controllers (memory + FDs) are migrated so that EVERY rollback is a
+            // saturating uncharge (can never fail) or the pre-existing best-effort
+            // migrate_task reverse — there is no fallible reverse-charge that could
+            // strand a charge in the destination. Protocol: (1) charge the FD count
+            // to the DESTINATION first; (2) migrate memory (charge-dest-first,
+            // R148-1); (3) complete the FD move by uncharging the SOURCE. The
+            // reverse of step 1 is uncharge_fds (never fails); a step-2 failure
+            // leaves memory at the source (R148-1), so we just undo step 1.
+            // fds_charged_count is read under the held Process lock.
+            let fd_count = proc.fds_charged_count;
+            if let Err(_e) = cgroup::try_charge_fds(cgroup_id, fd_count) {
+                let _ = cgroup::migrate_task(pid as u64, cgroup_id, old_cgroup_id);
+                return Err(SyscallError::EAGAIN);
+            }
             if let Err(_e) = cgroup::migrate_memory_charges(
                 total_charged_bytes,
                 old_cgroup_id,
                 cgroup_id,
             ) {
-                // R156-5 FIX: Keep Process lock held during rollback.
-                // Previously drop(proc) created a window where PCB says
-                // old_cgroup but membership is in new_cgroup — exit in
-                // that window leaks the task in the destination cgroup.
+                // Memory dest-charge failed → source memory untouched (R148-1).
+                // Undo the FD dest-charge (saturating, never fails) and revert.
+                // R156-5 FIX: keep the Process lock held throughout the rollback.
+                cgroup::uncharge_fds(cgroup_id, fd_count);
                 let _ = cgroup::migrate_task(pid as u64, cgroup_id, old_cgroup_id);
                 return Err(SyscallError::ENOMEM);
             }
+            // Both destinations charged and memory source uncharged. Complete the
+            // FD migration: uncharge the source (never fails). FDs + memory now
+            // both reside at the destination, consistent with proc.cgroup_id.
+            cgroup::uncharge_fds(old_cgroup_id, fd_count);
 
             proc.cgroup_id = cgroup_id;
             Ok(0)
@@ -11463,6 +11527,12 @@ const CGROUP_LIMIT_MEMORY_HIGH: u32 = 4;
 const CGROUP_LIMIT_PIDS_MAX: u32 = 5;
 const CGROUP_LIMIT_IO_MAX_BPS: u32 = 6;
 const CGROUP_LIMIT_IO_MAX_IOPS: u32 = 7;
+/// J2-7: per-cgroup open-FD count limit (`files.max`). value = max fds (u64::MAX = unlimited).
+const CGROUP_LIMIT_FILES_MAX: u32 = 8;
+/// J2-8 (reserved): per-cgroup ephemeral-port count limit (`net.ports.max`).
+const CGROUP_LIMIT_PORTS_MAX: u32 = 9;
+/// J2-10 (reserved): per-cgroup VFS dir-enumeration byte limit (`vfs_dir.max`).
+const CGROUP_LIMIT_VFS_DIR_MAX: u32 = 10;
 
 /// sys_cgroup_set_limit - Set a resource limit on a cgroup
 ///
@@ -11539,6 +11609,19 @@ fn sys_cgroup_set_limit(cgroup_id: u64, limit_type: u32, value: u64) -> Result<u
                 return Err(SyscallError::EINVAL);
             }
             limits.io_max_iops_per_sec = Some(value);
+        }
+        CGROUP_LIMIT_FILES_MAX => {
+            // J2-7: per-cgroup open-FD budget (value = max fds; u64::MAX = unlimited).
+            // 0 is a valid limit (no fds allowed), mirroring pids.max semantics.
+            limits.fds_max = Some(value);
+        }
+        CGROUP_LIMIT_PORTS_MAX => {
+            // J2-8: stored now; enforced when the NET-port charge wiring lands.
+            limits.ports_max = Some(value);
+        }
+        CGROUP_LIMIT_VFS_DIR_MAX => {
+            // J2-10: stored now; enforced when the VFS dir-budget wiring lands.
+            limits.vfs_dir_max = Some(value);
         }
         _ => return Err(SyscallError::EINVAL),
     }

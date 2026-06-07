@@ -112,6 +112,33 @@ pub fn test_per_ns_tcp_budgets() {
     klog_always!("    ✓ per-netns recv-byte budget: decide-gate + reconcile-to-F + FIN-clear-no-overcount + Drop residual");
 }
 
+/// Test the Phase J.2 item 7 per-cgroup open-FD budget (`files.max`).
+///
+/// Runs real assertions over the hierarchical FILES controller: fail-closed cap
+/// enforcement with ancestor rollback, ancestor propagation, the root id==0
+/// short-circuit, migrate_fd_charges balance across chains, and saturating
+/// uncharge. Any failure panics, detected by `make test` / `make boot-check`.
+pub fn test_cgroup_fd_budget() {
+    klog_always!("  [TEST] Per-Cgroup FD Budget (J.2-7)...");
+    kernel_core::cgroup::run_cgroup_fd_budget_self_test();
+    klog_always!("    ✓ hierarchical files.max cap (fail-closed) + ancestor rollback");
+    klog_always!("    ✓ root id==0 exemption + migrate_fd_charges balance + saturating uncharge");
+}
+
+/// Test the Phase J.2 item 10 per-cgroup VFS dir-enumeration budget (`vfs_dir.max`).
+///
+/// Runs real assertions over the Arc-chain-pinning VfsDirBudgetGuard: cap clamping
+/// (granted reduced → graceful short read), ancestor propagation, the headline
+/// DELETION-SAFETY property (delete the charged leaf, then drop the guard → the
+/// ancestor counter still returns to 0 via the held Arcs), root id==0 exemption,
+/// and release idempotency. Any failure panics, detected by make test / boot-check.
+pub fn test_cgroup_vfs_dir_budget() {
+    klog_always!("  [TEST] Per-Cgroup VFS Dir Budget (J.2-10)...");
+    kernel_core::cgroup::run_cgroup_vfs_dir_budget_self_test();
+    klog_always!("    ✓ vfs_dir.max clamp (short read) + ancestor propagation");
+    klog_always!("    ✓ Arc-pinned uncharge survives leaf deletion + root exempt + idempotent release");
+}
+
 /// 运行所有集成测试
 pub fn run_all_tests() {
     klog_always!();
@@ -127,6 +154,8 @@ pub fn run_all_tests() {
     test_memory_mapping();
     test_fallible_map();
     test_per_ns_tcp_budgets();
+    test_cgroup_fd_budget();
+    test_cgroup_vfs_dir_budget();
     test_ext2_write();
 
     klog_always!();
