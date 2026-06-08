@@ -4420,6 +4420,20 @@ fn sys_exec(
                 cgroup::uncharge_memory(cgroup_id, elf_bytes);
             }
 
+            // J2-9 FIX: Uncharge the old image's page-table-frame kmem. exec()
+            // replaces the whole address space; free_address_space(old_space)
+            // below (~line 4518) SYNCHRONOUSLY frees the old AS's entire
+            // page-table hierarchy, so a stale pt_charged_bytes would leak
+            // memory_current monotonically across every execve() (container DoS)
+            // AND propagate phantom bytes cross-cgroup on a later migration. exec
+            // already rejected shared/CLONE_VM address spaces, so this runs
+            // ungated (the last and only holder).
+            let pt_bytes = mm.pt_charged_bytes;
+            if pt_bytes > 0 {
+                cgroup::uncharge_memory(cgroup_id, pt_bytes);
+            }
+            mm.pt_charged_bytes = 0;
+
             // R131-6 FIX: Reset per-task charge counter — the old image's charges
             // were fully uncharged above; new ELF image starts with a clean slate.
             mm.vm_charged_bytes = 0;
@@ -6973,13 +6987,59 @@ fn sys_mmap(
     // snapshot an uncharged PENDING_MAP entry. The old standalone charge call
     // and its rollback are no longer needed.
 
+    // J2-9 FIX: A frame-allocator shim that counts every frame handed out — both
+    // the per-page DATA frames the map loop pulls explicitly and the intermediate
+    // PT/PD/PDPT frames x86_64 `map_to` pulls via `create_next_table`. After a
+    // successful map, `count - data_pages` is exactly the number of new page-table
+    // frames, which Phase 3 charges to the cgroup MEMORY controller (page-table
+    // memory is kernel memory and rides `memory.max`). `deallocate_frame` never
+    // touches `count` (rollback frees must not lower the charge basis). Both
+    // allocate bodies delegate to `self.inner` (never `Self::allocate_frame`) to
+    // avoid recursion between the inherent and trait methods.
+    struct CountingFrameAllocator {
+        inner: FrameAllocator,
+        count: u64,
+    }
+    impl CountingFrameAllocator {
+        fn allocate_frame(&mut self) -> Option<x86_64::structures::paging::PhysFrame> {
+            let f = self.inner.allocate_frame();
+            if f.is_some() {
+                self.count = self.count.saturating_add(1);
+            }
+            f
+        }
+        fn deallocate_frame(&mut self, frame: x86_64::structures::paging::PhysFrame) {
+            self.inner.deallocate_frame(frame);
+        }
+    }
+    unsafe impl x86_64::structures::paging::FrameAllocator<x86_64::structures::paging::Size4KiB>
+        for CountingFrameAllocator
+    {
+        fn allocate_frame(
+            &mut self,
+        ) -> Option<x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>>
+        {
+            let f = self.inner.allocate_frame();
+            if f.is_some() {
+                self.count = self.count.saturating_add(1);
+            }
+            f
+        }
+    }
+
     // 使用基于当前 CR3 的页表管理器进行映射
     // 使用 tracked vector 记录已映射的页，确保失败时完整回滚，避免帧泄漏
-    let map_result: Result<(), SyscallError> = unsafe {
+    // J2-9: the closure returns the TOTAL frames allocated (data + page-table) so
+    // Phase 3 can charge the page-table-frame kmem AFTER PT_LOCK is dropped (the
+    // cgroup charge must never run under PT_LOCK — lock_ordering invariant).
+    let map_result: Result<u64, SyscallError> = unsafe {
         use x86_64::structures::paging::PhysFrame;
 
-        with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
-            let mut frame_alloc = FrameAllocator::new();
+        with_current_manager(VirtAddr::new(0), |manager| -> Result<u64, SyscallError> {
+            let mut frame_alloc = CountingFrameAllocator {
+                inner: FrameAllocator::new(),
+                count: 0,
+            };
             // 跟踪已成功映射的 (page, frame) 对，用于失败时回滚
             let mut mapped: vec::Vec<(Page, PhysFrame)> = vec::Vec::new();
 
@@ -7075,7 +7135,7 @@ fn sys_mmap(
                 mapped.push((page, frame));
             }
 
-            Ok(())
+            Ok(frame_alloc.count)
         })
     };
 
@@ -7084,38 +7144,75 @@ fn sys_mmap(
     // R148-2 FIX: Remove reservation under process lock AND capture current
     // cgroup_id, then uncharge with the fresh id. The cached cgroup_id from
     // Phase 1 may be stale if cgroup migration occurred during PT operations.
-    if let Err(e) = map_result {
-        let rollback_cgroup_id = {
-            let proc = process.lock();
-            let mut mm = mm_arc.lock();
-            mm.mmap_regions.remove(&base);
-            if update_next && mm.next_mmap_addr == end {
-                mm.next_mmap_addr = old_next_mmap_addr;
-            }
-            proc.cgroup_id
-        };
-        cgroup::uncharge_memory(rollback_cgroup_id, length_aligned as u64);
-        return Err(e);
-    }
+    // J2-9: the closure now yields the total frames allocated on success; capture
+    // it for the page-table-kmem charge below (the closure freed its own frames on
+    // every Err path, so the count is only meaningful on Ok).
+    let total_allocs = match map_result {
+        Err(e) => {
+            let rollback_cgroup_id = {
+                let proc = process.lock();
+                let mut mm = mm_arc.lock();
+                mm.mmap_regions.remove(&base);
+                if update_next && mm.next_mmap_addr == end {
+                    mm.next_mmap_addr = old_next_mmap_addr;
+                }
+                proc.cgroup_id
+            };
+            cgroup::uncharge_memory(rollback_cgroup_id, length_aligned as u64);
+            return Err(e);
+        }
+        Ok(n) => n,
+    };
 
-    // Phase 3: Commit the reservation by clearing the PENDING_MAP flag.
-    // The entry transitions from (length | PENDING_MAP) to (length | prot flags).
+    // J2-9: derive the page-table-frame charge. `map_to` pulls ONLY intermediate
+    // tables from the allocator (create_next_table, guarded by is_unused()); the
+    // leaf data frame is set, not allocator-sourced. So the page-table frames are
+    // the total minus the one data frame per mapped page. saturating_sub is
+    // defensive — total_allocs >= data_pages always holds on the success path.
+    let data_pages = (length_aligned / 0x1000) as u64;
+    let pt_bytes = total_allocs.saturating_sub(data_pages).saturating_mul(0x1000);
+
+    // Phase 3: Commit the reservation (clear PENDING_MAP) AND record the
+    // page-table-frame kmem in the SAME Process-lock critical section. Doing both
+    // under the Process lock — the sanctioned Process → MmState → cgroup order,
+    // exactly like the Phase-1 DATA charge at the top of this fn — makes this
+    // mutually exclusive with cgroup migration, which holds the Process lock
+    // across compute_cgroup_charged_bytes + the cgroup_id update (R155-5). So the
+    // forced pt charge and the pt_charged_bytes mirror land atomically w.r.t.
+    // migration, and no transient mirror field is needed.
+    //
+    // J2-9: the pt charge is a SOFT / forced charge (charge_memory_forced), NOT a
+    // hard try_charge_memory. The page-table-frame count is knowable only AFTER
+    // map_to has run (IM-14: "delta known only after the mutation ⇒ soft cap"),
+    // and by then the frames physically exist. A hard reject here would have to
+    // free the already-built intermediate PT tables (a leak-prone rollback that
+    // would ORPHAN them uncharged → a partial memory.max bypass); instead we KEEP
+    // and CHARGE them, accepting a bounded overshoot (≤ this one mapping's pt
+    // delta, ~1/512 of the data that already passed the Phase-1 HARD gate). The
+    // HARD gate on the NEXT allocation re-enforces memory.max, so this is the
+    // over-count-safe / never-under-count direction — it cannot bypass memory.max.
     // R144-2 FIX: Store protection bits so procfs /proc/[pid]/maps shows accurate perms.
     let prot_flags = mmap_prot_to_flags(prot);
     let committed_len_with_flags = MmapEntry::from_len_flags(length_aligned, prot_flags);
     {
+        let proc = process.lock();
         let mut mm = mm_arc.lock();
         // next-phase #11: `base` is still present from Phase 1 (PENDING_MAP), so
         // this is an in-place replace clearing the flag — no allocation.
         mm.mmap_regions
             .try_insert(base, committed_len_with_flags)
             .map_err(|_| SyscallError::ENOMEM)?;
-        // R131-6 FIX: Track per-address-space cgroup charge.
-        mm.vm_charged_bytes = mm
-            .vm_charged_bytes
-            .saturating_add(length_aligned as u64);
+        // R131-6 FIX: Track per-address-space cgroup DATA charge.
+        mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_add(length_aligned as u64);
         if mm.next_mmap_addr < end {
             mm.next_mmap_addr = end;
+        }
+        // J2-9: record the page-table-frame kmem (forced soft charge) under this
+        // same Process lock so the cgroup counter and the per-AS mirror move
+        // together and stay consistent with proc.cgroup_id (migration-atomic).
+        if pt_bytes > 0 {
+            cgroup::charge_memory_forced(proc.cgroup_id, pt_bytes);
+            mm.pt_charged_bytes = mm.pt_charged_bytes.saturating_add(pt_bytes);
         }
     }
 

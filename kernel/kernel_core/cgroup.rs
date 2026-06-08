@@ -1959,6 +1959,46 @@ pub fn uncharge_memory(cgroup_id: CgroupId, bytes: u64) {
     }
 }
 
+/// J2-9: Force-charges `bytes` of kernel memory to a cgroup + every
+/// MEMORY-controller ancestor WITHOUT rejecting on `memory.max` (saturating add
+/// over the same chain `uncharge_memory` walks). This is the SOFT-cap charge for
+/// the page-table-frame kmem allocated by `map_to`: that frame count is knowable
+/// only AFTER the mapping is built (IM-14 "delta known only after the mutation ⇒
+/// soft cap"), and the frames physically exist by then — so accounting must
+/// record them even if they push `memory_current` transiently past `memory.max`.
+/// The overshoot is bounded by ONE mmap's page-table delta (~1/512 of the data,
+/// itself already capped by the HARD Phase-1 DATA gate) and the HARD gate on the
+/// NEXT allocation re-enforces the limit. Thus this is the over-count-safe /
+/// never-under-count direction — it cannot create a `memory.max` bypass (unlike a
+/// reject-then-rollback, which would orphan the already-allocated PT frames
+/// uncharged). Root cgroup (id 0) is NOT exempt: page-table memory is real kernel
+/// memory and rides `memory.current` exactly like the DATA charge.
+pub fn charge_memory_forced(cgroup_id: CgroupId, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
+    while let Some(cgroup) = cursor {
+        if cgroup.controllers.contains(CgroupControllers::MEMORY) {
+            // fetch_update (never fetch_add — lint-fetch-add) with a closure that
+            // always returns Some never fails: an unconditional saturating add.
+            let _ = cgroup.stats.memory_current.fetch_update(
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_add(bytes)),
+            );
+        }
+
+        if depth >= MAX_CGROUP_DEPTH {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        cursor = cgroup.parent();
+    }
+}
+
 /// Atomically transfers cgroup memory charges from one cgroup to another.
 ///
 /// R143-1 FIX: When a process is migrated between cgroups, its existing memory
@@ -2635,6 +2675,101 @@ pub fn run_cgroup_fd_budget_self_test() {
     let _ = delete_cgroup(b_id);
     let _ = delete_cgroup(a_id);
     let _ = delete_cgroup(c_id);
+}
+
+/// J2-9: in-kernel self-test for the page-table-frame kmem accounting. The pt
+/// charge rides the MEMORY controller (try_charge_memory / uncharge_memory /
+/// migrate_memory_charges) EXACTLY like the mmap DATA charge, so this exercises
+/// those primitives over the same hierarchy / migration / exit / fork balance
+/// points that sys_mmap's pt charge, compute_cgroup_charged_bytes (migration),
+/// free_process_resources (exit), and fork_inner (fork) depend on — including the
+/// INV-5 trap that the MEMORY controller (unlike files/ports/vfs_dir) does NOT
+/// exempt the root cgroup. Root counters carry live boot charges, so root
+/// assertions use DELTAS; fresh task-less children start at 0 (absolute).
+pub fn run_cgroup_pt_kmem_self_test() {
+    const PAGE: u64 = 0x1000;
+    let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
+
+    // Fresh, empty, task-less MEMORY cgroups under root:
+    // A(memory.max=64 pages) ⊃ B(memory.max=8 pages), sibling C(memory.max=64 pages).
+    let a = create_cgroup(0, CgroupControllers::MEMORY).expect("create A");
+    let a_id = a.id();
+    a.set_limit(CgroupLimits { memory_max: Some(64 * PAGE), ..Default::default() })
+        .expect("set A.memory.max");
+    let b = create_cgroup(a_id, CgroupControllers::MEMORY).expect("create B");
+    let b_id = b.id();
+    b.set_limit(CgroupLimits { memory_max: Some(8 * PAGE), ..Default::default() })
+        .expect("set B.memory.max");
+    let c = create_cgroup(a_id, CgroupControllers::MEMORY).expect("create C");
+    let c_id = c.id();
+    c.set_limit(CgroupLimits { memory_max: Some(64 * PAGE), ..Default::default() })
+        .expect("set C.memory.max");
+
+    // 1) FORCED PT charge + ANCESTOR propagation. charge_memory_forced is how
+    //    sys_mmap records the page-table-frame kmem (the frame count is known only
+    //    AFTER map_to runs ⇒ soft cap per IM-14). Charge 6 PT pages under B.
+    charge_memory_forced(b_id, 6 * PAGE);
+    assert_eq!(mem(&b), 6 * PAGE, "B after forced PT charge");
+    assert_eq!(mem(&a), 6 * PAGE, "A (ancestor) after forced PT charge under B");
+
+    // 2) SOFT overshoot: a forced PT charge NEVER rejects, even past memory.max.
+    //    6 + 4 = 10 > B.max(8) is ALLOWED — the frames physically exist, and
+    //    over-count is the safe direction (bounded by one mmap's tiny pt delta in
+    //    practice). Both B and the ancestor A rise.
+    charge_memory_forced(b_id, 4 * PAGE);
+    assert_eq!(mem(&b), 10 * PAGE, "B forced past memory.max (soft, over-count-safe)");
+    assert_eq!(mem(&a), 10 * PAGE, "A after forced overshoot under B");
+
+    // 3) The HARD gate RE-ENFORCES on the NEXT data-style allocation: now that B is
+    //    over its max, try_charge_memory (the Phase-1 DATA gate) rejects — so the
+    //    soft pt overshoot cannot be parlayed into an unbounded bypass.
+    assert_eq!(
+        try_charge_memory(b_id, PAGE),
+        Err(CgroupError::MemoryLimitExceeded),
+        "hard DATA gate re-enforces memory.max after pt overshoot",
+    );
+    assert_eq!(mem(&b), 10 * PAGE, "B unchanged after rejected hard charge");
+
+    // 4) ROOT NOT EXEMPT (INV-5 trap): unlike files/ports/vfs_dir, the MEMORY
+    //    controller charges the root cgroup. A root-targeted forced charge MUST
+    //    move root.memory_current — asserted via delta (root carries live charges).
+    let root = lookup_cgroup(0).expect("root");
+    let root_before = mem(&root);
+    charge_memory_forced(0, 5 * PAGE);
+    assert_eq!(mem(&root), root_before + 5 * PAGE, "root IS charged (no exemption)");
+    uncharge_memory(0, 5 * PAGE);
+    assert_eq!(mem(&root), root_before, "root PT uncharge restores baseline");
+
+    // 5) MIGRATION TRANSFER (compute_cgroup_charged_bytes path): move B's 10 PT
+    //    pages B → C. B's chain (B, A) drops by 10; C's chain (C, A) gains 10. The
+    //    shared ancestor A nets 0; B ends at 0, C ends at 10.
+    migrate_memory_charges(10 * PAGE, b_id, c_id).expect("migrate PT B→C");
+    assert_eq!(mem(&b), 0, "B drained after PT migrate");
+    assert_eq!(mem(&c), 10 * PAGE, "C charged after PT migrate");
+    assert_eq!(mem(&a), 10 * PAGE, "A (shared ancestor) net unchanged by sibling migrate");
+
+    // 6) EXIT BALANCE: last-exit uncharge of C's PT returns the chain to baseline.
+    uncharge_memory(c_id, 10 * PAGE);
+    assert_eq!(mem(&c), 0, "C drained after exit uncharge");
+    assert_eq!(mem(&a), 0, "A drained after C exit uncharge");
+
+    // 7) FORK == EXIT balance (per-process +X / -X): fork charges the inherited
+    //    child PT to the PARENT cgroup with the HARD gate (the value is known
+    //    pre-fork ⇒ hard per IM-14); the child's last-exit uncharge cancels it.
+    try_charge_memory(a_id, 6 * PAGE).expect("fork: charge inherited child PT to parent cgroup");
+    assert_eq!(mem(&a), 6 * PAGE, "A after fork PT charge");
+    uncharge_memory(a_id, 6 * PAGE); // child last-exit
+    assert_eq!(mem(&a), 0, "A back to baseline: fork PT charge cancelled by child exit");
+
+    // 8) SATURATING uncharge: over-uncharge floors at 0 (never drives memory_current
+    //    below true usage → never a downstream memory.max bypass).
+    uncharge_memory(a_id, 999 * PAGE);
+    assert_eq!(mem(&a), 0, "A saturates at 0 on over-uncharge");
+
+    // Cleanup: delete children before parents (no tasks attached).
+    let _ = delete_cgroup(b_id);
+    let _ = delete_cgroup(c_id);
+    let _ = delete_cgroup(a_id);
 }
 
 // ============================================================================

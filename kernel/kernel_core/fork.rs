@@ -218,6 +218,19 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
             // ELF loader charges (inherited verbatim from parent)
             bytes = bytes.saturating_add(parent_mm.elf_charged_bytes);
 
+            // J2-9 FIX: Charge the inherited page-table-frame kmem. fork gives the
+            // child its OWN freshly-allocated page tables (plan_clone_level), so
+            // the child's last-exit uncharge of its copied pt_charged_bytes must be
+            // matched by a charge here (to the parent cgroup, like the rest of the
+            // inherited virtual footprint) or memory_current drifts below true
+            // usage and bypasses memory.max. Follows the elf LIFECYCLE (charge at
+            // fork, child last-exit cancels) — conservative for COW-shared pages,
+            // exactly like the mmap/heap/elf terms above. Note: this accounts only
+            // the INHERITED mmap page-table value; the child's whole-AS page tables
+            // (ELF/stack/brk/entry-island/KPTI) beyond that are a tracked deferred
+            // residual, not claimed to cancel.
+            bytes = bytes.saturating_add(parent_mm.pt_charged_bytes);
+
             drop(parent_mm);
             bytes
         };
@@ -508,6 +521,11 @@ fn fork_inner(
                 next_mmap_addr: parent_mm.next_mmap_addr,
                 vm_charged_bytes: parent_mm.vm_charged_bytes,
                 elf_charged_bytes: parent_mm.elf_charged_bytes,
+                // J2-9 FIX: inherit the page-table-frame kmem charge. The child
+                // builds its OWN page tables (so the value, like elf, is a copy of
+                // the parent's) and its last-exit uncharges this; the matching
+                // charge to the parent cgroup is folded into fork_charge_bytes.
+                pt_charged_bytes: parent_mm.pt_charged_bytes,
                 // Transient pending counters reset for child — no in-flight
                 // operations can be inherited across fork.
                 brk_pending_growth: 0,

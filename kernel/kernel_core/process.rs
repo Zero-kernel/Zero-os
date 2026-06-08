@@ -478,6 +478,23 @@ pub struct MmState {
     /// and the initial user stack. Uncharged on last-exit or subsequent exec.
     pub elf_charged_bytes: u64,
 
+    /// J2-9 FIX: Cgroup MEMORY-controller bytes charged for the INTERMEDIATE
+    /// page-table frames (PT/PD/PDPT) that `map_to` allocated to back this
+    /// address space's anonymous `mmap()` mappings. Page-table memory is kernel
+    /// memory (kmem) and rides `memory.max` (cgroup-v2 folds kmem into
+    /// `memory.current`); without this term a tenant bypasses `memory.max` by
+    /// forcing unbounded page-table growth. MONOTONIC during the AS lifetime:
+    /// `sys_munmap` reclaims only leaf data frames, never intermediate tables
+    /// (those are freed solely at last-AS teardown by `free_page_table_level`),
+    /// so this is charged on successful `sys_mmap` and uncharged+zeroed ONLY at
+    /// last exit (`free_process_resources`) and at exec image replacement
+    /// (`sys_exec`, which frees the old AS synchronously). Follows the elf
+    /// LIFECYCLE (copy-on-fork, parent charged at fork, child last-exit cancels)
+    /// — NOT elf's value (the ELF loader charges ZERO page-table frames today).
+    /// SCOPE: mmap-only. brk/mprotect/COW-fault/ELF-image page-table frames are
+    /// NOT yet counted (bounded, teardown-reclaimed, tracked deferred residual).
+    pub pt_charged_bytes: u64,
+
     /// Transient: bytes charged to cgroup via sys_brk growth not yet
     /// reflected in `brk`. Non-zero only while MmState lock is dropped
     /// for PT operations. Included by `compute_cgroup_charged_bytes()`.
@@ -514,6 +531,7 @@ impl MmState {
             next_mmap_addr,
             vm_charged_bytes: 0,
             elf_charged_bytes: 0,
+            pt_charged_bytes: 0,
             brk_pending_growth: 0,
             mprotect_pending_bytes: 0,
             exec_pending_bytes: 0,
@@ -3772,6 +3790,19 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTree
             crate::cgroup::uncharge_memory(cgroup_id, elf_bytes);
             mm.elf_charged_bytes = 0;
         }
+
+        // J2-9 FIX: Uncharge the page-table-frame kmem (PT/PD/PDPT frames charged
+        // by sys_mmap). The intermediate tables are freed below by
+        // free_page_table_level at last-AS teardown, so the charge is released
+        // here under the SAME gate as the mmap/heap/elf uncharge: only the last
+        // task holding this MmState (!keep_address_space && !mm_shared) uncharges,
+        // exactly once. The non-last CLONE_VM exit (the else-if below) is a pt
+        // no-op — surviving siblings still own the shared page-table frames.
+        let pt_bytes = mm.pt_charged_bytes;
+        if pt_bytes > 0 {
+            crate::cgroup::uncharge_memory(cgroup_id, pt_bytes);
+            mm.pt_charged_bytes = 0;
+        }
     } else if (keep_address_space || mm_shared) && proc.memory_space != 0 {
         // Non-last CLONE_VM exit keeps the shared address space and MmState.
         // Do NOT uncharge — pages remain mapped in the shared page tables.
@@ -4174,12 +4205,24 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
     // ELF loader charges (PT_LOAD segments + user stack).
     let elf_bytes = mm.elf_charged_bytes;
 
+    // J2-9 FIX: Include the page-table-frame kmem charge. MANDATORY for cgroup
+    // migration correctness: cgroup migration transfers exactly
+    // compute_cgroup_charged_bytes() from source to destination. If the pt term
+    // were omitted, migration would under-transfer the pt bytes — the source
+    // would later double-uncharge them (memory_current underflow → memory.max
+    // bypass) and the destination would under-count. pt_charged_bytes is the
+    // sole pt term (charged under the Process lock at sys_mmap Phase 3, so no
+    // lock-dropped in-flight window exists that would need a transient mirror —
+    // migration is Process-lock-atomic, see sys_cgroup_attach R155-5).
+    let pt_bytes = mm.pt_charged_bytes;
+
     mmap_bytes
         .saturating_add(heap_bytes)
         .saturating_add(pending_brk)
         .saturating_add(pending_mprotect)
         .saturating_add(pending_exec)
         .saturating_add(elf_bytes)
+        .saturating_add(pt_bytes)
 }
 
 /// 进程统计信息

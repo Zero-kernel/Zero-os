@@ -139,6 +139,23 @@ pub fn test_cgroup_vfs_dir_budget() {
     klog_always!("    ✓ Arc-pinned uncharge survives leaf deletion + root exempt + idempotent release");
 }
 
+/// Test the Phase J.2 item 9 per-cgroup page-table-frame kmem accounting.
+///
+/// Exercises the MEMORY-controller primitives the sys_mmap pt charge rides on,
+/// over the hierarchy / migration / exit / fork balance points: forced soft-cap
+/// charge + ancestor propagation, BOUNDED overshoot past memory.max (the pt-frame
+/// count is known only after map_to ⇒ soft per IM-14), the HARD DATA gate
+/// re-enforcing the limit on the next allocation, the INV-5 trap that the MEMORY
+/// controller does NOT exempt root (unlike files/ports/vfs_dir), migration
+/// transfer, fork==exit balance, and saturating uncharge. Any failure panics,
+/// detected by `make test` / `make boot-check`.
+pub fn test_cgroup_pt_kmem() {
+    klog_always!("  [TEST] Per-Cgroup PT-frame kmem (J.2-9)...");
+    kernel_core::cgroup::run_cgroup_pt_kmem_self_test();
+    klog_always!("    ✓ forced soft-cap PT charge + ancestor propagation + bounded overshoot");
+    klog_always!("    ✓ hard DATA gate re-enforces + root NOT exempt + migration transfer + fork==exit + saturating");
+}
+
 /// 运行所有集成测试
 pub fn run_all_tests() {
     klog_always!();
@@ -156,6 +173,7 @@ pub fn run_all_tests() {
     test_per_ns_tcp_budgets();
     test_cgroup_fd_budget();
     test_cgroup_vfs_dir_budget();
+    test_cgroup_pt_kmem();
     test_ext2_write();
 
     klog_always!();
