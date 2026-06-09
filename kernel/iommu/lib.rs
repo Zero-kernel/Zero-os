@@ -812,6 +812,11 @@ pub fn unmap_range(domain_id: DomainId, iova: u64, size: usize) -> IommuResult<(
 /// * `Ok(domain_id)` - New domain ID
 /// * `Err(IommuError)` - Domain creation failed
 pub fn create_domain(domain_type: DomainType) -> IommuResult<DomainId> {
+    // R169-L6 FIX: Fail closed if the IOMMU is disabled / init-failed, mirroring
+    // create_vm_domain and the other gated entry points — never register a
+    // domain for a dead/uninitialized IOMMU (a fail-open precondition gap).
+    ensure_iommu_ready()?;
+
     let mut domains = DOMAINS.write();
 
     if domains.len() >= MAX_DOMAINS {

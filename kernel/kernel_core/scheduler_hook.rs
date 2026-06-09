@@ -133,6 +133,21 @@ pub fn on_scheduler_tick() {
 /// process-context path where deferred destruction work gets done.
 #[inline]
 pub fn reschedule_if_needed() {
+    // R169-5 FIX (D1-CGROUP-IRQ-L5): This is the full process-context
+    // deferred-work drain — it performs BLOCKING Level-8 (sockets/tcp_conns
+    // teardown) and non-IRQ-safe Level-5 (CGROUP_REGISTRY port-uncharge,
+    // Process) acquisitions plus a context-switch callback, so it MUST be
+    // entered with interrupts ENABLED. An idle loop that needs a race-free arm
+    // window must disable IRQs ONLY across the need_resched check + sti;hlt,
+    // NEVER across this drain (see arch/smp.rs `ap_idle_loop`). `force_reschedule()`
+    // is the deliberately drain-free, IRQ-adjacent-safe variant. This converts
+    // the previously comment-only contract into a machine-checked invariant.
+    debug_assert!(
+        x86_64::instructions::interrupts::are_enabled(),
+        "reschedule_if_needed() (full L8 + L5 deferred-work drain) must run with \
+         interrupts ENABLED — never from an IRQ-off context (R169-5)"
+    );
+
     // R65-6 FIX: Drain deferred TCP timer work before scheduling check
     crate::time::drain_deferred_tcp_timers();
 
@@ -140,11 +155,14 @@ pub fn reschedule_if_needed() {
     // AFTER the TCP-timer drain because that sweep can tear down ESTABLISHED
     // connections (cleanup_tcp_connection), which ENQUEUE port uncharges in this
     // same pass. The cgroup uncharge takes CGROUP_REGISTRY (Level 5) and so must
-    // run here (process context, no net-binding lock held), never under the
-    // binding lock or in IRQ. NOT wired into force_reschedule(): that hook is
-    // reachable from IRQ-adjacent paths where a Level-5 acquire is illegal; the
-    // fold-by-cgid queue bounds any transient overshoot until this drain runs on
-    // the syscall-return path.
+    // run here (process context, IRQs ENABLED, no net-binding lock held), never
+    // under the binding lock or in IRQ. NOT wired into force_reschedule(): that
+    // hook is reachable from IRQ-adjacent paths where a Level-5 acquire is
+    // illegal. R169-5: every caller of this function (syscall return, nanosleep,
+    // BSP idle, and now the AP idle loop after its restructure) runs with IRQs
+    // enabled, so this drain is genuinely process-context on all paths — the
+    // debug_assert above enforces it. The fold-by-cgid queue bounds any
+    // transient overshoot until this drain runs.
     net::socket_table().drain_deferred_port_uncharges();
 
     // R149-1 FIX: Drain deferred stdin wakes from keyboard/serial IRQ.

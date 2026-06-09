@@ -129,6 +129,31 @@ const STRICT_ALLOWED: &[u64] = &[
     231, // exit_group
 ];
 
+/// R169-12: Conservative worst-case instruction count for a generated pledge
+/// filter — `1` (LdSyscallNr) + `2` per allowed syscall + `1` (Ret Kill). The
+/// deduped union of every promise's syscall list is <= 48 today; we bound it at
+/// 64 distinct syscalls for headroom. The const-assert below makes any future
+/// promise/syscall expansion that would overrun `MAX_TRUSTED_INSNS` a BUILD
+/// error rather than a silent runtime fail-closed (deny-all). If you add
+/// promises, update `MAX_PLEDGE_SYSCALLS` to the new deduped maximum.
+const MAX_PLEDGE_SYSCALLS: usize = 64;
+const WORST_CASE_PLEDGE_INSNS: usize = 2 + 2 * MAX_PLEDGE_SYSCALLS;
+const _: () = assert!(WORST_CASE_PLEDGE_INSNS <= types::MAX_TRUSTED_INSNS);
+
+/// R169-12: Minimal fail-closed filter — a single `Ret(Kill)` with a `Kill`
+/// default action (deny everything). Used as the panic-free fallback for the
+/// trusted generators if a generated program ever exceeds `MAX_TRUSTED_INSNS`
+/// (a future-regression backstop; the const-assert above keeps the current
+/// vocabulary within bounds). A 1-instruction `[Ret(Kill)]` program is trivially
+/// valid (non-empty, has a terminator, no jumps), so this construction cannot
+/// itself fail. Deny-all is the safe direction.
+fn deny_all_filter() -> SeccompFilter {
+    let mut prog = Vec::new();
+    prog.push(SeccompInsn::Ret(SeccompAction::Kill));
+    SeccompFilter::new_trusted(prog, SeccompAction::Kill, SeccompFlags::empty())
+        .expect("minimal [Ret(Kill)] filter is always valid")
+}
+
 /// Create a filter for strict mode.
 pub fn strict_filter() -> SeccompFilter {
     let mut prog = Vec::new();
@@ -145,8 +170,11 @@ pub fn strict_filter() -> SeccompFilter {
     // Default: kill
     prog.push(SeccompInsn::Ret(SeccompAction::Kill));
 
-    SeccompFilter::new(prog, SeccompAction::Kill, SeccompFlags::empty())
-        .expect("strict filter should be valid")
+    // R169-12 FIX: trusted generator — validate against MAX_TRUSTED_INSNS and
+    // FAIL CLOSED (deny-all [Ret(Kill)]) rather than panic if a future
+    // STRICT_ALLOWED expansion ever overruns the bound.
+    SeccompFilter::new_trusted(prog, SeccompAction::Kill, SeccompFlags::empty())
+        .unwrap_or_else(|_| deny_all_filter())
 }
 
 // ============================================================================
@@ -298,8 +326,16 @@ pub fn pledge_to_filter(promises: PledgePromises) -> SeccompFilter {
     // Default: kill
     prog.push(SeccompInsn::Ret(SeccompAction::Kill));
 
-    SeccompFilter::new(prog, SeccompAction::Kill, SeccompFlags::empty())
-        .expect("pledge filter should be valid")
+    // R169-12 FIX: trusted generator — validate the (compile-time-bounded)
+    // program against MAX_TRUSTED_INSNS and FAIL CLOSED (deny-all [Ret(Kill)])
+    // rather than panic. The prior `SeccompFilter::new(...).expect(...)` used the
+    // untrusted MAX_INSNS=64 bound, so a broad-but-legitimate pledge set (the
+    // deduped union runs to 98 insns) panicked the kernel on VALID input. The
+    // worst case is const-asserted (WORST_CASE_PLEDGE_INSNS) to fit
+    // MAX_TRUSTED_INSNS, so the fallback is a future-regression backstop, not a
+    // path any current promise set takes.
+    SeccompFilter::new_trusted(prog, SeccompAction::Kill, SeccompFlags::empty())
+        .unwrap_or_else(|_| deny_all_filter())
 }
 
 // ============================================================================

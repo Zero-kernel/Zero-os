@@ -876,6 +876,22 @@ impl VtdUnit {
             return Err(IommuError::DeviceAlreadyAttached);
         }
 
+        // R169-13 FIX (Layer 2, authoritative DMA-isolation boundary): The
+        // domain id is written into the context-entry hi dword
+        // (new_translated/new_passthrough below) and into IOTLB/context
+        // invalidation commands. It MUST be < THIS unit's hardware-supported
+        // domain count (CAP.ND via num_domains()), or two distinct kernel
+        // DomainIds alias the same hardware DID on constrained units (ND=0->16,
+        // ND=1->64), breaking DMA isolation and mis-steering IOTLB flushes.
+        // REJECT (never clamp — clamping would itself collapse two ids into one
+        // hw DID). Gating here transitively closes the IOTLB/context-invalidation
+        // path, since those commands run only after a successful attach. Mirrors
+        // the sibling CAP.SAGAW/AGAW check in the PageTable branch below; applies
+        // to BOTH the passthrough and translated branches.
+        if (domain.id() as u32) >= self.num_domains() {
+            return Err(IommuError::InvalidRange);
+        }
+
         // Build context entry based on domain type
         let ctx_entry = match domain.domain_type() {
             DomainType::Identity => {

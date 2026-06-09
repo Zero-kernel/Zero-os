@@ -277,8 +277,18 @@ fn tsc_entropy() -> u64 {
             options(nomem, nostack, preserves_flags)
         );
     }
-    // Mix in a constant to avoid predictable patterns
-    ((high as u64) << 32) | (low as u64) ^ 0x5bf0_a8a5_5a5a_f00d
+    // R169-L5 FIX (operator-precedence / KASLR-in-logs entropy, VD-08):
+    // Assemble the full 64-bit TSC FIRST, then XOR the mixing constant across
+    // ALL bits. The prior one-liner
+    //   ((high as u64) << 32) | (low as u64) ^ 0x5bf0_a8a5_5a5a_f00d
+    // parses (Rust: `^` binds tighter than `|`) as
+    //   ((high as u64) << 32) | ((low as u64) ^ 0x5bf0_a8a5_5a5a_f00d)
+    // so the constant's HIGH half (0x5bf0_a8a5) was OR-ed into the high TSC
+    // bits — forcing those bits permanently to 1 (constant, predictable) and
+    // leaving only the low 32 bits actually mixed. The two-statement form makes
+    // the precedence unambiguous and mixes the constant into the whole value.
+    let tsc = ((high as u64) << 32) | (low as u64);
+    tsc ^ 0x5bf0_a8a5_5a5a_f00d
 }
 
 // ============================================================================

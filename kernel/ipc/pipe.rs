@@ -258,12 +258,25 @@ impl Pipe {
             let should_wait = {
                 let mut inner = self.inner.lock();
 
-                // R163-33 FIX: Always return BrokenPipe when readers == 0,
-                // even if partial data was written. POSIX allows either
-                // partial count or EPIPE, but Linux delivers SIGPIPE/EPIPE
-                // unconditionally. Returning Ok(partial) silently hides the
-                // broken pipe from the caller.
+                // R169-L3 FIX (incomplete-fix of R163-33): When the read end is
+                // gone, return the SHORT COUNT if bytes were already delivered
+                // this call, and only signal BrokenPipe (EPIPE/SIGPIPE) when
+                // NOTHING was written. POSIX: a write() that has transferred
+                // data returns that byte count; EPIPE is reported only for a
+                // write that made zero progress. The prior R163-33 form returned
+                // BrokenPipe UNCONDITIONALLY even after a partial write,
+                // discarding the already-written count — so a caller that
+                // retries from offset 0 re-sends bytes the pipe already accepted
+                // (duplicate delivery). Reporting the short count lets the caller
+                // resume from the correct offset; the NEXT write (zero progress,
+                // readers still 0) then correctly returns BrokenPipe. NOTE: this
+                // is a kernel/userspace write() contract, not full
+                // class-elimination — the SIGPIPE signal itself is still raised
+                // by the syscall layer on the zero-progress EPIPE path.
                 if inner.readers == 0 {
+                    if total_written > 0 {
+                        return Ok(total_written);
+                    }
                     return Err(PipeError::BrokenPipe);
                 }
 

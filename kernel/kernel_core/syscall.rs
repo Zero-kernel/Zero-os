@@ -2397,13 +2397,16 @@ pub fn syscall_dispatcher(
         ),
         48 => sys_shutdown(arg0 as i32, arg1 as i32),
 
-        // F.2 Cgroup v2 syscalls (Zero-OS specific, 500-504, 513)
+        // F.2 Cgroup v2 syscalls (Zero-OS specific, 500-504, 513, 516)
         500 => sys_cgroup_create(arg0 as u64, arg1 as u32),
         501 => sys_cgroup_destroy(arg0 as u64),
         502 => sys_cgroup_attach(arg0 as u64),
         503 => sys_cgroup_set_limit(arg0 as u64, arg1 as u32, arg2),
+        // 504 is the FROZEN v1 stats ABI (2-arg, writes the 104-byte v1 prefix, returns 0).
         504 => sys_cgroup_get_stats(arg0 as u64, arg1 as *mut CgroupStatsBuf),
         513 => sys_cgroup_delegate(arg0 as u64, arg1 as u64),
+        // J.2: v2 stats with statx-style size negotiation (writes min(buf_len, sizeof)).
+        516 => sys_cgroup_get_stats2(arg0 as u64, arg1 as *mut CgroupStatsBuf, arg2 as usize),
 
         // G.3 Compliance syscalls (Zero-OS specific, 505-508)
         505 => sys_compliance_status(arg0 as *mut ComplianceStatusBuf),
@@ -2981,6 +2984,7 @@ fn sys_clone(
         parent_user_ns,              // F.1: User namespace
         parent_user_ns_for_children, // F.1: User namespace for children
         parent_fd_table_snapshot,    // R133-5 FIX: fd_table snapshot under parent lock
+        parent_cloexec_snapshot,     // R169-L1 FIX: cloexec_fds snapshot under parent lock
         parent_cap_table_clone,      // R133-5 FIX: cap_table clone under parent lock
     ) = {
         let mut parent = parent_arc.lock();
@@ -3010,6 +3014,23 @@ fn sys_clone(
             } else {
                 Vec::new()
             };
+
+        // R169-L1 FIX: Snapshot cloexec_fds under the parent lock too (fallibly,
+        // matching fd_snapshot), so a CLONE_FILES child inherits the parent's
+        // close-on-exec marks instead of silently losing them (a latent CLOEXEC
+        // bypass that diverges from fork.rs). Reading parent.cloexec_fds at the
+        // child-setup site would re-acquire the parent lock = R133-5 child->parent
+        // inversion; the bounded set is rebuilt into the child OUTSIDE the lock.
+        let cloexec_snapshot: Vec<i32> = if flags & CLONE_FILES != 0 {
+            let mut snap = Vec::new();
+            if snap.try_reserve_exact(parent.cloexec_fds.len()).is_err() {
+                return Err(SyscallError::ENOMEM);
+            }
+            snap.extend(parent.cloexec_fds.iter().copied());
+            snap
+        } else {
+            Vec::new()
+        };
 
         let cap_clone = if flags & CLONE_THREAD != 0 {
             // Thread: share parent's cap_table (via Arc)
@@ -3057,6 +3078,7 @@ fn sys_clone(
             parent.user_ns.clone(),              // F.1: User namespace
             parent.user_ns_for_children.clone(), // F.1: User namespace for children
             fd_snapshot,                         // R133-5 FIX: fd_table snapshot
+            cloexec_snapshot,                    // R169-L1 FIX: cloexec_fds snapshot
             cap_clone,                           // R133-5 FIX: cap_table clone
         )
     };
@@ -3638,6 +3660,14 @@ fn sys_clone(
         if flags & CLONE_FILES != 0 {
             for (fd, desc) in parent_fd_table_snapshot {
                 child.fd_table.insert(fd, desc);
+            }
+            // R169-L1 FIX: Inherit the close-on-exec marks captured under the
+            // parent lock. The rebuild is bounded by MAX_FD and runs OUTSIDE the
+            // parent lock, so the infallible BTreeSet insert cannot panic while a
+            // foreign lock is held. Matches fork.rs, closing the CLOEXEC-bypass
+            // parity gap (VD-03) where a CLONE_FILES child silently lost CLOEXEC.
+            for fd in parent_cloexec_snapshot {
+                child.cloexec_fds.insert(fd);
             }
         }
 
@@ -4374,8 +4404,23 @@ fn sys_exec(
     let argv_base = (buf_base + word) as u64; // argv[0] 的地址
 
     // 更新进程 PCB
-    let (old_space, old_user_space) = {
+    let (old_space, old_user_space, cloexec_removed, cloexec_cgroup_id, cloexec_closed) = {
         let mut proc = process.lock();
+
+        // R169-4 FIX: Reserve the close-on-exec drop buffer to the CURRENT
+        // cloexec-fd count BEFORE any irreversible exec mutation (capability
+        // revocation at cap_table.apply_cloexec(), fd close). On allocation
+        // failure we return ENOMEM here — nothing has been mutated yet, so the
+        // exec rolls back cleanly via space_guard. FD state is per-process
+        // (never Arc-shared, even under CLONE_FILES) and nothing in this lock
+        // hold adds cloexec marks, so this capacity is EXACTLY sufficient for
+        // take_cloexec_fds_into() below: every push fits without realloc,
+        // guaranteeing no FileDescriptor ever drops inline under the Process
+        // lock (the R169-4 lock-inversion class) — with no fatal-OOM residual.
+        let mut cloexec_removed: Vec<crate::process::FileDescriptor> = Vec::new();
+        if cloexec_removed.try_reserve(proc.cloexec_fds.len()).is_err() {
+            return Err(SyscallError::ENOMEM);
+        }
 
         let old_space = proc.memory_space;
         let old_user_space = proc.user_memory_space;
@@ -4532,12 +4577,35 @@ fn sys_exec(
         // 2. exec 不可信程序后，该程序意外获得块设备访问权限
         //
         // 注意：此操作必须在 commit 之前执行，确保 exec 回滚时 fd 不变
-        proc.apply_fd_cloexec();
+        //
+        // R169-4 FIX: Drain the removed CLOEXEC descriptors into the
+        // pre-reserved buffer (no inline drop) and capture the closed count +
+        // owning cgroup, but DEFER the actual FileDescriptor drops and the L5
+        // per-cgroup FD-budget uncharge to OUTSIDE this block (below the `};`).
+        let cloexec_cgroup_id = proc.cgroup_id;
+        let cloexec_closed = proc.take_cloexec_fds_into(&mut cloexec_removed);
 
         proc.state = ProcessState::Ready;
 
-        (old_space, old_user_space)
+        (
+            old_space,
+            old_user_space,
+            cloexec_removed,
+            cloexec_cgroup_id,
+            cloexec_closed,
+        )
     };
+
+    // R169-4 FIX (HIGH, lock inversion): Drop the closed CLOEXEC
+    // FileDescriptors and uncharge the per-cgroup FD budget OUTSIDE the Process
+    // lock. SocketFile::Drop → socket close → wake_all (re-locks PROCESS_TABLE +
+    // a foreign Process::inner) and uncharge_fds → CGROUP_REGISTRY (L5); running
+    // either under the Process lock is a lock inversion (R154-3/R155-3) and an
+    // L5-under-Process-lock acquire (D1-CGROUP-IRQ-L5).
+    if cloexec_closed > 0 {
+        crate::cgroup::uncharge_fds(cloexec_cgroup_id, cloexec_closed);
+    }
+    drop(cloexec_removed);
 
     // S-7 fix: Commit the exec - prevent guard from rolling back
     // This must be called after all error-prone operations are complete.
@@ -6499,9 +6567,20 @@ fn sys_brk(addr: usize) -> SyscallResult {
         }
 
         // F.2 Cgroup: Charge memory before heap expansion.
-        // R162-12 FIX: Re-read cgroup_id fresh — the cached value from line ~5993
-        // may be stale if cgroup migration occurred during mm lock drops.
-        let cgroup_id = process.lock().cgroup_id;
+        // R169-1 FIX (CRITICAL self-deadlock): Reuse the `cgroup_id` cached at
+        // the top of sys_brk instead of re-locking the Process mutex here. The
+        // `proc` guard acquired at function entry is held CONTINUOUSLY until
+        // `drop(proc)` below (only the separate `mm` lock is taken/released in
+        // between — never the Process lock), and every cgroup-migration path
+        // (sys_cgroup_attach and the cgroupfs task-move) takes that same Process
+        // lock before it writes `proc.cgroup_id`. No migration can therefore
+        // occur in this window, so the cached value is provably
+        // current. The prior R162-12 `process.lock()` re-acquired the
+        // already-held, non-reentrant `spin::Mutex` on the SAME CPU →
+        // deterministic self-deadlock on every paging brk() growth (the common
+        // glibc-malloc path). Any genuinely-fresh post-PT read must happen only
+        // AFTER `drop(proc)`, mirroring the shrink (6791) and rollback (6682)
+        // paths which re-read only once the guard is released.
         if cgroup::try_charge_memory(cgroup_id, grow_size as u64).is_err() {
             return Ok(old_brk); // Quota exceeded, return current brk
         }
@@ -11250,7 +11329,7 @@ pub struct CgroupStatsBuf {
     pub id: u64,
     /// Depth in hierarchy (root = 0)
     pub depth: u32,
-    /// Enabled controllers bitmap (CPU=1, MEMORY=2, PIDS=4, IO=8)
+    /// Enabled controllers bitmap (CPU=1, MEMORY=2, PIDS=4, IO=8, FILES=0x10, NET=0x20)
     pub controllers: u32,
     /// Current number of attached tasks
     pub nr_tasks: u64,
@@ -11277,18 +11356,57 @@ pub struct CgroupStatsBuf {
     pub io_write_ios: u64,
     /// Number of times I/O was throttled due to io.max limit
     pub io_throttle_events: u64,
+    // J.2 items 7/8/10: per-cgroup FD / ephemeral-port / VFS-dir accounting.
+    // APPENDED (offset-stable) so a caller declaring the old 104-byte length via
+    // `buf_len` still receives the exact v1 prefix (statx-style negotiation in
+    // sys_cgroup_get_stats). Order chosen for zero implicit padding: three u64
+    // (8-aligned) then two u32. kmem (item 9) is intentionally OMITTED — its
+    // counter is not yet wired (page-table frames charge `memory_current`, not
+    // `kmem_current`), so exposing it would publish a permanent zero.
+    /// J2-7: current open file-descriptor count (FILES controller)
+    pub fds_current: u64,
+    /// J2-8: current ephemeral-port count (NET controller)
+    pub ports_current: u64,
+    /// J2-10: current in-flight VFS dir-enumeration bytes (MEMORY controller)
+    pub vfs_dir_current: u64,
+    /// J2-7: number of files.max exceeded events
+    pub fds_events_max: u32,
+    /// J2-8: number of ports.max exceeded events
+    pub ports_events_max: u32,
 }
 
-// H.0.1-3: Compile-time ABI size assertion (104 bytes, no implicit padding).
-const _: [(); 104] = [(); core::mem::size_of::<CgroupStatsBuf>()];
+// H.0.1-3: Compile-time ABI size assertion (136 bytes, no implicit padding).
+// J.2: grown from 104 → 136 (3×u64 + 2×u32 appended). The v2 entry point
+// (sys_cgroup_get_stats2) negotiates the length via its `buf_len` argument; the
+// kernel never writes past the declared buffer.
+const _: [(); 136] = [(); core::mem::size_of::<CgroupStatsBuf>()];
+
+/// J.2: Frozen v1 ABI size for syscall 504. CgroupStatsBuf may grow over time
+/// (new fields are APPENDED), but syscall 504 ALWAYS writes exactly this many
+/// bytes — the offset-stable v1 prefix — so its ABI is permanently stable. New
+/// appended fields are read only via the negotiated v2 entry point (syscall 516).
+const CGROUP_STATS_V1_SIZE: usize = 104;
+
+// Pin the first appended field to the v1 boundary: this guarantees the bytes
+// syscall 504 writes (the [0, CGROUP_STATS_V1_SIZE) prefix) are EXACTLY the v1
+// fields (id … io_throttle_events). If a future edit inserts a field before
+// `fds_current`, this assertion fails — forcing a deliberate ABI decision.
+const _: [(); CGROUP_STATS_V1_SIZE] = [(); core::mem::offset_of!(CgroupStatsBuf, fds_current)];
 
 /// H.0.1-3: Copy CgroupStatsBuf to userspace via a zeroed byte buffer so that
 /// any padding bytes (explicit `_padding` field) are guaranteed zero, preventing
 /// kernel memory disclosure. Mirrors the VfsStat pattern (R113-1).
+///
+/// J.2: `copy_len` is the statx-style negotiated length (== min(caller buf_len,
+/// sizeof)). The full struct is serialized into the zeroed buffer, then ONLY the
+/// first `copy_len` bytes are written to userspace — the kernel never writes past
+/// the caller's declared buffer. Appended fields are offset-stable, so a caller
+/// declaring the old 104-byte length receives exactly the v1 prefix.
 #[inline]
 fn copy_cgroup_stats_to_user(
     user_dst: *mut CgroupStatsBuf,
     stats: &CgroupStatsBuf,
+    copy_len: usize,
 ) -> Result<(), SyscallError> {
     let mut buf = [0u8; mem::size_of::<CgroupStatsBuf>()];
 
@@ -11315,8 +11433,16 @@ fn copy_cgroup_stats_to_user(
     put!(io_read_ios);
     put!(io_write_ios);
     put!(io_throttle_events);
+    // J.2 appended fields.
+    put!(fds_current);
+    put!(ports_current);
+    put!(vfs_dir_current);
+    put!(fds_events_max);
+    put!(ports_events_max);
 
-    copy_to_user(user_dst as *mut u8, &buf)
+    // Negotiated length: never write past the caller's declared buffer.
+    let n = copy_len.min(buf.len());
+    copy_to_user(user_dst as *mut u8, &buf[..n])
 }
 
 /// P1-3: Returns `true` if the current process's host-mapped euid is a
@@ -11664,9 +11790,9 @@ const CGROUP_LIMIT_IO_MAX_BPS: u32 = 6;
 const CGROUP_LIMIT_IO_MAX_IOPS: u32 = 7;
 /// J2-7: per-cgroup open-FD count limit (`files.max`). value = max fds (u64::MAX = unlimited).
 const CGROUP_LIMIT_FILES_MAX: u32 = 8;
-/// J2-8 (reserved): per-cgroup ephemeral-port count limit (`net.ports.max`).
+/// J2-8: per-cgroup ephemeral-port count limit (`ports.max`). value = max ports (u64::MAX = unlimited).
 const CGROUP_LIMIT_PORTS_MAX: u32 = 9;
-/// J2-10 (reserved): per-cgroup VFS dir-enumeration byte limit (`vfs_dir.max`).
+/// J2-10: per-cgroup VFS dir-enumeration byte limit (`vfs_dir.max`). value = max bytes (u64::MAX = unlimited).
 const CGROUP_LIMIT_VFS_DIR_MAX: u32 = 10;
 
 /// sys_cgroup_set_limit - Set a resource limit on a cgroup
@@ -11782,18 +11908,64 @@ fn sys_cgroup_set_limit(cgroup_id: u64, limit_type: u32, value: u64) -> Result<u
 ///
 /// # Arguments
 /// * `cgroup_id` - ID of target cgroup
-/// * `buf` - Pointer to CgroupStatsBuf to fill
+/// * `buf` - Pointer to a userspace CgroupStatsBuf to fill
 ///
 /// # Returns
-/// * On success: 0
+/// * On success: 0 (writes exactly the frozen `CGROUP_STATS_V1_SIZE` v1 prefix)
 /// * On error: Negative errno
+///
+/// J.2 ABI NOTE: syscall 504 is FROZEN at the v1 layout. It always writes
+/// `CGROUP_STATS_V1_SIZE` bytes (the offset-stable v1 prefix) and returns 0,
+/// regardless of how CgroupStatsBuf grows. The appended fields (fds/ports/vfs_dir
+/// current + events) are read via the negotiated v2 entry point
+/// `sys_cgroup_get_stats2` (syscall 516) — 504's ABI never changes.
 fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usize, SyscallError> {
-    // R162-13 FIX: Use validate_user_ptr_mut for full range check (start + size).
-    // Previously only checked start address, not that the entire struct fits.
+    cgroup_stats_collect_and_copy(cgroup_id, buf, CGROUP_STATS_V1_SIZE)?;
+    Ok(0)
+}
+
+/// sys_cgroup_get_stats2 - Get cgroup statistics with statx-style size negotiation.
+///
+/// # Arguments
+/// * `cgroup_id` - ID of target cgroup
+/// * `buf` - Pointer to a userspace CgroupStatsBuf to fill
+/// * `buf_len` - Caller-declared size of `buf` in bytes. The kernel writes EXACTLY
+///   `min(buf_len, size_of::<CgroupStatsBuf>())` bytes and NEVER past the declared
+///   length. Appended fields are offset-stable, so a caller declaring a smaller
+///   buffer receives the matching prefix; a larger buffer is filled up to sizeof.
+///
+/// # Returns
+/// * On success: number of bytes written (== `min(buf_len, sizeof)`; 0 when buf_len==0)
+/// * On error: Negative errno
+fn sys_cgroup_get_stats2(
+    cgroup_id: u64,
+    buf: *mut CgroupStatsBuf,
+    buf_len: usize,
+) -> Result<usize, SyscallError> {
+    let copy_len = buf_len.min(core::mem::size_of::<CgroupStatsBuf>());
+    cgroup_stats_collect_and_copy(cgroup_id, buf, copy_len)?;
+    Ok(copy_len)
+}
+
+/// J.2: Shared collector for the cgroup-stats syscalls (v1 504 + v2 516).
+///
+/// Validates the caller, builds the full CgroupStatsBuf, and writes EXACTLY
+/// `copy_len` bytes — the offset-stable prefix — never more. `copy_len == 0` is a
+/// valid no-op (writes nothing): it must NOT call `validate_user_ptr_mut`, which
+/// rejects a zero-length range (defense against NULL/zero-size confusion).
+fn cgroup_stats_collect_and_copy(
+    cgroup_id: u64,
+    buf: *mut CgroupStatsBuf,
+    copy_len: usize,
+) -> Result<(), SyscallError> {
     if buf.is_null() {
         return Err(SyscallError::EFAULT);
     }
-    validate_user_ptr_mut(buf as *mut u8, core::mem::size_of::<CgroupStatsBuf>())?;
+    // R162-13 FIX: full range check (start + size) — but only over the bytes we
+    // will actually write. Skip for the zero-length no-op (validate rejects len 0).
+    if copy_len > 0 {
+        validate_user_ptr_mut(buf as *mut u8, copy_len)?;
+    }
 
     // P1-3: Stats access should respect delegation boundaries.
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
@@ -11824,12 +11996,19 @@ fn sys_cgroup_get_stats(cgroup_id: u64, buf: *mut CgroupStatsBuf) -> Result<usiz
         io_read_ios: stats.io_read_ios,
         io_write_ios: stats.io_write_ios,
         io_throttle_events: stats.io_throttle_events,
+        // J.2 items 7/8/10: FD / ephemeral-port / VFS-dir accounting.
+        fds_current: stats.fds_current,
+        ports_current: stats.ports_current,
+        vfs_dir_current: stats.vfs_dir_current,
+        fds_events_max: stats.fds_events_max,
+        ports_events_max: stats.ports_events_max,
     };
 
     // H.0.1-3: Copy via zeroed byte buffer so padding bytes are guaranteed zero.
-    copy_cgroup_stats_to_user(buf, &result)?;
-
-    Ok(0)
+    if copy_len > 0 {
+        copy_cgroup_stats_to_user(buf, &result, copy_len)?;
+    }
+    Ok(())
 }
 
 // ============================================================================

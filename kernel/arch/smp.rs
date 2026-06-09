@@ -1061,17 +1061,37 @@ pub extern "C" fn ap_rust_entry(
 /// user processes, not just the BSP.
 fn ap_idle_loop() -> ! {
     loop {
-        // R70-1 FIX: Disable interrupts during check to prevent race.
-        // This ensures no IPI can slip in between the check and HLT.
-        x86_64::instructions::interrupts::disable();
+        // R169-5 FIX (D1-CGROUP-IRQ-L5): Run the full deferred-work drain with
+        // interrupts ENABLED. reschedule_if_needed() is NOT a lightweight check
+        // — it is the system's process-context deferred-work flush: blocking
+        // Level-8 TCP-timer teardown (sockets/tcp_conns), the J2-8 Level-5
+        // CGROUP_REGISTRY port-uncharge (drain_deferred_port_uncharges ->
+        // uncharge_ports -> lookup_cgroup), stdin/irq-terminate drains,
+        // rcu::poll, and a context-switch callback. Running it with IRQs masked
+        // (the prior `disable()` then `reschedule_if_needed()`) could block on
+        // an L8/L5 lock held by another CPU with IRQs off, stalling timer /
+        // TLB-shootdown / reschedule / halt IPIs on this AP (unbounded IRQ
+        // latency / cross-CPU stall), and made the scheduler_hook L5
+        // "never IRQ-adjacent" contract false. The BSP idle loop (main.rs) has
+        // run this identical drain IRQs-ON since R98-3; this brings the AP to
+        // parity.
+        //
+        // R70-1 is preserved: that idle race only requires the need_resched
+        // CHECK + the sti;hlt arming to be atomic w.r.t. IPIs — NOT the drain —
+        // so we disable IRQs ONLY across that narrow window below. The leading
+        // enable() also covers the `continue` branch so the loop never re-enters
+        // with IRQs left disabled.
+        x86_64::instructions::interrupts::enable();
 
-        // Check if scheduler has work for us (set by timer tick or reschedule IPI)
+        // Drain deferred work + consume reschedule requests in true process
+        // context (IRQs on), exactly as the BSP idle loop and syscall return do.
         kernel_core::reschedule_if_needed();
 
-        // Check need_resched flag with interrupts disabled
+        // R70-1 FIX: narrow race-free window — disable IRQs only for the
+        // need_resched check + sti;hlt arming so no IPI can slip in between.
+        x86_64::instructions::interrupts::disable();
         if cpu_local::current_cpu().need_resched.load(Ordering::SeqCst) {
-            // Work is pending, enable interrupts and continue to next iteration
-            x86_64::instructions::interrupts::enable();
+            // Work is pending — loop; the top-of-loop enable() re-arms IRQs.
             continue;
         }
 

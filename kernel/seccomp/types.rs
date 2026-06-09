@@ -224,6 +224,21 @@ pub enum SeccompInsn {
 /// Maximum program length to prevent DoS.
 pub const MAX_INSNS: usize = 64;
 
+/// R169-12 FIX: Instruction bound for TRUSTED, kernel-generated filters
+/// (`pledge_to_filter` / `strict_filter`).
+///
+/// `MAX_INSNS` (64) is a DoS guard for UNTRUSTED, user-supplied programs copied
+/// in via `sys_seccomp` (arbitrary attacker-controlled length). It was wrongly
+/// applied to in-kernel generators, whose length is a FIXED compile-time
+/// function of the promise vocabulary (worst case `1 + 2*N + 1` with the full
+/// deduped pledge union `N <= 48` → 98 insns), so a broad-but-legitimate pledge
+/// set hit the 64 bound and the generator `.expect()`ed → kernel panic on valid
+/// input. Decoupling the trusted bound keeps the untrusted DoS guard at 64 while
+/// letting generators emit their (bounded) worst case. 256 leaves comfortable
+/// headroom above 98 for future promise growth (enforced by the const-assert in
+/// the seccomp crate's lib.rs).
+pub const MAX_TRUSTED_INSNS: usize = 256;
+
 // ============================================================================
 // Seccomp Filter
 // ============================================================================
@@ -273,6 +288,29 @@ impl SeccompFilter {
         // Compute filter ID (simple hash of program)
         let id = compute_filter_id(&prog);
 
+        Ok(Self {
+            default_action,
+            prog: prog.into(),
+            fast_allow,
+            id,
+            flags,
+        })
+    }
+
+    /// R169-12 FIX: Create a filter from a TRUSTED, kernel-generated program,
+    /// validating its length against `MAX_TRUSTED_INSNS` instead of the
+    /// untrusted `MAX_INSNS`. Use ONLY for in-kernel generators
+    /// (`pledge_to_filter`, `strict_filter`) whose length is bounded by the
+    /// fixed promise vocabulary; NEVER for user-supplied programs — those must
+    /// use [`SeccompFilter::new`], which keeps the `MAX_INSNS` DoS guard.
+    pub fn new_trusted(
+        prog: Vec<SeccompInsn>,
+        default_action: SeccompAction,
+        flags: SeccompFlags,
+    ) -> Result<Self, SeccompError> {
+        validate_program_with_limit(&prog, MAX_TRUSTED_INSNS)?;
+        let fast_allow = compute_fast_allow(&prog);
+        let id = compute_filter_id(&prog);
         Ok(Self {
             default_action,
             prog: prog.into(),
@@ -659,10 +697,21 @@ impl fmt::Display for SeccompError {
 /// land on a valid instruction. Allowing target == prog.len() enables
 /// policy bypass by falling through to the default action.
 fn validate_program(prog: &[SeccompInsn]) -> Result<(), SeccompError> {
+    validate_program_with_limit(prog, MAX_INSNS)
+}
+
+/// R169-12 FIX: Validate a program against a caller-chosen instruction limit so
+/// trusted kernel generators can validate against `MAX_TRUSTED_INSNS` while the
+/// untrusted `sys_seccomp` path keeps the `MAX_INSNS` DoS guard. All other
+/// checks (terminator, jump-target bounds, argument indices) are identical.
+fn validate_program_with_limit(
+    prog: &[SeccompInsn],
+    max_insns: usize,
+) -> Result<(), SeccompError> {
     if prog.is_empty() {
         return Err(SeccompError::NoTerminator);
     }
-    if prog.len() > MAX_INSNS {
+    if prog.len() > max_insns {
         return Err(SeccompError::ProgramTooLong);
     }
 

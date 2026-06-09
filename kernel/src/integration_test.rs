@@ -175,6 +175,21 @@ pub fn test_cgroup_port_budget() {
     klog_always!("    ✓ dead-Weak reaper (+ port-availability prune) + netns backstop + deferred-drain idempotency");
 }
 
+/// Test the Phase J.2 cgroupfs ABI surface (files/ports/vfs_dir control files).
+///
+/// Covers the user-facing cgroupfs files that expose the FILES / NET / MEMORY-
+/// vfs_dir enforcement landed by J.2 items 7/8/10: filename round-trip, read-only
+/// classification, controller-gated visibility, append-only inode safety, and the
+/// read/format path (numeric, unlimited="max", *.current gauges). The write path
+/// is credential-gated (covered via set_limit + read-back, not write_content).
+/// Any failure panics, detected by `make test` / `make boot-check`.
+pub fn test_cgroupfs_abi() {
+    klog_always!("  [TEST] Cgroupfs ABI surface (J.2 files/ports/vfs_dir)...");
+    vfs::cgroupfs::run_cgroupfs_j2_abi_self_test();
+    klog_always!("    ✓ filename round-trip + *.max writable / *.current read-only + inode non-aliasing");
+    klog_always!("    ✓ read/format path (numeric + unlimited=\"max\" + current) + controller-gated visibility");
+}
+
 /// 运行所有集成测试
 pub fn run_all_tests() {
     klog_always!();
@@ -194,6 +209,7 @@ pub fn run_all_tests() {
     test_cgroup_vfs_dir_budget();
     test_cgroup_pt_kmem();
     test_cgroup_port_budget();
+    test_cgroupfs_abi();
     test_ext2_write();
 
     klog_always!();

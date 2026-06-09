@@ -794,7 +794,7 @@ impl fmt::Display for CgroupError {
             CgroupError::PermissionDenied => write!(f, "permission denied"),
             CgroupError::NotEmpty => write!(f, "cgroup has children or attached tasks"),
             CgroupError::FdsLimitExceeded => write!(f, "files.max limit exceeded"),
-            CgroupError::PortsLimitExceeded => write!(f, "net.ports.max limit exceeded"),
+            CgroupError::PortsLimitExceeded => write!(f, "ports.max limit exceeded"),
         }
     }
 }
@@ -937,11 +937,20 @@ impl CgroupNode {
         if self.delegate_uid() == Some(uid) {
             return true;
         }
+        // R169-L4 FIX: Bound the ancestor walk by MAX_CGROUP_DEPTH — the backstop
+        // every other cgroup ancestor walk uses — so a corrupted/cyclic parent
+        // chain cannot spin forever. The hierarchy is depth-capped at create time
+        // (MAX_CGROUP_DEPTH), so this never truncates a legitimate chain.
+        let mut depth: u32 = 0;
         let mut cursor = self.parent();
         while let Some(node) = cursor {
             if node.delegate_uid() == Some(uid) {
                 return true;
             }
+            if depth >= MAX_CGROUP_DEPTH {
+                break;
+            }
+            depth = depth.saturating_add(1);
             cursor = node.parent();
         }
         false
@@ -969,6 +978,10 @@ impl CgroupNode {
         let mut eff_ports_max: Option<u64> = None;
         let mut eff_vfs_dir_max: Option<u64> = None;
 
+        // R169-L4 FIX: bound the ancestor walk by MAX_CGROUP_DEPTH (mirrors the
+        // other cgroup ancestor walks) so a corrupted/cyclic parent chain cannot
+        // spin forever. Depth-capped at create time, so legitimate chains fit.
+        let mut depth: u32 = 0;
         let mut cursor = self.parent();
         while let Some(ancestor) = cursor {
             let al = ancestor.limits();
@@ -1031,6 +1044,10 @@ impl CgroupNode {
                 }
             }
 
+            if depth >= MAX_CGROUP_DEPTH {
+                break;
+            }
+            depth = depth.saturating_add(1);
             cursor = ancestor.parent();
         }
 
@@ -1266,9 +1283,17 @@ impl CgroupNode {
         // Solution: Use fetch_update CAS to atomically check-and-increment.
         // On any failure, rollback previously charged ancestors.
         let mut ancestors: alloc::vec::Vec<Arc<CgroupNode>> = alloc::vec::Vec::new();
+        // R169-L4 FIX: bound the ancestor collection by MAX_CGROUP_DEPTH (mirrors
+        // the other cgroup ancestor walks) so a corrupted/cyclic parent chain
+        // cannot spin forever. Depth-capped at create time, so legitimate chains fit.
+        let mut depth: u32 = 0;
         let mut cursor = self.parent();
         while let Some(p) = cursor {
             ancestors.push(p.clone());
+            if depth >= MAX_CGROUP_DEPTH {
+                break;
+            }
+            depth = depth.saturating_add(1);
             cursor = p.parent();
         }
 
@@ -1354,9 +1379,17 @@ impl CgroupNode {
     pub fn detach_task(&self, task: TaskId) -> Result<(), CgroupError> {
         // R83-3 FIX: Collect ancestors before detaching for hierarchical count update
         let mut ancestors: alloc::vec::Vec<Arc<CgroupNode>> = alloc::vec::Vec::new();
+        // R169-L4 FIX: bound the ancestor collection by MAX_CGROUP_DEPTH (mirrors
+        // the other cgroup ancestor walks) so a corrupted/cyclic parent chain
+        // cannot spin forever. Depth-capped at create time, so legitimate chains fit.
+        let mut depth: u32 = 0;
         let mut cursor = self.parent();
         while let Some(p) = cursor {
             ancestors.push(p.clone());
+            if depth >= MAX_CGROUP_DEPTH {
+                break;
+            }
+            depth = depth.saturating_add(1);
             cursor = p.parent();
         }
 
@@ -1563,6 +1596,29 @@ pub fn lookup_cgroup(id: CgroupId) -> Option<Arc<CgroupNode>> {
     CGROUP_REGISTRY.read().get(&id).cloned()
 }
 
+/// R169-2 FIX (D1-CGROUP-IRQ-L5): Non-blocking sibling of `lookup_cgroup` for
+/// IRQ / IRQ-disabled contexts (the timer-tick CPU accounting at
+/// `on_clock_tick`, and the scheduler pick path via `cpu_quota_is_throttled`).
+///
+/// `lookup_cgroup` takes a BLOCKING `CGROUP_REGISTRY.read()` on a non-reentrant
+/// `spin::RwLock`. If a same-CPU process-context writer (`create_cgroup` 1202 /
+/// `delete_cgroup` 1639 / `migrate_task` 1708, all IRQs-enabled) is interrupted
+/// mid-hold by the timer, the IRQ's blocking read spins forever on the lock the
+/// suspended writer can never release → deterministic self-deadlock.
+///
+/// `try_read()` returns `None` immediately (never spins) on writer contention,
+/// so this CANNOT block in an IRQ-off context regardless of writer discipline —
+/// eliminating the deadlock class at the single chokepoint every IRQ-unsafe
+/// registry read flows through. Mirrors the existing `cgroup.limits.try_lock()`
+/// IRQ-safety pattern (2589). Root (id 0) short-circuits to `ROOT_CGROUP` and
+/// never touches the registry, so it always resolves even in IRQ context.
+pub fn try_lookup_cgroup(id: CgroupId) -> Option<Arc<CgroupNode>> {
+    if id == 0 {
+        return Some(ROOT_CGROUP.clone());
+    }
+    CGROUP_REGISTRY.try_read().and_then(|g| g.get(&id).cloned())
+}
+
 /// Creates a new child cgroup under the specified parent.
 ///
 /// This is a convenience wrapper around `CgroupNode::new_child()`.
@@ -1633,6 +1689,19 @@ pub fn delete_cgroup(id: CgroupId) -> Result<(), CgroupError> {
         return Err(CgroupError::PermissionDenied);
     }
 
+    // R169-3 FIX (D2-J2-CHARGE-LIFETIME): Flush the deferred per-cgroup
+    // port-uncharge queue in process context BEFORE taking the registry write
+    // lock, so a just-exited process's queued-but-not-yet-applied port uncharge
+    // is reflected in `ports_current` at the gate below (otherwise a
+    // legitimately idle cgroup would be spuriously rejected until the next
+    // syscall-return/idle drain). This MUST run before `CGROUP_REGISTRY.write()`
+    // is held: the drain acquires the L5 read lock (uncharge_ports ->
+    // lookup_cgroup) and the non-reentrant spin::RwLock would self-deadlock if a
+    // write guard were already held. `delete_cgroup` runs in process context
+    // (cgroupfs rmdir / sys path) with IRQs enabled, so the blocking drain is
+    // safe here.
+    net::socket_table().drain_deferred_port_uncharges();
+
     // CODEX FIX: Hold registry write lock throughout to prevent TOCTOU race
     // This blocks lookup_cgroup() used by attach_task(), ensuring no new
     // tasks can be attached between the emptiness check and removal.
@@ -1656,6 +1725,46 @@ pub fn delete_cgroup(id: CgroupId) -> Result<(), CgroupError> {
     }
     if !node.processes.lock().is_empty() {
         // Rollback deleted flag since deletion failed
+        node.deleted.store(false, Ordering::Release);
+        return Err(CgroupError::NotEmpty);
+    }
+
+    // R169-3 FIX (D2-J2-CHARGE-LIFETIME): Reject deletion while the cgroup still
+    // carries LIVE per-cgroup resource charges. These charges are keyed by a
+    // bare `cgid` (e.g. `PortBinding.charged_cgroup`, and the memory/fd ancestor
+    // walks); if the node leaves the registry while a charge still references
+    // its id, the later `uncharge_*()` -> `lookup_cgroup(id) == None` becomes a
+    // SILENT no-op and the `+N` applied to every ancestor at charge time is
+    // NEVER reversed → permanent ancestor over-count → eventual
+    // ports.max / files.max / memory.max self-DoS of the surviving subtree (the
+    // R169-3 leak; ids are monotonic and never recycled, 1537, so there is no
+    // misapply — only the leak). Gating the delete on the live counters (read
+    // under the held write lock, `Acquire` to pair with the `SeqCst` charge
+    // stores) keeps the id registry-resident until every charge is reconciled,
+    // so each uncharge is guaranteed to find the node and actually decrement.
+    // The `deleted` flag is already set (blocking new attach_task), and the
+    // lifecycle guarantees no NEW charge lands after this gate samples zero:
+    // migration is serialized under the Process lock and exit detaches the task
+    // before its deferred uncharges, so the only post-gate counter motion is
+    // DECREMENTS (the charge helpers themselves do not consult `deleted` — the
+    // safety here is lifecycle-based, not flag-enforced).
+    //
+    // EXCLUDED from the gate: `kmem_current` (a currently-unwired/dead stat
+    // field, always 0; J2-9 page-table kmem rides `memory_current`) and
+    // `vfs_dir_current` (RAII `VfsDirBudgetGuard` Arc-pins the node, so its
+    // uncharge always reaches the same node it charged and self-reconciles).
+    // Only the bare-cgid PORT / FD / MEMORY charges can outlive the id.
+    //
+    // Fail-CLOSED: a transient `NotEmpty`/EBUSY (the CAP_SYS_ADMIN / delegated
+    // owner retries once in-flight teardown + uncharge settles — promptly,
+    // because the deferred port queue was force-drained above and exit-path
+    // uncharges run on every syscall-return/idle drain) is strictly safer than
+    // a silent, unrecoverable over-count. ids are never recycled, so a deferred
+    // delete can never misapply to a different cgroup.
+    let live_ports = node.stats.ports_current.load(Ordering::Acquire);
+    let live_fds = node.stats.fds_current.load(Ordering::Acquire);
+    let live_mem = node.stats.memory_current.load(Ordering::Acquire);
+    if live_ports != 0 || live_fds != 0 || live_mem != 0 {
         node.deleted.store(false, Ordering::Release);
         return Err(CgroupError::NotEmpty);
     }
@@ -1697,6 +1806,29 @@ pub fn cgroup_count() -> usize {
 /// * `NotFound` - Source or target cgroup doesn't exist
 /// * `TaskNotAttached` - Task is not in source cgroup
 /// * `PidsLimitExceeded` - Target cgroup's pids.max exceeded
+///
+/// # Caller obligations (R169-L12)
+///
+/// This migrates ONLY the task's cgroup MEMBERSHIP and the hierarchical **pids**
+/// accounting (`detach_task`/`attach_task`). It does NOT transfer the per-cgroup
+/// **FD** or **memory** charges — a caller that re-homes a task between cgroups
+/// MUST migrate those separately (see `sys_cgroup_attach`, which moves fd +
+/// memory charges under the Process lock); omitting that strands them on the
+/// source ancestor chain. Ephemeral-**port** charges are NOT task-migratable by
+/// design: each is bound at allocation to the socket's owning cgroup via
+/// `PortBinding.charged_cgroup` (and uncharged against that stored id), and
+/// deliberately does NOT move on cgroup attach (the J2-8 self-test asserts this).
+/// Re-homing the task therefore leaves the port charge with the original cgroup —
+/// whether that SHOULD change is the open D2-J2-CHARGE-LIFETIME / R169-7 question,
+/// not a caller obligation of this function.
+///
+/// Lock discipline: `migrate_task` holds the **non-reentrant** `CGROUP_REGISTRY`
+/// read lock for the whole window (R90-4). Callers MUST therefore run any
+/// charge/uncharge primitive (each does `lookup_cgroup` → a registry read) AFTER
+/// `migrate_task` returns, never inside a callback under this guard. Callers MUST
+/// NOT fold `address_space_share_count()` (which takes PROCESS_TABLE then foreign
+/// Process locks) into a "hold the target Process lock across `migrate_task`"
+/// obligation — that is the R156-1 child→parent ABBA / self-deadlock footgun.
 pub fn migrate_task(
     task: TaskId,
     from_id: CgroupId,
@@ -1781,8 +1913,15 @@ pub fn check_fork_allowed(cgroup_id: CgroupId) -> bool {
 }
 
 /// Records CPU time for a cgroup (called from scheduler).
+///
+/// R169-2 FIX (D1-CGROUP-IRQ-L5): Invoked from `on_clock_tick` in true timer-IRQ
+/// context (IRQs disabled), so it MUST NOT take the blocking registry lock. Uses
+/// `try_lookup_cgroup` and FAILS OPEN on registry contention: a dropped tick is
+/// harmless because CPU-time accounting is monotonic-add-only (no paired
+/// uncharge), so it can never underflow, orphan a charge, or breach a limit —
+/// the missing tick self-corrects on the next one.
 pub fn account_cpu_time(cgroup_id: CgroupId, delta_ns: u64) {
-    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
+    if let Some(cgroup) = try_lookup_cgroup(cgroup_id) {
         cgroup.stats.add_cpu_time(delta_ns);
     }
 }
@@ -2579,7 +2718,22 @@ pub fn charge_cpu_quota(
     let mut overall_throttle_until: u64 = 0;
 
     let mut depth: u32 = 0;
-    let mut cursor = lookup_cgroup(cgroup_id);
+    // R169-2 FIX (D1-CGROUP-IRQ-L5): on_clock_tick calls this in timer-IRQ
+    // context (IRQs disabled), so the leaf lookup must be NON-blocking. Fail
+    // CLOSED on registry contention — return a bounded throttle, identical to
+    // the existing limits.try_lock() contention branch below (2589). This
+    // preserves isolation (cpu.max can never be bypassed by inducing registry
+    // contention) and self-corrects on the next tick. The ancestor walk uses
+    // cgroup.parent() (Weak::upgrade, no registry), so only the entry lookup
+    // changes.
+    let mut cursor = match try_lookup_cgroup(cgroup_id) {
+        Some(c) => Some(c),
+        None => {
+            return CpuQuotaStatus::Throttled(
+                now_ns.saturating_add(LOCK_CONTENTION_THROTTLE_NS),
+            );
+        }
+    };
     while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::CPU) {
             // IRQ-safe: Use try_lock() to avoid deadlock when process-context
@@ -2686,7 +2840,15 @@ pub fn charge_cpu_quota(
 pub fn cpu_quota_is_throttled(cgroup_id: CgroupId, now_ns: u64) -> Option<u64> {
     // P2-9 FIX: Walk ancestors so parent throttling also blocks descendants.
     let mut depth: u32 = 0;
-    let mut cursor = lookup_cgroup(cgroup_id);
+    // R169-2 FIX (D1-CGROUP-IRQ-L5): This is reached from select_next_locked
+    // (the scheduler pick path) inside without_interrupts — a THIRD IRQ-off
+    // registry reader the original finding missed. Use the non-blocking
+    // try_lookup_cgroup; on registry contention it yields None, the walk is
+    // skipped, and we return None (not throttled) — exactly this function's
+    // already-documented conservative contended-limits behavior (the throttle
+    // is detected on the next check). The ancestor walk uses parent()
+    // (Weak::upgrade, no registry), so only the entry lookup changes.
+    let mut cursor = try_lookup_cgroup(cgroup_id);
     let mut overall_until: u64 = 0;
 
     while let Some(cgroup) = cursor {

@@ -42,7 +42,7 @@ static NEXT_FS_ID: AtomicU64 = AtomicU64::new(300);
 /// Inode = (cgroup_id + 1) * STRIDE + file_offset.
 /// J2-SHARED-CORE: STRIDE widened 16 → 64 (1 dir + up to 63 control files). The
 /// previous 16 left only 3 spare slots; the J.2 items 7-10 add per-cgroup control
-/// files (files.max/current, net.ports.max/current, vfs_dir.max/current, …) which
+/// files (files.max/current, ports.max/current, vfs_dir.max/current, …) which
 /// would push ctrl_index+1 ≥ 16 and ALIAS (cgroup_id+2)*16 = the next cgroup's dir
 /// inode. The arithmetic below is stride-parametric, so widening before any file is
 /// appended preserves R154-2 determinism and keeps inodes for files at the same
@@ -92,6 +92,23 @@ enum CtrlKind {
     IoMax,
     /// io.stat - I/O statistics (read-only)
     IoStat,
+    // J.2 items 7/8/10: per-cgroup FD / ephemeral-port / VFS-dir control files.
+    // APPENDED here AND in all() — the order is load-bearing: index() drives the
+    // R154-2 deterministic inode, so a control file's inode stays stable only if
+    // new kinds are added at the END. (kmem — item 9 — is intentionally NOT
+    // exposed: its counter is not yet wired, see the StatsBuf note in syscall.rs.)
+    /// J2-7: files.max - Maximum open file descriptors (FILES controller)
+    FilesMax,
+    /// J2-7: files.current - Current open FD count (read-only)
+    FilesCurrent,
+    /// J2-8: ports.max - Maximum ephemeral ports (NET controller)
+    PortsMax,
+    /// J2-8: ports.current - Current ephemeral-port count (read-only)
+    PortsCurrent,
+    /// J2-10: vfs_dir.max - Maximum per-tenant VFS dir-enumeration bytes (MEMORY controller)
+    VfsDirMax,
+    /// J2-10: vfs_dir.current - Current in-flight dir-enumeration bytes (read-only)
+    VfsDirCurrent,
 }
 
 impl CtrlKind {
@@ -110,6 +127,12 @@ impl CtrlKind {
             CtrlKind::PidsCurrent => "pids.current",
             CtrlKind::IoMax => "io.max",
             CtrlKind::IoStat => "io.stat",
+            CtrlKind::FilesMax => "files.max",
+            CtrlKind::FilesCurrent => "files.current",
+            CtrlKind::PortsMax => "ports.max",
+            CtrlKind::PortsCurrent => "ports.current",
+            CtrlKind::VfsDirMax => "vfs_dir.max",
+            CtrlKind::VfsDirCurrent => "vfs_dir.current",
         }
     }
 
@@ -117,7 +140,13 @@ impl CtrlKind {
     fn is_readonly(&self) -> bool {
         matches!(
             self,
-            CtrlKind::Controllers | CtrlKind::MemoryCurrent | CtrlKind::PidsCurrent | CtrlKind::IoStat
+            CtrlKind::Controllers
+                | CtrlKind::MemoryCurrent
+                | CtrlKind::PidsCurrent
+                | CtrlKind::IoStat
+                | CtrlKind::FilesCurrent
+                | CtrlKind::PortsCurrent
+                | CtrlKind::VfsDirCurrent
         )
     }
 
@@ -130,6 +159,9 @@ impl CtrlKind {
             }
             CtrlKind::PidsMax | CtrlKind::PidsCurrent => Some(CgroupControllers::PIDS),
             CtrlKind::IoMax | CtrlKind::IoStat => Some(CgroupControllers::IO),
+            CtrlKind::FilesMax | CtrlKind::FilesCurrent => Some(CgroupControllers::FILES),
+            CtrlKind::PortsMax | CtrlKind::PortsCurrent => Some(CgroupControllers::NET),
+            CtrlKind::VfsDirMax | CtrlKind::VfsDirCurrent => Some(CgroupControllers::MEMORY),
             _ => None,
         }
     }
@@ -149,6 +181,13 @@ impl CtrlKind {
             CtrlKind::PidsCurrent,
             CtrlKind::IoMax,
             CtrlKind::IoStat,
+            // J.2 — appended last (inode stability, see CtrlKind doc).
+            CtrlKind::FilesMax,
+            CtrlKind::FilesCurrent,
+            CtrlKind::PortsMax,
+            CtrlKind::PortsCurrent,
+            CtrlKind::VfsDirMax,
+            CtrlKind::VfsDirCurrent,
         ]
     }
 
@@ -172,6 +211,12 @@ impl CtrlKind {
             "pids.current" => Some(CtrlKind::PidsCurrent),
             "io.max" => Some(CtrlKind::IoMax),
             "io.stat" => Some(CtrlKind::IoStat),
+            "files.max" => Some(CtrlKind::FilesMax),
+            "files.current" => Some(CtrlKind::FilesCurrent),
+            "ports.max" => Some(CtrlKind::PortsMax),
+            "ports.current" => Some(CtrlKind::PortsCurrent),
+            "vfs_dir.max" => Some(CtrlKind::VfsDirMax),
+            "vfs_dir.current" => Some(CtrlKind::VfsDirCurrent),
             _ => None,
         }
     }
@@ -508,42 +553,9 @@ impl CgroupCtrlInode {
                 // For now, return empty or stats.pids_current as placeholder
                 format!("# {} tasks attached\n", stats.pids_current)
             }
-            CtrlKind::Controllers => {
-                // List available controllers
-                let controllers = cgroup.controllers();
-                let mut parts = Vec::new();
-                if controllers.contains(CgroupControllers::CPU) {
-                    parts.push("cpu");
-                }
-                if controllers.contains(CgroupControllers::MEMORY) {
-                    parts.push("memory");
-                }
-                if controllers.contains(CgroupControllers::PIDS) {
-                    parts.push("pids");
-                }
-                if controllers.contains(CgroupControllers::IO) {
-                    parts.push("io");
-                }
-                parts.join(" ") + "\n"
-            }
-            CtrlKind::SubtreeControl => {
-                // Same as controllers for now (no separate subtree_control field)
-                let controllers = cgroup.controllers();
-                let mut parts = Vec::new();
-                if controllers.contains(CgroupControllers::CPU) {
-                    parts.push("cpu");
-                }
-                if controllers.contains(CgroupControllers::MEMORY) {
-                    parts.push("memory");
-                }
-                if controllers.contains(CgroupControllers::PIDS) {
-                    parts.push("pids");
-                }
-                if controllers.contains(CgroupControllers::IO) {
-                    parts.push("io");
-                }
-                parts.join(" ") + "\n"
-            }
+            CtrlKind::Controllers => controllers_string(cgroup.controllers()),
+            // Same as controllers for now (no separate subtree_control field).
+            CtrlKind::SubtreeControl => controllers_string(cgroup.controllers()),
             CtrlKind::CpuWeight => {
                 let weight = limits.cpu_weight.unwrap_or(100);
                 format!("{}\n", weight)
@@ -616,6 +628,27 @@ impl CgroupCtrlInode {
                     stats.io_throttle_events
                 )
             }
+            // J2-7: files.max — unlimited (None or u64::MAX) prints "max".
+            CtrlKind::FilesMax => match limits.fds_max {
+                Some(max) if max == u64::MAX => String::from("max\n"),
+                Some(max) => format!("{}\n", max),
+                None => String::from("max\n"),
+            },
+            CtrlKind::FilesCurrent => format!("{}\n", stats.fds_current),
+            // J2-8: ports.max — unlimited (None or u64::MAX) prints "max".
+            CtrlKind::PortsMax => match limits.ports_max {
+                Some(max) if max == u64::MAX => String::from("max\n"),
+                Some(max) => format!("{}\n", max),
+                None => String::from("max\n"),
+            },
+            CtrlKind::PortsCurrent => format!("{}\n", stats.ports_current),
+            // J2-10: vfs_dir.max — unlimited (None or u64::MAX) prints "max".
+            CtrlKind::VfsDirMax => match limits.vfs_dir_max {
+                Some(max) if max == u64::MAX => String::from("max\n"),
+                Some(max) => format!("{}\n", max),
+                None => String::from("max\n"),
+            },
+            CtrlKind::VfsDirCurrent => format!("{}\n", stats.vfs_dir_current),
         })
     }
 
@@ -846,6 +879,51 @@ impl CgroupCtrlInode {
                 apply_limit(&cgroup, &limits, is_delegate)?;
                 Ok(())
             }
+            // J2-7: files.max — "max" clears the limit (u64::MAX). apply_limit
+            // enforces the FILES controller + delegation boundary.
+            CtrlKind::FilesMax => {
+                let max = if data == "max" {
+                    u64::MAX
+                } else {
+                    data.parse().map_err(|_| FsError::Invalid)?
+                };
+                let limits = CgroupLimits {
+                    fds_max: Some(max),
+                    ..Default::default()
+                };
+                apply_limit(&cgroup, &limits, is_delegate)?;
+                Ok(())
+            }
+            // J2-8: ports.max — "max" clears the limit (u64::MAX). apply_limit
+            // enforces the NET controller + delegation boundary.
+            CtrlKind::PortsMax => {
+                let max = if data == "max" {
+                    u64::MAX
+                } else {
+                    data.parse().map_err(|_| FsError::Invalid)?
+                };
+                let limits = CgroupLimits {
+                    ports_max: Some(max),
+                    ..Default::default()
+                };
+                apply_limit(&cgroup, &limits, is_delegate)?;
+                Ok(())
+            }
+            // J2-10: vfs_dir.max — "max" clears the limit (u64::MAX). apply_limit
+            // enforces the MEMORY controller + delegation boundary.
+            CtrlKind::VfsDirMax => {
+                let max = if data == "max" {
+                    u64::MAX
+                } else {
+                    data.parse().map_err(|_| FsError::Invalid)?
+                };
+                let limits = CgroupLimits {
+                    vfs_dir_max: Some(max),
+                    ..Default::default()
+                };
+                apply_limit(&cgroup, &limits, is_delegate)?;
+                Ok(())
+            }
             _ => Err(FsError::NotSupported),
         }
     }
@@ -969,11 +1047,19 @@ fn effective_owner(cgroup_id: CgroupId) -> u32 {
         if let Some(uid) = cg.delegate_uid() {
             return uid;
         }
+        // R169-L4 FIX: Bound the ancestor walk by MAX_CGROUP_DEPTH (mirrors the
+        // other cgroup ancestor walks) so a corrupted/cyclic parent chain cannot
+        // spin forever. Depth-capped at create time, so legitimate chains fit.
+        let mut depth: u32 = 0;
         let mut cursor = cg.parent();
         while let Some(node) = cursor {
             if let Some(uid) = node.delegate_uid() {
                 return uid;
             }
+            if depth >= cgroup::MAX_CGROUP_DEPTH {
+                break;
+            }
+            depth = depth.saturating_add(1);
             cursor = node.parent();
         }
     }
@@ -1025,6 +1111,152 @@ fn apply_limit(
     })
 }
 
+/// Render the cgroup-v2 controller-name list shared by `cgroup.controllers` and
+/// `cgroup.subtree_control`.
+///
+/// J.2 NOTE: the advertised set MUST stay in lockstep with
+/// `CtrlKind::required_controller()` — every controller that gates a control
+/// file's visibility is advertised here, otherwise `files.max`/`ports.max`/
+/// `vfs_dir.max` would appear in a directory whose controller is unlisted.
+fn controllers_string(controllers: CgroupControllers) -> String {
+    let mut parts = Vec::new();
+    if controllers.contains(CgroupControllers::CPU) {
+        parts.push("cpu");
+    }
+    if controllers.contains(CgroupControllers::MEMORY) {
+        parts.push("memory");
+    }
+    if controllers.contains(CgroupControllers::PIDS) {
+        parts.push("pids");
+    }
+    if controllers.contains(CgroupControllers::IO) {
+        parts.push("io");
+    }
+    if controllers.contains(CgroupControllers::FILES) {
+        parts.push("files");
+    }
+    if controllers.contains(CgroupControllers::NET) {
+        parts.push("net");
+    }
+    parts.join(" ") + "\n"
+}
+
+/// J.2 cgroupfs ABI self-test (wired into the kernel boot integration suite).
+///
+/// Verifies the control-file surface exposing the FILES / NET / MEMORY-vfs_dir
+/// enforcement that J.2 items 7/8/10 landed: filename round-trip, read-only
+/// classification, controller-gated visibility, append-only inode safety, and
+/// the read/format path (numeric, unlimited="max", and *.current gauges).
+///
+/// The WRITE path (`write_content`) is intentionally NOT driven here: it is
+/// process-credential-gated (`current_host_euid` / host-root) and would be
+/// environment-dependent in boot context. Its RW arms are structural twins of
+/// the proven `memory.max`/`pids.max` arms (parse → `CgroupLimits` → `apply_limit`)
+/// and are covered by the Codex convergence review. Limits are instead set via
+/// the `set_limit` primitive and read back through `read_content`.
+///
+/// Any failure panics — detected by `make test` / `make boot-check`.
+pub fn run_cgroupfs_j2_abi_self_test() {
+    // 1. Pure-function invariants over EVERY kind (catches an append-only slip).
+    for kind in CtrlKind::all() {
+        assert_eq!(
+            CtrlKind::from_filename(kind.filename()),
+            Some(*kind),
+            "cgroupfs: filename<->from_filename round-trip broken"
+        );
+    }
+    // Append-only inode safety: ctrl_index + 1 must stay within the stride or a
+    // file's inode would alias the next cgroup's directory (R154-2).
+    assert!(
+        (CtrlKind::all().len() as u64) < CGROUPFS_INO_STRIDE,
+        "cgroupfs: control-file count exceeds inode stride (aliasing risk)"
+    );
+    assert!(
+        CtrlKind::FilesCurrent.is_readonly()
+            && CtrlKind::PortsCurrent.is_readonly()
+            && CtrlKind::VfsDirCurrent.is_readonly(),
+        "cgroupfs: *.current must be read-only"
+    );
+    assert!(
+        !CtrlKind::FilesMax.is_readonly()
+            && !CtrlKind::PortsMax.is_readonly()
+            && !CtrlKind::VfsDirMax.is_readonly(),
+        "cgroupfs: *.max must be writable"
+    );
+
+    // 2. Read/format path on a real cgroup carrying FILES | NET | MEMORY.
+    let cg = cgroup::create_cgroup(
+        0,
+        CgroupControllers::FILES | CgroupControllers::NET | CgroupControllers::MEMORY,
+    )
+    .expect("cgroupfs self-test: create cgroup");
+    let cg_id = cg.id();
+    cg.set_limit(CgroupLimits {
+        fds_max: Some(7),
+        ports_max: Some(11),
+        vfs_dir_max: Some(4096),
+        ..Default::default()
+    })
+    .expect("cgroupfs self-test: set limits");
+
+    let read = |kind: CtrlKind| {
+        CgroupCtrlInode {
+            fs_id: 0,
+            ino: cgroup_ctrl_ino(cg_id, kind.index()),
+            cgroup_id: cg_id,
+            kind,
+        }
+        .read_content()
+        .expect("cgroupfs self-test: read_content")
+    };
+    assert_eq!(read(CtrlKind::FilesMax), "7\n");
+    assert_eq!(read(CtrlKind::PortsMax), "11\n");
+    assert_eq!(read(CtrlKind::VfsDirMax), "4096\n");
+    // *.current gauges are readable numerics (task-less cgroup ⇒ "0\n").
+    assert_eq!(read(CtrlKind::FilesCurrent), "0\n");
+    assert_eq!(read(CtrlKind::PortsCurrent), "0\n");
+    assert_eq!(read(CtrlKind::VfsDirCurrent), "0\n");
+
+    // 3. Unlimited (unset) limit renders as "max".
+    let cg2 = cgroup::create_cgroup(0, CgroupControllers::FILES)
+        .expect("cgroupfs self-test: create cg2");
+    let cg2_id = cg2.id();
+    let files_max_cg2 = CgroupCtrlInode {
+        fs_id: 0,
+        ino: cgroup_ctrl_ino(cg2_id, CtrlKind::FilesMax.index()),
+        cgroup_id: cg2_id,
+        kind: CtrlKind::FilesMax,
+    }
+    .read_content()
+    .expect("cgroupfs self-test: read cg2 files.max");
+    assert_eq!(files_max_cg2, "max\n");
+
+    // 4. Controller-gated visibility.
+    let dir = CgroupDirInode {
+        fs_id: 0,
+        ino: cgroup_dir_ino(cg2_id),
+        cgroup_id: cg2_id,
+        name: String::new(),
+    };
+    let avail = dir.available_ctrl_files();
+    assert!(
+        avail.contains(&CtrlKind::FilesMax),
+        "cgroupfs: files.max must be visible under the FILES controller"
+    );
+    // ports.max must be hidden when the NET controller is absent (robust to
+    // whatever controller set create_cgroup grants the child).
+    if !cg2.controllers().contains(CgroupControllers::NET) {
+        assert!(
+            !avail.contains(&CtrlKind::PortsMax),
+            "cgroupfs: ports.max must be hidden without the NET controller"
+        );
+    }
+
+    // Cleanup (leaf, task-less ⇒ deletable).
+    let _ = cgroup::delete_cgroup(cg_id);
+    let _ = cgroup::delete_cgroup(cg2_id);
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1038,6 +1270,10 @@ mod tests {
         assert_eq!(CtrlKind::Procs.filename(), "cgroup.procs");
         assert_eq!(CtrlKind::CpuWeight.filename(), "cpu.weight");
         assert_eq!(CtrlKind::MemoryCurrent.filename(), "memory.current");
+        // J.2 control files.
+        assert_eq!(CtrlKind::FilesMax.filename(), "files.max");
+        assert_eq!(CtrlKind::PortsMax.filename(), "ports.max");
+        assert_eq!(CtrlKind::VfsDirCurrent.filename(), "vfs_dir.current");
     }
 
     #[test]
@@ -1047,6 +1283,13 @@ mod tests {
         assert!(CtrlKind::MemoryCurrent.is_readonly());
         assert!(CtrlKind::PidsCurrent.is_readonly());
         assert!(CtrlKind::IoStat.is_readonly());
+        // J.2: *.max writable, *.current read-only.
+        assert!(!CtrlKind::FilesMax.is_readonly());
+        assert!(!CtrlKind::PortsMax.is_readonly());
+        assert!(!CtrlKind::VfsDirMax.is_readonly());
+        assert!(CtrlKind::FilesCurrent.is_readonly());
+        assert!(CtrlKind::PortsCurrent.is_readonly());
+        assert!(CtrlKind::VfsDirCurrent.is_readonly());
     }
 
     #[test]
@@ -1060,5 +1303,31 @@ mod tests {
             Some(CtrlKind::CpuWeight)
         );
         assert_eq!(CtrlKind::from_filename("invalid"), None);
+        // J.2 round-trip.
+        assert_eq!(CtrlKind::from_filename("files.current"), Some(CtrlKind::FilesCurrent));
+        assert_eq!(CtrlKind::from_filename("ports.max"), Some(CtrlKind::PortsMax));
+        assert_eq!(CtrlKind::from_filename("vfs_dir.max"), Some(CtrlKind::VfsDirMax));
+    }
+
+    #[test]
+    fn test_ctrl_kind_required_controller() {
+        assert_eq!(
+            CtrlKind::FilesMax.required_controller(),
+            Some(CgroupControllers::FILES)
+        );
+        assert_eq!(
+            CtrlKind::PortsCurrent.required_controller(),
+            Some(CgroupControllers::NET)
+        );
+        assert_eq!(
+            CtrlKind::VfsDirMax.required_controller(),
+            Some(CgroupControllers::MEMORY)
+        );
+    }
+
+    #[test]
+    fn test_ctrl_index_within_inode_stride() {
+        // Append-only inode safety (mirrors the boot self-test guard).
+        assert!((CtrlKind::all().len() as u64) < CGROUPFS_INO_STRIDE);
     }
 }

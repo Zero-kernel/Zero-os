@@ -1071,22 +1071,58 @@ impl Process {
     ///
     /// SECURITY: 防止敏感句柄（如设备、管道）泄漏到 exec 后的新程序。
     /// 这是 POSIX close-on-exec 语义的实现。
-    pub fn apply_fd_cloexec(&mut self) {
-        let to_close: Vec<i32> = self.cloexec_fds.iter().copied().collect();
+    ///
+    /// # R169-4 FIX (HIGH, lock inversion): drop CLOEXEC FDs OUTSIDE the lock
+    ///
+    /// This runs with the Process lock held. The previous version dropped each
+    /// removed `FileDescriptor` INLINE (`fd_table.remove(&fd).is_some()`), so a
+    /// `SocketFile`'s `Drop` ran under the Process lock → socket `close` →
+    /// `wake_all` (re-locks PROCESS_TABLE + a foreign `Process::inner`) and
+    /// `uncharge_port_cgroup` (L5 `CGROUP_REGISTRY`). That is exactly the
+    /// Process→foreign-PCB lock inversion (R154-3/R155-3) that
+    /// `replace_fd_charged` was written to avoid, plus an L5-under-Process-lock
+    /// acquire (D1-CGROUP-IRQ-L5). Two concurrent execs each closing a socket
+    /// that wakes the other could ABBA-deadlock.
+    ///
+    /// Drains the close-on-exec descriptors into the caller-provided `removed`
+    /// buffer and returns the closed count. The CALLER MUST have pre-reserved
+    /// `removed` to at least the current `cloexec_fds.len()` (the exec caller
+    /// snapshots that count under this same lock hold, before any irreversible
+    /// exec mutation, and fails with ENOMEM if the reservation fails). Because
+    /// capacity is guaranteed and FD state is per-process (never Arc-shared,
+    /// even under `CLONE_FILES`) so nothing adds cloexec marks in between, every
+    /// `push` here is infallible and **no `FileDescriptor` is ever dropped
+    /// inline under the Process lock** — fully eliminating the lock-inversion
+    /// class for the cloexec-on-exec path, with no fatal-OOM residual.
+    ///
+    /// The `fds_charged_count` decrement is a Process-local field and stays
+    /// under the lock; the caller performs the L5 `uncharge_fds` and the actual
+    /// descriptor drops AFTER releasing the Process lock. The `cloexec_fds` set
+    /// is taken out with `mem::take` (which clears it and lets us iterate it
+    /// while mutating `fd_table`), replacing the prior infallible `.collect()`.
+    #[must_use = "the returned closed count must be uncharged from the per-cgroup \
+                  FD budget (L5) OUTSIDE the Process lock (R169-4)"]
+    pub fn take_cloexec_fds_into(&mut self, removed: &mut Vec<FileDescriptor>) -> u64 {
+        let cloexec = core::mem::take(&mut self.cloexec_fds);
+        debug_assert!(
+            removed.capacity().saturating_sub(removed.len()) >= cloexec.len(),
+            "take_cloexec_fds_into: caller under-reserved the cloexec drop buffer"
+        );
         let mut closed: u64 = 0;
-        for fd in to_close {
-            if self.fd_table.remove(&fd).is_some() {
+        for fd in cloexec.iter().copied() {
+            if let Some(desc) = self.fd_table.remove(&fd) {
+                // Stale cloexec entries for already-closed fds contribute 0
+                // (remove() == None), so the uncharge count stays exact.
                 closed += 1;
+                // Infallible: the caller pre-reserved enough capacity, so this
+                // never reallocates and never drops `desc` inline under the lock.
+                removed.push(desc);
             }
         }
         if closed > 0 {
-            // J2-7: uncharge the per-cgroup FD budget for descriptors ACTUALLY
-            // closed (count removals, not cloexec_fds.len(), so a stale cloexec
-            // entry for an already-closed fd cannot over-uncharge → under-count).
-            crate::cgroup::uncharge_fds(self.cgroup_id, closed);
             self.fds_charged_count = self.fds_charged_count.saturating_sub(closed);
         }
-        self.cloexec_fds.clear();
+        closed
     }
 
     /// J2-7: Install `desc` at a caller-chosen `fd` (dup2/dup3 semantics),

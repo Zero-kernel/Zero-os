@@ -405,6 +405,8 @@ pub fn futex_lock_pi(
 
     // 出队并更新 PI 状态
     let mut owner_died = false;
+    // R169-8 FIX: track whether the caller actually became the PI-mutex owner.
+    let mut acquired = false;
     {
         let mut b = bucket.lock();
         if b.waiter_count > 0 {
@@ -434,7 +436,12 @@ pub fn futex_lock_pi(
         if b.owner.is_none() {
             b.owner = Some(pid);
             b.owner_dead = false;
+            acquired = true; // R169-8: took over the lock from a cleared owner
         }
+        // else: b.owner == Some(other_pid) — the PI mutex is STILL held by
+        // another task and we were woken WITHOUT acquiring it (a signal/kill/
+        // spurious wake, NOT a grant). `acquired` stays false → fail CLOSED at
+        // the tail rather than falsely reporting Ok(0).
     }
 
     // 清除等待标记
@@ -446,10 +453,29 @@ pub fn futex_lock_pi(
     recompute_pi_state(key, &bucket);
     cleanup_empty_bucket(key, &bucket);
 
-    if owner_died {
-        Err(FutexError::OwnerDied)
+    // R169-8 FIX (fail-closed-on-non-grant, INV-FUTEX-PI): report success ONLY
+    // when the caller actually OWNS the PI mutex. `acquired` is the takeover case
+    // (b.owner was None and we claimed it under the bucket lock above); the
+    // case-A transfer (b.owner == Some(pid)) already returned early. `owner_died`
+    // is meaningful ONLY when we hold the lock: a robust-owner handoff sets
+    // `owner_dead = true` WITH `owner = Some(successor)`, so surfacing OwnerDied
+    // for a NON-owner wake would falsely tell the caller it owns an inconsistent
+    // mutex — the SAME fail-open class as the original Ok(0) fallthrough. Hence
+    // `owner_died` is conditioned on `acquired`. Any other wake (b.owner ==
+    // Some(other): signal/kill/spurious, NOT a grant) failed to acquire → return
+    // EAGAIN (WouldBlock) so the caller retries the LOCK_PI loop, and cancel any
+    // stale WaitQueue entry first so the retry re-enqueues cleanly (finish_wait()
+    // can return without a dequeuing waker, and a leftover entry would make
+    // prepare_to_wait() skip the Blocked transition → busy-retry).
+    if acquired {
+        if owner_died {
+            Err(FutexError::OwnerDied)
+        } else {
+            Ok(0)
+        }
     } else {
-        Ok(0)
+        queue.cancel_wait();
+        Err(FutexError::WouldBlock)
     }
 }
 

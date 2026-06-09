@@ -163,7 +163,17 @@ fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
 
     // Walk the capability list (max 48 iterations to prevent infinite loop)
     for _ in 0..48 {
-        if ptr < 0x40 {
+        // R169-L8 FIX: `ptr` is driven by the device-controlled `next` byte and
+        // the per-cap reads compute `ptr + N` as a u8 (config offsets are u8). A
+        // virtio cap is processed only when cap_len >= 16 (it occupies
+        // ptr..ptr+15), so a valid start cannot exceed 0xF0 (ptr+15 <= 0xFF).
+        // Reject ptr outside [0x40, 0xF0] so the base + notify-len reads (up to
+        // ptr+12) never wrap u8 and never read outside the 256-byte config
+        // space; the deeper ptr+16 notify-multiplier read is bounded separately
+        // below. Without this a malicious device advertising a cap pointer in
+        // 0xF1..=0xFF wraps the u8 add (release: misread offset; with
+        // overflow-checks: panic-DoS).
+        if !(0x40..=0xF0).contains(&ptr) {
             break;
         }
 
@@ -202,7 +212,11 @@ fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
                         let notify_len = pci_config_read32(bus, dev, func, ptr + 12);
                         caps.notify_len = notify_len;
                         // Notify capability has extra field at offset 16
-                        if cap_len >= 20 {
+                        // R169-L8 FIX: ptr+16 must not wrap the u8 add; only read
+                        // it when ptr <= 0xEF (0xEF+16 == 0xFF). A cap claiming
+                        // length >= 20 at a higher start is malformed — skip the
+                        // optional multiplier rather than overflow.
+                        if cap_len >= 20 && ptr <= 0xEF {
                             caps.notify_off_multiplier =
                                 pci_config_read32(bus, dev, func, ptr + 16);
                         }

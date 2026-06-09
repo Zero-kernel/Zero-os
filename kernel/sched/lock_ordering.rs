@@ -149,15 +149,18 @@
 //!
 //! # Phase J.2: Per-Tenant (Per-Network-Namespace) TCP Budget Leaves
 //!
-//! The network stack's per-namespace TCP resource budgets (net/src/socket.rs) add
-//! two Level-8 (Device) **leaf** mutexes, charged/uncharged strictly nested under
-//! an already-held parent lock and themselves acquiring NO further lock:
+//! The network stack's per-namespace TCP resource budgets and the per-cgroup
+//! ephemeral-port budget (net/src/socket.rs) add the following Level-8 (Device)
+//! **leaf** mutexes, charged/uncharged strictly nested under an already-held
+//! parent lock and themselves acquiring NO further lock WHILE HELD (R169-I1: the
+//! port_uncharge_pending row was previously missing from this ledger):
 //!
 //! ```text
-//! tcp_conns (SocketTable)       > per_ns_conn_counts   (J2-1 connection budget)
-//! listen.lock (TcpListenState)  > per_ns_syn_counts     (J2-2 SYN-backlog budget)
-//! sock.tcp (SocketState)        > per_ns_send_bytes     (J2-6 TX-memory budget)
-//! sock.tcp (SocketState)        > per_ns_recv_bytes     (J2-4 RX-memory budget)
+//! tcp_conns (SocketTable)         > per_ns_conn_counts    (J2-1 connection budget)
+//! listen.lock (TcpListenState)    > per_ns_syn_counts      (J2-2 SYN-backlog budget)
+//! sock.tcp (SocketState)          > per_ns_send_bytes      (J2-6 TX-memory budget)
+//! sock.tcp (SocketState)          > per_ns_recv_bytes      (J2-4 RX-memory budget)
+//! binding-lock (tcp/udp_bindings) > port_uncharge_pending  (J2-8 deferred port uncharge — GATES a later L5 acquire)
 //! ```
 //!
 //! Rules (enforced by construction in socket.rs):
@@ -193,6 +196,21 @@
 //!   amount; it never under-counts (no isolation bypass). The send and recv leaves
 //!   are independent siblings under `sock.tcp` — a path may take both, but only
 //!   ever `sock.tcp > {send|recv}` leaf, never leaf > leaf, so no new cycle.
+//! - `port_uncharge_pending` (J2-8) is a Level-8 leaf taken at the fold-by-cgid
+//!   `enqueue_port_uncharge` choke-points (most under a binding lock
+//!   `tcp_bindings`/`udp_bindings`, though some producers enqueue just AFTER
+//!   dropping it) AND standalone in `drain_deferred_port_uncharges`. It acquires
+//!   NO further lock WHILE HELD. Unlike the four byte/count leaves above it does NOT complete
+//!   its accounting inline: it ENQUEUES a deferred per-cgroup port uncharge whose
+//!   actual **Level-5 `CGROUP_REGISTRY`** acquire runs LATER, in process context
+//!   (`drain_deferred_port_uncharges`, on the syscall-return / idle path with IRQs
+//!   ENABLED — see scheduler_hook.rs). So this leaf is binding-lock-nested and
+//!   lock-free *while held*, but it is the GATE for a DEFERRED L5 acquire that must
+//!   NEVER run under a binding lock or in IRQ context — the deferred-queue design
+//!   exists precisely to move that L5 work into a safe process-context point
+//!   (R169-3 forced-drain-at-delete, R169-5 IRQs-enabled AP drain). Categorizing it
+//!   as a plain "takes no further lock" leaf (without this deferred-L5 caveat)
+//!   would understate the contract.
 //! - The strong `Arc<SocketState>` owners are `sockets` AND a listener's
 //!   `accept_queue` (udp_bindings/tcp_bindings/tcp_conns hold only Weak).
 //!   Accept-queue children carry no charged send bytes (not yet accept()ed, so
