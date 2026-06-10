@@ -246,6 +246,158 @@ impl PageTableManager {
         Some(frame)
     }
 
+    /// R169-L2 FIX: reclaim now-empty intermediate page tables after a rollback
+    /// has cleared this operation's leaf PTEs.
+    ///
+    /// `map_page`/`map_to` pulls intermediate PT/PD frames from the supplied
+    /// allocator (`create_next_table`). When an mmap / mprotect-Path-A commit
+    /// OOMs partway, the unwind unmaps the leaf PTEs and frees the DATA frames,
+    /// but the intermediate tables it created are orphaned until address-space
+    /// teardown. This walks `[start, start+len)` and, for every PT and PD table
+    /// that is now **entirely empty**, clears the parent entry pointing at it and
+    /// queues the freed frame into `frames_to_free`.
+    ///
+    /// # Scope
+    ///
+    /// Only the **PT** and **PD** levels are pruned. These clear a PDE / PDPTE in
+    /// a PDPT/PD that is *shared by value* between the kernel root and the KPTI
+    /// user root (only PML4 entries are copied per-root — see `fork.rs`), so the
+    /// change is visible through both roots with no mirroring. The PDPT level is
+    /// intentionally **not** pruned: freeing a PDPT means clearing a PML4E, which
+    /// would have to be mirrored into the KPTI user root. The residual is at most
+    /// one PDPT frame per fresh-512 GiB-region rollback, which is exit-reclaimed.
+    ///
+    /// # Safety invariant
+    ///
+    /// A table is freed **iff all 512 entries are unused**. Under `PT_LOCK` (held
+    /// via `with_current_manager`) writers are serialized, so a table still
+    /// reachable by any other live mapping retains at least one present entry and
+    /// is never freed; an all-empty table can only be one this operation created
+    /// (or one whose last mapping this rollback removed) → safe to free. HUGE_PAGE
+    /// parents are leaf mappings, never walked or freed.
+    ///
+    /// The parent entry is cleared **only if the frame is successfully queued**;
+    /// otherwise the table is left present (and reclaimed at teardown), so a frame
+    /// is never orphaned by a clear-without-free.
+    ///
+    /// # Caller contract
+    ///
+    /// - Hold `PT_LOCK` (inside `with_current_manager`).
+    /// - Have already cleared every leaf PTE this operation mapped in the range.
+    /// - Pass the SAME `len` used for the post-rollback `flush_current_as_range`,
+    ///   and free `frames_to_free` only AFTER that flush — so the paging-structure
+    ///   caches referencing the freed tables are invalidated before reuse (the
+    ///   freed frames ride the existing 3-phase data-frame free).
+    pub unsafe fn prune_empty_tables_in_range(
+        &mut self,
+        start: VirtAddr,
+        len: usize,
+        frames_to_free: &mut Vec<PhysFrame>,
+    ) {
+        if len == 0 {
+            return;
+        }
+
+        /// 2 MiB — virtual span covered by one PT (512 × 4 KiB).
+        const PT_SPAN: u64 = 0x20_0000;
+        /// 1 GiB — virtual span covered by one PD (512 × 2 MiB).
+        const PD_SPAN: u64 = 0x4000_0000;
+
+        #[inline]
+        fn table_empty(table: &PageTable) -> bool {
+            table.iter().all(|entry| entry.is_unused())
+        }
+
+        let start_u = start.as_u64();
+        let end_u = start_u.saturating_add((len as u64).saturating_sub(1));
+        // Set when any parent entry is collapsed; drives the post-pass full flush.
+        let mut reclaimed_any = false;
+        // PML4 reference (matches take_nonpresent_leaf_frame). We only READ PML4
+        // entries here (never clear them), so no per-root KPTI mirroring is needed;
+        // the lower PDPT/PD/PT frames are shared by value between both roots.
+        let pml4 = self.mapper.level_4_table_mut();
+
+        // ── PT pass: free empty PTs, clear their PDEs (in the shared PD). ──
+        let mut cursor = start_u & !(PT_SPAN - 1);
+        loop {
+            let addr = VirtAddr::new(cursor);
+            let p4 = usize::from(addr.p4_index());
+            let p3 = usize::from(addr.p3_index());
+            let p2 = usize::from(addr.p2_index());
+
+            let pml4e = &pml4[p4];
+            if pml4e.flags().contains(PageTableFlags::PRESENT) {
+                let pdpt = &mut *phys_to_virt(pml4e.addr()).as_mut_ptr::<PageTable>();
+                let pdpte_flags = pdpt[p3].flags();
+                if pdpte_flags.contains(PageTableFlags::PRESENT)
+                    && !pdpte_flags.contains(PageTableFlags::HUGE_PAGE)
+                {
+                    let pd = &mut *phys_to_virt(pdpt[p3].addr()).as_mut_ptr::<PageTable>();
+                    let pde = &mut pd[p2];
+                    let pde_flags = pde.flags();
+                    if pde_flags.contains(PageTableFlags::PRESENT)
+                        && !pde_flags.contains(PageTableFlags::HUGE_PAGE)
+                    {
+                        let pt = &*phys_to_virt(pde.addr()).as_ptr::<PageTable>();
+                        if table_empty(pt) && frames_to_free.try_reserve(1).is_ok() {
+                            frames_to_free.push(PhysFrame::containing_address(pde.addr()));
+                            pde.set_unused();
+                            reclaimed_any = true;
+                        }
+                    }
+                }
+            }
+
+            match cursor.checked_add(PT_SPAN) {
+                Some(next) if next <= end_u => cursor = next,
+                _ => break,
+            }
+        }
+
+        // ── PD pass: free empty PDs, clear their PDPTEs (in the shared PDPT). ──
+        cursor = start_u & !(PD_SPAN - 1);
+        loop {
+            let addr = VirtAddr::new(cursor);
+            let p4 = usize::from(addr.p4_index());
+            let p3 = usize::from(addr.p3_index());
+
+            let pml4e = &pml4[p4];
+            if pml4e.flags().contains(PageTableFlags::PRESENT) {
+                let pdpt = &mut *phys_to_virt(pml4e.addr()).as_mut_ptr::<PageTable>();
+                let pdpte = &mut pdpt[p3];
+                let pdpte_flags = pdpte.flags();
+                if pdpte_flags.contains(PageTableFlags::PRESENT)
+                    && !pdpte_flags.contains(PageTableFlags::HUGE_PAGE)
+                {
+                    let pd = &*phys_to_virt(pdpte.addr()).as_ptr::<PageTable>();
+                    if table_empty(pd) && frames_to_free.try_reserve(1).is_ok() {
+                        frames_to_free.push(PhysFrame::containing_address(pdpte.addr()));
+                        pdpte.set_unused();
+                        reclaimed_any = true;
+                    }
+                }
+            }
+
+            match cursor.checked_add(PD_SPAN) {
+                Some(next) if next <= end_u => cursor = next,
+                _ => break,
+            }
+        }
+
+        // R169-L2 FIX: a collapsed PDE/PDPTE removes a paging-structure entry that
+        // spans up to 2 MiB / 1 GiB — beyond the caller's leaf-range flush. Issue a
+        // full TLB + paging-structure-cache shootdown (all CPUs) so no stale cached
+        // parent translation can reference a freed table frame once the caller
+        // returns it to the allocator. Runs under PT_LOCK like the caller's range
+        // flush; only on the rare OOM-rollback-that-reclaimed-a-table path, so the
+        // extra shootdown cost is irrelevant (Safety > Speed). The caller still
+        // frees `frames_to_free` after this returns, so the clear→flush→free order
+        // holds for the freed table frames too.
+        if reclaimed_any {
+            crate::tlb_shootdown::flush_current_as_all();
+        }
+    }
+
     /// 转换虚拟地址到物理地址
     pub fn translate_addr(&self, addr: VirtAddr) -> Option<PhysAddr> {
         use x86_64::structures::paging::mapper::TranslateResult;

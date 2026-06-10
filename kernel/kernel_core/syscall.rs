@@ -4722,7 +4722,13 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
             match get_process(*child_pid) {
                 Some(child_proc) => {
                     let child = child_proc.lock();
-                    if child.state == ProcessState::Zombie {
+                    // R169-9: only reap a Zombie whose teardown has been published
+                    // (teardown_done) — never before its cgroup/ns/futex teardown ran.
+                    if child.state == ProcessState::Zombie
+                        && child
+                            .teardown_done
+                            .load(core::sync::atomic::Ordering::Acquire)
+                    {
                         zombie_child = Some((
                             *child_pid,
                             child.exit_code.unwrap_or(0),
@@ -7177,6 +7183,14 @@ fn sys_mmap(
                                 }
                             }
                         }
+                        // R169-L2 FIX: reclaim the intermediate PT/PD tables the
+                        // rolled-back leaves left empty; the frames ride the same
+                        // flush+free below (3-phase: clear entry, flush, free).
+                        manager.prune_empty_tables_in_range(
+                            VirtAddr::new(base as u64),
+                            flush_len,
+                            &mut frames_to_free,
+                        );
                         if !frames_to_free.is_empty() {
                             mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
                             for frame in frames_to_free {
@@ -7196,7 +7210,9 @@ fn sys_mmap(
                 if let Err(_) = manager.map_page(page, frame, page_flags, &mut frame_alloc) {
                     frame_alloc.deallocate_frame(frame);
                     // R127-2 + R158-12 FIX: 3-phase rollback with fallible Vec.
-                    let flush_len = mapped.len() * 0x1000;
+                    // R169-L2: +1 page so the prune covers the CURRENT page, whose
+                    // intermediate tables map_to may have created before failing.
+                    let flush_len = (mapped.len() + 1) * 0x1000;
                     let mut frames_to_free = vec::Vec::new();
                     let _ = frames_to_free.try_reserve(mapped.len());
                     for (cleanup_page, cleanup_frame) in mapped.drain(..) {
@@ -7209,6 +7225,12 @@ fn sys_mmap(
                             }
                         }
                     }
+                    // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
+                    manager.prune_empty_tables_in_range(
+                        VirtAddr::new(base as u64),
+                        flush_len,
+                        &mut frames_to_free,
+                    );
                     if !frames_to_free.is_empty() {
                         mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
                         for frame in frames_to_free {
@@ -7224,7 +7246,9 @@ fn sys_mmap(
                         mm::flush_current_as_page(page.start_address());
                         frame_alloc.deallocate_frame(frame);
                     }
-                    let flush_len = mapped.len() * 0x1000;
+                    // R169-L2: +1 page — the current page was mapped then locally
+                    // unmapped above, so its intermediate tables may now be prunable.
+                    let flush_len = (mapped.len() + 1) * 0x1000;
                     let mut frames_to_free = vec::Vec::new();
                     let _ = frames_to_free.try_reserve(mapped.len());
                     for (cleanup_page, cleanup_frame) in mapped.drain(..) {
@@ -7237,6 +7261,12 @@ fn sys_mmap(
                             }
                         }
                     }
+                    // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
+                    manager.prune_empty_tables_in_range(
+                        VirtAddr::new(base as u64),
+                        flush_len,
+                        &mut frames_to_free,
+                    );
                     if !frames_to_free.is_empty() {
                         mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
                         for frame in frames_to_free {
@@ -7873,6 +7903,12 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                                         }
                                     }
                                 }
+                                // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
+                                manager.prune_empty_tables_in_range(
+                                    VirtAddr::new(region_base as u64),
+                                    flush_len,
+                                    &mut frames_to_free,
+                                );
                                 if !frames_to_free.is_empty() {
                                     mm::flush_current_as_range(
                                         VirtAddr::new(region_base as u64),
@@ -7893,7 +7929,9 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         if let Err(_) = manager.map_page(page, frame, flags, &mut frame_alloc) {
                             frame_alloc.deallocate_frame(frame);
                             // R159-4 FIX: Fallible rollback.
-                            let flush_len = mapped.len() * 0x1000;
+                            // R169-L2: +1 page so the prune covers the CURRENT page,
+                            // whose tables map_to may have created before failing.
+                            let flush_len = (mapped.len() + 1) * 0x1000;
                             let mut frames_to_free = vec::Vec::new();
                             let _ = frames_to_free.try_reserve(mapped.len());
                             for (cp, cf) in mapped.drain(..) {
@@ -7906,6 +7944,12 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                                     }
                                 }
                             }
+                            // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
+                            manager.prune_empty_tables_in_range(
+                                VirtAddr::new(region_base as u64),
+                                flush_len,
+                                &mut frames_to_free,
+                            );
                             if !frames_to_free.is_empty() {
                                 mm::flush_current_as_range(
                                     VirtAddr::new(region_base as u64),
@@ -7925,7 +7969,9 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                                 frame_alloc.deallocate_frame(frame);
                             }
                             // R159-4 FIX: Fallible rollback.
-                            let flush_len = mapped.len() * 0x1000;
+                            // R169-L2: +1 page — the current page was mapped then
+                            // locally unmapped; its tables may now be prunable.
+                            let flush_len = (mapped.len() + 1) * 0x1000;
                             let mut frames_to_free = vec::Vec::new();
                             let _ = frames_to_free.try_reserve(mapped.len());
                             for (cp, cf) in mapped.drain(..) {
@@ -7938,6 +7984,12 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                                     }
                                 }
                             }
+                            // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
+                            manager.prune_empty_tables_in_range(
+                                VirtAddr::new(region_base as u64),
+                                flush_len,
+                                &mut frames_to_free,
+                            );
                             if !frames_to_free.is_empty() {
                                 mm::flush_current_as_range(
                                     VirtAddr::new(region_base as u64),
@@ -10573,18 +10625,24 @@ fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
 
     // Bind via socket_table (includes LSM hook_net_bind check)
     // R51-1: Support both UDP and TCP binding
-    // J2-8: explicit bind() (incl. bind(0) -> ephemeral) is NOT charged to the
-    // per-cgroup ports.max budget (charge_ephemeral = false); only active-open
-    // auto-binds (connect / UDP send) are. bind(0) is a documented out-of-scope
-    // residual for this slice.
-    let port_opt = if port == 0 { None } else { Some(port) };
+    // R169-6 FIX (D2-J2-PORT-COVERAGE): an explicit `bind(0)` allocates and holds
+    // a live ephemeral port exactly like an active-open auto-bind, so it MUST be
+    // charged to the per-cgroup `ports.max` budget — otherwise `socket();
+    // bind(fd,0); connect()` consumes an uncharged port and, repeated, bypasses
+    // the quota. We pass `charge_ephemeral = (port == 0)`: the kernel-chosen
+    // ephemeral port is charged, while an explicit NON-zero bind stays uncharged
+    // this round (charging explicit/listener binds needs the binding-kind-gated
+    // teardown rewrite — DEFERRED). The bind(0)+connect self-replace undercount
+    // is closed on the connect side (see `connect`'s reuse-live-binding gate).
+    let charge_ephemeral = port == 0;
+    let port_opt = if charge_ephemeral { None } else { Some(port) };
     if socket.ty == net::SocketType::Dgram && socket.proto == net::SocketProtocol::Udp {
         net::socket_table()
-            .bind_udp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged, false)
+            .bind_udp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged, charge_ephemeral)
             .map_err(socket_error_to_syscall)?;
     } else if socket.ty == net::SocketType::Stream && socket.proto == net::SocketProtocol::Tcp {
         net::socket_table()
-            .bind_tcp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged, false)
+            .bind_tcp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged, charge_ephemeral)
             .map_err(socket_error_to_syscall)?;
     } else {
         return Err(SyscallError::EOPNOTSUPP);
@@ -11721,10 +11779,27 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
                 crate::process::compute_cgroup_charged_bytes(&proc);
 
             // J2-7: combined cgroup migration with a HOLE-FREE rollback. The two
-            // controllers (memory + FDs) are migrated so that EVERY rollback is a
-            // saturating uncharge (can never fail) or the pre-existing best-effort
-            // migrate_task reverse — there is no fallible reverse-charge that could
-            // strand a charge in the destination. Protocol: (1) charge the FD count
+            // MOVABLE controllers (memory + FDs) are migrated so that EVERY rollback
+            // is a saturating uncharge (can never fail) or the pre-existing
+            // best-effort migrate_task reverse — there is no fallible reverse-charge
+            // that could strand a charge in the destination.
+            //
+            // R169-7 (D2-J2-CHARGE-LIFETIME): per-cgroup ephemeral-PORT charges are
+            // intentionally NOT re-homed here. Unlike fds/memory (per-process
+            // tallies owned by this PID), a port charge is anchored in the
+            // `PortBinding.charged_cgroup` of an `Arc<SocketState>` that may be
+            // SHARED by N file descriptors across fork/CLONE_FILES/dup — there is no
+            // per-process port tally to move, and re-keying by PID would
+            // mis-attribute a sibling's still-live charge. The charge therefore
+            // stays anchored to the cgroup that allocated the port until the binding
+            // is torn down (uncharge uses the STORED cgid) or dead-`Weak` reaped by
+            // the global sweep (`sweep_stranded_port_charges`). The residual is made
+            // LOUD by the R169-3 `delete_cgroup` gate (the source cgroup cannot be
+            // deleted while a live port charge references it) and self-heals on
+            // socket teardown. Full Arc-shared port migration is a separate
+            // from-scratch design (needs a designated-owner socket set), DEFERRED.
+            //
+            // Protocol: (1) charge the FD count
             // to the DESTINATION first; (2) migrate memory (charge-dest-first,
             // R148-1); (3) complete the FD move by uncharging the SOURCE. The
             // reverse of step 1 is uncharge_fds (never fails); a step-2 failure

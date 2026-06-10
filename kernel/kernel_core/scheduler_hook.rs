@@ -5,7 +5,7 @@
 //! - syscall 模块通过此钩子触发重调度检查
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use cpu_local::CpuLocal;
 use spin::Mutex;
 
@@ -29,6 +29,16 @@ static RESCHED_CB: Mutex<Option<ReschedCallback>> = Mutex::new(None);
 /// R67-4 FIX: Now per-CPU to avoid cross-CPU races where one CPU
 /// sets the flag and another clears it.
 static IRQ_RESCHED_PENDING: CpuLocal<AtomicBool> = CpuLocal::new(|| AtomicBool::new(false));
+
+/// R169-L9/L10/L11: cadence of the global stranded-port-charge sweep. One
+/// `sweep_stranded_port_charges()` pass runs every `PORT_CHARGE_SWEEP_INTERVAL`
+/// full process-context deferred-work drains, amortizing its full-map scan. A
+/// global counter (a coarse rate gate; exact per-CPU accuracy is unnecessary)
+/// drives it. The sweep is enqueue-only and the correctness backstop for dead-
+/// `Weak` port-charge reclamation, so the interval only affects RECLAIM LATENCY,
+/// never correctness (`delete_cgroup` sweeps synchronously before its gate).
+const PORT_CHARGE_SWEEP_INTERVAL: u32 = 256;
+static PORT_CHARGE_SWEEP_TICK: AtomicU32 = AtomicU32::new(0);
 
 /// R151-5 FIX: Force-initialize the per-CPU resched flag before IRQs are enabled.
 ///
@@ -151,18 +161,37 @@ pub fn reschedule_if_needed() {
     // R65-6 FIX: Drain deferred TCP timer work before scheduling check
     crate::time::drain_deferred_tcp_timers();
 
+    // R169-L9/L10/L11: rate-gated ns-agnostic stranded-port-charge sweep. The
+    // alloc-time `reap_dead_bindings` only visits the namespace of an active
+    // ephemeral allocation, so a socket dropped without close(), a charge stranded
+    // in a quiescent sibling netns, or a binding pinned by a zombie process would
+    // never be revisited and its port charge would leak toward ports.max. This
+    // sweep generalizes the proven dead-`Weak` reap across both binding maps and
+    // ALL namespaces (the maps are the single source of truth — no per-socket
+    // mirror, hence no ABA-prone side state). It only ENQUEUES to the deferred
+    // queue drained just below (so reclaimed charges apply this same pass) and
+    // never crosses L8 -> L5 under a lock. Rate-gated (1 pass per
+    // PORT_CHARGE_SWEEP_INTERVAL drains) to amortize the full-map scan.
+    {
+        // Coarse wrapping rate-gate tick, not an ID/refcount — wraparound is benign.
+        let prev = PORT_CHARGE_SWEEP_TICK.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow
+        if prev % PORT_CHARGE_SWEEP_INTERVAL == 0 {
+            net::socket_table().sweep_stranded_port_charges();
+        }
+    }
+
     // J2-8: Drain deferred per-cgroup port uncharges in process context. Placed
-    // AFTER the TCP-timer drain because that sweep can tear down ESTABLISHED
-    // connections (cleanup_tcp_connection), which ENQUEUE port uncharges in this
-    // same pass. The cgroup uncharge takes CGROUP_REGISTRY (Level 5) and so must
-    // run here (process context, IRQs ENABLED, no net-binding lock held), never
-    // under the binding lock or in IRQ. NOT wired into force_reschedule(): that
-    // hook is reachable from IRQ-adjacent paths where a Level-5 acquire is
-    // illegal. R169-5: every caller of this function (syscall return, nanosleep,
-    // BSP idle, and now the AP idle loop after its restructure) runs with IRQs
-    // enabled, so this drain is genuinely process-context on all paths — the
-    // debug_assert above enforces it. The fold-by-cgid queue bounds any
-    // transient overshoot until this drain runs.
+    // AFTER the TCP-timer drain and the rate-gated sweep because both can tear
+    // down ESTABLISHED connections / reap dead bindings, which ENQUEUE port
+    // uncharges in this same pass. The cgroup uncharge takes CGROUP_REGISTRY
+    // (Level 5) and so must run here (process context, IRQs ENABLED, no
+    // net-binding lock held), never under the binding lock or in IRQ. NOT wired
+    // into force_reschedule(): that hook is reachable from IRQ-adjacent paths
+    // where a Level-5 acquire is illegal. R169-5: every caller of this function
+    // (syscall return, nanosleep, BSP idle, and now the AP idle loop after its
+    // restructure) runs with IRQs enabled, so this drain is genuinely
+    // process-context on all paths — the debug_assert above enforces it. The
+    // fold-by-cgid queue bounds any transient overshoot until this drain runs.
     net::socket_table().drain_deferred_port_uncharges();
 
     // R149-1 FIX: Drain deferred stdin wakes from keyboard/serial IRQ.

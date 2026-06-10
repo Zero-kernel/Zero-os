@@ -10,6 +10,11 @@ extern crate klog;
 
 pub mod buddy_allocator;
 pub mod dma;
+/// R169-11: `FallibleOrderedMap` lives in `mm` (a leaf crate both `kernel_core`
+/// and `net` depend on) so the `net` fragment reassembler can use it for an
+/// allocation-fallible per-fragment map without a `net -> kernel_core` dependency
+/// cycle. Re-exported from `kernel_core::fallible_map` for source compatibility.
+pub mod fallible_map;
 pub mod memory;
 pub mod oom_killer;
 pub mod page_cache;

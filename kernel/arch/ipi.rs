@@ -359,8 +359,14 @@ pub unsafe fn get_ipi_handler(ipi_type: IpiType) -> Option<IpiHandler> {
 // LAPIC Interface (Stubs for SMP)
 // ============================================================================
 
-/// LAPIC memory-mapped register base address (default)
-pub const LAPIC_BASE: u64 = 0xFEE0_0000;
+/// LAPIC memory-mapped register base address (default).
+///
+/// R169-L7 FIX: derived from the single source of truth in `cpu_local` rather
+/// than re-declaring the `0xFEE0_0000` literal. The runtime authority is
+/// `cpu_local::LAPIC_MMIO_BASE`; IPIs are sent via `apic::send_ipi_raw`, which
+/// reads that base through `apic::lapic_write`, so this constant is only the
+/// architected default for reference.
+pub const LAPIC_BASE: u64 = cpu_local::LAPIC_MMIO_DEFAULT_BASE as u64;
 
 /// LAPIC register offsets
 pub mod lapic_regs {

@@ -1689,17 +1689,23 @@ pub fn delete_cgroup(id: CgroupId) -> Result<(), CgroupError> {
         return Err(CgroupError::PermissionDenied);
     }
 
-    // R169-3 FIX (D2-J2-CHARGE-LIFETIME): Flush the deferred per-cgroup
-    // port-uncharge queue in process context BEFORE taking the registry write
-    // lock, so a just-exited process's queued-but-not-yet-applied port uncharge
-    // is reflected in `ports_current` at the gate below (otherwise a
-    // legitimately idle cgroup would be spuriously rejected until the next
-    // syscall-return/idle drain). This MUST run before `CGROUP_REGISTRY.write()`
-    // is held: the drain acquires the L5 read lock (uncharge_ports ->
-    // lookup_cgroup) and the non-reentrant spin::RwLock would self-deadlock if a
-    // write guard were already held. `delete_cgroup` runs in process context
-    // (cgroupfs rmdir / sys path) with IRQs enabled, so the blocking drain is
-    // safe here.
+    // R169-3 / R169-L9/L10/L11 FIX (D2-J2-CHARGE-LIFETIME): BEFORE taking the
+    // registry write lock, FIRST sweep dead-`Weak` bindings across ALL namespaces,
+    // THEN flush the deferred per-cgroup port-uncharge queue in process context.
+    // The sweep reclaims a charge stranded by a socket dropped without close() /
+    // in a quiescent sibling netns (which the rate-gated reschedule sweep may not
+    // have visited yet) so it stops inflating `ports_current` at the emptiness
+    // gate below; the drain then applies every enqueued (swept + just-exited)
+    // uncharge so the gate samples the true live count. A genuinely LIVE charge
+    // (its `Weak` still upgrades) is left intact and correctly fails the delete
+    // closed (the R169-3 loud-strand guarantee). BOTH steps MUST run before
+    // `CGROUP_REGISTRY.write()` is held: the sweep takes the L8 binding locks and
+    // only enqueues (no L5), but the drain acquires the L5 read path
+    // (`uncharge_ports` -> `lookup_cgroup`) and the non-reentrant spin::RwLock
+    // would self-deadlock under a held write guard. `delete_cgroup` runs in
+    // process context (cgroupfs rmdir / sys path) with IRQs enabled, so the
+    // blocking sweep+drain is safe here.
+    net::socket_table().sweep_stranded_port_charges();
     net::socket_table().drain_deferred_port_uncharges();
 
     // CODEX FIX: Hold registry write lock throughout to prevent TOCTOU race

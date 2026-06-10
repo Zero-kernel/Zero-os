@@ -57,8 +57,12 @@ use x86_64::instructions::port::{Port, PortWriteOnly};
 // LAPIC Constants and Registers
 // ============================================================================
 
-/// Default LAPIC base address (x2APIC mode uses MSRs instead)
-pub const LAPIC_DEFAULT_BASE: u64 = 0xFEE0_0000;
+/// Default LAPIC base address (x2APIC mode uses MSRs instead).
+///
+/// R169-L7 FIX: derived from the single source of truth in `cpu_local` rather
+/// than re-declaring the `0xFEE0_0000` literal. The runtime authority for the
+/// LAPIC MMIO base lives in `cpu_local::LAPIC_MMIO_BASE`.
+pub const LAPIC_DEFAULT_BASE: u64 = cpu_local::LAPIC_MMIO_DEFAULT_BASE as u64;
 
 /// LAPIC register offsets (memory-mapped)
 pub mod lapic {
@@ -234,9 +238,6 @@ pub mod redir_bits {
 static LAPIC_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static IOAPIC_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// LAPIC base address (may be relocated via MSR)
-static LAPIC_BASE: AtomicU32 = AtomicU32::new(LAPIC_DEFAULT_BASE as u32);
-
 /// I/O APIC base address
 static IOAPIC_BASE: AtomicU32 = AtomicU32::new(IOAPIC_DEFAULT_BASE as u32);
 
@@ -290,7 +291,8 @@ const LAPIC_CALIBRATION_WINDOW_MS: u32 = 10;
 /// The LAPIC must be mapped at the stored base address.
 #[inline]
 pub unsafe fn lapic_read(reg: u32) -> u32 {
-    let base = LAPIC_BASE.load(Ordering::Relaxed) as u64;
+    // R169-L7 FIX: read through the single authoritative base in `cpu_local`.
+    let base = cpu_local::lapic_mmio_base() as u64;
     let addr = (base + reg as u64) as *const u32;
     read_volatile(addr)
 }
@@ -302,7 +304,8 @@ pub unsafe fn lapic_read(reg: u32) -> u32 {
 /// The LAPIC must be mapped at the stored base address.
 #[inline]
 pub unsafe fn lapic_write(reg: u32, value: u32) {
-    let base = LAPIC_BASE.load(Ordering::Relaxed) as u64;
+    // R169-L7 FIX: write through the single authoritative base in `cpu_local`.
+    let base = cpu_local::lapic_mmio_base() as u64;
     let addr = (base + reg as u64) as *mut u32;
     write_volatile(addr, value);
 }
@@ -679,6 +682,58 @@ pub unsafe fn lapic_hw_enable() {
     );
 }
 
+/// R169-L7 FIX: detect the LAPIC operating mode and MMIO base from
+/// `IA32_APIC_BASE` and publish them to `cpu_local` — the single runtime
+/// authority that `current_cpu_id()` and `lapic_read`/`lapic_write` share.
+///
+/// This is the *only* publisher of that state, so the base/mode can never be out
+/// of sync with the hardware. It is boot-time only and fails closed on any
+/// configuration this kernel does not support (x2APIC mode, or a firmware
+/// relocated LAPIC base), rather than silently performing invalid MMIO or
+/// aliasing per-CPU data. Idempotent: re-reading the MSR yields the same values.
+///
+/// Called as early as possible in BSP boot (before the IDT is installed, so the
+/// guard covers the first exception that could touch per-CPU state) and again at
+/// each LAPIC init; the idempotence makes the repeated calls harmless.
+///
+/// # Safety
+///
+/// Reads an MSR; must run at CPL0 during early boot.
+pub unsafe fn publish_lapic_state() {
+    // IA32_APIC_BASE (MSR 0x1B): bit 10 = x2APIC enable (EXTD), bits 12+ = base.
+    let low: u32;
+    let high: u32;
+    core::arch::asm!(
+        "rdmsr",
+        in("ecx") 0x1Bu32,
+        out("eax") low,
+        out("edx") high,
+        options(nomem, nostack)
+    );
+    let msr_value = ((high as u64) << 32) | (low as u64);
+    let x2apic = (msr_value & (1 << 10)) != 0;
+    let base = msr_value & 0xFFFF_F000;
+
+    cpu_local::set_x2apic_active(x2apic);
+
+    // arch::apic is xAPIC-MMIO only: the LAPIC register window is invalid in
+    // x2APIC mode and the 256-entry cpu_local reverse map cannot represent
+    // >8-bit x2APIC IDs. Refuse to proceed rather than corrupt per-CPU state.
+    assert!(
+        !x2apic,
+        "publish_lapic_state: x2APIC mode is unsupported (arch::apic is xAPIC-MMIO only)"
+    );
+    // Only the architected base is supported: the identity-map hardening carve-out
+    // preserves exactly LAPIC_MMIO_DEFAULT_BASE. A firmware-relocated base would
+    // make these MMIO reads target an unmapped/aliased page, so fail closed.
+    assert!(
+        base == cpu_local::LAPIC_MMIO_DEFAULT_BASE as u64,
+        "publish_lapic_state: relocated LAPIC base {:#x} is unsupported",
+        base
+    );
+    cpu_local::set_lapic_mmio_base(base as u32);
+}
+
 /// Initialize the LAPIC for this CPU
 ///
 /// This sets up the LAPIC for interrupt handling:
@@ -692,6 +747,12 @@ pub unsafe fn lapic_hw_enable() {
 /// - Must be called early in boot before enabling interrupts
 /// - LAPIC MMIO region must be identity-mapped or properly mapped
 pub unsafe fn init_lapic() {
+    // R169-L7 FIX: publish/validate the LAPIC base + mode to cpu_local before any
+    // MMIO read or current_cpu_id() slot access. Runs on the BSP path inside
+    // arch::apic::init(), before arch::init_bsp, so the global x2APIC flag is set
+    // for every CPU. Done before the early-return so re-entry is still validated.
+    publish_lapic_state();
+
     if LAPIC_INITIALIZED.load(Ordering::Relaxed) {
         return; // Already initialized
     }
@@ -754,6 +815,13 @@ pub unsafe fn init_lapic() {
 /// - Must be called from AP context (not BSP)
 /// - LAPIC MMIO region must be accessible
 pub unsafe fn init_lapic_for_ap() {
+    // R169-L7 FIX: re-validate the LAPIC base + mode from this AP's IA32_APIC_BASE
+    // before its per-CPU slot is touched in cpu_local::init_ap. The x2APIC flag and
+    // base are global and already published by the BSP (and again early in BSP
+    // boot), so this is a redundant per-AP confirmation; it runs before init_ap's
+    // current_cpu_id() slot access, so an unsupported AP fails closed there.
+    publish_lapic_state();
+
     // Enable LAPIC in hardware if not already
     if !lapic_hw_enabled() {
         lapic_hw_enable();

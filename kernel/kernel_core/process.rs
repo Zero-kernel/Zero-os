@@ -899,6 +899,23 @@ pub struct Process {
     /// If set, the scheduler sends heartbeats during context switches.
     /// Unregistered on process termination.
     pub watchdog_handle: Option<WatchdogHandle>,
+
+    /// R169-9 FIX: exactly-once heavy-teardown CLAIM. The IRQ-deferred kill path
+    /// may pre-set `state = Zombie` (to mark the halted task non-runnable) BEFORE
+    /// the deferred `terminate_process` runs, so `state` can no longer be the
+    /// teardown-skip arbiter (doing so skipped teardown entirely — the R169-9
+    /// leak). This atomic is: the first `terminate_process` to win
+    /// `compare_exchange(false -> true)` runs the heavy teardown; all others
+    /// early-return. Strictly stronger than the old `Zombie|Terminated` state
+    /// guard for exactly-once, while a pre-set Zombie no longer suppresses it.
+    pub teardown_claimed: core::sync::atomic::AtomicBool,
+
+    /// R169-9 FIX: published (Release) when heavy teardown has COMPLETED. A
+    /// Zombie is reapable ONLY when this is set — this blocks the reaper
+    /// (`wait_process`/`cleanup_zombie`/`sys_wait4`) from freeing the PCB before
+    /// the deferred `terminate_process` has actually torn it down (cgroup / pid-ns
+    /// / futex / FPU-owner / watchdog), which would strand those charges (BREAK #1).
+    pub teardown_done: core::sync::atomic::AtomicBool,
 }
 
 impl Process {
@@ -1003,6 +1020,9 @@ impl Process {
             seccomp_installing: false,
             // G.1: Watchdog not registered until process starts running
             watchdog_handle: None,
+            // R169-9: teardown bookkeeping starts unclaimed / not-done.
+            teardown_claimed: core::sync::atomic::AtomicBool::new(false),
+            teardown_done: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -3038,6 +3058,34 @@ pub fn defer_irq_terminate(pid: ProcessId, exit_code: i32) -> bool {
     false
 }
 
+/// R169-9 FIX: lock-free membership test for the IRQ-deferred-kill set.
+///
+/// A task killed from IRQ context (`defer_irq_terminate`) is queued for teardown
+/// but may not yet be `Zombie` — if the IRQ path's `try_lock` to set `Zombie`
+/// failed, the scheduler would otherwise re-select the still-`Ready` task and
+/// resume it into its no-return `loop { hlt() }` (IRQs disabled), wedging the CPU
+/// on UP before the deferred drain runs. The scheduler consults this predicate so
+/// such a task is never selected; it idles via the scheduler (IRQs enabled) until
+/// `drain_deferred_irq_terminates` → `terminate_process` marks it `Zombie` and the
+/// reaper frees it. The pid is present for exactly the [defer → drain] window;
+/// after the drain, the `Zombie` state already excludes it.
+///
+/// Lock-free (8 `Acquire` loads, no locks / no allocation), so it is safe to call
+/// while holding the ready-queue and PCB locks.
+pub fn is_pending_irq_kill(pid: ProcessId) -> bool {
+    // 0 is the empty-slot marker (and a reserved pid), never a schedulable task.
+    if pid == 0 {
+        return false;
+    }
+    let pid_raw = pid as u64;
+    for i in 0..MAX_DEFERRED_IRQ_KILLS {
+        if DEFERRED_IRQ_KILL_PIDS[i].load(Ordering::Acquire) == pid_raw {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn drain_deferred_irq_terminates() {
     if !DEFERRED_IRQ_KILL_PENDING.load(Ordering::Acquire) {
         return;
@@ -3152,11 +3200,30 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
 
         {
             let mut proc = process.lock();
-            // R159-5 FIX: Idempotency guard — prevent double-terminate from
-            // corrupting cgroup counters (fetch_sub underflow) and namespace
-            // state (double detach_pid_chain). Reachable via concurrent
-            // drain_deferred_irq_terminates + signal delivery.
-            if matches!(proc.state, ProcessState::Zombie | ProcessState::Terminated) {
+            // R169-9 FIX (supersedes the R159-5 state guard): `state` is no longer
+            // the exactly-once teardown arbiter — the IRQ-deferred kill path may
+            // pre-set `Zombie` before the FIRST real teardown runs, and treating
+            // that pre-set Zombie as "already torn down" skipped teardown entirely
+            // (the R169-9 cgroup/ns/fd charge leak). Two guards now:
+            //  (1) `Terminated` stays a HARD fast-return: the unscheduled-child
+            //      error paths (`cleanup_unscheduled_process`) mark a PCB
+            //      `Terminated` while it is briefly still in the table; a stray
+            //      terminate here must NOT re-run teardown.
+            //  (2) the exactly-once teardown CLAIM (`teardown_claimed`) is the sole
+            //      teardown-skip arbiter — the first caller to win runs the heavy
+            //      teardown; concurrent drain + signal delivery on the same pid
+            //      serialize on it (stronger than the old guard: a pre-set Zombie
+            //      no longer suppresses the first teardown, double-teardown is
+            //      still blocked, so cgroup fetch_sub underflow / double
+            //      detach_pid_chain cannot occur).
+            if proc.state == ProcessState::Terminated {
+                return;
+            }
+            if proc
+                .teardown_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
                 return;
             }
             proc.state = ProcessState::Zombie;
@@ -3273,6 +3340,16 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         if !children_to_reparent.is_empty() {
             reparent_orphans(&children_to_reparent);
         }
+
+        // R169-9 FIX: heavy teardown (cgroup detach / pid-ns detach / clear_child_tid
+        // futex / FPU-owner clear / watchdog / reparent) is now COMPLETE. Publish
+        // teardown completion (Release) BEFORE waking/notifying the parent, so the
+        // woken waiter (and any concurrent reaper) observes `teardown_done == true`
+        // together with the already-set `Zombie` state and may now reap. Until this
+        // store, every reaper gate (wait_process / cleanup_zombie / sys_wait4) sees
+        // `teardown_done == false` and refuses to free the PCB — closing the
+        // IRQ-deferred early-reap / teardown-bypass leak (R169-9 BREAK #1).
+        process.lock().teardown_done.store(true, Ordering::Release);
 
         // R160-16 FIX: Deliver SIGCHLD to parent per POSIX. Previously only
         // the waitpid wakeup path was used. SIGCHLD enables async notification
@@ -3448,7 +3525,11 @@ fn handle_namespace_init_death(
 pub fn wait_process(pid: ProcessId) -> Option<i32> {
     if let Some(process) = get_process(pid) {
         let proc = process.lock();
-        if proc.state == ProcessState::Zombie {
+        // R169-9: a Zombie is reapable/observable as exited ONLY after teardown
+        // has been published — never report exit before teardown ran.
+        if proc.state == ProcessState::Zombie
+            && proc.teardown_done.load(Ordering::Acquire)
+        {
             return proc.exit_code;
         }
     }
@@ -3518,7 +3599,11 @@ pub fn cleanup_zombie(pid: ProcessId) {
             if let Some(slot) = table.get(pid) {
                 if let Some(process) = slot {
                     let proc = process.lock();
-                    if proc.state == ProcessState::Zombie {
+                    // R169-9: only a torn-down Zombie (teardown_done published) is
+                    // reapable — block the IRQ-deferred early-reap before teardown.
+                    if proc.state == ProcessState::Zombie
+                        && proc.teardown_done.load(Ordering::Acquire)
+                    {
                         (proc.memory_space, true)
                     } else {
                         (0, false)
@@ -3565,8 +3650,12 @@ pub fn cleanup_zombie(pid: ProcessId) {
             if let Some(slot) = table.get_mut(pid) {
                 if let Some(process) = slot.take() {
                     let mut proc = process.lock();
-                    // Re-validate state (defensive against concurrent modification)
-                    if proc.state == ProcessState::Zombie {
+                    // Re-validate state + teardown completion (defensive against
+                    // concurrent modification). R169-9: a Zombie whose teardown has
+                    // not been published is NOT reapable — restore the slot below.
+                    if proc.state == ProcessState::Zombie
+                        && proc.teardown_done.load(Ordering::Acquire)
+                    {
                         proc.state = ProcessState::Terminated;
                         // Capture IDs needed for Phase 2 callbacks before dropping the lock
                         let reaped_pid = proc.pid;

@@ -17,7 +17,11 @@ pub use drivers::vga_buffer;
 pub mod cgroup;
 pub mod elf_loader;
 pub mod exception_table;
-pub mod fallible_map;
+// R169-11: `fallible_map` was relocated to the `mm` crate (so `net` can use it
+// without a `net -> kernel_core` cycle). Re-exported here so existing
+// `crate::fallible_map::…` and `kernel_core::fallible_map::…` references keep
+// resolving unchanged.
+pub use mm::fallible_map;
 pub mod fork;
 pub mod ipc_namespace;
 pub mod mount_namespace;

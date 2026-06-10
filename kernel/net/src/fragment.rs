@@ -21,6 +21,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::{Mutex, Once};
 
+// R169-11: per-fragment map is allocation-fallible (FallibleOrderedMap, relocated
+// to the `mm` crate) so a crafted fragment stream cannot OOM-abort the kernel.
+use mm::fallible_map::FallibleOrderedMap;
+
 use crate::ipv4::Ipv4Header;
 
 // ============================================================================
@@ -57,6 +61,25 @@ pub const GLOBAL_MAX_FRAGS: usize = 32_768;
 /// R62-2 FIX: Global maximum buffered fragment bytes (DoS bound)
 /// 64MB global limit prevents memory exhaustion from fragment floods
 pub const GLOBAL_MAX_FRAG_BYTES: usize = 64 * 1024 * 1024;
+
+// R169-10: per-namespace fragment-reassembly ceilings = a FIXED 1/4 of each
+// global budget. The cross-ns isolation goal (one netns flooding crafted
+// fragments must not deny another netns reassembly) requires capping ALL THREE
+// dimensions per-ns: a queue-count cap alone is insufficient because the global
+// BYTE budget exhausts at 64MiB/512KiB = 128 queues and the global FRAG budget at
+// 32768/64 = 512 queues — BOTH below the 1024 queue cap — so a flooder would
+// exhaust the byte/frag pool below any queue cap (those rejection paths have no
+// LRU recycling => renewable cross-ns starvation). Fixing each per-ns cap at 1/4
+// of global guarantees >=3/4 of every global budget is ALWAYS reachable by other
+// tenants, and a tenant's ceiling never shrinks as neighbors appear (a FIXED
+// fraction, NOT GLOBAL/live_ns_count — which would have a shrinking-floor TOCTOU
+// hazard). DOCUMENTED RESIDUAL (per-ns FAIRNESS, not the single-flooder goal): 4
+// coordinated flooding namespaces each at their ceiling jointly consume the full
+// 4x16MiB = 64MiB global pool and can deny a 5th — an intentional trade of
+// multi-ns headroom for the non-shrinking single-tenant floor.
+pub const MAX_QUEUES_PER_NS: usize = GLOBAL_MAX_QUEUES / 4; // 1024
+pub const MAX_FRAGS_PER_NS: usize = GLOBAL_MAX_FRAGS / 4; // 8192
+pub const MAX_BYTES_PER_NS: u64 = (GLOBAL_MAX_FRAG_BYTES as u64) / 4; // 16 MiB
 
 /// Minimum L4 header bytes required in first fragment
 /// (8 bytes covers UDP header and TCP source/dest ports)
@@ -201,6 +224,12 @@ pub enum FragmentDropReason {
     ZeroLength,
     /// Duplicate fragment
     Duplicate,
+    /// R169-10: per-namespace live-queue count ceiling reached
+    PerNsQueueLimit,
+    /// R169-10: per-namespace buffered-fragment ceiling reached
+    PerNsFragLimit,
+    /// R169-10: per-namespace buffered-byte ceiling reached
+    PerNsByteLimit,
 }
 
 // ============================================================================
@@ -312,8 +341,10 @@ struct FragmentQueue {
     received_bytes: usize,
     /// Hole list (gaps to fill)
     holes: Vec<FragmentHole>,
-    /// Fragment data keyed by offset
-    frags: BTreeMap<u16, Vec<u8>>,
+    /// Fragment data keyed by offset. R169-11: allocation-fallible map (the only
+    /// no_std fallible ordered map) so an attacker's fragment stream cannot
+    /// OOM-abort the kernel on a per-fragment insert.
+    frags: FallibleOrderedMap<u16, Vec<u8>>,
     /// First fragment (offset 0) received
     have_first: bool,
     /// Last fragment (MF=0) received
@@ -325,25 +356,34 @@ struct FragmentQueue {
 }
 
 impl FragmentQueue {
-    fn new(key: FragmentKey, now_ms: u64) -> Self {
-        Self {
+    /// R169-11: fallible constructor — the initial single-hole `Vec` is reserved
+    /// via `try_reserve_exact` so an OOM here returns `Err(QueueByteLimit)` instead
+    /// of aborting the kernel. The caller propagates the error WITHOUT charging any
+    /// counter (the queue was never inserted), so accounting stays balanced.
+    fn new(key: FragmentKey, now_ms: u64) -> Result<Self, FragmentDropReason> {
+        let mut holes: Vec<FragmentHole> = Vec::new();
+        holes
+            .try_reserve_exact(1)
+            .map_err(|_| FragmentDropReason::QueueByteLimit)?;
+        // Initial hole: entire possible packet range (capacity reserved above).
+        holes.push(FragmentHole {
+            start: 0,
+            end: u16::MAX,
+        });
+        Ok(Self {
             key,
             created_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(FRAG_TIMEOUT_MS),
             total_len: None,
             received_frags: 0,
             received_bytes: 0,
-            // Initial hole: entire possible packet range
-            holes: alloc::vec![FragmentHole {
-                start: 0,
-                end: u16::MAX
-            }],
-            frags: BTreeMap::new(),
+            holes,
+            frags: FallibleOrderedMap::new(),
             have_first: false,
             have_last: false,
             l4_header_ok: false,
             rate_limiter: RateLimiter::new(now_ms),
-        }
+        })
     }
 
     /// Insert a fragment into the queue
@@ -414,7 +454,7 @@ impl FragmentQueue {
             // Security: If we already have fragments beyond this new total_len,
             // it's an inconsistent/malicious datagram - reject as overlap
             // This catches attacks that try to shrink the packet after data is buffered
-            for (&stored_off, stored_data) in &self.frags {
+            for (&stored_off, stored_data) in self.frags.iter() {
                 let stored_end = stored_off.saturating_add(stored_data.len() as u16);
                 if stored_end > frag_end {
                     return Err(FragmentDropReason::Overlap);
@@ -446,12 +486,25 @@ impl FragmentQueue {
             }
         }
 
-        // RFC 815 hole algorithm: fragment must fill part of a hole
-        // Holes are clipped to max_end to allow reassembly to complete
-        let mut new_holes = Vec::with_capacity(self.holes.len() + 1);
+        // RFC 815 hole algorithm: fragment must fill part of a hole.
+        // R169-11 (transactional, OOM-safe): reserve the new-holes buffer BEFORE
+        // touching `self.holes`, and iterate `self.holes` by COPY (FragmentHole is
+        // `Copy`) instead of `drain(..)`. So if the `try_reserve` here — or the
+        // payload copy / `try_insert` below — fails under memory pressure, the
+        // ACCOUNTING-critical queue state (`holes`, `frags`, `total_len`,
+        // `have_last`, `received_frags`/`received_bytes`) is left unchanged and we
+        // return `Err(QueueByteLimit)`. (The first-fragment `have_first`/
+        // `l4_header_ok` flags and the rate-limiter token are updated earlier, but
+        // that does NOT affect retry correctness: the offset-0 hole is still
+        // present, so `is_complete()` cannot mis-fire and a retry of the same
+        // fragment re-inserts normally.)
+        let mut new_holes: Vec<FragmentHole> = Vec::new();
+        new_holes
+            .try_reserve(self.holes.len() + 1)
+            .map_err(|_| FragmentDropReason::QueueByteLimit)?;
         let mut covered = false;
 
-        for hole in self.holes.drain(..) {
+        for hole in self.holes.iter().copied() {
             // Skip holes entirely beyond the known packet length
             if hole.start >= max_end {
                 continue;
@@ -476,7 +529,10 @@ impl FragmentQueue {
 
             covered = true;
 
-            // Split the hole around the fragment
+            // Split the hole around the fragment. Bound proof: exactly one hole is
+            // `covered` (yields <=2 outputs, consuming 1) and every other hole
+            // yields <=1, so total pushes <= self.holes.len() + 1 — the reserved
+            // capacity — and these pushes therefore never reallocate.
             if hole.start < frag_start {
                 new_holes.push(FragmentHole {
                     start: hole.start,
@@ -493,25 +549,42 @@ impl FragmentQueue {
 
         if !covered {
             // Fragment doesn't fit in any hole - duplicate or overlap
-            // Per RFC 5722, this should trigger queue discard (handled by caller)
+            // Per RFC 5722, this should trigger queue discard (handled by caller).
+            // `self` is still unmutated (drain replaced by copy-iteration).
             return Err(FragmentDropReason::Duplicate);
         }
 
-        // === Fragment validated successfully - now commit state changes ===
+        // === Fragment validated. R169-11: perform ALL fallible allocation FIRST,
+        // then commit the accounting-critical state — so an OOM cannot leave the
+        // queue's hole list / stored fragments / byte+frag counts half-mutated
+        // (the offset-0 hole + counters stay consistent, so a retry is correct). ===
 
-        // Set last fragment flags only after validation succeeds
-        // This prevents attacker-controlled total_len from persisting on failed insert
+        // 1. Payload copy — fallible (attacker-sized up to the fragment MTU). The
+        //    capacity is reserved exactly, so `extend_from_slice` cannot reallocate.
+        let mut frag_data: Vec<u8> = Vec::new();
+        frag_data
+            .try_reserve_exact(data.len())
+            .map_err(|_| FragmentDropReason::QueueByteLimit)?;
+        frag_data.extend_from_slice(data);
+
+        // 2. Fallible ordered-map insert (FallibleOrderedMap::try_insert reserves
+        //    its backing Vec before the shift; on Err the map is unchanged).
+        //    Offset uniqueness was established by the overlap checks above.
+        self.frags
+            .try_insert(offset, frag_data)
+            .map_err(|_| FragmentDropReason::QueueByteLimit)?;
+
+        // 3. COMMIT — all infallible from here; the accounting-critical state
+        //    (holes/frags/total_len/have_last/received_*) was untouched until now.
+        //    Deferring the is_last/total_len write past the fallible steps is what
+        //    keeps the insert transactional (a retry after an OOM here must not see
+        //    a stale `total_len`/`have_last` with no stored fragment).
         if is_last {
             self.have_last = true;
             self.total_len = Some(frag_end);
         }
-
-        // Sort holes by start offset
         new_holes.sort_by_key(|h| h.start);
         self.holes = new_holes;
-
-        // Store fragment data
-        self.frags.insert(offset, data.to_vec());
         self.received_frags += 1;
         self.received_bytes += len as usize;
 
@@ -541,9 +614,17 @@ impl FragmentQueue {
             return None;
         }
 
-        let mut buf = alloc::vec![0u8; total];
+        // R169-11: fallible output allocation — `total` is attacker-influenced (up
+        // to MAX_PACKET_SIZE). On OOM return `None` (folds into the existing
+        // `Option<Vec<u8>>` contract); the completion-boundary caller treats a
+        // `None` here as an OOM drop and still fully unwinds the queue's charges.
+        let mut buf: Vec<u8> = Vec::new();
+        if buf.try_reserve_exact(total).is_err() {
+            return None;
+        }
+        buf.resize(total, 0); // capacity reserved above → no reallocation
 
-        for (&off, frag) in &self.frags {
+        for (&off, frag) in self.frags.iter() {
             let start = off as usize;
             let end = start + frag.len();
             if end > total {
@@ -574,8 +655,70 @@ pub struct FragmentCache {
     /// could exhaust the per-source budget for all namespaces sharing the
     /// same source IP (cross-namespace DoS).
     per_src_counts: Mutex<BTreeMap<(u64, u32), usize>>,
+    /// R169-10: per-netns fragment budget counts (queues / frags / bytes). The
+    /// INNERMOST reassembly lock — order: `queues` -> `per_src_counts` ->
+    /// `per_ns_counts`. An entry exists only while a namespace holds >=1 live
+    /// queue (or any buffered frag/byte) and is pruned when all three reach 0, so
+    /// the map stays bounded by the live-namespace count. Plain `BTreeMap` (NOT
+    /// `FallibleOrderedMap`): the value is a 24-byte `PerNsBudget` and its node
+    /// alloc is the same bounded AD-02 residual class as `per_src.entry`, gated by
+    /// the admission caps checked immediately above it.
+    per_ns_counts: Mutex<BTreeMap<u64, PerNsBudget>>,
     /// Statistics
     stats: FragmentStats,
+}
+
+/// R169-10: a namespace's contribution to the three global fragment budgets.
+/// `sum(per_ns) == global` is maintained as an invariant across every charge /
+/// release site (asserted by `run_fragment_perns_self_test`).
+#[derive(Debug, Default, Clone, Copy)]
+struct PerNsBudget {
+    /// live reassembly queues owned by this namespace (mirrors active_queues)
+    queues: usize,
+    /// buffered fragments charged to this namespace (mirrors buffered_fragments)
+    frags: u32,
+    /// buffered bytes charged to this namespace (mirrors buffered_bytes)
+    bytes: u64,
+}
+
+// R169-10: per-ns budget mutators. Free functions over the held guard's map so
+// they never re-enter the lock. `*_charge_*` use `entry().or_default()`; `*_release_*`
+// saturating-sub then prune. PRUNE ONLY when ALL THREE fields are 0 (a live queue
+// implies `queues >= 1`, so an entry is never dropped while a queue lives — which
+// keeps `entry()`/`get()` for an existing queue's frag/byte charge consistent).
+fn per_ns_charge_queue(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64) {
+    m.entry(ns).or_default().queues += 1;
+}
+fn per_ns_charge_frag(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64) {
+    m.entry(ns).or_default().frags += 1;
+}
+fn per_ns_charge_bytes(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64, b: u64) {
+    m.entry(ns).or_default().bytes += b;
+}
+fn per_ns_prune_if_zero(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64) {
+    if let Some(e) = m.get(&ns) {
+        if e.queues == 0 && e.frags == 0 && e.bytes == 0 {
+            m.remove(&ns);
+        }
+    }
+}
+fn per_ns_release_queue(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64) {
+    if let Some(e) = m.get_mut(&ns) {
+        e.queues = e.queues.saturating_sub(1);
+    }
+    per_ns_prune_if_zero(m, ns);
+}
+fn per_ns_release_frags(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64, n: u32) {
+    if let Some(e) = m.get_mut(&ns) {
+        e.frags = e.frags.saturating_sub(n);
+    }
+    per_ns_prune_if_zero(m, ns);
+}
+fn per_ns_release_bytes(m: &mut BTreeMap<u64, PerNsBudget>, ns: u64, b: u64) {
+    if let Some(e) = m.get_mut(&ns) {
+        e.bytes = e.bytes.saturating_sub(b);
+    }
+    per_ns_prune_if_zero(m, ns);
 }
 
 impl FragmentCache {
@@ -584,6 +727,7 @@ impl FragmentCache {
         Self {
             queues: Mutex::new(BTreeMap::new()),
             per_src_counts: Mutex::new(BTreeMap::new()),
+            per_ns_counts: Mutex::new(BTreeMap::new()),
             stats: FragmentStats::new(),
         }
     }
@@ -615,10 +759,13 @@ impl FragmentCache {
         let offset = header.fragment_offset() * 8;
         let more_fragments = header.more_fragments();
 
-        // R163-27 FIX: Document lock ordering — `queues` before `per_src_counts`.
-        // Both are always acquired in this order; never reverse.
+        // R163-27 / R169-10 FIX: Document lock ordering — `queues` before
+        // `per_src_counts` before `per_ns_counts` (innermost leaf). Always acquired
+        // in this order; never reverse. All three held for the whole critical
+        // section, acquired once up front, never re-locked.
         let mut queues = self.queues.lock();
         let mut per_src = self.per_src_counts.lock();
+        let mut per_ns = self.per_ns_counts.lock();
 
         // Check for expired queue on arrival and drop it
         // (Fixed queue lifetime - no extension on fragment arrival)
@@ -644,6 +791,12 @@ impl FragmentCache {
                         .buffered_bytes
                         .fetch_sub(byte_count, Ordering::Relaxed);
                 }
+                // R169-10 R0: release the expired queue's per-ns charges (this ns).
+                per_ns_release_queue(&mut per_ns, key.net_ns_id);
+                if frag_count > 0 {
+                    per_ns_release_frags(&mut per_ns, key.net_ns_id, frag_count);
+                    per_ns_release_bytes(&mut per_ns, key.net_ns_id, byte_count);
+                }
                 return Err(FragmentDropReason::Timeout);
             }
         }
@@ -661,6 +814,31 @@ impl FragmentCache {
         let queue = if let Some(q) = queues.get_mut(&key) {
             q
         } else {
+            // R169-10: per-ns admission gate — the SECURITY CRUX. Checked FIRST in
+            // the create branch (BEFORE the global-LRU eviction below), so a
+            // flooding tenant hits its OWN per-ns ceiling and returns Err before LRU
+            // victim-selection can run — it can never evict another namespace's
+            // in-flight queue. ns 0 (root) is cap-EXEMPT here but is still
+            // charged/released below so `sum(per_ns) == global` holds. The per-ns
+            // FRAG and BYTE ceilings are ALSO enforced at the reserve sites (C2/C3)
+            // for existing queues; this create-branch check covers the queue count
+            // (mutated only on create/teardown) and gives an early frag/byte reject.
+            if key.net_ns_id != 0 {
+                let nb = per_ns.get(&key.net_ns_id).copied().unwrap_or_default();
+                if nb.queues >= MAX_QUEUES_PER_NS {
+                    self.stats.queue_limit_drops.fetch_add(1, Ordering::Relaxed);
+                    return Err(FragmentDropReason::PerNsQueueLimit);
+                }
+                if (nb.frags as usize) >= MAX_FRAGS_PER_NS {
+                    self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+                    return Err(FragmentDropReason::PerNsFragLimit);
+                }
+                if nb.bytes.saturating_add(payload.len() as u64) > MAX_BYTES_PER_NS {
+                    self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+                    return Err(FragmentDropReason::PerNsByteLimit);
+                }
+            }
+
             // R101-12 FIX: LRU eviction under memory pressure.
             //
             // When the global queue limit is reached, instead of simply rejecting
@@ -669,9 +847,15 @@ impl FragmentCache {
             // packets have a chance even when an attacker is flooding with crafted
             // fragments that are never completed.
             if current_queues >= GLOBAL_MAX_QUEUES {
-                // Find and evict the oldest queue (by creation time)
+                // Find and evict the oldest queue (by creation time).
+                // R169-10: SAME-NS filter — only the arriving fragment's OWN
+                // namespace is an eviction candidate, so a tenant can cannibalize
+                // only its own oldest queue, never another ns's. (With the per-ns
+                // queue cap above, a single flooder is already rejected at 1024
+                // before reaching here; this filter is cheap defense-in-depth.)
                 let oldest_key = queues
                     .iter()
+                    .filter(|(k, _)| k.net_ns_id == key.net_ns_id)
                     .min_by_key(|(_, q)| q.created_ms)
                     .map(|(&k, _)| k);
 
@@ -695,6 +879,16 @@ impl FragmentCache {
                             self.stats
                                 .buffered_bytes
                                 .fetch_sub(byte_count, Ordering::Relaxed);
+                        }
+                        // R169-10 R8: release the VICTIM's per-ns charges. MUST key
+                        // off evict_key.net_ns_id (the victim), NOT key.net_ns_id —
+                        // the same-ns filter makes them equal today, but keying off
+                        // the victim is correct/robust if any path ever evicts
+                        // cross-ns.
+                        per_ns_release_queue(&mut per_ns, evict_key.net_ns_id);
+                        if frag_count > 0 {
+                            per_ns_release_frags(&mut per_ns, evict_key.net_ns_id, frag_count);
+                            per_ns_release_bytes(&mut per_ns, evict_key.net_ns_id, byte_count);
                         }
                         self.stats.timeout_drops.fetch_add(1, Ordering::Relaxed);
                     }
@@ -726,11 +920,36 @@ impl FragmentCache {
                 return Err(FragmentDropReason::PerSourceLimit);
             }
 
-            // Create new queue
-            let new_queue = FragmentQueue::new(key, now_ms);
+            // Create new queue. R169-11: the constructor is now fallible — on OOM
+            // building the initial hole list, propagate the error BEFORE charging
+            // any counter (the queue is never inserted, per_src/active_queues never
+            // bumped), so accounting stays balanced with nothing to roll back.
+            let new_queue = match FragmentQueue::new(key, now_ms) {
+                Ok(q) => q,
+                Err(reason) => {
+                    self.stats.queue_limit_drops.fetch_add(1, Ordering::Relaxed);
+                    return Err(reason);
+                }
+            };
+            // Carried-forward residual (AD-02): `queues.insert` and `per_src.entry`
+            // / `per_ns.entry` are infallible `BTreeMap` node allocations (no no_std
+            // fallible BTreeMap). These are SMALL fixed-size nodes, bounded by the
+            // per-ns + per-src (MAX_QUEUES_PER_SRC) + global (GLOBAL_MAX_QUEUES)
+            // admission caps checked just above. R169-10/D-2 DELIBERATELY does NOT
+            // migrate `queues` to a `Vec`-backed FallibleOrderedMap: each `queues`
+            // value is a LARGE FragmentQueue (holes Vec + frags map + counters), so
+            // a Vec-backed map's O(n) element-shift on every insert/remove would
+            // convert this DoS-pressured per-packet fast path from O(log n) to O(n)
+            // — the cure is worse than the bounded-small-node disease. If fallible
+            // queue insertion is ever needed, use a NODE-allocating fallible map to
+            // keep O(log n) + pointer stability.
             queues.insert(key, new_queue);
             *per_src.entry(per_src_key).or_insert(0) += 1;
             self.stats.active_queues.fetch_add(1, Ordering::Relaxed);
+            // R169-10 C1: charge this ns's per-ns queue count (paired with the
+            // active_queues++ above). Unconditional for all ns (admission already
+            // guaranteed headroom for ns!=0; ns 0 is charged though cap-exempt).
+            per_ns_charge_queue(&mut per_ns, key.net_ns_id);
             created_new_queue = true;
 
             queues.get_mut(&key).unwrap()
@@ -744,9 +963,17 @@ impl FragmentCache {
         // because we hold the queue lock and haven't committed anything yet).
         // For existing queues, we must atomically reserve.
 
-        // R66-11 FIX: Atomically reserve fragment slot
-        if !self.stats.try_reserve_fragment(GLOBAL_MAX_FRAGS) {
-            // Codex review fix: Roll back queue creation on reservation failure
+        // R169-10 C2: enforce the per-ns FRAG ceiling (ns!=0, for ALL queues
+        // new+existing — an existing-queue fragment pump must also be bounded)
+        // BEFORE the global atomic reserve, so a flooder hits its own ceiling first.
+        // On exceed, roll back a just-created queue incl. its C1 per-ns charge (R1).
+        if key.net_ns_id != 0
+            && per_ns
+                .get(&key.net_ns_id)
+                .map(|b| b.frags as usize)
+                .unwrap_or(0)
+                >= MAX_FRAGS_PER_NS
+        {
             if created_new_queue {
                 queues.remove(&key);
                 if let Some(count) = per_src.get_mut(&per_src_key) {
@@ -756,22 +983,47 @@ impl FragmentCache {
                     }
                 }
                 self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
+                per_ns_release_queue(&mut per_ns, key.net_ns_id);
+            }
+            self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+            return Err(FragmentDropReason::PerNsFragLimit);
+        }
+        // R66-11 FIX: Atomically reserve fragment slot
+        if !self.stats.try_reserve_fragment(GLOBAL_MAX_FRAGS) {
+            // Codex review fix: Roll back queue creation on reservation failure (R1).
+            if created_new_queue {
+                queues.remove(&key);
+                if let Some(count) = per_src.get_mut(&per_src_key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        per_src.remove(&per_src_key);
+                    }
+                }
+                self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
+                per_ns_release_queue(&mut per_ns, key.net_ns_id);
             }
             self.stats
                 .global_limit_drops
                 .fetch_add(1, Ordering::Relaxed);
             return Err(FragmentDropReason::GlobalFragLimit);
         }
+        // R169-10 C2 commit: charge the per-ns frag ONLY after the global reserve
+        // succeeded — a global-reserve failure then has nothing per-ns to leak.
+        per_ns_charge_frag(&mut per_ns, key.net_ns_id);
 
-        // R66-11 FIX: Atomically reserve bytes
-        if !self
-            .stats
-            .try_reserve_bytes(payload.len(), GLOBAL_MAX_FRAG_BYTES)
+        // R169-10 C3: enforce the per-ns BYTE ceiling (ns!=0) BEFORE the global byte
+        // reserve. On exceed, UNDO C2 (release the global frag slot + the per-ns frag
+        // charge) and roll back a just-created queue incl. its C1 per-ns charge (R2).
+        if key.net_ns_id != 0
+            && per_ns
+                .get(&key.net_ns_id)
+                .map(|b| b.bytes)
+                .unwrap_or(0)
+                .saturating_add(payload.len() as u64)
+                > MAX_BYTES_PER_NS
         {
-            // Release the fragment slot we just reserved
             self.stats.release_fragment();
-
-            // Codex review fix: Roll back queue creation on reservation failure
+            per_ns_release_frags(&mut per_ns, key.net_ns_id, 1);
             if created_new_queue {
                 queues.remove(&key);
                 if let Some(count) = per_src.get_mut(&per_src_key) {
@@ -781,6 +1033,32 @@ impl FragmentCache {
                     }
                 }
                 self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
+                per_ns_release_queue(&mut per_ns, key.net_ns_id);
+            }
+            self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+            return Err(FragmentDropReason::PerNsByteLimit);
+        }
+        // R66-11 FIX: Atomically reserve bytes
+        if !self
+            .stats
+            .try_reserve_bytes(payload.len(), GLOBAL_MAX_FRAG_BYTES)
+        {
+            // Release the global fragment slot we reserved AND undo the C2 per-ns
+            // frag charge (R2). Both are UNCONDITIONAL (C2 charged for all ns).
+            self.stats.release_fragment();
+            per_ns_release_frags(&mut per_ns, key.net_ns_id, 1);
+
+            // Codex review fix: Roll back queue creation on reservation failure.
+            if created_new_queue {
+                queues.remove(&key);
+                if let Some(count) = per_src.get_mut(&per_src_key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        per_src.remove(&per_src_key);
+                    }
+                }
+                self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
+                per_ns_release_queue(&mut per_ns, key.net_ns_id);
             }
 
             self.stats
@@ -788,6 +1066,9 @@ impl FragmentCache {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(FragmentDropReason::GlobalByteLimit);
         }
+        // R169-10 C3 commit: charge the per-ns bytes ONLY after the global reserve
+        // succeeded.
+        per_ns_charge_bytes(&mut per_ns, key.net_ns_id, payload.len() as u64);
 
         // Insert fragment (resources are now reserved)
         match queue.insert(offset, more_fragments, payload, now_ms) {
@@ -816,9 +1097,33 @@ impl FragmentCache {
                     self.stats
                         .buffered_bytes
                         .fetch_sub(byte_count, Ordering::Relaxed);
-                    self.stats.reassembled.fetch_add(1, Ordering::Relaxed);
-
-                    Ok(result)
+                    // R169-10 R3: whole-queue per-ns release, UNCONDITIONAL (mirrors
+                    // the unguarded global completion sub above — runs whether
+                    // reassemble() returned Some or None/OOM). The per-call C2/C3
+                    // charges were folded into received_frags/received_bytes by the
+                    // successful inserts, so this whole-queue release balances them.
+                    per_ns_release_queue(&mut per_ns, key.net_ns_id);
+                    per_ns_release_frags(&mut per_ns, key.net_ns_id, frag_count);
+                    per_ns_release_bytes(&mut per_ns, key.net_ns_id, byte_count);
+                    // R169-11: the whole-queue uncharge above (queues.remove +
+                    // per_src-- + active_queues/buffered_fragments/buffered_bytes
+                    // decrements) is UNCONDITIONAL once `complete` — it runs whether
+                    // or not `reassemble()` succeeded, so an OOM in the reassembly
+                    // output never strands the queue's bytes/frags/active_queues (the
+                    // permanent-counter-climb DoS the QA flagged). Only the success
+                    // bookkeeping is gated on the allocation: a `None` here is an
+                    // OOM drop (reassemble() reserved its output fallibly), so count
+                    // it as a global-limit drop, NOT a reassembly.
+                    match result {
+                        Some(buf) => {
+                            self.stats.reassembled.fetch_add(1, Ordering::Relaxed);
+                            Ok(Some(buf))
+                        }
+                        None => {
+                            self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+                            Ok(None)
+                        }
+                    }
                 } else {
                     Ok(None)
                 }
@@ -828,6 +1133,15 @@ impl FragmentCache {
                 // We reserved 1 fragment slot and payload.len() bytes before insert
                 self.stats.release_fragment();
                 self.stats.release_bytes(payload.len());
+                // R169-10 R4: undo THIS failed fragment's C2/C3 per-ns charges,
+                // UNCONDITIONAL (to reach this arm both global reserves committed, so
+                // both C2 and C3 committed their per-ns charges). DISJOINT from R5/R6
+                // below: the failed fragment was rejected by queue.insert and never
+                // folded into the queue's received_frags/received_bytes, so R4 (this
+                // frag) and R5/R6 (the queue's prior committed contents) release
+                // different magnitudes — do NOT collapse them.
+                per_ns_release_frags(&mut per_ns, key.net_ns_id, 1);
+                per_ns_release_bytes(&mut per_ns, key.net_ns_id, payload.len() as u64);
 
                 // RFC 5722 compliance: on overlap OR duplicate, discard the ENTIRE reassembly queue
                 // Both indicate either an attack or a retransmission with different data
@@ -851,6 +1165,14 @@ impl FragmentCache {
                         self.stats
                             .buffered_bytes
                             .fetch_sub(byte_count, Ordering::Relaxed);
+                    }
+                    // R169-10 R5: release the discarded queue's PRIOR committed
+                    // contents (disjoint from R4's failed frag). queue unconditional;
+                    // frags/bytes gated fc>0 (mirror the global sub above).
+                    per_ns_release_queue(&mut per_ns, key.net_ns_id);
+                    if frag_count > 0 {
+                        per_ns_release_frags(&mut per_ns, key.net_ns_id, frag_count);
+                        per_ns_release_bytes(&mut per_ns, key.net_ns_id, byte_count);
                     }
                     self.stats.overlap_drops.fetch_add(1, Ordering::Relaxed);
                     return Err(reason);
@@ -879,6 +1201,13 @@ impl FragmentCache {
                             .buffered_bytes
                             .fetch_sub(byte_count, Ordering::Relaxed);
                     }
+                    // R169-10 R6: release the discarded queue's prior committed
+                    // contents (reached only when !created_new_queue, existing guard).
+                    per_ns_release_queue(&mut per_ns, key.net_ns_id);
+                    if frag_count > 0 {
+                        per_ns_release_frags(&mut per_ns, key.net_ns_id, frag_count);
+                        per_ns_release_bytes(&mut per_ns, key.net_ns_id, byte_count);
+                    }
                     self.stats
                         .first_too_small_drops
                         .fetch_add(1, Ordering::Relaxed);
@@ -896,6 +1225,9 @@ impl FragmentCache {
                         }
                     }
                     self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
+                    // R169-10 R7: queue-only per-ns release (received_frags == 0, so
+                    // no committed frags/bytes — the failed frag was released by R4).
+                    per_ns_release_queue(&mut per_ns, key.net_ns_id);
                 }
 
                 // Update appropriate counter
@@ -926,13 +1258,22 @@ impl FragmentCache {
     /// Should be called periodically from timer interrupt.
     /// Returns number of queues cleaned up.
     pub fn cleanup_expired(&self, now_ms: u64) -> usize {
+        // R169-10: same lock order as process_fragment (queues -> per_src -> per_ns).
         let mut queues = self.queues.lock();
         let mut per_src = self.per_src_counts.lock();
+        let mut per_ns = self.per_ns_counts.lock();
 
         let mut expired_keys = Vec::new();
 
         for (&key, queue) in queues.iter() {
             if queue.is_expired(now_ms) {
+                // R169-11: fallible scratch push — under memory pressure, defer the
+                // remaining expired queues to the NEXT sweep rather than aborting.
+                // No counter is touched until the removal loop below, so a deferral
+                // leaks nothing (the still-expired queues are reclaimed next tick).
+                if expired_keys.try_reserve(1).is_err() {
+                    break;
+                }
                 // R62-2 FIX: Include byte count for cleanup
                 // R141-2 FIX: Use namespace-scoped per-source key.
                 expired_keys.push((
@@ -963,6 +1304,11 @@ impl FragmentCache {
             self.stats
                 .buffered_bytes
                 .fetch_sub(byte_count as u64, Ordering::Relaxed);
+            // R169-10 R9: per-ns release for each expired queue (its ns is
+            // per_src_key.0). Unguarded — saturating_sub tolerates a 0-frag queue.
+            per_ns_release_queue(&mut per_ns, per_src_key.0);
+            per_ns_release_frags(&mut per_ns, per_src_key.0, frag_count as u32);
+            per_ns_release_bytes(&mut per_ns, per_src_key.0, byte_count as u64);
         }
 
         count
@@ -1003,6 +1349,135 @@ pub fn process_fragment(
 /// Should be called from timer interrupt handler.
 pub fn cleanup_expired_fragments(now_ms: u64) -> usize {
     fragment_cache().cleanup_expired(now_ms)
+}
+
+/// R169-10: in-kernel self-test for the per-ns fragment triple-budget. Proves the
+/// load-bearing `sum(per_ns) == global` invariant across the create / complete /
+/// timeout release paths (R3, R9, C1/C2/C3), the per-ns prune, and the cross-ns
+/// isolation gate (one ns at its QUEUE ceiling is rejected with `PerNsQueueLimit`
+/// — fired ABOVE the global-LRU branch — while another ns still reassembles
+/// normally). Runs against a LOCAL `FragmentCache`; wired into the boot suite.
+pub fn run_fragment_perns_self_test() {
+    fn hdr(src: [u8; 4], id: u16, offset: u16, mf: bool) -> Ipv4Header {
+        Ipv4Header {
+            version: 4,
+            ihl: 5,
+            dscp_ecn: 0,
+            total_len: 0,
+            identification: id,
+            flags_fragment: if mf { 0x2000 | offset } else { offset },
+            ttl: 64,
+            protocol: 17, // UDP
+            checksum: 0,
+            src: crate::ipv4::Ipv4Addr(src),
+            dst: crate::ipv4::Ipv4Addr([192, 168, 1, 1]),
+            options_len: 0,
+        }
+    }
+    // sum(per_ns) == the three global atomics — the invariant every charge/release
+    // site must preserve. A single missed/duplicated per-ns op breaks this.
+    fn assert_balanced(c: &FragmentCache, ctx: &str) {
+        let pn = c.per_ns_counts.lock();
+        let mut q = 0usize;
+        let mut f = 0u64;
+        let mut b = 0u64;
+        for v in pn.values() {
+            q += v.queues;
+            f += v.frags as u64;
+            b += v.bytes;
+        }
+        let gq = c.stats.active_queues.load(Ordering::Relaxed) as usize;
+        let gf = c.stats.buffered_fragments.load(Ordering::Relaxed) as u64;
+        let gb = c.stats.buffered_bytes.load(Ordering::Relaxed);
+        assert!(
+            q == gq && f == gf && b == gb,
+            "R169-10 balance [{}]: per_ns(q={},f={},b={}) != global(q={},f={},b={})",
+            ctx, q, f, b, gq, gf, gb
+        );
+    }
+
+    let cache = FragmentCache::new();
+    let (ns_a, ns_b) = (10u64, 20u64);
+    let payload = [0u8; 64]; // >= MIN_L4_HEADER_BYTES
+
+    // (1) create one incomplete queue in each ns (offset 0, MF=1 -> 1 buffered frag).
+    assert!(matches!(
+        cache.process_fragment(ns_a, &hdr([10, 0, 0, 1], 1, 0, true), &payload, 0),
+        Ok(None)
+    ));
+    assert_balanced(&cache, "A create");
+    assert!(matches!(
+        cache.process_fragment(ns_b, &hdr([20, 0, 0, 1], 1, 0, true), &payload, 0),
+        Ok(None)
+    ));
+    assert_balanced(&cache, "B create");
+    {
+        let pn = cache.per_ns_counts.lock();
+        assert_eq!(
+            pn.get(&ns_a).map(|v| (v.queues, v.frags, v.bytes)),
+            Some((1, 1, 64)),
+            "R169-10: ns A charged 1 queue / 1 frag / 64 bytes"
+        );
+    }
+
+    // (1b) ROOT namespace (ns 0): cap-EXEMPT at admission / C2 / C3, but STILL
+    // charged AND released, so the `sum(per_ns) == global` invariant must hold for
+    // the ns-0 entry too. (Its release is covered by the timeout sweep in step 4.)
+    assert!(matches!(
+        cache.process_fragment(0, &hdr([1, 1, 1, 1], 7, 0, true), &payload, 0),
+        Ok(None)
+    ));
+    assert_eq!(
+        cache
+            .per_ns_counts
+            .lock()
+            .get(&0)
+            .map(|v| (v.queues, v.frags, v.bytes)),
+        Some((1, 1, 64)),
+        "R169-10: root ns 0 IS charged (cap-exempt but fully accounted)"
+    );
+    assert_balanced(&cache, "root ns 0 charged");
+
+    // (2) complete A (offset 8*8=64, MF=0 fills [64,128)) -> R3 whole-queue release.
+    assert!(matches!(
+        cache.process_fragment(ns_a, &hdr([10, 0, 0, 1], 1, 8, false), &payload, 0),
+        Ok(Some(_))
+    ));
+    assert_balanced(&cache, "A complete");
+    assert!(
+        cache.per_ns_counts.lock().get(&ns_a).is_none(),
+        "R169-10: ns A pruned after completion (R3 + prune-at-zero)"
+    );
+
+    // (3) overlap-discard (exercises R4 + R5, the subtlest accounting): create a
+    // fresh ns B queue, then send an OVERLAPPING fragment for it. The Err arm
+    // releases BOTH the failed fragment's per-ns C2/C3 charges (R4) AND the queue's
+    // prior committed contents (R5) — disjoint magnitudes that must both balance.
+    // Heap-light (a couple of 64-byte fragments), unlike a queue-cap test which
+    // would need MAX_QUEUES_PER_NS=1024 live queues (cap correctness is simple
+    // arithmetic, covered by review). ns A is untouched, proving per-ns isolation.
+    assert!(matches!(
+        cache.process_fragment(ns_b, &hdr([20, 0, 0, 2], 2, 0, true), &payload, 0),
+        Ok(None)
+    ));
+    assert!(
+        matches!(
+            cache.process_fragment(ns_b, &hdr([20, 0, 0, 2], 2, 0, true), &payload, 0),
+            Err(FragmentDropReason::Overlap) | Err(FragmentDropReason::Duplicate)
+        ),
+        "R169-10: an overlapping fragment discards the queue (R4 + R5 release)"
+    );
+    assert_balanced(&cache, "B overlap-discard (R4 + R5)");
+
+    // (4) timeout sweep -> R9 drains every queue; per_ns map empties, globals -> 0.
+    cache.cleanup_expired(FRAG_TIMEOUT_MS + 1);
+    assert_balanced(&cache, "after timeout sweep");
+    assert!(
+        cache.per_ns_counts.lock().is_empty()
+            && cache.stats.active_queues.load(Ordering::Relaxed) == 0
+            && cache.stats.buffered_bytes.load(Ordering::Relaxed) == 0,
+        "R169-10: per_ns + globals fully drained after the timeout sweep"
+    );
 }
 
 // ============================================================================

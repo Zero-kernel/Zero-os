@@ -257,6 +257,7 @@ impl Scheduler {
 
                 if proc.state == ProcessState::Ready
                     && !proc.stopped // R98-1 FIX: Skip job-control stopped processes
+                    && !process::is_pending_irq_kill(pid) // R169-9 FIX: skip IRQ-killed tasks
                     && Self::cpu_allowed(cpu_id, effective_mask)
                     && !throttled
                 {
@@ -279,6 +280,7 @@ impl Scheduler {
 
                 if proc.state == ProcessState::Ready
                     && !proc.stopped // R98-1 FIX: Skip job-control stopped processes
+                    && !process::is_pending_irq_kill(skip) // R169-9 FIX: skip IRQ-killed tasks
                     && Self::cpu_allowed(cpu_id, effective_mask)
                     && !throttled
                 {
@@ -600,8 +602,10 @@ impl Scheduler {
             }
             if let Some(proc_arc) = Self::find_pcb(&guard, pid) {
                 let mut pcb = proc_arc.lock();
-                if pcb.state != ProcessState::Ready || pcb.stopped {
-                    // R98-1 FIX: Also skip job-control stopped processes
+                if pcb.state != ProcessState::Ready
+                    || pcb.stopped // R98-1 FIX: Also skip job-control stopped processes
+                    || process::is_pending_irq_kill(pid) // R169-9 FIX: don't steal IRQ-killed tasks
+                {
                     drop(pcb);
                     candidate = Self::select_next_locked(&guard, Some(pid));
                     continue;
@@ -737,8 +741,12 @@ impl Scheduler {
             if Some(pid) != current_pid {
                 if let Some(proc_arc) = Self::find_pcb(&queue, pid) {
                     let mut pcb = proc_arc.lock();
-                    if pcb.state == ProcessState::Ready && !pcb.stopped {
+                    if pcb.state == ProcessState::Ready
+                        && !pcb.stopped
+                        && !process::is_pending_irq_kill(pid)
+                    {
                         // R98-1 FIX: Only transition to Running if truly runnable
+                        // R169-9 FIX: re-validate the IRQ-kill set after re-locking
                         pcb.state = ProcessState::Running;
                         pcb.reset_time_slice();
                         pcb.reset_wait_ticks();

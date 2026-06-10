@@ -38,6 +38,15 @@ const INVALID_CPU_ID: usize = usize::MAX;
 /// Size of LAPIC ID reverse mapping table (covers all 8-bit LAPIC IDs)
 const LAPIC_ID_REVERSE_MAP_SIZE: usize = 256;
 
+/// Architected xAPIC MMIO base address (Intel SDM reset default).
+///
+/// R169-L7 FIX: the single named source for the LAPIC MMIO base. The kernel runs
+/// the local APIC in xAPIC mode at this base, and the identity-map hardening
+/// carve-out preserves exactly this page, so `current_cpu_id()` and `arch::apic`
+/// must agree on it. `arch::apic::LAPIC_DEFAULT_BASE` and `arch::ipi::LAPIC_BASE`
+/// are derived from this constant rather than re-declaring the literal.
+pub const LAPIC_MMIO_DEFAULT_BASE: u32 = 0xFEE0_0000;
+
 /// R151-6 FIX: Flag set when SMP bring-up is complete.
 ///
 /// After this point, `current_cpu_id()` must not silently fall back to CPU 0
@@ -53,6 +62,61 @@ static CPU_LOCAL_SMP_DONE: AtomicBool = AtomicBool::new(false);
 #[inline]
 pub fn set_smp_init_done() {
     CPU_LOCAL_SMP_DONE.store(true, Ordering::Release);
+}
+
+/// Authoritative LAPIC MMIO base shared by `current_cpu_id()` and `arch::apic`.
+///
+/// R169-L7 FIX: single runtime source of truth for the LAPIC MMIO base. Both the
+/// per-CPU-id lookup in `current_cpu_id()` and `arch::apic::{lapic_read,
+/// lapic_write}` read this one atomic, replacing the three previously-duplicated
+/// hard-coded `0xFEE0_0000` copies (the old `apic::LAPIC_BASE` static, the
+/// `current_cpu_id()` literal, and the dead `ipi::LAPIC_BASE` const). `arch::apic`
+/// is the sole publisher — it validates the base against IA32_APIC_BASE at LAPIC
+/// init — so the value is never out of sync with the hardware or the consumers.
+static LAPIC_MMIO_BASE: AtomicU32 = AtomicU32::new(LAPIC_MMIO_DEFAULT_BASE);
+
+/// True once the platform is operating the local APIC in x2APIC mode.
+///
+/// R169-L7 FIX: in x2APIC mode the APIC ID is delivered via an MSR, can exceed
+/// 8 bits (overflowing the 256-entry `LAPIC_ID_REVERSE_MAP`), and the xAPIC MMIO
+/// ID register is invalid. `current_cpu_id()` fails closed when this is set rather
+/// than read a bogus ID and alias another CPU's per-CPU slot. Published by
+/// `arch::apic` at LAPIC init; the current kernel never enables x2APIC.
+static X2APIC_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Read the authoritative LAPIC MMIO base (see [`LAPIC_MMIO_BASE`]).
+#[inline]
+pub fn lapic_mmio_base() -> u32 {
+    LAPIC_MMIO_BASE.load(Ordering::Acquire)
+}
+
+/// Publish the LAPIC MMIO base. Called by `arch::apic` at LAPIC init.
+///
+/// # Panics
+///
+/// Panics if `base` is not 4 KiB aligned (a malformed APIC base would desync the
+/// register reads from the page tables).
+#[inline]
+pub fn set_lapic_mmio_base(base: u32) {
+    assert_eq!(
+        base & 0xFFF,
+        0,
+        "LAPIC MMIO base {:#x} must be 4 KiB aligned",
+        base
+    );
+    LAPIC_MMIO_BASE.store(base, Ordering::Release);
+}
+
+/// Report whether the local APIC is operating in x2APIC mode.
+#[inline]
+pub fn x2apic_active() -> bool {
+    X2APIC_ACTIVE.load(Ordering::Acquire)
+}
+
+/// Publish the x2APIC-mode flag. Called by `arch::apic` at LAPIC init.
+#[inline]
+pub fn set_x2apic_active(active: bool) {
+    X2APIC_ACTIVE.store(active, Ordering::Release);
 }
 
 /// Marker for "no FPU owner" in per-CPU lazy FPU tracking
@@ -580,10 +644,24 @@ impl<T> CpuLocal<T> {
 /// could cause slot aliasing. In debug builds, this generates a warning.
 #[inline]
 pub fn current_cpu_id() -> usize {
-    // Read LAPIC ID from hardware (0xFEE00020)
+    // R169-L7 FIX: in x2APIC mode the APIC ID comes from an MSR, can exceed 8 bits
+    // (overflowing the 256-entry reverse map), and the xAPIC MMIO ID register read
+    // below is invalid. Reading it would alias another CPU's per-CPU slot, so fail
+    // closed. `arch::apic` publishes this flag at LAPIC init (it is xAPIC-MMIO
+    // only); the kernel never enables x2APIC, so on supported hardware this branch
+    // is never taken.
+    if X2APIC_ACTIVE.load(Ordering::Acquire) {
+        panic!("current_cpu_id: x2APIC mode is unsupported (would alias per-CPU data)");
+    }
+
+    // R169-L7 FIX: read the LAPIC ID register (offset 0x20, bits 31:24) through the
+    // single authoritative MMIO base shared with `arch::apic::lapic_read`, not a
+    // hard-coded `0xFEE0_0020` literal. The base is validated to be the architected
+    // `LAPIC_MMIO_DEFAULT_BASE` at LAPIC init, so this read targets the same page
+    // the identity-map hardening carve-out preserves.
     let apic_id = unsafe {
-        let apic_base = 0xFEE0_0020 as *const u32;
-        (core::ptr::read_volatile(apic_base) >> 24) as usize
+        let id_reg = (lapic_mmio_base() as usize + 0x20) as *const u32;
+        (core::ptr::read_volatile(id_reg) >> 24) as usize
     };
 
     // R67-8 FIX: O(1) reverse lookup instead of linear search

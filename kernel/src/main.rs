@@ -317,6 +317,16 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     klog_always!("==============================");
     klog_always!();
 
+    // R169-L7 FIX: latch the LAPIC MMIO base + APIC mode into cpu_local BEFORE the
+    // IDT is installed. After the IDT loads, an early exception handler can reach
+    // current_cpu_id()/current_pid() (per-CPU lookup), so publishing here makes the
+    // x2APIC/relocated-base fail-closed guard cover the very first such access. The
+    // call only reads IA32_APIC_BASE and stores atomics; it is re-run (idempotently)
+    // at each LAPIC init.
+    unsafe {
+        arch::apic::publish_lapic_state();
+    }
+
     // 阶段1：初始化中断处理
     klog_always!("[1/3] Initializing interrupts...");
     arch::interrupts::init();

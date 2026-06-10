@@ -1660,8 +1660,10 @@ impl From<LsmError> for SocketError {
 /// NOT recoverable from a dead `Weak`. So the charged cgroup travels INSIDE the
 /// map value: this is the single source of truth for the per-cgroup port budget
 /// (`ports_current(g)` == count of live entries with `charged_cgroup == g`, by
-/// construction). `charged_cgroup == 0` means "not charged" (explicit bind,
-/// listener auto-bind, passive-open child, or root cgroup) — a no-op at uncharge.
+/// construction). `charged_cgroup == 0` means "not charged" (explicit non-zero
+/// bind, passive-open child, or root cgroup) — a no-op at uncharge. R169-6: the
+/// listener auto-bind is now CHARGED (kernel-chosen ephemeral port), so it is no
+/// longer in the uncharged set.
 ///
 /// Changing the value type from a bare `Weak<SocketState>` is deliberate: it is
 /// the single source of truth, evicted atomically with the entry by
@@ -2117,9 +2119,32 @@ impl SocketTable {
         ns: NamespaceId,
     ) {
         let mut to_enqueue: Vec<u64> = Vec::new();
+        Self::collect_dead_binding_charges(bindings, Some(ns), &mut to_enqueue);
+        for cgid in to_enqueue {
+            self.enqueue_port_uncharge(cgid, 1);
+        }
+    }
+
+    /// R169-L9/L10/L11: the shared dead-`Weak` collector behind both the
+    /// alloc-time namespace-local reaper (`reap_dead_bindings`) and the global
+    /// stranded-charge sweep (`sweep_stranded_port_charges`). Drops EVERY dead
+    /// entry (so a stale `Weak` never makes a port look in-use to the ephemeral
+    /// allocator — the pre-existing port-availability fix) and pushes the
+    /// `charged_cgroup` of each dead CHARGED entry onto `to_enqueue`. When `ns`
+    /// is `Some`, only that namespace is scanned (leaving others untouched);
+    /// `None` scans all namespaces. Runs under the caller's held binding guard;
+    /// it never charges/uncharges (the L5 cgroup uncharge is deferred to the
+    /// process-context drain), so it is a pure Level-8-leaf operation.
+    fn collect_dead_binding_charges(
+        bindings: &mut BTreeMap<(NamespaceId, u16), PortBinding>,
+        ns: Option<NamespaceId>,
+        to_enqueue: &mut Vec<u64>,
+    ) {
         bindings.retain(|key, pb| {
-            if key.0 != ns {
-                return true; // leave other namespaces untouched
+            if let Some(target_ns) = ns {
+                if key.0 != target_ns {
+                    return true; // leave other namespaces untouched
+                }
             }
             let alive = pb.sock.strong_count() > 0;
             if !alive && pb.charged_cgroup != 0 {
@@ -2127,6 +2152,37 @@ impl SocketTable {
             }
             alive
         });
+    }
+
+    /// R169-L9/L10/L11: ns-AGNOSTIC sweep of stranded per-cgroup port charges.
+    ///
+    /// `reap_dead_bindings` only runs for the namespace of an *active* ephemeral
+    /// allocation, so a socket dropped without `close()` (L9), a charge stranded
+    /// in a quiescent sibling namespace (L10), or a binding whose owning netns is
+    /// pinned alive by a zombie process (L11) would never be revisited and its
+    /// charge would leak toward `ports.max` indefinitely. This sweep generalizes
+    /// the proven dead-`Weak` reap across BOTH binding maps and ALL namespaces:
+    /// the binding maps are the single source of truth, and a dead `Weak` is
+    /// sufficient proof that the stored charge is reclaimable — no per-socket
+    /// mirror (and therefore no ABA-prone side state) is required.
+    ///
+    /// Enqueue-only: each reclaimed charge is folded into the deferred
+    /// port-uncharge queue (pure Level-8 leaf push under the binding lock); the
+    /// Level-5 cgroup uncharge runs later in `drain_deferred_port_uncharges`
+    /// (process context, IRQs enabled, no binding lock held). Locks the two maps
+    /// one at a time and never crosses L8 -> L5 under a lock. Driven rate-gated
+    /// from the reschedule deferred-work drain and synchronously before the
+    /// `delete_cgroup` emptiness gate.
+    pub fn sweep_stranded_port_charges(&self) {
+        let mut to_enqueue: Vec<u64> = Vec::new();
+        {
+            let mut bindings = self.udp_bindings.lock();
+            Self::collect_dead_binding_charges(&mut bindings, None, &mut to_enqueue);
+        }
+        {
+            let mut bindings = self.tcp_bindings.lock();
+            Self::collect_dead_binding_charges(&mut bindings, None, &mut to_enqueue);
+        }
         for cgid in to_enqueue {
             self.enqueue_port_uncharge(cgid, 1);
         }
@@ -3164,8 +3220,115 @@ impl SocketTable {
         );
         table.drain_deferred_port_uncharges();
 
+        // (8) R169-L9/L10/L11 global sweep: reaps dead charged bindings across
+        //     ALL namespaces and BOTH maps, even when no allocator ever revisits
+        //     that namespace — the idle/cross-netns/zombie-pinned reclamation
+        //     class. A live binding in any ns is left intact.
+        let live_keep = mk(402, other_ns);
+        {
+            let dead_udp = mk(400, ns);
+            let dead_tcp = mk(401, other_ns);
+            {
+                let mut b = table.udp_bindings.lock();
+                SocketTable::insert_binding_charged(&mut b, (ns, 7100), &dead_udp, 81);
+            }
+            {
+                let mut b = table.tcp_bindings.lock();
+                SocketTable::insert_binding_charged(&mut b, (other_ns, 7101), &dead_tcp, 91);
+                SocketTable::insert_binding_charged(&mut b, (other_ns, 7102), &live_keep, 17);
+            }
+            // dead_udp / dead_tcp dropped here -> their Weaks become dead.
+        }
+        table.sweep_stranded_port_charges();
+        {
+            let bu = table.udp_bindings.lock();
+            assert!(
+                !bu.contains_key(&(ns, 7100)),
+                "R169-L10: global sweep reaps a dead UDP binding with no ns-local allocator"
+            );
+        }
+        {
+            let bt = table.tcp_bindings.lock();
+            assert!(
+                !bt.contains_key(&(other_ns, 7101)),
+                "R169-L10: global sweep reaps a dead TCP binding in another namespace"
+            );
+            assert!(
+                bt.contains_key(&(other_ns, 7102)),
+                "R169-L10: global sweep must keep a LIVE binding"
+            );
+        }
+        assert_eq!(
+            table.port_uncharge_pending.lock().get(&81).copied(),
+            Some(1),
+            "R169-L10: sweep enqueued the dead UDP binding charge"
+        );
+        assert_eq!(
+            table.port_uncharge_pending.lock().get(&91).copied(),
+            Some(1),
+            "R169-L10: sweep enqueued the dead TCP binding charge"
+        );
+        assert!(
+            table.port_uncharge_pending.lock().get(&17).is_none(),
+            "R169-L10: sweep must NOT enqueue a live binding's charge"
+        );
+        table.drain_deferred_port_uncharges();
+
+        // (9) R169-6 slice-1 (listener charging) invariant. A listener now carries
+        //     a real charge in its single (ns,port) PortBinding. Assert the two
+        //     properties that make charging it through the existing Ephemeral path
+        //     safe: (a) a passive-open CHILD (a distinct Arc sharing the listener's
+        //     (ns,port)) can NEVER uncharge the listener — ptr-eq miss — and the
+        //     listener's charge survives intact; (b) the listener's OWN close
+        //     refunds the stored charge exactly once; (c) a no-close listener drop
+        //     is reclaimed by the global sweep. This regression-guards the widening
+        //     of charged bindings to listeners.
+        let listener = mk(500, ns);
+        let child = mk(501, ns); // passive-open child: distinct Arc, same (ns,port)
+        {
+            let mut b = table.tcp_bindings.lock();
+            SocketTable::insert_binding_charged(&mut b, (ns, 7200), &listener, 123);
+            // (a) child cannot uncharge the listener (ptr-eq miss); entry restored.
+            assert!(
+                SocketTable::remove_binding_charged(&mut b, (ns, 7200), Some(Arc::as_ptr(&child)))
+                    .is_none(),
+                "R169-6: a passive-open child must NOT uncharge the listener's port"
+            );
+            assert_eq!(
+                b.get(&(ns, 7200)).map(|pb| pb.charged_cgroup),
+                Some(123),
+                "R169-6: the listener's charge survives a child's removal attempt"
+            );
+            // (b) the listener's own close refunds exactly once.
+            assert_eq!(
+                SocketTable::remove_binding_charged(&mut b, (ns, 7200), Some(Arc::as_ptr(&listener))),
+                Some(123),
+                "R169-6: the listener's own close refunds its stored charge once"
+            );
+        }
+        // (c) a no-close listener drop is reclaimed by the global sweep.
+        {
+            let dropped_listener = mk(502, ns);
+            {
+                let mut b = table.tcp_bindings.lock();
+                SocketTable::insert_binding_charged(&mut b, (ns, 7201), &dropped_listener, 124);
+            }
+            // dropped_listener dropped here -> its Weak is dead.
+        }
+        table.sweep_stranded_port_charges();
+        assert!(
+            !table.tcp_bindings.lock().contains_key(&(ns, 7201)),
+            "R169-6: a no-close listener drop is reaped by the global sweep"
+        );
+        assert_eq!(
+            table.port_uncharge_pending.lock().get(&124).copied(),
+            Some(1),
+            "R169-6: the dropped listener's charge is reclaimed exactly once"
+        );
+        table.drain_deferred_port_uncharges();
+
         // Keep every live socket alive through all assertions above.
-        let _ = (&s1, &s_other, &live, &s_a, &s_b, &s_c);
+        let _ = (&s1, &s_other, &live, &s_a, &s_b, &s_c, &live_keep, &listener, &child);
     }
 
     /// Create a UDP socket.
@@ -3340,8 +3503,9 @@ impl SocketTable {
     /// (`send_to_udp` with no explicit bind). When that and `port.is_none()`
     /// both hold, one ephemeral port is charged to the current cgroup's NET
     /// `ports.max` after LSM admits and before the binding lock; the charge is
-    /// rolled back if the port turns out to be in use. Explicit `bind` (incl.
-    /// `bind(0)`) passes `false`.
+    /// rolled back if the port turns out to be in use. R169-6: an explicit
+    /// `bind(0)` now passes `true` (it allocates a live ephemeral port and is
+    /// charged); an explicit NON-zero `bind` and listener auto-bind pass `false`.
     pub fn bind_udp(
         &self,
         sock: &Arc<SocketState>,
@@ -3470,10 +3634,13 @@ impl SocketTable {
     ///
     /// # J2-8
     ///
-    /// `charge_ephemeral` mirrors `bind_udp` (see there). `listen()` auto-bind
-    /// and explicit `sys_bind` (incl. `bind(0)`) pass `false`; the active-open
-    /// TCP path (`connect`) allocates inline and charges at its own site rather
-    /// than through `bind_tcp`.
+    /// `charge_ephemeral` mirrors `bind_udp` (see there). R169-6: explicit
+    /// `sys_bind(.., port=0)` now passes `true` (the kernel-chosen ephemeral port
+    /// is charged); `listen()` auto-bind and explicit NON-zero `sys_bind` pass
+    /// `false`. The active-open TCP path (`connect`) allocates inline and charges
+    /// at its own site rather than through `bind_tcp`; its `did_alloc==false`
+    /// reconnect over an own charged `bind(0)` preserves that charge (reuse-live-
+    /// binding) rather than displacing it.
     pub fn bind_tcp(
         &self,
         sock: &Arc<SocketState>,
@@ -3605,9 +3772,22 @@ impl SocketTable {
                 .local_ip()
                 .map(Ipv4Addr)
                 .unwrap_or(Ipv4Addr([0, 0, 0, 0]));
-            // J2-8: listener auto-bind is NOT charged (a server's single
-            // listening port is not the ephemeral-exhaustion vector).
-            let _ = self.bind_tcp(sock, current, cap_id, local_ip, None, can_bind_privileged, false)?;
+            // R169-6 FIX (slice 1): the listener auto-bind IS charged to the
+            // current cgroup's `ports.max`. The port is KERNEL-CHOSEN (port==None
+            // → is_ephemeral, so the existing `charge_ephemeral && is_ephemeral`
+            // gate in bind_tcp charges it exactly like an active-open auto-bind),
+            // it stamps `charged_cgroup` into the single (ns,port) PortBinding, and
+            // it tears down through the EXISTING class-agnostic sites with Ephemeral
+            // semantics: close() (5121) reads the STORED cgid and uncharges (ptr-eq
+            // gated, so a passive-open child sharing this (ns,port) can never
+            // uncharge it), and the dead-Weak triad (lookup cleanup / reap /
+            // sweep / netns-Drop backstop) reclaims a no-close drop. A listener is
+            // charged exactly ONCE: passive-open children share this entry and
+            // never re-insert. Closes the listener-port exhaustion bypass where a
+            // server forking thousands of listeners escaped ports.max entirely.
+            // (Explicit bind(non-zero) charging is a separate slice — it needs a
+            // BindKind/hold-until-close mechanism — DEFERRED; see R169-6 plan note.)
+            let _ = self.bind_tcp(sock, current, cap_id, local_ip, None, can_bind_privileged, true)?;
         }
 
         // LSM listen hook
@@ -3647,10 +3827,10 @@ impl SocketTable {
             Some(_) => None, // Bound but not listening
             None => {
                 // J2-8: clean up the stale Weak AND enqueue its charge (this runs
-                // in RX/lookup context under the binding lock — DEFERRED uncharge;
-                // listener entries carry cgid 0, so this is a no-op for them, but
-                // we read the stored id for correctness). No expect_ptr: the entry
-                // is already known dead.
+                // in RX/lookup context under the binding lock — DEFERRED uncharge).
+                // R169-6: listener entries are now CHARGED (Ephemeral semantics), so
+                // reading the STORED cgid here correctly reclaims a dead listener's
+                // port charge. No expect_ptr: the entry is already known dead.
                 if let Some(cgid) = Self::remove_binding_charged(&mut bindings, binding_key, None) {
                     self.enqueue_port_uncharge(cgid, 1);
                 }
@@ -3890,6 +4070,21 @@ impl SocketTable {
             // Register local port in tcp_bindings
             {
                 let mut bindings = self.tcp_bindings.lock();
+                // R169-6: skip the re-insert ONLY when a LIVE binding for this
+                // (ns,port) owned by THIS socket already exists. That entry already
+                // carries the correct stored charge (including the new charged
+                // `bind(0)` path), so overwriting it with the `did_alloc == false`
+                // speculative charge (0) would displace + refund the live `bind(0)`
+                // charge while the port stays held — the R169-6 self-replace
+                // undercount. It is NOT safe to gate purely on `did_alloc`: an
+                // UNcharged explicit-bind teardown (`cleanup_tcp_connection` / the
+                // blocking-connect cleanup arms) can remove the `tcp_bindings`
+                // entry while leaving `local_port` set, so a later `connect()` with
+                // `did_alloc == false` must still REPAIR a now-missing binding.
+                // Every CHARGED removal clears `local_port` (see those sites), so an
+                // absent binding here is always an UNcharged one — repairing it with
+                // the speculative 0 is correct and never undercounts.
+                let mut reuse_live_binding = false;
                 // Reject only a LIVE binding owned by a DIFFERENT socket (a live
                 // binding owned by THIS socket — re-connect — proceeds).
                 if let Some(existing) = bindings.get(&binding_key) {
@@ -3897,20 +4092,23 @@ impl SocketTable {
                         if !Arc::ptr_eq(&existing_sock, sock) {
                             return Err(SocketError::PortInUse);
                         }
+                        reuse_live_binding = !did_alloc;
                     }
                 }
-                // J2-8: stamp the (possibly 0) charge into the binding value, and
-                // refund any displaced stale charge (enqueue — we hold the L8
-                // binding lock). From here the BINDING owns `charged_cgroup`; the
-                // failure rollback below removes it (returning the charge to
-                // uncharge), so `binding_registered` gates direct-vs-via-binding
-                // refund of the speculative charge.
-                if let InsertOutcome::DisplacedCharge(old) =
-                    Self::insert_binding_charged(&mut bindings, binding_key, sock, charged_cgroup)
-                {
-                    self.enqueue_port_uncharge(old, 1);
+                if !reuse_live_binding {
+                    // J2-8: stamp the (possibly 0) charge into a newly-created or
+                    // repaired binding value, and refund any displaced stale charge
+                    // (enqueue — we hold the L8 binding lock). From here the BINDING
+                    // owns `charged_cgroup`; the failure rollback below removes it
+                    // (returning the charge to uncharge), so `binding_registered`
+                    // gates direct-vs-via-binding refund of the speculative charge.
+                    if let InsertOutcome::DisplacedCharge(old) =
+                        Self::insert_binding_charged(&mut bindings, binding_key, sock, charged_cgroup)
+                    {
+                        self.enqueue_port_uncharge(old, 1);
+                    }
+                    binding_registered = true;
                 }
-                binding_registered = true;
             }
 
             // Register connection 4-tuple

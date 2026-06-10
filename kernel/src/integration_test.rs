@@ -190,6 +190,20 @@ pub fn test_cgroupfs_abi() {
     klog_always!("    ✓ read/format path (numeric + unlimited=\"max\" + current) + controller-gated visibility");
 }
 
+/// Test the R169-10 per-namespace fragment triple-budget (byte/frag/queue).
+///
+/// Covers the load-bearing `sum(per_ns) == global` accounting invariant across the
+/// create / complete (R3) / timeout-sweep (R9) release paths + the per-ns prune,
+/// and the cross-ns isolation gate (a namespace at its queue ceiling is rejected
+/// with `PerNsQueueLimit` — fired ABOVE the global-LRU branch — while another
+/// namespace still reassembles). Any failure panics, detected by `make test`.
+pub fn test_fragment_perns_budget() {
+    klog_always!("  [TEST] Per-NS Fragment Triple-Budget (R169-10)...");
+    net::fragment::run_fragment_perns_self_test();
+    klog_always!("    ✓ sum(per_ns) == global across create/complete/timeout + prune-at-zero");
+    klog_always!("    ✓ cross-ns isolation: PerNsQueueLimit above the LRU branch, sibling ns unaffected");
+}
+
 /// 运行所有集成测试
 pub fn run_all_tests() {
     klog_always!();
@@ -210,6 +224,7 @@ pub fn run_all_tests() {
     test_cgroup_pt_kmem();
     test_cgroup_port_budget();
     test_cgroupfs_abi();
+    test_fragment_perns_budget();
     test_ext2_write();
 
     klog_always!();

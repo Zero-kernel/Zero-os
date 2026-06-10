@@ -161,6 +161,7 @@
 //! sock.tcp (SocketState)          > per_ns_send_bytes      (J2-6 TX-memory budget)
 //! sock.tcp (SocketState)          > per_ns_recv_bytes      (J2-4 RX-memory budget)
 //! binding-lock (tcp/udp_bindings) > port_uncharge_pending  (J2-8 deferred port uncharge — GATES a later L5 acquire)
+//! frag queues (FragmentCache)     > per_src_counts > per_ns_counts (R169-10 per-ns fragment triple-budget; per_ns_counts is the innermost leaf)
 //! ```
 //!
 //! Rules (enforced by construction in socket.rs):
