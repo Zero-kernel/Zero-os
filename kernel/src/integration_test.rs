@@ -169,10 +169,15 @@ pub fn test_cgroup_pt_kmem() {
 pub fn test_cgroup_port_budget() {
     klog_always!("  [TEST] Per-Cgroup Port Budget (J.2-8)...");
     kernel_core::cgroup::run_cgroup_ports_budget_self_test();
+    // R170-2: origin-pinned delete-gate (controller-disabled-leaf coverage).
+    kernel_core::cgroup::run_cgroup_disabled_leaf_gate_self_test();
+    klog_always!("    ✓ R170-2 origin-pinned gate: disabled-leaf charge pins leaf + delete EBUSY + unpin/rollback/saturate");
     net::socket::SocketTable::run_per_cgroup_port_budget_self_test();
     klog_always!("    ✓ hierarchical ports.max cap (fail-closed) + ancestor rollback + root exempt + saturating");
     klog_always!("    ✓ PortBinding single-source + ptr-eq uncharge-once + displaced-charge refund");
     klog_always!("    ✓ dead-Weak reaper (+ port-availability prune) + netns backstop + deferred-drain idempotency");
+    klog_always!("    ✓ R169-6 s2 choke-point: charged Explicit pure-skip / charged Ephemeral remove+refund / uncharged-Explicit not held / privileged identical");
+    klog_always!("    ✓ R169-6 s2 lifecycle: terminal remove (not hold-forever) + dead-Explicit displacement refund + netns-drain-then-repair net-once");
 }
 
 /// Test the Phase J.2 cgroupfs ABI surface (files/ports/vfs_dir control files).

@@ -763,6 +763,22 @@ impl CgroupCtrlInode {
                 // Complete the FD migration: uncharge the source (never fails).
                 cgroup::uncharge_fds(old_cgroup_id, fd_count);
 
+                // R170-3 FIX: this `cgroup.procs` write is the THIRD live
+                // `cgroup_id` re-point (alongside sys_cgroup_attach and exit);
+                // land any contention-deferred CPU-quota debt on the OLD
+                // cgroup BEFORE re-pointing (take under the held proc_guard,
+                // then flush). Without this, the next tick's tag-mismatch
+                // branch would silently discard the source cgroup's deferred
+                // charge — a narrowed re-opening of the R170-3 evasion.
+                let quota_debt =
+                    (proc_guard.cpu_quota_debt_cgid, proc_guard.cpu_quota_debt_ns);
+                proc_guard.cpu_quota_debt_ns = 0;
+                cgroup::flush_cpu_quota_debt(
+                    quota_debt.0,
+                    quota_debt.1,
+                    kernel_core::current_timestamp_ms().saturating_mul(1_000_000),
+                );
+
                 // Update process's cgroup_id in PCB to keep state synchronized.
                 // Still under process lock — no window for concurrent memory ops
                 // to charge against the wrong cgroup.

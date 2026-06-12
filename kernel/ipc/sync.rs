@@ -519,9 +519,25 @@ impl WaitQueue {
                 cancel_timed_wait(self as *const _ as usize, pid);
 
                 // 恢复进程状态为就绪
+                //
+                // R170-4 FIX: restore Ready ONLY when the state is still the
+                // `Blocked` our own prepare_to_wait() wrote (the exact undo).
+                // cancel_wait is also reached from paths where the caller has
+                // already RESUMED and is Running (the futex_lock_pi success /
+                // EAGAIN exits after a non-dequeuing wake): tasks stay in the
+                // ready queue while Running, and `state == Ready` is the
+                // scheduler's claim gate, so an unconditional Ready re-stamp
+                // would let another CPU's pick/steal claim a task that is
+                // still executing here (same-task-on-two-CPUs). The guard
+                // also stops resurrecting a Zombie/Terminated task to Ready.
+                // Every legacy caller cancels immediately after
+                // prepare_to_wait (state IS Blocked), so their behavior is
+                // byte-identical.
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
-                    proc.state = ProcessState::Ready;
+                    if proc.state == ProcessState::Blocked {
+                        proc.state = ProcessState::Ready;
+                    }
                 }
 
                 true

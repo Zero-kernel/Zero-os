@@ -140,6 +140,17 @@ const MAX_PLEDGE_SYSCALLS: usize = 64;
 const WORST_CASE_PLEDGE_INSNS: usize = 2 + 2 * MAX_PLEDGE_SYSCALLS;
 const _: () = assert!(WORST_CASE_PLEDGE_INSNS <= types::MAX_TRUSTED_INSNS);
 
+/// R170-I1: parallel bound for the OTHER trusted generator — `strict_filter`
+/// emits exactly 1 (LdSyscallNr) + 2 per allowed syscall (JmpEq + Ret Allow)
+/// + 1 (Ret Kill) = `2 + 2 * STRICT_ALLOWED.len()` instructions. This makes a
+/// future `STRICT_ALLOWED` expansion that would overrun `MAX_TRUSTED_INSNS` a
+/// BUILD error instead of a silent runtime flip of strict mode to deny-all
+/// (the fail-closed fallback below would otherwise mask it). Keep this assert
+/// ADJACENT to the pledge assert above so both trusted generators are visibly
+/// bounded together.
+const WORST_CASE_STRICT_INSNS: usize = 2 + 2 * STRICT_ALLOWED.len();
+const _: () = assert!(WORST_CASE_STRICT_INSNS <= types::MAX_TRUSTED_INSNS);
+
 /// R169-12: Minimal fail-closed filter — a single `Ret(Kill)` with a `Kill`
 /// default action (deny everything). Used as the panic-free fallback for the
 /// trusted generators if a generated program ever exceeds `MAX_TRUSTED_INSNS`

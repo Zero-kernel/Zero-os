@@ -86,8 +86,8 @@
 //! | BUDDY_ALLOCATOR | mm/buddy_allocator.rs | 4 | Mutex | Global |
 //! | ALLOCATOR | mm/memory.rs | 4 | LockedHeap | Global |
 //! | PROCESS_TABLE | kernel_core/process.rs | 5 | Array<Option<Arc<Mutex>>> | Global |
-//! | CGROUP_REGISTRY | kernel_core/cgroup.rs | 5 | spin::RwLock<BTreeMap> | Global; NON-reentrant, take-and-drop only |
-//! | CgroupNode.limits | kernel_core/cgroup.rs | 5 | Mutex<CgroupLimits> | Per-node leaf; snapshot-then-drop, never 2 held |
+//! | CGROUP_REGISTRY | kernel_core/cgroup.rs | 5 | spin::RwLock<BTreeMap> | Global; NON-reentrant, take-and-drop only; IRQ/scheduler-context readers MUST use `try_lookup_cgroup` (R169-2/R170-1: blocking read vs IRQs-enabled writer = same-CPU self-deadlock) |
+//! | CgroupNode.limits | kernel_core/cgroup.rs | 5 | Mutex<CgroupLimits> | Per-node leaf; snapshot-then-drop, never 2 held; IRQ/scheduler-context readers MUST use `try_lock` (R170-1: `set_limits` holds it IRQs-enabled — `get_effective_cpu_weight`/`charge_cpu_quota`/`cpu_quota_is_throttled` are the converted readers) |
 //! | VFS_ROOT | vfs/lib.rs | 6 | Arc<dyn Fs> | Global |
 //!
 //! ## J2-SHARED-CORE: cgroup charge/uncharge lock invariant
@@ -212,6 +212,19 @@
 //!   (R169-3 forced-drain-at-delete, R169-5 IRQs-enabled AP drain). Categorizing it
 //!   as a plain "takes no further lock" leaf (without this deferred-L5 caveat)
 //!   would understate the contract.
+//! - R169-6 slice 2 (HOLD-UNTIL-CLOSE): a CHARGED `BindKind::Explicit` binding
+//!   (explicit `bind(non-zero)`) is held until close. TCP enforces this via the
+//!   five while-alive PURE-SKIP arms (`resolve_while_alive_teardown` — the kind
+//!   peek is a pure read on the already-held L8 binding guard, NO further lock,
+//!   and `SkipExplicit` performs NO inline/deferred uncharge, so the
+//!   L8 > port_uncharge_pending > deferred-L5 contract above is unchanged);
+//!   UDP enforces it BY CONSTRUCTION (no UDP while-alive remover exists). The
+//!   PURE-SKIP applies ONLY while the owning socket is NOT closed — on the
+//!   `is_closed()` terminal cleanup the Explicit binding is removed + enqueued
+//!   like Ephemeral, and the kind-agnostic close() arm + dead-Weak sweep triad
+//!   remain the reclaim safety nets. The bind-side Explicit charge gate also
+//!   takes the L8 binding lock briefly to reap dead bindings BEFORE the L5
+//!   charge (own block; guard dropped first) — same order, no new edge.
 //! - The strong `Arc<SocketState>` owners are `sockets` AND a listener's
 //!   `accept_queue` (udp_bindings/tcp_bindings/tcp_conns hold only Weak).
 //!   Accept-queue children carry no charged send bytes (not yet accept()ed, so

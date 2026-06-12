@@ -56,26 +56,38 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
         .map_err(pipe_error_to_syscall)?;
 
     // 分配文件描述符
-    let (read_fd, write_fd) = {
+    //
+    // R170-6 FIX (D2-FD-DROP-UNDER-LOCK): every rollback object is bound
+    // OUTSIDE the lock scope so its Drop (PipeHandle close → wake paths)
+    // never runs while the Process lock is held — mirroring the sys_close
+    // extract-then-drop pattern in `fd_close_callback` below (R155-3). The
+    // `remove_fd` uncharge itself stays under the lock (it reverses THIS
+    // call's charge); only the object teardown is deferred.
+    let mut rollback_outside: [Option<Box<dyn FileOps>>; 2] = [None, None];
+    let alloc_result = {
         let mut proc = process.lock();
 
-        // 分配读端 fd
-        let rfd = proc
-            .allocate_fd(Box::new(read_handle) as Box<dyn FileOps>)
-            .ok_or(SyscallError::EMFILE)?;
-
-        // 分配写端 fd，失败时回滚
-        let wfd = match proc.allocate_fd(Box::new(write_handle) as Box<dyn FileOps>) {
-            Some(fd) => fd,
-            None => {
-                // 回滚：移除已分配的读端 fd
-                proc.remove_fd(rfd);
-                return Err(SyscallError::EMFILE);
+        match proc.allocate_fd(Box::new(read_handle) as Box<dyn FileOps>) {
+            Ok(rfd) => {
+                // 分配写端 fd，失败时回滚（读端移除 + 两个对象都在锁外析构）
+                match proc.allocate_fd(Box::new(write_handle) as Box<dyn FileOps>) {
+                    Ok(wfd) => Ok((rfd, wfd)),
+                    Err(write_box) => {
+                        rollback_outside[0] = proc.remove_fd(rfd);
+                        rollback_outside[1] = Some(write_box);
+                        Err(SyscallError::EMFILE)
+                    }
+                }
             }
-        };
-
-        (rfd, wfd)
+            Err(read_box) => {
+                rollback_outside[0] = Some(read_box);
+                Err(SyscallError::EMFILE)
+            }
+        }
     };
+    // Process lock released — rollback PipeHandles (if any) drop HERE.
+    drop(rollback_outside);
+    let (read_fd, write_fd) = alloc_result?;
 
     kprintln!(
         "sys_pipe: created pipe (read_fd={}, write_fd={})",

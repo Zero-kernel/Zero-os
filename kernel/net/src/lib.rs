@@ -89,10 +89,10 @@ pub use ipv4::{
     build_ipv4_header, compute_checksum, parse_ipv4, Ipv4Addr, Ipv4Error, Ipv4Header, Ipv4Proto,
 };
 pub use socket::{
-    register_cgroup_port_hooks, register_socket_wait_hooks, socket_table, CgroupPortHooks,
-    PendingDatagram, SocketDomain, SocketError, SocketLabel, SocketProtocol, SocketState,
-    SocketStats, SocketTable, SocketType, SocketWaitHooks, TableStats, TcpConnectResult,
-    WaitOutcome, WaitQueue,
+    register_cgroup_port_hooks, register_socket_wait_hooks, socket_table, BindCharge,
+    CgroupPortHooks, PendingDatagram, SocketDomain, SocketError, SocketLabel, SocketProtocol,
+    SocketState, SocketStats, SocketTable, SocketType, SocketWaitHooks, TableStats,
+    TcpConnectResult, WaitOutcome, WaitQueue,
 };
 pub use stack::{
     handle_timer_tick, network_config, process_frame, transmit_tcp_segment, transmit_udp_datagram,

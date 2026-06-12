@@ -5864,7 +5864,15 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
     // 分配文件描述符并存入 fd_table
     let fd = {
         let mut proc = process.lock();
-        let fd = proc.allocate_fd(file_ops).ok_or(SyscallError::EMFILE)?;
+        // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the rejected
+        // object on the EMFILE arm (byte-equivalent to the old
+        // allocate_fd-internal drop); conversion to drop-outside tracked.
+        let fd = proc
+            .allocate_fd(file_ops)
+            .map_err(|rejected| {
+                drop(rejected);
+                SyscallError::EMFILE
+            })?;
 
         // R39-4 FIX: 如果 flags 包含 O_CLOEXEC，标记 fd 为 close-on-exec
         //
@@ -9870,7 +9878,15 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     // Allocate fd
     let fd = {
         let mut proc = process.lock();
-        let fd = proc.allocate_fd(file_ops).ok_or(SyscallError::EMFILE)?;
+        // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the rejected
+        // object on the EMFILE arm (byte-equivalent to the old
+        // allocate_fd-internal drop); conversion to drop-outside tracked.
+        let fd = proc
+            .allocate_fd(file_ops)
+            .map_err(|rejected| {
+                drop(rejected);
+                SyscallError::EMFILE
+            })?;
 
         if open_flags & O_CLOEXEC != 0 {
             proc.set_fd_cloexec(fd, true);
@@ -9899,7 +9915,15 @@ fn sys_dup(oldfd: i32) -> SyscallResult {
     let src = proc.get_fd(oldfd).ok_or(SyscallError::EBADF)?;
     let cloned = src.clone_box();
 
-    let newfd = proc.allocate_fd(cloned).ok_or(SyscallError::EMFILE)?;
+    // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the rejected clone on
+    // the EMFILE arm (byte-equivalent to the old allocate_fd-internal drop);
+    // conversion to drop-outside tracked.
+    let newfd = proc
+        .allocate_fd(cloned)
+        .map_err(|rejected| {
+            drop(rejected);
+            SyscallError::EMFILE
+        })?;
     Ok(newfd as usize)
 }
 
@@ -10540,8 +10564,14 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
         let sock_file = SocketFile::new(cap_id, socket.id, nonblock);
         // R51-4 FIX: Roll back allocations if fd table is full
         let fd = match proc.allocate_fd(alloc::boxed::Box::new(sock_file)) {
-            Some(fd) => fd,
-            None => {
+            Ok(fd) => fd,
+            Err(rejected) => {
+                // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the
+                // rejected SocketFile (byte-equivalent to the old
+                // allocate_fd-internal drop — keeps the audited teardown
+                // ORDER: box-drop, then cap revoke, then explicit close);
+                // conversion to drop-outside tracked.
+                drop(rejected);
                 // Release capability and close socket to prevent resource leak
                 // R65-13 FIX: Audit event for capability revocation (rollback)
                 {
@@ -10625,24 +10655,34 @@ fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
 
     // Bind via socket_table (includes LSM hook_net_bind check)
     // R51-1: Support both UDP and TCP binding
-    // R169-6 FIX (D2-J2-PORT-COVERAGE): an explicit `bind(0)` allocates and holds
-    // a live ephemeral port exactly like an active-open auto-bind, so it MUST be
-    // charged to the per-cgroup `ports.max` budget — otherwise `socket();
-    // bind(fd,0); connect()` consumes an uncharged port and, repeated, bypasses
-    // the quota. We pass `charge_ephemeral = (port == 0)`: the kernel-chosen
-    // ephemeral port is charged, while an explicit NON-zero bind stays uncharged
-    // this round (charging explicit/listener binds needs the binding-kind-gated
-    // teardown rewrite — DEFERRED). The bind(0)+connect self-replace undercount
-    // is closed on the connect side (see `connect`'s reuse-live-binding gate).
-    let charge_ephemeral = port == 0;
-    let port_opt = if charge_ephemeral { None } else { Some(port) };
+    // R169-6 FIX (D2-J2-PORT-COVERAGE): EVERY bind now charges the per-cgroup
+    // `ports.max` budget (root cgroup id 0 exempt at the charge layer).
+    // - `bind(0)` charges a kernel-chosen port as BindCharge::Ephemeral
+    //   (ghost-bind teardown; POSIX-deviation note: its port does NOT persist
+    //   across a failed connect — unchanged shipped semantics; the
+    //   bind(0)+connect self-replace undercount stays closed on the connect
+    //   side via the reuse-live-binding gate).
+    // - R169-6 slice 2: an explicit NON-zero bind charges as
+    //   BindCharge::Explicit with HOLD-UNTIL-CLOSE teardown (the while-alive
+    //   teardown arms pure-skip it, so the port + charge persist until
+    //   close()/exit) — closing the last ports.max bypass: `socket();
+    //   bind(fd,p); ...` repeated no longer consumes uncharged ports.
+    // A tenant at ports.max gets QuotaExceeded -> EAGAIN (definitively EAGAIN
+    // via socket_error_to_syscall — NOT EADDRINUSE, so a quota failure is
+    // never confused with a real port collision; note quota is checked before
+    // the in-use probe, so a busy-port bind at the cap also reports EAGAIN).
+    let (port_opt, policy) = if port == 0 {
+        (None, net::BindCharge::Ephemeral)
+    } else {
+        (Some(port), net::BindCharge::Explicit)
+    };
     if socket.ty == net::SocketType::Dgram && socket.proto == net::SocketProtocol::Udp {
         net::socket_table()
-            .bind_udp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged, charge_ephemeral)
+            .bind_udp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged, policy)
             .map_err(socket_error_to_syscall)?;
     } else if socket.ty == net::SocketType::Stream && socket.proto == net::SocketProtocol::Tcp {
         net::socket_table()
-            .bind_tcp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged, charge_ephemeral)
+            .bind_tcp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged, policy)
             .map_err(socket_error_to_syscall)?;
     } else {
         return Err(SyscallError::EOPNOTSUPP);
@@ -10882,8 +10922,14 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
 
         let sock_file = SocketFile::new(new_cap, child.id, nonblock);
         match proc.allocate_fd(alloc::boxed::Box::new(sock_file)) {
-            Some(fd) => fd,
-            None => {
+            Ok(fd) => fd,
+            Err(rejected) => {
+                // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the
+                // rejected SocketFile (byte-equivalent to the old
+                // allocate_fd-internal drop — keeps the audited teardown
+                // ORDER: box-drop, then cap revoke, then cleanup_child);
+                // conversion to drop-outside tracked.
+                drop(rejected);
                 // Rollback capability allocation
                 // R65-13 FIX: Audit event for capability revocation (rollback)
                 {
@@ -11826,6 +11872,20 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
             // FD migration: uncharge the source (never fails). FDs + memory now
             // both reside at the destination, consistent with proc.cgroup_id.
             cgroup::uncharge_fds(old_cgroup_id, fd_count);
+
+            // R170-3 FIX: land any contention-deferred CPU-quota debt on the
+            // OLD cgroup BEFORE re-pointing (take under the held Process
+            // lock, then flush — the blocking walk is process-context-legal
+            // under the established Process → cgroup order). Without this,
+            // the next tick's tag-mismatch branch would silently discard the
+            // source cgroup's deferred charge.
+            let quota_debt = (proc.cpu_quota_debt_cgid, proc.cpu_quota_debt_ns);
+            proc.cpu_quota_debt_ns = 0;
+            cgroup::flush_cpu_quota_debt(
+                quota_debt.0,
+                quota_debt.1,
+                crate::current_timestamp_ms().saturating_mul(1_000_000),
+            );
 
             proc.cgroup_id = cgroup_id;
             Ok(0)

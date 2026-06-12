@@ -420,6 +420,17 @@ pub fn futex_lock_pi(
         if b.owner == Some(pid) {
             // 已经被 unlock_pi 转移了所有权
             drop(b);
+            // R170-4 FIX (R169-8 asymmetry): a NON-dequeuing wake (signal/kill
+            // wake, timeout) can leave our WaitQueue entry behind even though
+            // unlock_pi transferred ownership to us — the stale entry would
+            // make the next prepare_to_wait() on this queue skip the Blocked
+            // transition (busy-spin) and could consume a wake_one meant for a
+            // real waiter. Clear it BEFORE the PI recompute / bucket-emptiness
+            // check (mirrors the tail exits below). Idempotent: a genuine
+            // wake_specific already dequeued us → no-op. The Ready re-stamp
+            // hazard on a Running task is closed by cancel_wait's new
+            // Blocked-only state guard (sync.rs, R170-4).
+            queue.cancel_wait();
             if let Some(proc) = process::get_process(pid) {
                 proc.lock().set_waiting_on_futex(None);
             }
@@ -449,6 +460,18 @@ pub fn futex_lock_pi(
         proc.lock().set_waiting_on_futex(None);
     }
 
+    // R170-4 FIX (R169-8 asymmetry): clear any stale WaitQueue entry on EVERY
+    // exit — takeover success AND EAGAIN — not just the retry path. After a
+    // non-dequeuing wake (signal/kill wake, timeout) the entry lingers; on the
+    // SUCCESS exit it is a phantom that (a) makes the next prepare_to_wait()
+    // skip the Blocked transition (busy-spin on a later wait) and (b) can
+    // consume a wake_one meant for a real waiter. Runs BEFORE the PI
+    // recompute / bucket-emptiness check so cleanup_empty_bucket never
+    // observes a phantom entry. Idempotent on the normal grant path (the
+    // waker already dequeued us); the Ready re-stamp on a Running task is
+    // closed by cancel_wait's Blocked-only guard (sync.rs, R170-4).
+    queue.cancel_wait();
+
     // 等待者离开后重新计算 PI
     recompute_pi_state(key, &bucket);
     cleanup_empty_bucket(key, &bucket);
@@ -463,10 +486,10 @@ pub fn futex_lock_pi(
     // mutex — the SAME fail-open class as the original Ok(0) fallthrough. Hence
     // `owner_died` is conditioned on `acquired`. Any other wake (b.owner ==
     // Some(other): signal/kill/spurious, NOT a grant) failed to acquire → return
-    // EAGAIN (WouldBlock) so the caller retries the LOCK_PI loop, and cancel any
-    // stale WaitQueue entry first so the retry re-enqueues cleanly (finish_wait()
-    // can return without a dequeuing waker, and a leftover entry would make
-    // prepare_to_wait() skip the Blocked transition → busy-retry).
+    // EAGAIN (WouldBlock) so the caller retries the LOCK_PI loop. The stale
+    // WaitQueue entry was already cleared for BOTH exits by the R170-4
+    // queue.cancel_wait() above (before the PI recompute), so the retry
+    // re-enqueues cleanly and the success exit leaves no phantom entry.
     if acquired {
         if owner_died {
             Err(FutexError::OwnerDied)
@@ -474,7 +497,6 @@ pub fn futex_lock_pi(
             Ok(0)
         }
     } else {
-        queue.cancel_wait();
         Err(FutexError::WouldBlock)
     }
 }

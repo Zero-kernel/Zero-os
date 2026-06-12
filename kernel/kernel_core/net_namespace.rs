@@ -455,6 +455,13 @@ impl Drop for NetNamespace {
             // so this is enqueue-only; the Level-5 uncharge happens at the next
             // process-context drain).
             net::socket_table().drain_ns_port_bindings(self.id);
+            // R170-7 FIX: also drain the five per-ns COUNTER maps (socket /
+            // conn / syn counts, send / recv byte budgets). They self-prune
+            // at zero on the decrement paths, but a namespace destroyed with
+            // any counter still non-zero leaked its row forever (ns ids are
+            // never reused). Pure-leaf mutexes, locked one at a time — see
+            // the lock-context proof on `drain_ns_counters` itself.
+            net::socket_table().drain_ns_counters(self.id);
             NET_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
         }
     }

@@ -303,7 +303,13 @@ impl SeccompFilter {
     /// (`pledge_to_filter`, `strict_filter`) whose length is bounded by the
     /// fixed promise vocabulary; NEVER for user-supplied programs — those must
     /// use [`SeccompFilter::new`], which keeps the `MAX_INSNS` DoS guard.
-    pub fn new_trusted(
+    ///
+    /// R170-I1 FIX: sealed `pub(crate)` so the trusted/untrusted split is
+    /// TYPE-enforced, not doc-convention: an out-of-crate caller (e.g. a future
+    /// syscall path) physically cannot route a user-supplied program past the
+    /// `MAX_INSNS` guard. All legitimate callers are this crate's generators
+    /// (`deny_all_filter`, `strict_filter`, `pledge_to_filter`).
+    pub(crate) fn new_trusted(
         prog: Vec<SeccompInsn>,
         default_action: SeccompAction,
         flags: SeccompFlags,

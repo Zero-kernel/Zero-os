@@ -880,6 +880,24 @@ pub struct Process {
     /// limits based on this membership.
     pub cgroup_id: crate::cgroup::CgroupId,
 
+    /// R170-3 FIX: contention-deferred CPU-quota debt (ns) not yet landed on
+    /// `cpu_quota_debt_cgid`'s quota windows. `on_clock_tick` folds TICK_NS in
+    /// here when `charge_cpu_quota` returns `ContentionDeferred` (which
+    /// guarantees NOTHING was accumulated) and passes `TICK_NS + debt` on the
+    /// next tick — so induced registry/limits contention DEFERS quota
+    /// accounting by a tick instead of silently DROPPING it (the R170-3
+    /// cpu.max evasion). Read/written only under the PCB lock. Taken
+    /// (read + zero, same critical section) and flushed via
+    /// `cgroup::flush_cpu_quota_debt` at every `cgroup_id` re-point
+    /// (`sys_cgroup_attach`, cgroupfs `cgroup.procs`) and at
+    /// `terminate_process`, so the tag below can never go stale.
+    pub cpu_quota_debt_ns: u64,
+    /// R170-3 FIX: the cgroup id the deferred debt was accrued against (the
+    /// tag). On a tag/cgroup_id mismatch the tick handler drops the debt
+    /// defensively rather than mis-charge — unreachable while the three
+    /// flush sites above hold.
+    pub cpu_quota_debt_cgid: crate::cgroup::CgroupId,
+
     // ========== Seccomp/Pledge 沙箱 ==========
     /// Seccomp 过滤器状态
     /// 包含 BPF 过滤器栈和 no_new_privs 标志
@@ -962,6 +980,11 @@ impl Process {
             children_reserved: 0,
             children_incomplete: false,
             cpu_time: 0,
+            // R170-3: no deferred quota debt at birth. `Process::new` is the
+            // sole full constructor (fork builds children through it), so a
+            // child can never inherit its parent's debt.
+            cpu_quota_debt_ns: 0,
+            cpu_quota_debt_cgid: 0,
             wait_ticks: 0, // R65-19 FIX: Initialize starvation counter
             allowed_cpus: 0xFFFFFFFFFFFFFFFF, // SMP: Allow on all CPUs by default
             cpuset_id: 0, // Root cpuset (all CPUs)
@@ -1032,19 +1055,34 @@ impl Process {
     ///
     /// # Returns
     ///
-    /// 成功返回分配的 fd，失败（达到上限）返回 None
-    pub fn allocate_fd(&mut self, desc: FileDescriptor) -> Option<i32> {
-        let fd = self.next_available_fd()?;
+    /// 成功返回分配的 fd；失败（fd 上限 / `files.max` 拒绝）返回 `Err(desc)`。
+    ///
+    /// # R170-6 FIX (D2-FD-DROP-UNDER-LOCK)
+    ///
+    /// On failure the un-installed object is handed BACK to the caller instead
+    /// of being dropped inside this `&mut self` (Process-lock-held) scope —
+    /// a `FileOps` Drop can re-enter wake paths / foreign Process locks / the
+    /// L5 cgroup registry (the R154-3/R155-3 inversion family). The caller
+    /// owns the object again and SHOULD let it drop only after releasing the
+    /// Process lock (`sys_pipe` does); callers that deliberately keep today's
+    /// inline-drop timing are tagged `D2-FD-DROP-UNDER-LOCK` at the call site.
+    /// Both failure arms are charge-neutral: the no-slot arm never charged,
+    /// and the charge arm's `try_charge_fds` already failed.
+    pub fn allocate_fd(&mut self, desc: FileDescriptor) -> Result<i32, FileDescriptor> {
+        let fd = match self.next_available_fd() {
+            Some(fd) => fd,
+            None => return Err(desc),
+        };
         // J2-7: charge the per-cgroup FD budget BEFORE installing (fail-closed:
-        // returns None, which every caller surfaces as EMFILE). The Process lock
+        // returns Err, which every caller surfaces as EMFILE). The Process lock
         // is held (&mut self); "Process lock → cgroup charge" is the established
         // order (fork.rs charges memory under the parent lock at ~line 200).
         if crate::cgroup::try_charge_fds(self.cgroup_id, 1).is_err() {
-            return None;
+            return Err(desc);
         }
         self.fds_charged_count = self.fds_charged_count.saturating_add(1);
         self.fd_table.insert(fd, desc);
-        Some(fd)
+        Ok(fd)
     }
 
     /// 获取指定 fd 对应的描述符引用
@@ -3040,22 +3078,68 @@ static DEFERRED_IRQ_KILL_CODES: [AtomicI32; MAX_DEFERRED_IRQ_KILLS] =
     [const { AtomicI32::new(0) }; MAX_DEFERRED_IRQ_KILLS];
 static DEFERRED_IRQ_KILL_PENDING: AtomicBool = AtomicBool::new(false);
 
+// R170-5 FIX: scheduler-visibility companion set for IRQ-deferred kills,
+// index-paired with DEFERRED_IRQ_KILL_PIDS. The R169-9 skip-predicate used to
+// scan DEFERRED_IRQ_KILL_PIDS directly, but the drain's exactly-once `swap(0)`
+// claim cleared that membership BEFORE `terminate_process` published `Zombie`
+// — re-opening a [swap → Zombie] window on SMP where another CPU's scheduler
+// saw `state == Ready && !is_pending_irq_kill` and re-selected the halting
+// victim into its IRQs-off no-return halt loop (R170-5).
+//
+// Lifecycle: `defer_irq_terminate` CAS-claims NONRUNNABLE[i] FIRST (this is
+// the slot-ownership claim; DEFERRED[i] then gets a plain store — invariant:
+// DEFERRED[i] != 0 ⟹ NONRUNNABLE[i] == the same pid, established before the
+// kill is drain-visible, so there is no publication gap and no rollback
+// path). `is_pending_irq_kill` scans THIS set, whose membership spans
+// [defer → Zombie-publish]. The entry is cleared by `terminate_process`
+// ITSELF (value-keyed CAS, `clear_irq_kill_nonrunnable`) immediately after
+// the Zombie store — strictly BEFORE `teardown_done` is published and before
+// any internal `force_reschedule`, so a reaped-and-recycled pid can NEVER
+// inherit a stale membership (recycling requires reap, which requires
+// `Zombie && teardown_done`, which the clear precedes on the terminating
+// thread). That kills the unbounded recycled-pid scheduler-skip the
+// clear-after-terminate variant suffered from.
+static IRQ_KILL_NONRUNNABLE_PIDS: [AtomicU64; MAX_DEFERRED_IRQ_KILLS] =
+    [const { AtomicU64::new(0) }; MAX_DEFERRED_IRQ_KILLS];
+
 pub fn defer_irq_terminate(pid: ProcessId, exit_code: i32) -> bool {
     for i in 0..MAX_DEFERRED_IRQ_KILLS {
-        if DEFERRED_IRQ_KILL_PIDS[i].load(Ordering::Relaxed) == 0 {
-            // Store exit code BEFORE publishing PID to prevent drain from
-            // reading a stale code on a concurrent swap.
-            DEFERRED_IRQ_KILL_CODES[i].store(exit_code, Ordering::Relaxed);
-            if DEFERRED_IRQ_KILL_PIDS[i]
+        // R170-5 FIX: the NONRUNNABLE entry IS the slot claim (CAS) and is
+        // published BEFORE the drain-visible DEFERRED store, so the scheduler
+        // skip-predicate covers the kill from the instant it can be drained.
+        if IRQ_KILL_NONRUNNABLE_PIDS[i].load(Ordering::Relaxed) == 0
+            && IRQ_KILL_NONRUNNABLE_PIDS[i]
                 .compare_exchange(0, pid as u64, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
-            {
-                DEFERRED_IRQ_KILL_PENDING.store(true, Ordering::Release);
-                return true;
-            }
+        {
+            // Store exit code BEFORE publishing the PID to the drain so a
+            // concurrent swap can never read a stale code. The slot is OURS
+            // (NONRUNNABLE claim), so plain stores suffice here.
+            DEFERRED_IRQ_KILL_CODES[i].store(exit_code, Ordering::Relaxed);
+            DEFERRED_IRQ_KILL_PIDS[i].store(pid as u64, Ordering::Release);
+            DEFERRED_IRQ_KILL_PENDING.store(true, Ordering::Release);
+            return true;
         }
     }
     false
+}
+
+/// R170-5 FIX: drop `pid` from the IRQ-kill non-runnable set. Called by
+/// `terminate_process` (the teardown-claim WINNER) immediately after the
+/// `Zombie` publish and strictly before `teardown_done` — see the set's doc.
+/// Value-keyed CAS so a slot already re-claimed for a DIFFERENT pid is never
+/// erased; iterates all slots so a hypothetical double-defer of one pid
+/// cannot strand a duplicate entry. Lock-free; takes no locks.
+fn clear_irq_kill_nonrunnable(pid: ProcessId) {
+    let pid_raw = pid as u64;
+    for i in 0..MAX_DEFERRED_IRQ_KILLS {
+        let _ = IRQ_KILL_NONRUNNABLE_PIDS[i].compare_exchange(
+            pid_raw,
+            0,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
 }
 
 /// R169-9 FIX: lock-free membership test for the IRQ-deferred-kill set.
@@ -3067,8 +3151,16 @@ pub fn defer_irq_terminate(pid: ProcessId, exit_code: i32) -> bool {
 /// on UP before the deferred drain runs. The scheduler consults this predicate so
 /// such a task is never selected; it idles via the scheduler (IRQs enabled) until
 /// `drain_deferred_irq_terminates` → `terminate_process` marks it `Zombie` and the
-/// reaper frees it. The pid is present for exactly the [defer → drain] window;
-/// after the drain, the `Zombie` state already excludes it.
+/// reaper frees it.
+///
+/// R170-5 FIX: scans `IRQ_KILL_NONRUNNABLE_PIDS` (not the drain-claim set), so
+/// membership now spans [defer → `Zombie`-publish] instead of [defer →
+/// drain-`swap(0)`] — closing the SMP window where the drain's claim cleared
+/// the predicate BEFORE `terminate_process` published `Zombie` and another
+/// CPU could select/steal the still-`Ready` victim. Every scheduler admission
+/// point checks this together with `state == Ready` under the held PCB lock,
+/// so post-clear observers see `Zombie` (the clear is program-ordered after
+/// the Zombie store's lock release on the terminating thread).
 ///
 /// Lock-free (8 `Acquire` loads, no locks / no allocation), so it is safe to call
 /// while holding the ready-queue and PCB locks.
@@ -3079,7 +3171,7 @@ pub fn is_pending_irq_kill(pid: ProcessId) -> bool {
     }
     let pid_raw = pid as u64;
     for i in 0..MAX_DEFERRED_IRQ_KILLS {
-        if DEFERRED_IRQ_KILL_PIDS[i].load(Ordering::Acquire) == pid_raw {
+        if IRQ_KILL_NONRUNNABLE_PIDS[i].load(Ordering::Acquire) == pid_raw {
             return true;
         }
     }
@@ -3092,6 +3184,12 @@ pub fn drain_deferred_irq_terminates() {
     }
     DEFERRED_IRQ_KILL_PENDING.store(false, Ordering::Relaxed);
     for i in 0..MAX_DEFERRED_IRQ_KILLS {
+        // The swap(0) stays the exactly-once TERMINATION claim (two drains can
+        // never both terminate one entry). R170-5: it no longer doubles as the
+        // scheduler-visibility membership — that lives in
+        // IRQ_KILL_NONRUNNABLE_PIDS and is cleared by terminate_process itself
+        // right after the Zombie publish, so the [swap → Zombie] window is no
+        // longer scheduler-visible. This drain does NOT touch NONRUNNABLE.
         let pid_raw = DEFERRED_IRQ_KILL_PIDS[i].swap(0, Ordering::Acquire);
         if pid_raw != 0 {
             let code = DEFERRED_IRQ_KILL_CODES[i].load(Ordering::Relaxed);
@@ -3195,6 +3293,9 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         let pid_ns_chain: Vec<crate::pid_namespace::PidNamespaceMembership>;
         // F.2: Save cgroup_id for task detachment
         let cgroup_id: crate::cgroup::CgroupId;
+        // R170-3: (tag, ns) of any contention-deferred CPU-quota debt, taken
+        // (read + zero) under the PCB lock below and flushed after it drops.
+        let quota_debt: (crate::cgroup::CgroupId, u64);
         // G.1: Save watchdog handle for unregistration
         let watchdog_handle: Option<WatchdogHandle>;
 
@@ -3249,9 +3350,41 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
             pid_ns_chain = proc.pid_ns_chain.clone();
             // F.2: Copy cgroup_id for detachment
             cgroup_id = proc.cgroup_id;
+            // R170-3 FIX: take (read + zero) the deferred quota debt in this
+            // SAME critical section — a concurrent on_clock_tick on another
+            // CPU serializes on this PCB lock, so it can never re-fold the ns
+            // taken here (any ticks it folds AFTER this point are dropped:
+            // bounded by the [take → deschedule] window of a dying task).
+            quota_debt = (proc.cpu_quota_debt_cgid, proc.cpu_quota_debt_ns);
+            proc.cpu_quota_debt_ns = 0;
             // G.1: Take watchdog handle (process no longer needs it)
             watchdog_handle = proc.watchdog_handle.take();
         }
+
+        // R170-5 FIX: drop the pid from the IRQ-kill non-runnable set NOW —
+        // immediately after the Zombie publish (the scheduler skip is taken
+        // over by `state == Zombie`, checked under the same PCB lock) and
+        // strictly BEFORE `teardown_done` is published or any internal
+        // `force_reschedule` runs. Pid recycling requires reap, which requires
+        // `Zombie && teardown_done`; the clear precedes `teardown_done` on
+        // this thread, so a recycled pid can never inherit a stale membership
+        // (the unbounded recycled-pid scheduler-skip the clear-after-
+        // terminate variant suffered from). Only the teardown-claim WINNER
+        // reaches this point — the early returns above leave the membership
+        // for the winner to clear. Invariant carried (pre-existing,
+        // Codex-verified): a deferred pid reaches terminate_process
+        // exclusively via the drain (remote kills route through
+        // pending_kill → defer; the direct terminate callers are
+        // never-scheduled-child cleanups that are never deferred).
+        clear_irq_kill_nonrunnable(pid);
+
+        // R170-3 FIX: land the taken contention-deferred quota debt on its
+        // origin cgroup (process context — the blocking walk is legal here).
+        crate::cgroup::flush_cpu_quota_debt(
+            quota_debt.0,
+            quota_debt.1,
+            time::current_timestamp_ms().saturating_mul(1_000_000),
+        );
 
         // G.1 Observability: Unregister watchdog before any other cleanup.
         // This must happen early to prevent false hung-task alerts during teardown.

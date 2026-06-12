@@ -1020,13 +1020,52 @@ impl Scheduler {
                     // F.2 Cgroup: Enforce cpu.max quota and throttle if exceeded
                     // Calculate current time in nanoseconds for quota accounting
                     let now_ns = kernel_core::get_ticks().saturating_mul(TICK_NS);
-                    if let cgroup::CpuQuotaStatus::Throttled(_) =
-                        cgroup::charge_cpu_quota(proc.cgroup_id, TICK_NS, now_ns)
-                    {
-                        // Quota exceeded - preempt this process immediately
-                        proc.state = ProcessState::Ready;
-                        proc.reset_time_slice();
-                        current_cpu().set_need_resched();
+                    // R170-3 FIX: fold any contention-deferred quota debt into
+                    // this tick's charge. The debt is tagged with the cgroup
+                    // it was accrued against; attach/cgroup.procs/exit all
+                    // take-and-flush it synchronously under this same PCB
+                    // lock, so a tag mismatch is unreachable — dropped
+                    // defensively rather than mis-charged to a different
+                    // cgroup.
+                    let debt_ns = if proc.cpu_quota_debt_cgid == proc.cgroup_id {
+                        proc.cpu_quota_debt_ns
+                    } else {
+                        proc.cpu_quota_debt_ns = 0;
+                        0
+                    };
+                    match cgroup::charge_cpu_quota(
+                        proc.cgroup_id,
+                        TICK_NS.saturating_add(debt_ns),
+                        now_ns,
+                    ) {
+                        cgroup::CpuQuotaStatus::ContentionDeferred(_) => {
+                            // NOTHING was accumulated (guaranteed by
+                            // charge_cpu_quota's snapshot-first phases): keep
+                            // the prior debt, defer this tick too, and
+                            // PREEMPT exactly like Throttled — without the
+                            // preempt, farming registry/limits contention
+                            // would keep the task running while accounting
+                            // merely defers (the R170-3 evasion).
+                            proc.cpu_quota_debt_ns = debt_ns.saturating_add(TICK_NS);
+                            proc.cpu_quota_debt_cgid = proc.cgroup_id;
+                            proc.state = ProcessState::Ready;
+                            proc.reset_time_slice();
+                            current_cpu().set_need_resched();
+                        }
+                        cgroup::CpuQuotaStatus::Throttled(_) => {
+                            // Accumulation ran (the folded debt landed too)
+                            // — clear the debt and preempt as before.
+                            proc.cpu_quota_debt_ns = 0;
+                            proc.state = ProcessState::Ready;
+                            proc.reset_time_slice();
+                            current_cpu().set_need_resched();
+                        }
+                        cgroup::CpuQuotaStatus::Allowed
+                        | cgroup::CpuQuotaStatus::Unlimited => {
+                            // Accumulation ran (or no quota exists anywhere
+                            // in the chain) — the debt is consumed/moot.
+                            proc.cpu_quota_debt_ns = 0;
+                        }
                     }
                 }
 

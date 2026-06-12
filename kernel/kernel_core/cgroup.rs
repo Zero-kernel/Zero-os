@@ -216,6 +216,28 @@ pub struct CgroupStats {
     pub ports_current: AtomicU64,
     /// J2-8: Number of times ports.max was hit.
     pub ports_events_max: AtomicU32,
+    /// R170-2 FIX: number of live FD charges KEYED to this cgroup id —
+    /// controller-INDEPENDENT (incremented at the charge ORIGIN even when
+    /// this node has the FILES controller disabled and the display counter
+    /// `fds_current` therefore stays 0). The `delete_cgroup` gate samples
+    /// THIS, not the display counter: the charge walkers push display
+    /// counters only to controller-bearing nodes while the stored uncharge
+    /// key is the bare origin id, so a FILES-disabled leaf could be deleted
+    /// with live ancestor charges keyed to it — the later uncharge then found
+    /// no node and silently stranded the ancestors (the R170-2 leak class).
+    /// NOT exposed in cgroupfs / the stats snapshot (display semantics are
+    /// byte-identical to pre-R170-2). Mutated ONLY by
+    /// `try_charge_fds`/`uncharge_fds` (and their migrate composition), so it
+    /// cannot drift against a separate mirror (FA-04 inapplicable); a
+    /// double-uncharge saturates DOWNWARD → the gate goes transiently
+    /// lenient, never permanently blocked.
+    pub fds_pinned: AtomicU64,
+    /// R170-2 FIX: number of live ephemeral-port charges KEYED to this cgroup
+    /// id — controller-independent twin of `fds_pinned` for the NET family
+    /// (see its doc). This is the LIVE R170-2 instance: `PortBinding.
+    /// charged_cgroup` stores the bare leaf id while a NET-disabled leaf's
+    /// `ports_current` is permanently 0.
+    pub ports_pinned: AtomicU64,
     /// J2-10: Current bytes of VFS directory-enumeration memory charged to this cgroup.
     pub vfs_dir_current: AtomicU64,
     /// J2-9: Current bytes of kernel memory charged to this cgroup (observability;
@@ -243,6 +265,9 @@ impl CgroupStats {
             fds_events_max: AtomicU32::new(0),
             ports_current: AtomicU64::new(0),
             ports_events_max: AtomicU32::new(0),
+            // R170-2: origin-keyed pinned counters (delete-gate, not display).
+            fds_pinned: AtomicU64::new(0),
+            ports_pinned: AtomicU64::new(0),
             vfs_dir_current: AtomicU64::new(0),
             kmem_current: AtomicU64::new(0),
         }
@@ -364,6 +389,23 @@ impl CgroupStats {
             Ordering::Relaxed,
             |current| Some(current.saturating_sub(n)),
         );
+    }
+
+    /// R170-2: pin/unpin `n` origin-keyed charges of the given family on THIS
+    /// node (controller-independent; saturating on unpin — see the field docs).
+    #[inline]
+    fn pin_origin(&self, pinned: &AtomicU64, n: u64) {
+        let _ = pinned.fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(n))
+        });
+    }
+
+    /// R170-2: saturating unpin (see `pin_origin`).
+    #[inline]
+    fn unpin_origin(&self, pinned: &AtomicU64, n: u64) {
+        let _ = pinned.fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(n))
+        });
     }
 
     /// J2-8: Records a ports.max exceeded event.
@@ -528,7 +570,16 @@ pub enum CpuQuotaStatus {
     /// Quota available, time has been charged.
     Allowed,
     /// Quota exceeded; cgroup is throttled until the specified time (ns).
+    /// The delta WAS accumulated (or coasted inside a live throttle window).
     Throttled(u64),
+    /// R170-3 FIX: NOTHING was accumulated — the registry lookup or a
+    /// per-node `limits` lock was contended and `charge_cpu_quota` bailed
+    /// BEFORE any `period_usage_ns` motion (guaranteed by its snapshot-first
+    /// phase structure). The payload is a retry hint like `Throttled`'s.
+    /// Distinct from `Throttled` so the tick handler folds the un-accumulated
+    /// delta into the per-PCB quota debt ONLY in this case — folding on a
+    /// genuine `Throttled` would double-count a delta that already landed.
+    ContentionDeferred(u64),
 }
 
 // ============================================================================
@@ -1755,20 +1806,47 @@ pub fn delete_cgroup(id: CgroupId) -> Result<(), CgroupError> {
     // DECREMENTS (the charge helpers themselves do not consult `deleted` — the
     // safety here is lifecycle-based, not flag-enforced).
     //
+    // R170-2 FIX: the PORT and FD legs of the gate sample the origin-keyed
+    // PINNED counters, NOT the display counters. The display counters are
+    // controller-gated (the charge walkers skip controller-disabled nodes,
+    // cgroup.rs try_charge_ports/try_charge_fds), while the stored uncharge
+    // key is the bare ORIGIN id — so a NET/FILES-disabled leaf's display
+    // counter stayed permanently 0, this gate passed, the leaf was deleted
+    // with live ancestor charges keyed to it, and the later uncharge found no
+    // node and silently stranded the ancestor chain (the R170-2 reopened
+    // leak). `ports_pinned`/`fds_pinned` are incremented at the origin node
+    // by every charge REGARDLESS of controller bits and decremented by every
+    // uncharge of that key, so "gate passes ⇒ no live charge references this
+    // id" now holds by construction for both families.
+    //
+    // MEMORY deliberately stays on the DISPLAY counter: the memory family's
+    // charge/uncharge is NOT amount/origin-symmetric (fork charges one
+    // aggregated lump to the parent's cgroup while the child's exit uncharges
+    // four independently recomputed sums; migration re-snapshots
+    // compute_cgroup_charged_bytes) with documented over-count-biased
+    // residuals — an origin-pinned memory counter would convert that benign,
+    // diffuse drift into a PERMANENTLY-undeletable cgroup (the FA-04
+    // direction). The controller-disabled-leaf memory window therefore
+    // remains a DOCUMENTED latent residual (reachability requires the
+    // exit-ordering race, unlike the port instance which needs no race),
+    // tracked for closure once the memory tallies are made amount-symmetric
+    // (R171 obligation / D-R170-DELETE-GATE-LEAF).
+    //
     // EXCLUDED from the gate: `kmem_current` (a currently-unwired/dead stat
     // field, always 0; J2-9 page-table kmem rides `memory_current`) and
     // `vfs_dir_current` (RAII `VfsDirBudgetGuard` Arc-pins the node, so its
     // uncharge always reaches the same node it charged and self-reconciles).
-    // Only the bare-cgid PORT / FD / MEMORY charges can outlive the id.
     //
     // Fail-CLOSED: a transient `NotEmpty`/EBUSY (the CAP_SYS_ADMIN / delegated
     // owner retries once in-flight teardown + uncharge settles — promptly,
     // because the deferred port queue was force-drained above and exit-path
     // uncharges run on every syscall-return/idle drain) is strictly safer than
     // a silent, unrecoverable over-count. ids are never recycled, so a deferred
-    // delete can never misapply to a different cgroup.
-    let live_ports = node.stats.ports_current.load(Ordering::Acquire);
-    let live_fds = node.stats.fds_current.load(Ordering::Acquire);
+    // delete can never misapply to a different cgroup. A saturating
+    // double-uncharge can only under-count a pinned counter (transient
+    // leniency, today's risk direction) — never permanently block deletion.
+    let live_ports = node.stats.ports_pinned.load(Ordering::Acquire);
+    let live_fds = node.stats.fds_pinned.load(Ordering::Acquire);
     let live_mem = node.stats.memory_current.load(Ordering::Acquire);
     if live_ports != 0 || live_fds != 0 || live_mem != 0 {
         node.deleted.store(false, Ordering::Release);
@@ -1876,11 +1954,37 @@ pub fn migrate_task(
 /// Returns the effective CPU weight for a task in the given cgroup.
 ///
 /// If no explicit weight is set, returns the default (100).
+///
+/// # R170-1 FIX (D-R170-CPU-L5; the 4th IRQ-off L5 reader R169-2 missed)
+///
+/// Reached in TRUE timer-IRQ context on every time-slice expiry
+/// (`on_clock_tick` → `reset_time_slice` → `calculate_time_slice_with_cgroup`),
+/// from the scheduler pick paths (`select_next_process`/`steal_one` →
+/// `reset_time_slice`, under `without_interrupts`), and from the futex-PI
+/// `recompute_effective_priority` chain (FutexBucket + Process locks held).
+/// The original BLOCKING `lookup_cgroup` (`CGROUP_REGISTRY.read()`, L5) AND
+/// BLOCKING `limits.lock()` here each self-deadlock against a same-CPU
+/// process-context holder with IRQs enabled (`create/delete/migrate_cgroup`
+/// hold the registry write lock; `set_limits`/`sys_cgroup_set_limit` hold the
+/// per-node `limits` mutex) — both acquisitions must be non-blocking, not
+/// just the registry read the QA report cited.
+///
+/// Fail direction: OPEN to `DEFAULT_WEIGHT` on either contention. This is
+/// deliberately the OPPOSITE of `charge_cpu_quota` (which fails CLOSED on the
+/// same contention): cpu_weight is an advisory slice-length heuristic whose
+/// one-tick default-weight slice self-corrects at the next expiry (this also
+/// holds for the PI-boost reacher — the recomputed slice is re-derived on
+/// every subsequent boost/clear and tick), while cpu.max is a hard
+/// enforcement gate that must never be bypassable by induced contention
+/// (FX-09 fail-direction rule).
 pub fn get_effective_cpu_weight(cgroup_id: CgroupId) -> u32 {
     const DEFAULT_WEIGHT: u32 = 100;
 
-    if let Some(cgroup) = lookup_cgroup(cgroup_id) {
-        cgroup.limits.lock().cpu_weight.unwrap_or(DEFAULT_WEIGHT)
+    if let Some(cgroup) = try_lookup_cgroup(cgroup_id) {
+        match cgroup.limits.try_lock() {
+            Some(limits) => limits.cpu_weight.unwrap_or(DEFAULT_WEIGHT),
+            None => DEFAULT_WEIGHT,
+        }
     } else {
         DEFAULT_WEIGHT
     }
@@ -2241,6 +2345,12 @@ pub fn try_charge_fds(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupError
     // Collect the chain: target cgroup + ancestors with the FILES controller.
     let mut depth: u32 = 0;
     let mut cursor = lookup_cgroup(cgroup_id);
+    // R170-2 FIX: pin at the ORIGIN node first, controller-independent —
+    // twin of try_charge_ports' pin (see CgroupStats::fds_pinned).
+    let origin: Option<Arc<CgroupNode>> = cursor.clone();
+    if let Some(o) = &origin {
+        o.stats.pin_origin(&o.stats.fds_pinned, count);
+    }
     let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
     while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::FILES) {
@@ -2254,7 +2364,11 @@ pub fn try_charge_fds(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupError
     }
 
     if chain.is_empty() {
-        return Ok(()); // No FILES controller anywhere in the chain.
+        // No FILES controller anywhere: the PIN stays (the per-process FD
+        // tallies key their exit/migrate uncharge to this id, which unpins
+        // symmetrically) — keeps the delete-gate sound for a controller-less
+        // chain. See try_charge_ports.
+        return Ok(());
     }
 
     // Snapshot per-node limits (lock each briefly; never hold two at once).
@@ -2285,6 +2399,10 @@ pub fn try_charge_fds(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupError
                 for &j in &charged {
                     chain[j].stats.decrement_fds(count);
                 }
+                // R170-2: roll back the origin pin too (nothing was keyed).
+                if let Some(o) = &origin {
+                    o.stats.unpin_origin(&o.stats.fds_pinned, count);
+                }
                 return Err(CgroupError::FdsLimitExceeded);
             }
         }
@@ -2303,6 +2421,11 @@ pub fn uncharge_fds(cgroup_id: CgroupId, count: u64) {
 
     let mut depth: u32 = 0;
     let mut cursor = lookup_cgroup(cgroup_id);
+    // R170-2 FIX: unpin at the ORIGIN node (controller-independent, symmetric
+    // with try_charge_fds' pin; saturating).
+    if let Some(o) = &cursor {
+        o.stats.unpin_origin(&o.stats.fds_pinned, count);
+    }
     while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::FILES) {
             cgroup.stats.decrement_fds(count);
@@ -2379,6 +2502,15 @@ pub fn try_charge_ports(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupErr
     // Collect the chain: target cgroup + ancestors with the NET controller.
     let mut depth: u32 = 0;
     let mut cursor = lookup_cgroup(cgroup_id);
+    // R170-2 FIX: pin the charge at the ORIGIN node (the node whose id the
+    // caller stores as the uncharge key) FIRST, controller-INDEPENDENT — see
+    // `CgroupStats::ports_pinned`. Pinned before the display charges so the
+    // delete-gate can never observe display motion without the pin; unpinned
+    // on rejection below.
+    let origin: Option<Arc<CgroupNode>> = cursor.clone();
+    if let Some(o) = &origin {
+        o.stats.pin_origin(&o.stats.ports_pinned, count);
+    }
     let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
     while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::NET) {
@@ -2392,7 +2524,12 @@ pub fn try_charge_ports(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupErr
     }
 
     if chain.is_empty() {
-        return Ok(()); // No NET controller anywhere in the chain.
+        // No NET controller anywhere: nothing to enforce or display-count,
+        // but the PIN stays — the caller still stores this id and the later
+        // uncharge_ports(id) unpins symmetrically, keeping the delete-gate
+        // sound even for a controller-less chain (and immune to controller
+        // flags being enabled between charge and uncharge).
+        return Ok(());
     }
 
     // Snapshot per-node limits (lock each briefly; never hold two at once).
@@ -2423,6 +2560,10 @@ pub fn try_charge_ports(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupErr
                 for &j in &charged {
                     chain[j].stats.decrement_ports(count);
                 }
+                // R170-2: roll back the origin pin too (nothing was keyed).
+                if let Some(o) = &origin {
+                    o.stats.unpin_origin(&o.stats.ports_pinned, count);
+                }
                 return Err(CgroupError::PortsLimitExceeded);
             }
         }
@@ -2448,6 +2589,11 @@ pub fn uncharge_ports(cgroup_id: CgroupId, count: u64) {
 
     let mut depth: u32 = 0;
     let mut cursor = lookup_cgroup(cgroup_id);
+    // R170-2 FIX: unpin at the ORIGIN node (controller-independent, symmetric
+    // with try_charge_ports' pin; saturating).
+    if let Some(o) = &cursor {
+        o.stats.unpin_origin(&o.stats.ports_pinned, count);
+    }
     while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::NET) {
             cgroup.stats.decrement_ports(count);
@@ -2649,6 +2795,15 @@ pub fn wait_for_io_window(
 /// * `cgroup_id` - The cgroup that performed the I/O
 /// * `bytes` - Number of bytes transferred
 /// * `op` - Read or Write direction
+///
+/// # WARNING (R170-1 sweep): process-context ONLY — blocking L5 read below.
+///
+/// This uses the BLOCKING `lookup_cgroup` (`CGROUP_REGISTRY.read()`). Every
+/// current caller is the block layer's process-context completion path, so it
+/// is safe today — but if I/O completion ever moves into an IRQ handler or an
+/// IRQs-disabled bottom half, this becomes a 5th instance of the R169-2/R170-1
+/// same-CPU writer-vs-IRQ self-deadlock and MUST be converted to
+/// `try_lookup_cgroup` (fail-open: a dropped statistics sample is benign).
 pub fn record_io_completion(cgroup_id: CgroupId, bytes: u64, op: IoDirection) {
     if bytes == 0 {
         return;
@@ -2679,14 +2834,42 @@ pub fn record_io_completion(cgroup_id: CgroupId, bytes: u64, op: IoDirection) {
 /// Called from the scheduler's tick handler to account CPU usage against
 /// the cgroup's quota and check for throttling.
 ///
-/// # Safety Note
+/// # Safety Note (R169-2 + R170-3)
 ///
-/// This function is called in IRQ context (timer interrupt handler).
-/// It uses `try_lock()` on the limits mutex to avoid deadlock: if
-/// a process-context thread holds the lock (e.g., setting limits),
-/// the charge is skipped for this tick. This is safe because:
-/// - Missing one tick of enforcement doesn't breach isolation
-/// - The quota will be enforced on subsequent ticks
+/// This function is called in IRQ context (timer interrupt handler), so it
+/// uses `try_lookup_cgroup` for the registry and `try_lock()` on every
+/// `limits` mutex (a blocking acquisition would self-deadlock against a
+/// same-CPU IRQs-enabled holder). It also must NOT heap-allocate (the
+/// allocator lock may be held by the interrupted context) — the chain
+/// snapshot below is a fixed `MAX_CGROUP_DEPTH`-bounded stack array.
+///
+/// # Phase structure (R170-3 FIX — contention can never drop accounting)
+///
+/// The old single-pass walk could return its contention fallback MID-WALK,
+/// after some nodes had already accumulated, and that fallback was
+/// indistinguishable from a genuine throttle — so the tick handler silently
+/// LOST the tick's delta on every induced registry/limits contention
+/// (the R170-3 cpu.max evasion; the prior comment's claim that contention
+/// "preserves isolation" was false — it preserved the PREEMPT but dropped
+/// the ACCOUNTING). Now:
+///
+/// * **Phase A** — non-blocking entry lookup; contention ⇒
+///   `ContentionDeferred` (nothing accumulated).
+/// * **Phase B** — collect the CPU-controller chain (`parent()` Weak
+///   upgrades, no registry) and snapshot every `cpu.max` via `try_lock`
+///   BEFORE any accumulation; any contention ⇒ `ContentionDeferred`
+///   (still nothing accumulated).
+/// * **Phase C** — accumulate per node with NO early returns.
+///
+/// `ContentionDeferred` therefore GUARANTEES zero accumulation, and the tick
+/// handler re-folds the delta into the per-PCB quota debt to land on a later
+/// tick (see `Process::cpu_quota_debt_ns` / `flush_cpu_quota_debt`), while
+/// still preempting exactly like `Throttled`. Residual (documented): a
+/// deferred delta can land one quota period later (per-period windows do not
+/// carry debt across refresh, mirroring Linux cpu.max semantics), so
+/// SUSTAINED multi-period adversarial contention still under-enforces within
+/// the contended periods — the durable fix is removing L5 from the tick path
+/// entirely (D-R170-CPU-L5 cached `Arc<CgroupNode>` on the PCB).
 ///
 /// # Arguments
 ///
@@ -2698,7 +2881,8 @@ pub fn record_io_completion(cgroup_id: CgroupId, bytes: u64, op: IoDirection) {
 ///
 /// * `Unlimited` - No CPU controller or cpu.max configured
 /// * `Allowed` - Quota available, time has been charged
-/// * `Throttled(until_ns)` - Quota exceeded, cgroup is throttled until specified time
+/// * `Throttled(until_ns)` - Quota exceeded/coasting; the delta was accumulated
+/// * `ContentionDeferred(retry_ns)` - lock contention; NOTHING was accumulated
 pub fn charge_cpu_quota(
     cgroup_id: CgroupId,
     delta_ns: u64,
@@ -2708,117 +2892,173 @@ pub fn charge_cpu_quota(
         return CpuQuotaStatus::Allowed;
     }
 
-    // P2-9 FIX: Hierarchical cpu.max enforcement.
-    //
-    // In cgroups v2, ancestor cpu.max quotas apply to all descendants.
-    // We charge CPU time at each level of the hierarchy and return the
-    // most restrictive throttle deadline.
-    //
-    // Design: walk from leaf to root.  At each node with a CPU controller
-    // and cpu.max configured, charge time and record throttle status.  The
-    // overall result is the latest (most restrictive) throttle deadline
-    // among all ancestors, or Allowed if none are throttled.
-    const LOCK_CONTENTION_THROTTLE_NS: u64 = 10_000_000; // 10ms
+    // P2-9 FIX: Hierarchical cpu.max enforcement — ancestor quotas apply to
+    // all descendants; the overall result is the most restrictive throttle
+    // deadline among all levels.
+    const LOCK_CONTENTION_THROTTLE_NS: u64 = 10_000_000; // 10ms retry hint
 
-    let mut any_quota = false;
-    let mut overall_throttle_until: u64 = 0;
-
-    let mut depth: u32 = 0;
-    // R169-2 FIX (D1-CGROUP-IRQ-L5): on_clock_tick calls this in timer-IRQ
-    // context (IRQs disabled), so the leaf lookup must be NON-blocking. Fail
-    // CLOSED on registry contention — return a bounded throttle, identical to
-    // the existing limits.try_lock() contention branch below (2589). This
-    // preserves isolation (cpu.max can never be bypassed by inducing registry
-    // contention) and self-corrects on the next tick. The ancestor walk uses
-    // cgroup.parent() (Weak::upgrade, no registry), so only the entry lookup
-    // changes.
-    let mut cursor = match try_lookup_cgroup(cgroup_id) {
-        Some(c) => Some(c),
+    // Phase A (R169-2 FIX, D1-CGROUP-IRQ-L5): NON-blocking entry lookup.
+    let origin = match try_lookup_cgroup(cgroup_id) {
+        Some(c) => c,
         None => {
-            return CpuQuotaStatus::Throttled(
+            return CpuQuotaStatus::ContentionDeferred(
                 now_ns.saturating_add(LOCK_CONTENTION_THROTTLE_NS),
             );
         }
     };
+
+    // Phase B (R170-3 FIX): collect the quota-bearing chain and snapshot every
+    // cpu.max BEFORE any accumulation. Fixed-size stack storage — IRQ context,
+    // no heap. Slots [0..chain_len) are Some.
+    let mut chain: [Option<(Arc<CgroupNode>, u64, u64)>; (MAX_CGROUP_DEPTH as usize) + 1] =
+        core::array::from_fn(|_| None);
+    let mut chain_len: usize = 0;
+    {
+        let mut depth: u32 = 0;
+        let mut cursor = Some(origin);
+        while let Some(cgroup) = cursor {
+            if cgroup.controllers.contains(CgroupControllers::CPU) {
+                // IRQ-safe: try_lock (R83-5 fail-direction now lives in the
+                // ContentionDeferred contract — the caller preempts AND defers
+                // the delta instead of dropping it).
+                let cpu_max = match cgroup.limits.try_lock() {
+                    Some(limits) => limits.cpu_max,
+                    None => {
+                        return CpuQuotaStatus::ContentionDeferred(
+                            now_ns.saturating_add(LOCK_CONTENTION_THROTTLE_NS),
+                        );
+                    }
+                };
+                if let Some((max_us, period_us)) = cpu_max {
+                    // u64::MAX means "max" (no quota) - mirrors Linux semantics
+                    if max_us != u64::MAX {
+                        chain[chain_len] = Some((cgroup.clone(), max_us, period_us));
+                        chain_len += 1;
+                    }
+                }
+            }
+            if depth >= MAX_CGROUP_DEPTH {
+                break;
+            }
+            depth = depth.saturating_add(1);
+            cursor = cgroup.parent();
+        }
+    }
+
+    if chain_len == 0 {
+        return CpuQuotaStatus::Unlimited;
+    }
+
+    // Phase C: accumulate. No locks taken, NO early returns — once Phase B
+    // succeeds the delta ALWAYS lands at every quota-bearing level (or coasts
+    // inside that level's live throttle window, exactly as before).
+    let mut overall_throttle_until: u64 = 0;
+    for slot in chain.iter().take(chain_len) {
+        let Some((cgroup, max_us, period_us)) = slot else {
+            continue;
+        };
+        let period_ns = period_us.saturating_mul(1_000);
+        let max_ns = max_us.saturating_mul(1_000);
+        let quota = &cgroup.cpu_quota;
+
+        // Refresh the window if the period has elapsed
+        quota.refresh_window(now_ns, period_ns);
+
+        // Check if currently throttled
+        let throttle_until = quota.throttled_until_ns.load(Ordering::Acquire);
+        let mut should_charge = true;
+        if throttle_until != 0 {
+            if now_ns < throttle_until {
+                // Still in throttle window
+                overall_throttle_until = overall_throttle_until.max(throttle_until);
+                should_charge = false;
+            } else {
+                // R110-2 FIX: Throttle expired — delegate to CAS-serialized
+                // refresh_window().
+                quota.refresh_window(now_ns, period_ns);
+            }
+        }
+
+        // R110-2 FIX: Skip charging while a refresh is in progress.
+        if should_charge && !quota.is_refreshing() {
+            let used = quota
+                .period_usage_ns
+                .fetch_add(delta_ns, Ordering::SeqCst)
+                .saturating_add(delta_ns);
+
+            if used > max_ns {
+                // Quota exceeded — throttle until end of current period
+                let until = quota
+                    .period_start_ns
+                    .load(Ordering::Relaxed)
+                    .saturating_add(period_ns);
+                quota.throttled_until_ns.store(until, Ordering::SeqCst);
+                quota.throttle_events.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
+                overall_throttle_until = overall_throttle_until.max(until);
+            }
+        }
+    }
+
+    if overall_throttle_until != 0 {
+        CpuQuotaStatus::Throttled(overall_throttle_until)
+    } else {
+        CpuQuotaStatus::Allowed
+    }
+}
+
+/// R170-3 FIX: synchronously land a contention-deferred CPU-quota debt on its
+/// ORIGIN cgroup's quota windows. PROCESS-CONTEXT ONLY — uses the blocking
+/// `lookup_cgroup` and blocking `limits.lock()` (legal under a held Process
+/// lock: the established Process → cgroup order).
+///
+/// Called from the three places a PCB's debt tag would otherwise go stale,
+/// each AFTER taking (read + zero) the debt fields under the held Process
+/// lock so a concurrent `on_clock_tick` can never re-fold the same ns:
+/// `sys_cgroup_attach` and the cgroupfs `cgroup.procs` migration (both before
+/// re-pointing `proc.cgroup_id`), and `terminate_process` (exit).
+///
+/// The debt is accumulated unconditionally at every quota-bearing level
+/// (modulo the R110-2 `is_refreshing` guard) — it represents time the task
+/// actually RAN, so a live throttle window must not suppress it. A missing
+/// node (cgroup deleted concurrently — only reachable once emptied) drops the
+/// debt, bounded by one contention window.
+pub fn flush_cpu_quota_debt(cgroup_id: CgroupId, debt_ns: u64, now_ns: u64) {
+    if debt_ns == 0 {
+        return;
+    }
+    let mut depth: u32 = 0;
+    let mut cursor = lookup_cgroup(cgroup_id);
     while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::CPU) {
-            // IRQ-safe: Use try_lock() to avoid deadlock when process-context
-            // code holds the limits lock (e.g., sys_cgroup_set_limit).
-            //
-            // R83-5 FIX: Fail-closed when lock is contended (prevents bypass).
-            let cpu_max = match cgroup.limits.try_lock() {
-                Some(limits) => limits.cpu_max,
-                None => {
-                    return CpuQuotaStatus::Throttled(
-                        now_ns.saturating_add(LOCK_CONTENTION_THROTTLE_NS),
-                    );
-                }
-            };
-
+            let cpu_max = cgroup.limits.lock().cpu_max;
             if let Some((max_us, period_us)) = cpu_max {
-                // u64::MAX means "max" (no quota) - mirrors Linux semantics
                 if max_us != u64::MAX {
-                    any_quota = true;
-
                     let period_ns = period_us.saturating_mul(1_000);
                     let max_ns = max_us.saturating_mul(1_000);
                     let quota = &cgroup.cpu_quota;
-
-                    // Refresh the window if the period has elapsed
                     quota.refresh_window(now_ns, period_ns);
-
-                    // Check if currently throttled
-                    let throttle_until = quota.throttled_until_ns.load(Ordering::Acquire);
-                    let mut should_charge = true;
-                    if throttle_until != 0 {
-                        if now_ns < throttle_until {
-                            // Still in throttle window
-                            overall_throttle_until =
-                                overall_throttle_until.max(throttle_until);
-                            should_charge = false;
-                        } else {
-                            // R110-2 FIX: Throttle expired — delegate to
-                            // CAS-serialized refresh_window().
-                            quota.refresh_window(now_ns, period_ns);
-                        }
-                    }
-
-                    // R110-2 FIX: Skip charging while a refresh is in progress.
-                    if should_charge && !quota.is_refreshing() {
+                    if !quota.is_refreshing() {
                         let used = quota
                             .period_usage_ns
-                            .fetch_add(delta_ns, Ordering::SeqCst)
-                            .saturating_add(delta_ns);
-
+                            .fetch_add(debt_ns, Ordering::SeqCst)
+                            .saturating_add(debt_ns);
                         if used > max_ns {
-                            // Quota exceeded — throttle until end of current period
                             let until = quota
                                 .period_start_ns
                                 .load(Ordering::Relaxed)
                                 .saturating_add(period_ns);
                             quota.throttled_until_ns.store(until, Ordering::SeqCst);
                             quota.throttle_events.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
-                            overall_throttle_until =
-                                overall_throttle_until.max(until);
                         }
                     }
                 }
             }
         }
-
         if depth >= MAX_CGROUP_DEPTH {
             break;
         }
         depth = depth.saturating_add(1);
         cursor = cgroup.parent();
-    }
-
-    if overall_throttle_until != 0 {
-        CpuQuotaStatus::Throttled(overall_throttle_until)
-    } else if any_quota {
-        CpuQuotaStatus::Allowed
-    } else {
-        CpuQuotaStatus::Unlimited
     }
 }
 
@@ -3042,6 +3282,95 @@ pub fn run_cgroup_ports_budget_self_test() {
     // Cleanup: delete children before parents (no tasks attached).
     let _ = delete_cgroup(b_id);
     let _ = delete_cgroup(a_id);
+}
+
+/// R170-2: in-kernel self-test for the ORIGIN-PINNED delete-gate counters
+/// (`ports_pinned`/`fds_pinned`) — the controller-DISABLED-leaf configuration
+/// the R169-3 display-counter gate was blind to.
+///
+/// Covers: (1) a charge keyed to a NET/FILES-disabled leaf pins the LEAF
+/// (controller-independent) while the display counters land only on the
+/// controller-bearing parent (display semantics unchanged); (2) the
+/// delete-gate REJECTS the pinned leaf (`NotEmpty`) even though every display
+/// counter on it is 0 — the exact R170-2 leak interleaving, now fail-closed;
+/// (3) uncharge keyed to the leaf unpins it and drains the parent's display
+/// counters; (4) the drained leaf then deletes cleanly; (5) a rejected charge
+/// rolls its pin back; (6) saturating unpin never wraps.
+pub fn run_cgroup_disabled_leaf_gate_self_test() {
+    let ports_disp = |n: &Arc<CgroupNode>| n.stats.ports_current.load(Ordering::SeqCst);
+    let fds_disp = |n: &Arc<CgroupNode>| n.stats.fds_current.load(Ordering::SeqCst);
+    let ports_pin = |n: &Arc<CgroupNode>| n.stats.ports_pinned.load(Ordering::SeqCst);
+    let fds_pin = |n: &Arc<CgroupNode>| n.stats.fds_pinned.load(Ordering::SeqCst);
+
+    // P carries NET+FILES+PIDS (with limits); C is a NET/FILES-DISABLED leaf
+    // under P — it enables only the PIDS subset (new_child rejects an empty
+    // controller set, so "controller-disabled" here means disabled for the
+    // NET/FILES families the gate samples — exactly the blind configuration).
+    let p = create_cgroup(
+        0,
+        CgroupControllers::NET | CgroupControllers::FILES | CgroupControllers::PIDS,
+    )
+    .expect("create P");
+    let p_id = p.id();
+    p.set_limit(CgroupLimits {
+        ports_max: Some(10),
+        fds_max: Some(10),
+        ..Default::default()
+    })
+    .expect("set P limits");
+    let c = create_cgroup(p_id, CgroupControllers::PIDS).expect("create C");
+    let c_id = c.id();
+
+    // 1) Charges keyed to C: display lands on P only; the PIN lands on C.
+    try_charge_ports(c_id, 2).expect("charge 2 ports keyed to C");
+    try_charge_fds(c_id, 3).expect("charge 3 fds keyed to C");
+    assert_eq!(ports_disp(&c), 0, "C display ports stay 0 (controller off)");
+    assert_eq!(fds_disp(&c), 0, "C display fds stay 0 (controller off)");
+    assert_eq!(ports_disp(&p), 2, "P (NET ancestor) display ports");
+    assert_eq!(fds_disp(&p), 3, "P (FILES ancestor) display fds");
+    assert_eq!(ports_pin(&c), 2, "C pinned ports (origin-keyed)");
+    assert_eq!(fds_pin(&c), 3, "C pinned fds (origin-keyed)");
+    assert_eq!(ports_pin(&p), 0, "P not pinned by a C-keyed charge");
+
+    // 2) The delete-gate must REJECT C while pinned (every display counter on
+    //    C is 0 — this exact configuration silently leaked before R170-2).
+    assert_eq!(
+        delete_cgroup(c_id),
+        Err(CgroupError::NotEmpty),
+        "pinned controller-disabled leaf must be undeletable"
+    );
+    assert!(lookup_cgroup(c_id).is_some(), "C still registry-resident");
+
+    // 3) Uncharge keyed to C: unpins C and drains P's display counters —
+    //    exactly what the pre-R170-2 gate let the delete skip forever.
+    uncharge_ports(c_id, 2);
+    uncharge_fds(c_id, 3);
+    assert_eq!(ports_pin(&c), 0, "C unpinned after port uncharge");
+    assert_eq!(fds_pin(&c), 0, "C unpinned after fd uncharge");
+    assert_eq!(ports_disp(&p), 0, "P display ports drained");
+    assert_eq!(fds_disp(&p), 0, "P display fds drained");
+
+    // 4) The drained leaf deletes cleanly.
+    delete_cgroup(c_id).expect("delete drained C");
+
+    // 5) A REJECTED charge rolls its pin back (overcharge through a fresh
+    //    NET-disabled leaf: P's ports_max=10 rejects 11).
+    let d = create_cgroup(p_id, CgroupControllers::PIDS).expect("create D");
+    let d_id = d.id();
+    assert_eq!(
+        try_charge_ports(d_id, 11),
+        Err(CgroupError::PortsLimitExceeded),
+        "over-cap charge keyed to D fails closed"
+    );
+    assert_eq!(ports_pin(&d), 0, "D pin rolled back on rejection");
+    assert_eq!(ports_disp(&p), 0, "P display rolled back on rejection");
+    delete_cgroup(d_id).expect("delete D");
+
+    // 6) Saturating unpin: over-uncharge floors at 0 (never wraps).
+    uncharge_ports(p_id, 999);
+    assert_eq!(ports_pin(&p), 0, "P pin saturates at 0");
+
+    let _ = delete_cgroup(p_id);
 }
 
 /// J2-9: in-kernel self-test for the page-table-frame kmem accounting. The pt
