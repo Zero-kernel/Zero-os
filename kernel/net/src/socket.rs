@@ -93,6 +93,9 @@ pub enum WaitOutcome {
     Closed,
     /// No process context available (called from kernel context)
     NoProcess,
+    /// R171 (F3): the waiting task has a pending kill — abort the blocking
+    /// syscall with EINTR instead of re-parking (the unkillable-blocked class).
+    Interrupted,
 }
 
 // ============================================================================
@@ -1633,6 +1636,9 @@ pub enum SocketError {
     Lsm(LsmError),
     /// R162-9 FIX: Allocation failed
     NoMemory,
+    /// R171 (F3): a blocking socket operation was interrupted by a pending kill
+    /// (maps to EINTR).
+    Interrupted,
 }
 
 impl From<UdpError> for SocketError {
@@ -4836,6 +4842,37 @@ impl SocketTable {
                     }
                     return Err(SocketError::Closed);
                 }
+                WaitOutcome::Interrupted => {
+                    // R171-F3 FIX: a pending kill interrupted the blocking connect.
+                    // Mirror the TimedOut teardown so the in-flight SYN_SENT
+                    // binding / port-charge / per-ns conn are released (no J2 quota
+                    // leak), then report EINTR.
+                    let binding_key = (sock.net_ns_id, local_port);
+                    let action = {
+                        let mut bindings = self.tcp_bindings.lock();
+                        Self::resolve_while_alive_teardown(
+                            &mut bindings,
+                            binding_key,
+                            Arc::as_ptr(sock),
+                        )
+                    };
+                    if let TeardownAction::Removed(Some(c)) = action {
+                        uncharge_port_cgroup(c, 1);
+                        let mut m = sock.meta.lock();
+                        m.local_ip = None;
+                        m.local_port = None;
+                    }
+                    if self.tcp_conns.lock().remove(&conn_key).is_some() {
+                        self.dec_ns_conn(conn_key.0);
+                    }
+                    {
+                        let mut meta = sock.meta.lock();
+                        meta.remote_ip = None;
+                        meta.remote_port = None;
+                    }
+                    self.detach_tcp_uncharged(sock);
+                    return Err(SocketError::Interrupted);
+                }
                 WaitOutcome::NoProcess => return Err(SocketError::NoProcess),
             }
         }
@@ -4910,6 +4947,8 @@ impl SocketTable {
                         WaitOutcome::TimedOut => return Err(SocketError::Timeout),
                         WaitOutcome::Closed => return Err(SocketError::Closed),
                         WaitOutcome::NoProcess => return Err(SocketError::NoProcess),
+                        // R171-F3: pending kill — interrupt the blocking recv (EINTR).
+                        WaitOutcome::Interrupted => return Err(SocketError::Interrupted),
                     }
                 }
             }
@@ -5396,6 +5435,8 @@ impl SocketTable {
                 WaitOutcome::TimedOut => return Err(SocketError::Timeout),
                 WaitOutcome::Closed => return Err(SocketError::Closed),
                 WaitOutcome::NoProcess => return Err(SocketError::NoProcess),
+                // R171-F3: pending kill — interrupt the blocking recv (EINTR).
+                WaitOutcome::Interrupted => return Err(SocketError::Interrupted),
             }
         }
     }

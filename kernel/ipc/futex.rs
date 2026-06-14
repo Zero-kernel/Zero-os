@@ -43,6 +43,8 @@ pub enum FutexError {
     TimedOut,
     /// E.4 PI: Robust futex - 锁持有者已退出
     OwnerDied,
+    /// R171 (F3): 等待期间检测到挂起的 kill —— 以 EINTR 中断 futex 等待。
+    Interrupted,
 }
 
 /// 单个 futex 地址的等待状态
@@ -216,6 +218,8 @@ pub fn futex_wait(
         WaitOutcome::Woken => Ok(0),
         WaitOutcome::TimedOut => Err(FutexError::TimedOut),
         WaitOutcome::Closed | WaitOutcome::NoProcess => Err(FutexError::NoProcess),
+        // R171-F3: a pending kill interrupted the futex wait (-> EINTR).
+        WaitOutcome::Interrupted => Err(FutexError::Interrupted),
     }
 }
 

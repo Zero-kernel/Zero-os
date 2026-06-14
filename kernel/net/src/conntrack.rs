@@ -1124,6 +1124,50 @@ impl ConntrackTable {
         }
     }
 
+    /// R171-G4-2 FIX: remove ALL conntrack flows belonging to a destroyed network
+    /// namespace and drop its per-ns counter row. Namespace teardown must reclaim
+    /// the ns's `CT_MAX_ENTRIES_PER_NS` budget + the global table slots immediately
+    /// (ns ids are never reused) rather than waiting for each flow to time out via
+    /// the periodic `sweep`. This is the conntrack analogue of the socket-table
+    /// `drain_ns_counters` teardown backstop (R170-7) — the 6th per-ns map that
+    /// backstop missed. Returns the number of flows removed.
+    pub fn drain_ns(&self, ns_id: u64) -> usize {
+        // Single write-locked `retain` pass removes EVERY flow for this namespace
+        // in one go — no intermediate allocation (hence no OOM/try_reserve
+        // best-effort path) and no read-then-write snapshot window where a flow
+        // could survive while the counter row is dropped. Namespace teardown is
+        // rare, so the O(table) write-lock hold is acceptable. (NOTE: a packet on
+        // a socket that outlives the namespace and still carries this raw ns id
+        // could re-create a flow AFTER this drain; that straggler is bounded and
+        // reclaimed by the now-wired periodic `ct_sweep`, matching the accepted
+        // self-healing residual of the socket-table teardown backstop, R170-7.)
+        let mut removed: u64 = 0;
+        {
+            let mut entries = self.entries.write();
+            entries.retain(|key, _entry| {
+                if key.net_ns_id == ns_id {
+                    removed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        // Drop the per-ns counter row entirely (the namespace is gone).
+        self.ns_entry_counts.lock().remove(&ns_id);
+
+        if removed > 0 {
+            self.stats
+                .entries_deleted
+                .fetch_add(removed, Ordering::Relaxed);
+            self.stats
+                .current_entries
+                .fetch_sub(removed as u32, Ordering::Relaxed);
+        }
+        removed as usize
+    }
+
     /// Get current statistics.
     pub fn stats(&self) -> &ConntrackStats {
         &self.stats
@@ -1270,4 +1314,51 @@ pub fn ct_process_icmp(
 /// Run conntrack sweep (call from timer).
 pub fn ct_sweep(now_ms: u64) -> usize {
     conntrack_table().sweep(now_ms, CT_SWEEP_BUDGET)
+}
+
+/// R171-G4-2 FIX: drain all conntrack flows for a destroyed network namespace.
+/// Called from `NetNamespace::Drop` so a torn-down namespace reclaims its
+/// conntrack budget + global table slots immediately. Returns flows removed.
+pub fn ct_drain_ns(ns_id: u64) -> usize {
+    conntrack_table().drain_ns(ns_id)
+}
+
+/// R171-G4-1/G4-2 in-kernel self-test (boot suite). Verifies (1) the periodic
+/// timer sweep reclaims an expired flow (`ct_sweep`, now wired into
+/// `net::handle_timer_tick`), and (2) namespace-teardown drain (`ct_drain_ns`)
+/// removes ALL of a namespace's flows and drops its per-ns counter row. Panics on
+/// failure → caught by `make test`. Uses high, otherwise-unused test namespace ids
+/// so it never perturbs real traffic.
+pub fn run_conntrack_reclaim_self_test() {
+    let table = conntrack_table();
+    let ns_sweep: u64 = 0x7E57_0001;
+    let ns_drain: u64 = 0x7E57_0002;
+    let ip_a = Ipv4Addr::new(10, 0, 0, 1);
+    let ip_b = Ipv4Addr::new(10, 0, 0, 2);
+    let t0: u64 = 1_000;
+    const SYN: u8 = 0x02;
+
+    // (1) the periodic sweep reclaims an expired flow.
+    let before = table.len();
+    let _ = ct_process_tcp(ns_sweep, ip_a, ip_b, 12345, 80, SYN, 0, t0);
+    assert!(
+        table.len() > before,
+        "conntrack: tracking a flow must grow the table"
+    );
+    let far_future = t0 + 24 * 3600 * 1000; // +24h: past any conntrack timeout
+    let swept = ct_sweep(far_future);
+    assert!(swept >= 1, "conntrack: ct_sweep must reclaim the expired flow");
+
+    // (2) namespace-teardown drain removes all of a ns's flows + drops its row.
+    for p in 0..4u16 {
+        let _ = ct_process_tcp(ns_drain, ip_a, ip_b, 20000 + p, 80, SYN, 0, far_future);
+    }
+    let drained = ct_drain_ns(ns_drain);
+    assert!(drained >= 1, "conntrack: ct_drain_ns must remove the ns's flows");
+    // Idempotent: nothing left, the counter row is already gone.
+    assert_eq!(
+        ct_drain_ns(ns_drain),
+        0,
+        "conntrack: ns drain must be idempotent"
+    );
 }

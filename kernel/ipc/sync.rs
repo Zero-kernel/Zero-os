@@ -28,6 +28,8 @@ pub enum WaitOutcome {
     Closed,
     /// 无当前进程
     NoProcess,
+    /// R171 (F3): 等待期间检测到挂起的 kill —— 以 EINTR 中断阻塞，而非重新挂起。
+    Interrupted,
 }
 
 /// R39-6 FIX: 定时等待者记录
@@ -217,6 +219,22 @@ impl WaitQueue {
             });
         }
 
+        // R171-F3 FIX: if a pending kill woke us, interrupt the wait (EINTR)
+        // instead of reporting a spurious Woken/TimedOut. A kill flips
+        // Blocked->Ready WITHOUT dequeuing us from this WaitQueue, so removing
+        // our own membership here is load-bearing (no stale waiter lingers).
+        if process::wait_should_abort(pid) {
+            interrupts::without_interrupts(|| {
+                self.waiters.lock().retain(|&(p, _)| p != pid);
+            });
+            // R171-F3: consume any timeout marker this wait may have stranded (a
+            // timer that fired just before/at the cancel above) so an exact
+            // (pid, generation) match can never surface it as a later spurious
+            // TimedOut. consume_timeout_flag is exact-gen, so it only clears OURS.
+            self.consume_timeout_flag(pid, my_gen);
+            return WaitOutcome::Interrupted;
+        }
+
         // R164-10 FIX: Pass generation to consume — only accept if the
         // timed_out entry's generation matches our wait call's generation.
         if self.consume_timeout_flag(pid, my_gen) {
@@ -249,35 +267,43 @@ impl WaitQueue {
             };
 
             // R155-2 FIX: try_lock() to avoid deadlock in IRQ context.
-            if let Some(proc_arc) = process::get_process(pid) {
-                if let Some(mut proc) = proc_arc.try_lock() {
-                    // R165-4 FIX: Record the timeout only when THIS call performs
-                    // the Blocked->Ready transition. If the task was already Ready
-                    // (a normal wake beat us), recording a timeout flag would be a
-                    // stale entry.
-                    let was_blocked = proc.state == ProcessState::Blocked;
-                    if was_blocked {
-                        proc.state = ProcessState::Ready;
-                    }
-                    drop(proc);
-                    waiters.remove(pos);
-                    drop(waiters);
-                    if was_blocked {
-                        // Tag with the waiter's OWN generation (from the timer
-                        // record); consume_timeout_flag requires an exact match.
-                        self.timed_out.lock().insert(pid, generation);
-                    }
-                    true
-                } else {
-                    // Contended (e.g. a concurrent wake holds the process lock).
-                    // Keep membership and retry on the next tick.
-                    false
-                }
-            } else {
+            // R171-G5-1 FIX: try_get_process() so the PROCESS_TABLE lookup itself
+            // also never blocks on the table in this IRQ-reachable scan.
+            match process::try_get_process(pid) {
+                // Contended table: keep membership and retry on the next tick
+                // (same defer-not-drop contract as the proc.try_lock() arm below).
+                None => false,
                 // R155-12 FIX: Process no longer exists (killed). Drop membership;
                 // do NOT insert a timeout flag (no one would consume it).
-                waiters.remove(pos);
-                true
+                Some(None) => {
+                    waiters.remove(pos);
+                    true
+                }
+                Some(Some(proc_arc)) => {
+                    if let Some(mut proc) = proc_arc.try_lock() {
+                        // R165-4 FIX: Record the timeout only when THIS call performs
+                        // the Blocked->Ready transition. If the task was already Ready
+                        // (a normal wake beat us), recording a timeout flag would be a
+                        // stale entry.
+                        let was_blocked = proc.state == ProcessState::Blocked;
+                        if was_blocked {
+                            proc.state = ProcessState::Ready;
+                        }
+                        drop(proc);
+                        waiters.remove(pos);
+                        drop(waiters);
+                        if was_blocked {
+                            // Tag with the waiter's OWN generation (from the timer
+                            // record); consume_timeout_flag requires an exact match.
+                            self.timed_out.lock().insert(pid, generation);
+                        }
+                        true
+                    } else {
+                        // Contended (e.g. a concurrent wake holds the process lock).
+                        // Keep membership and retry on the next tick.
+                        false
+                    }
+                }
             }
         })
     }
@@ -460,12 +486,31 @@ impl WaitQueue {
                 return false;
             }
 
+            // R171-F2 FIX: a pending kill must NOT enqueue / re-block — bail like
+            // the closed case so the caller's loop observes the kill and returns
+            // EINTR (e.g. a pipe read/write loop re-checks wait_should_abort at
+            // its top; without this gate the task would re-block under the kill).
+            if process::wait_should_abort(pid) {
+                return false;
+            }
+
             // R152-8 FIX: Check for duplicate enqueue before pushing.
             // Without this, spurious reschedule returns cause the same PID
             // to accumulate in the deque, consuming wake signals meant for
             // other waiters.
             let mut waiters = self.waiters.lock();
             if waiters.iter().any(|&(p, _)| p == pid) {
+                // R171-F2 FIX: already enqueued (a spurious-reschedule re-entry).
+                // RE-STAMP Blocked so the task genuinely blocks again instead of
+                // spinning Ready forever (the unkillable busy-spin): the prior
+                // code returned true WITHOUT re-Blocking, so finish_wait()'s
+                // reschedule immediately re-ran the still-Ready task at 100% CPU.
+                if let Some(proc_arc) = process::get_process(pid) {
+                    let mut proc = proc_arc.lock();
+                    if proc.state != ProcessState::Blocked {
+                        proc.state = ProcessState::Blocked;
+                    }
+                }
                 return true; // Already enqueued — no duplicate
             }
 

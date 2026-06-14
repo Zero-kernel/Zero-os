@@ -35,6 +35,18 @@ fn get_resume_callback() -> Option<ResumeCallback> {
     *RESUME_CALLBACK.lock()
 }
 
+/// R171-S-R170-5-01 FIX (SLICE 3): Kernel-internal un-stop hook used by the
+/// namespace init-death cascade's `force_remote_kill`. A SIGKILL must un-stop a
+/// job-control-stopped victim so the scheduler will dispatch it and it can reach a
+/// safe point to consume its pending kill — otherwise a `Stopped` member of a
+/// shutting-down namespace would survive the cascade (a live leak). No-op if the
+/// scheduler has not registered a resume callback.
+pub fn kernel_resume_stopped(pid: ProcessId) {
+    if let Some(resume) = get_resume_callback() {
+        resume(pid);
+    }
+}
+
 /// Signal identifier (1-64, 0 is invalid)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signal(u8);
@@ -217,8 +229,11 @@ impl From<SignalError> for SyscallError {
 }
 
 /// Calculate exit code for signal termination (128 + signal number)
+// R171-S-R170-5-01 FIX (SLICE 3): exposed `pub(crate)` so the namespace
+// init-death cascade can compute SIGKILL's exit code without re-deriving the
+// `128 + signum` convention (avoids a drifting magic number).
 #[inline]
-fn signal_exit_code(signal: Signal) -> i32 {
+pub(crate) fn signal_exit_code(signal: Signal) -> i32 {
     128 + signal.as_u8() as i32
 }
 

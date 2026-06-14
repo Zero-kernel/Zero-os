@@ -239,6 +239,24 @@ pub const MAX_INSNS: usize = 64;
 /// the seccomp crate's lib.rs).
 pub const MAX_TRUSTED_INSNS: usize = 256;
 
+/// R171-CG2x1 FIX: hard cap on the TOTAL number of BPF instructions across a
+/// process's ENTIRE seccomp filter chain (all installed filters combined).
+///
+/// `MAX_INSNS` bounds a SINGLE filter, but `seccomp(SET_MODE_FILTER)` stacks
+/// filters (most-restrictive-wins) and `SeccompState::evaluate()` runs EVERY
+/// filter on EVERY syscall — while the per-process lock is held. Without a
+/// chain-total bound a process could loop `seccomp(SET_MODE_FILTER)` to grow the
+/// filter `Vec` without limit (kernel-heap exhaustion) AND inflate the per-syscall
+/// O(total-insns) evaluation cost (CPU DoS + an unbounded Process-lock hold time).
+/// 32 maximal filters' worth of instructions; Linux likewise rejects with ENOMEM
+/// once a process's cumulative filter instruction count is exceeded.
+///
+/// LOCK-CLUSTER NOTE: this value is also the documented worst-case Process-lock
+/// hold-time bound (`evaluate()` runs under `proc.lock()`), which the IRQ-path
+/// `try_lock`-skip-and-retry convergence in the R171 proctable-tick / waitloop
+/// fixes relies on for forward progress.
+pub const MAX_FILTER_INSNS_TOTAL: usize = MAX_INSNS * 32; // = 2048
+
 // ============================================================================
 // Seccomp Filter
 // ============================================================================
@@ -257,19 +275,26 @@ bitflags! {
 }
 
 /// A compiled seccomp filter.
+// R171-CG1x2 FIX: the fields are PRIVATE so a `SeccompFilter` can ONLY be built
+// via `new`/`new_trusted` (which run `validate_program` / `validate_program_with_limit`).
+// Previously every field was `pub` and the struct is re-exported (lib.rs), so an
+// out-of-crate caller could assemble a filter via a struct literal carrying an
+// arbitrary `prog`, bypassing the MAX_INSNS validation entirely — voiding the
+// R170-I1 `new_trusted` seal at the construction boundary. The two fields read
+// out-of-crate (id, flags) are exposed through the `id()`/`flags()` accessors below.
 #[derive(Debug, Clone)]
 pub struct SeccompFilter {
     /// Default action when no rule matches.
-    pub default_action: SeccompAction,
+    default_action: SeccompAction,
     /// BPF-like program.
-    pub prog: Arc<[SeccompInsn]>,
+    prog: Arc<[SeccompInsn]>,
     /// Fast allow bitmap for common syscalls (syscall_nr < 512).
     /// If bit N is set, syscall N is unconditionally allowed.
-    pub fast_allow: FastAllowSet,
+    fast_allow: FastAllowSet,
     /// Unique filter ID (hash) for logging/dedup.
-    pub id: u64,
+    id: u64,
     /// Filter flags.
-    pub flags: SeccompFlags,
+    flags: SeccompFlags,
 }
 
 impl SeccompFilter {
@@ -324,6 +349,27 @@ impl SeccompFilter {
             id,
             flags,
         })
+    }
+
+    /// R171-CG1x2 FIX: public accessors for the now-private sealed fields that
+    /// out-of-crate code legitimately reads — `id` (seccomp-mode detection) and
+    /// `flags` (the LOG bit). Read-only by construction; there is no setter, so
+    /// the validated `prog`/`fast_allow` cannot be swapped after construction.
+    #[inline]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Filter flags (e.g. `SeccompFlags::LOG`).
+    #[inline]
+    pub fn flags(&self) -> SeccompFlags {
+        self.flags
+    }
+
+    /// Number of BPF instructions in this filter's validated program.
+    #[inline]
+    pub fn prog_len(&self) -> usize {
+        self.prog.len()
     }
 
     /// Evaluate this filter against a syscall.
@@ -573,7 +619,13 @@ impl PledgeState {
 #[derive(Debug, Clone)]
 pub struct SeccompState {
     /// Stack of filters (evaluated in order, most restrictive wins).
-    pub filters: Vec<Arc<SeccompFilter>>,
+    ///
+    /// R171-CG2x1 FIX: PRIVATE so the only way to grow the chain is through
+    /// `add_filter`, which enforces `MAX_FILTER_INSNS_TOTAL`. Were this `pub`, an
+    /// out-of-crate caller could `state.filters.push(..)` directly and bypass the
+    /// per-process chain-instruction cap (the bound is now type-enforced, not just
+    /// convention). Read access is via the `filters()` accessor below.
+    filters: Vec<Arc<SeccompFilter>>,
     /// PR_SET_NO_NEW_PRIVS flag.
     pub no_new_privs: bool,
     /// Log all violations.
@@ -619,7 +671,19 @@ impl SeccompState {
 
     // R159-6 FIX: Fallible filter addition. The old infallible push + Arc::new
     // could panic under OOM when a user installs many seccomp filters.
+    //
+    // R171-CG2x1 FIX: enforce the per-process TOTAL-instruction cap BEFORE
+    // committing the filter, so the chain can never grow without bound (heap DoS)
+    // and the per-syscall `evaluate()` cost / Process-lock hold time stay bounded.
+    // The sum is O(chain), but the chain is itself bounded by this very cap and
+    // installs are rare. `Err(())` maps to ENOMEM at both call sites — matching
+    // Linux, which returns -ENOMEM when a process's cumulative filter instruction
+    // count is exceeded.
     pub fn add_filter(&mut self, filter: SeccompFilter) -> Result<(), ()> {
+        let current_total: usize = self.filters.iter().map(|f| f.prog_len()).sum();
+        if current_total.saturating_add(filter.prog_len()) > MAX_FILTER_INSNS_TOTAL {
+            return Err(());
+        }
         self.filters.try_reserve(1).map_err(|_| ())?;
         self.filters.push(Arc::new(filter));
         Ok(())
@@ -628,6 +692,14 @@ impl SeccompState {
     /// Check if any filters are active.
     pub fn has_filters(&self) -> bool {
         !self.filters.is_empty()
+    }
+
+    /// R171-CG2x1 FIX: read-only view of the installed filter chain. The backing
+    /// `Vec` is private (see the field doc) so the only mutation path is
+    /// `add_filter`, which enforces `MAX_FILTER_INSNS_TOTAL`.
+    #[inline]
+    pub fn filters(&self) -> &[Arc<SeccompFilter>] {
+        &self.filters
     }
 
     // R161-3 FIX: Fallible clone for fork/clone path. The derived Clone

@@ -15,6 +15,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::sync::WaitQueue;
+use kernel_core::process::{current_pid, wait_should_abort};
 use kernel_core::{FileOps, SyscallError, VfsStat};
 
 /// 默认管道缓冲区大小（4KB）
@@ -37,6 +38,8 @@ pub enum PipeError {
     InvalidOperation,
     /// 管道 ID 分配耗尽
     PipeIdExhausted,
+    /// R171 (F2): 阻塞读/写期间检测到挂起的 kill —— 以 EINTR 中断（写已写出则返回短计数）。
+    Interrupted,
 }
 
 /// 管道标志
@@ -201,6 +204,15 @@ impl Pipe {
     /// 唤醒信号不会丢失。
     pub fn read(&self, dst: &mut [u8], flags: PipeFlags) -> Result<usize, PipeError> {
         loop {
+            // R171-F2 FIX: top-of-loop kill gate. A steadily-fed pipe may keep
+            // finding data and never reach prepare_to_wait, so a block-path-only
+            // check would never observe the kill — check every iteration so a
+            // killed reader returns EINTR instead of looping/blocking forever.
+            if let Some(pid) = current_pid() {
+                if wait_should_abort(pid) {
+                    return Err(PipeError::Interrupted);
+                }
+            }
             let should_wait = {
                 let mut inner = self.inner.lock();
 
@@ -255,6 +267,17 @@ impl Pipe {
         let mut total_written = 0;
 
         while total_written < src.len() {
+            // R171-F2 FIX: top-of-loop kill gate (see Pipe::read). On a pending
+            // kill, return the short count if any bytes were already written
+            // (POSIX short-count), otherwise EINTR.
+            if let Some(pid) = current_pid() {
+                if wait_should_abort(pid) {
+                    if total_written > 0 {
+                        return Ok(total_written);
+                    }
+                    return Err(PipeError::Interrupted);
+                }
+            }
             let should_wait = {
                 let mut inner = self.inner.lock();
 

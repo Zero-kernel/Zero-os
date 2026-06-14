@@ -1511,16 +1511,27 @@ fn apply_firewall_verdict(
 
 /// Handle periodic timer tick for network stack maintenance.
 ///
-/// This should be called from the system timer interrupt handler (e.g., every 1 second).
-/// Performs cleanup of expired fragment reassembly queues.
+/// Invoked from the PROCESS-CONTEXT deferred timer drain (kernel_core
+/// `drain_deferred_tcp_timers`, on syscall-return / reschedule), NOT the hard-IRQ
+/// timer handler — so it may take the conntrack/fragment locks. Performs cleanup
+/// of expired fragment reassembly queues and (R171-G4-1) the conntrack expiry sweep.
 ///
 /// # Arguments
 /// * `now_ms` - Current time in milliseconds
 ///
 /// # Returns
-/// Number of expired fragment queues cleaned up
+/// Number of expired fragment queues + conntrack flows reclaimed
 pub fn handle_timer_tick(now_ms: u64) -> usize {
-    cleanup_expired_fragments(now_ms)
+    // R171-G4-1 FIX: run the conntrack expiry sweep here too. `handle_timer_tick`
+    // is the already-rate-driven per-tick netns garbage-reclaim entry; previously
+    // `conntrack::ct_sweep` had ZERO callers, so expired conntrack flows + dead-ns
+    // rows were never proactively reclaimed and per-ns conntrack budgets could
+    // self-wedge as the global table filled. Process-context (timer bottom-half),
+    // so the conntrack locks are safe here — same context the fragment cleanup
+    // already runs in.
+    let fragments = cleanup_expired_fragments(now_ms);
+    let flows = crate::conntrack::ct_sweep(now_ms);
+    fragments + flows
 }
 
 // ============================================================================

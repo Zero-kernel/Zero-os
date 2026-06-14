@@ -3,9 +3,10 @@
 //! 实现完整的进程复制功能，包含写时复制(COW)机制
 
 use crate::process::{
-    create_process, current_pid, free_address_space, free_kernel_stack, get_process, ProcessId,
-    ProcessState,
+    create_process, current_pid, free_address_space, free_kernel_stack, get_process,
+    FileDescriptor, ProcessId, ProcessState,
 };
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -600,12 +601,13 @@ fn cleanup_partial_child(child_pid: ProcessId) {
     // 预先收集需要释放的资源，避免长时间持有 PROCESS_TABLE 锁
     // G.1: Also extract watchdog handle for unregistration
     // H.0.9: Also extract PID namespace chain for detachment outside lock
-    let (kstack, addr_space, user_addr_space, watchdog_handle, pid_ns_chain): (
+    let (kstack, addr_space, user_addr_space, watchdog_handle, pid_ns_chain, fds_to_drop): (
         Option<VirtAddr>,
         usize,
         usize,
         Option<WatchdogHandle>,
         Vec<crate::pid_namespace::PidNamespaceMembership>,
+        BTreeMap<i32, FileDescriptor>,
     ) = {
         let mut table = PROCESS_TABLE.lock();
         if let Some(slot) = table.get_mut(child_pid) {
@@ -626,12 +628,22 @@ fn cleanup_partial_child(child_pid: ProcessId) {
                     // even for partially-constructed children. Without detachment, the
                     // namespace PID slots leak and are never reclaimed.
                     proc.pid_ns_chain.clone(),
+                    // R171-F5 FIX: take the fd_table OUT so the FileDescriptor
+                    // (Box<dyn FileOps>) destructors do NOT run when the `process`
+                    // Arc drops at the end of this block — that drop happens while
+                    // PROCESS_TABLE (`table`) is still held, and an FD close can
+                    // take socket/pipe/vfs locks and wake_all -> get_process ->
+                    // PROCESS_TABLE (lock-order inversion / self-deadlock). The
+                    // emptied table makes the Arc drop FD-free; we drop the taken
+                    // map below, after PROCESS_TABLE is released. Mirrors
+                    // free_process_resources (process.rs:4105) + R154-3.
+                    core::mem::take(&mut proc.fd_table),
                 )
             } else {
-                (None, 0, 0, None, Vec::new())
+                (None, 0, 0, None, Vec::new(), BTreeMap::new())
             }
         } else {
-            (None, 0, 0, None, Vec::new())
+            (None, 0, 0, None, Vec::new(), BTreeMap::new())
         }
     };
 
@@ -660,6 +672,11 @@ fn cleanup_partial_child(child_pid: ProcessId) {
     if addr_space != 0 {
         free_address_space(addr_space);
     }
+
+    // R171-F5 FIX: drop the taken fd_table now — PROCESS_TABLE is released, so
+    // each FileDescriptor close (socket/pipe wake_all -> get_process ->
+    // PROCESS_TABLE) runs lock-free. (No-op when the table was already empty.)
+    drop(fds_to_drop);
 
     kprintln!("Fork failed: cleaned up partial child PID {}", child_pid);
 }

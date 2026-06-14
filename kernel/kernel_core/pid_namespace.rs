@@ -30,7 +30,7 @@
 //! let global = resolve_pid_in_namespace(&ns, ns_pid);
 //! ```
 
-use alloc::{collections::BTreeMap, sync::{Arc, Weak}, vec, vec::Vec};
+use alloc::{collections::{BTreeMap, TryReserveError}, sync::{Arc, Weak}, vec, vec::Vec};
 use cap::NamespaceId;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
@@ -380,6 +380,22 @@ impl PidNamespace {
         *self.init_global_pid.lock()
     }
 
+    /// R171-S-R170-5-01 FIX (SLICE 3): Clear this namespace's init mapping iff it
+    /// currently names `global_pid` (identity-checked; no-op otherwise).
+    ///
+    /// Called from `detach_pid_chain` on process teardown — which runs AFTER
+    /// `handle_namespace_init_death` in `terminate_process`, so the init-death
+    /// cascade's init-filter still observes the dying init before this clears it.
+    /// Clearing on detach closes the stale-`init_global_pid` ABA window: once a
+    /// (non-root) init detaches, a later recycled PID can never be mis-resolved as
+    /// this dead namespace's reaper by `reparent_orphans`.
+    pub fn clear_init(&self, global_pid: ProcessId) {
+        let mut init = self.init_global_pid.lock();
+        if *init == Some(global_pid) {
+            *init = None;
+        }
+    }
+
     /// Check if the given global PID is the init process of this namespace.
     #[inline]
     pub fn is_init(&self, global_pid: ProcessId) -> bool {
@@ -399,11 +415,63 @@ impl PidNamespace {
         self.shutting_down.load(Ordering::Acquire)
     }
 
+    /// R171-S-R170-5-01 FIX (SLICE 3): Mark every DESCENDANT namespace
+    /// shutting-down (this namespace is already marked by the caller's
+    /// `mark_shutting_down`). Run at the start of the init-death cascade so a
+    /// member that joins a nested namespace mid-teardown is never adopted as a
+    /// reaper by `reparent_orphans`, which skips `is_shutting_down` namespaces.
+    ///
+    /// Best-effort and allocation-fallible: the traversal stack uses `try_reserve`
+    /// and bails on OOM rather than panicking (this runs inside teardown, where a
+    /// panic would abandon the dying task). Touches only namespace leaf mutexes —
+    /// holds no PCB or `PROCESS_TABLE` lock.
+    pub fn mark_descendants_shutting_down(&self) {
+        let mut stack: Vec<Arc<PidNamespace>> = Vec::new();
+        {
+            let mut children = self.children.lock();
+            children.retain(|w: &Weak<PidNamespace>| w.strong_count() > 0);
+            for w in children.iter() {
+                if let Some(c) = w.upgrade() {
+                    if stack.try_reserve(1).is_err() {
+                        return;
+                    }
+                    stack.push(c);
+                }
+            }
+        }
+        while let Some(cur) = stack.pop() {
+            cur.shutting_down.store(true, Ordering::SeqCst);
+            let mut children = cur.children.lock();
+            children.retain(|w: &Weak<PidNamespace>| w.strong_count() > 0);
+            for w in children.iter() {
+                if let Some(c) = w.upgrade() {
+                    if stack.try_reserve(1).is_err() {
+                        break;
+                    }
+                    stack.push(c);
+                }
+            }
+        }
+    }
+
     /// Get all global PIDs of processes in this namespace.
     ///
     /// Used for cascade killing when init exits.
     pub fn members(&self) -> Vec<ProcessId> {
         self.pid_by_ns.lock().values().copied().collect()
+    }
+
+    /// R171-S-R170-5-01 FIX (SLICE 3): Fallible sibling of `members()` — appends
+    /// every member's global PID into `out` using `try_reserve`, so an OOM during
+    /// the init-death cascade cannot panic the dying task before it reaches
+    /// `teardown_done` (the abandonment class this slice eliminates).
+    fn members_into(&self, out: &mut Vec<ProcessId>) -> Result<(), TryReserveError> {
+        let map = self.pid_by_ns.lock();
+        out.try_reserve(map.len())?;
+        for &g in map.values() {
+            out.push(g); // capacity reserved above ⇒ push cannot realloc/fail
+        }
+        Ok(())
     }
 
     /// Get the number of processes in this namespace.
@@ -498,6 +566,15 @@ pub fn assign_pid_chain(
 /// * `global_pid` - The process's global PID
 pub fn detach_pid_chain(chain: &[PidNamespaceMembership], global_pid: ProcessId) {
     for membership in chain {
+        // R171-S-R170-5-01 FIX (SLICE 3): clear this namespace's init mapping if it
+        // named the departing PID, BEFORE removing the PID. ORDERING DEPENDENCY:
+        // `terminate_process` runs `handle_namespace_init_death` (whose init-filter
+        // reads `init_global_pid`) STRICTLY BEFORE calling `detach_pid_chain`, so
+        // clearing here never blinds the cascade. Clearing closes the stale-init
+        // ABA window so a recycled PID can never be mis-resolved as this (now-dead)
+        // namespace's reaper by `reparent_orphans`. (No-op for the root namespace,
+        // whose init mapping is never set.)
+        membership.ns.clear_init(global_pid);
         membership.ns.remove_pid(global_pid);
     }
 }
@@ -606,6 +683,48 @@ pub fn get_cascade_kill_pids(ns: &Arc<PidNamespace>) -> Vec<ProcessId> {
     }
 
     pids
+}
+
+/// R171-S-R170-5-01 FIX (SLICE 3): Fallible sibling of `get_cascade_kill_pids`.
+///
+/// Identical subtree traversal and init-filter, but every `Vec` growth uses
+/// `try_reserve`, so enumerating the victims of an init-death cascade can never
+/// panic on OOM. A panic here would unwind out of `terminate_process` BEFORE
+/// `teardown_done` is published — precisely the teardown-abandonment class this
+/// slice eliminates. On allocation failure the caller logs and skips the cascade
+/// (a logged leak of un-cascaded members) rather than abandoning teardown.
+pub fn get_cascade_kill_pids_fallible(
+    ns: &Arc<PidNamespace>,
+) -> Result<Vec<ProcessId>, TryReserveError> {
+    let mut pids: Vec<ProcessId> = Vec::new();
+    let mut stack: Vec<Arc<PidNamespace>> = Vec::new();
+    stack.try_reserve(1)?;
+    stack.push(ns.clone());
+
+    while let Some(cur) = stack.pop() {
+        // Get all members of this namespace (except init itself) — same @595 filter.
+        let init_pid = cur.init_global_pid();
+        let mut tmp: Vec<ProcessId> = Vec::new();
+        cur.members_into(&mut tmp)?;
+        for g in tmp {
+            if init_pid != Some(g) {
+                pids.try_reserve(1)?;
+                pids.push(g);
+            }
+        }
+
+        // Traverse child namespaces (drop released Weaks first).
+        let mut children = cur.children.lock();
+        children.retain(|w: &Weak<PidNamespace>| w.strong_count() > 0);
+        for w in children.iter() {
+            if let Some(c) = w.upgrade() {
+                stack.try_reserve(1)?;
+                stack.push(c);
+            }
+        }
+    }
+
+    Ok(pids)
 }
 
 // ============================================================================

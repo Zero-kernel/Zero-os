@@ -209,6 +209,26 @@ pub fn test_fragment_perns_budget() {
     klog_always!("    ✓ cross-ns isolation: PerNsQueueLimit above the LRU branch, sibling ns unaffected");
 }
 
+/// R171-CG2x1: per-process seccomp filter-chain total-instruction cap. Installing
+/// filters in a loop must REJECT before the chain grows without bound (kernel-heap
+/// + per-syscall-CPU DoS, and an unbounded Process-lock hold time). Any failure
+/// panics, detected by `make test`.
+pub fn test_seccomp_chain_cap() {
+    klog_always!("  [TEST] Seccomp filter-chain instruction cap (R171-CG2x1)...");
+    seccomp::run_seccomp_cap_self_test();
+    klog_always!("    ✓ chain bounded by MAX_FILTER_INSNS_TOTAL; install rejects past the cap");
+}
+
+/// R171-G4-1/G4-2: conntrack reclaim. The periodic timer sweep (ct_sweep, now
+/// wired into net::handle_timer_tick) must reclaim an expired flow, and namespace
+/// teardown drain (ct_drain_ns) must remove all of a destroyed ns's flows and drop
+/// its CT_MAX_ENTRIES_PER_NS counter row. Any failure panics, detected by `make test`.
+pub fn test_conntrack_reclaim() {
+    klog_always!("  [TEST] Conntrack reclaim: timer sweep + ns-teardown drain (R171-G4-1/2)...");
+    net::conntrack::run_conntrack_reclaim_self_test();
+    klog_always!("    ✓ expired flow swept; ns-drain removes flows + zeroes the per-ns counter");
+}
+
 /// 运行所有集成测试
 pub fn run_all_tests() {
     klog_always!();
@@ -230,6 +250,8 @@ pub fn run_all_tests() {
     test_cgroup_port_budget();
     test_cgroupfs_abi();
     test_fragment_perns_budget();
+    test_seccomp_chain_cap();
+    test_conntrack_reclaim();
     test_ext2_write();
 
     klog_always!();

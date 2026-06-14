@@ -484,6 +484,50 @@ pub fn init() {
 }
 
 // ============================================================================
+// In-kernel self-test (boot suite)
+// ============================================================================
+
+/// R171-CG2x1 self-test: the per-process seccomp filter chain MUST be bounded by
+/// `MAX_FILTER_INSNS_TOTAL`. Installing filters in a loop must REJECT (Err → the
+/// caller maps it to ENOMEM) before the chain grows without bound, and the
+/// cumulative instruction count must stay within the cap.
+///
+/// Runs from the kernel boot suite (NOT `#[cfg(test)]`, which does not compile
+/// under the no_std cross-build). Any failure panics → caught by `make test`.
+///
+/// The companion R171-CG1x2 seal (private `SeccompFilter` fields) is a COMPILE-TIME
+/// property — an out-of-crate struct literal that bypasses `validate_program` no
+/// longer compiles — so it needs no runtime check here.
+pub fn run_seccomp_cap_self_test() {
+    use types::{SeccompState, MAX_FILTER_INSNS_TOTAL};
+
+    let mut state = SeccompState::new();
+    let per = strict_filter().prog_len().max(1);
+    let max_installs = MAX_FILTER_INSNS_TOTAL / per;
+
+    let mut installed = 0usize;
+    let mut rejected = false;
+    // Try a few past the theoretical cap; the cap MUST reject before then.
+    for _ in 0..(max_installs + 4) {
+        if state.add_filter(strict_filter()).is_err() {
+            rejected = true;
+            break;
+        }
+        installed += 1;
+    }
+
+    assert!(rejected, "seccomp chain cap must reject before unbounded growth");
+    assert!(installed >= 1, "a below-cap install must succeed");
+    assert!(installed <= max_installs, "must not exceed the total-insn cap");
+
+    let total: usize = state.filters().iter().map(|f| f.prog_len()).sum();
+    assert!(
+        total <= MAX_FILTER_INSNS_TOTAL,
+        "chain total instructions must stay within the cap"
+    );
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

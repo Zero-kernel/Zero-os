@@ -12,7 +12,7 @@ use crate::fork::PAGE_REF_COUNT;
 use crate::process::{
     cleanup_unscheduled_process, cleanup_zombie, create_process, create_process_in_namespace,
     current_net_ns_id, current_pid, get_process, terminate_process, terminate_self_and_halt,
-    with_current_cap_table, ProcessId, ProcessState,
+    try_get_process, wait_should_abort, with_current_cap_table, ProcessId, ProcessState,
 };
 use cpu_local::{current_cpu, current_cpu_id, max_cpus};
 use alloc::format;
@@ -458,9 +458,12 @@ fn stdin_cancel_wait() {
 ///
 /// 在 prepare_to_wait 后调用，实际让出 CPU。
 /// 如果没有其他进程可调度，会进入 HLT 循环等待中断唤醒。
-fn stdin_finish_wait() {
+fn stdin_finish_wait() -> bool {
     // 尝试切换到其他进程
     crate::force_reschedule();
+
+    // R171-F3: true if a pending kill ended the wait (the caller returns EINTR).
+    let mut aborted = false;
 
     // 如果 force_reschedule 返回，说明没有其他进程可运行
     // 当前进程已被标记为 Blocked，需要等待中断（键盘/串口）唤醒
@@ -475,6 +478,22 @@ fn stdin_finish_wait() {
         // 必须在关中断状态下检查进程状态，避免与中断处理程序竞争
         // enable_and_hlt 后中断是开启的，需要先关闭再检查
         let should_continue = x86_64::instructions::interrupts::without_interrupts(|| {
+            // R171-F3 FIX: a pending kill interrupts the blocking stdin read.
+            // Dequeue from STDIN_WAITERS + mark Ready, flag aborted, and break so
+            // the caller returns EINTR instead of HLT-looping unkillably.
+            if let Some(pid) = current_pid() {
+                if wait_should_abort(pid) {
+                    STDIN_WAITERS.lock().retain(|&p| p != pid);
+                    if let Some(proc_arc) = get_process(pid) {
+                        let mut proc = proc_arc.lock();
+                        if proc.state == ProcessState::Blocked {
+                            proc.state = ProcessState::Ready;
+                        }
+                    }
+                    aborted = true;
+                    return false;
+                }
+            }
             if let Some(pid) = current_pid() {
                 if let Some(proc_arc) = get_process(pid) {
                     let proc = proc_arc.lock();
@@ -495,6 +514,8 @@ fn stdin_finish_wait() {
         // 键盘/串口中断会调用 wake_stdin_waiters() 将进程设为 Ready
         x86_64::instructions::interrupts::enable_and_hlt();
     }
+
+    aborted
 }
 
 /// 唤醒一个等待 stdin 的进程 (IRQ-safe fast path).
@@ -716,7 +737,10 @@ impl SocketWaiters {
                     break; // Will catch remaining on next tick
                 }
                 let is_timeout = deadline.map(|dl| current_ticks >= dl).unwrap_or(false);
-                let is_exited = get_process(pid).is_none();
+                // R171-G5-1 FIX: never block PROCESS_TABLE in this IRQ tick scan.
+                // A contended table (try_get_process == None) is NOT "exited" — it
+                // defers: the entry is left untouched and re-evaluated next tick.
+                let is_exited = matches!(try_get_process(pid), Some(None));
                 if is_timeout || is_exited {
                     expired[count] = Some((queue_addr, pid, generation, is_timeout));
                     count += 1;
@@ -745,14 +769,24 @@ impl SocketWaiters {
                     // contended, or a normal wake already readied it, we must not
                     // leave a stale timeout marker (mirrors sync.rs timeout_wake).
                     let mut record_timeout = false;
-                    if let Some(proc_arc) = get_process(pid) {
-                        if let Some(mut proc) = proc_arc.try_lock() {
-                            if proc.state == ProcessState::Blocked {
-                                proc.state = ProcessState::Ready;
-                                record_timeout = is_timeout;
+                    // R171-G5-1 FIX: tri-state try_get_process — never block
+                    // PROCESS_TABLE in IRQ context.
+                    match try_get_process(pid) {
+                        // Contended table: defer this waiter (leave it queued with
+                        // its original deadline; retried next tick). Do NOT remove.
+                        None => continue,
+                        // Process gone — fall through to remove membership with
+                        // record_timeout == false (R155-12: no stale timeout flag).
+                        Some(None) => {}
+                        Some(Some(proc_arc)) => {
+                            if let Some(mut proc) = proc_arc.try_lock() {
+                                if proc.state == ProcessState::Blocked {
+                                    proc.state = ProcessState::Ready;
+                                    record_timeout = is_timeout;
+                                }
+                            } else {
+                                continue;
                             }
-                        } else {
-                            continue;
                         }
                     }
 
@@ -789,7 +823,11 @@ impl SocketWaiters {
         // Clean up stale timeout markers for exited processes (prevents PID reuse issues)
         // Only do this periodically to avoid overhead on every tick
         if current_ticks % 100 == 0 {
-            self.timed_out.retain(|pid, _| get_process(*pid).is_some());
+            // R171-G5-1 FIX: prune only entries we can DEFINITIVELY confirm gone
+            // (Some(None)); a contended table (None) is kept and reconsidered at
+            // the next prune — never block PROCESS_TABLE in this IRQ scan.
+            self.timed_out
+                .retain(|pid, _| !matches!(try_get_process(*pid), Some(None)));
         }
     }
 }
@@ -863,8 +901,24 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
         crate::force_reschedule();
 
         // Phase 3: HLT loop waiting for interrupt (if no other process to run)
+        // R171-F3: track whether a pending kill (not a normal wake/timeout/close)
+        // ended the wait, so we can report Interrupted (EINTR) below.
+        let mut aborted = false;
         loop {
             let should_continue = x86_64::instructions::interrupts::without_interrupts(|| {
+                // R171-F3 FIX: a pending kill must interrupt the blocking
+                // accept/recv FIRST. A kill flips Blocked->Ready, so the
+                // `state != Blocked` check below would otherwise return a spurious
+                // "Woken" and the caller (sys_accept / recv) would re-park forever.
+                // Dequeue our exact (pid, generation), mark Ready, flag aborted.
+                if wait_should_abort(pid) {
+                    SOCKET_WAITERS.lock().remove_waiter(queue_addr, pid, Some(my_gen));
+                    if let Some(proc_arc) = get_process(pid) {
+                        proc_arc.lock().state = ProcessState::Ready;
+                    }
+                    aborted = true;
+                    return false;
+                }
                 if let Some(proc_arc) = get_process(pid) {
                     let proc = proc_arc.lock();
                     if proc.state != ProcessState::Blocked {
@@ -912,6 +966,14 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
 
             // Wait for interrupt (timer or network)
             x86_64::instructions::interrupts::enable_and_hlt();
+        }
+
+        // R171-F3 FIX: a pending-kill abort takes precedence over a coincident
+        // close/timeout/wake — consume any stale timeout marker for THIS wait and
+        // report Interrupted so the caller returns EINTR instead of re-parking.
+        if aborted {
+            SOCKET_WAITERS.lock().consume_timeout(pid, my_gen);
+            return net::WaitOutcome::Interrupted;
         }
 
         // Determine outcome using timeout marker (fixes race between timer and wake)
@@ -1907,6 +1969,8 @@ fn socket_error_to_syscall(err: net::SocketError) -> SyscallError {
         net::SocketError::IdExhausted => SyscallError::ENOSPC,
         net::SocketError::Lsm(e) => lsm_error_to_syscall(e),
         net::SocketError::NoMemory => SyscallError::ENOMEM,
+        // R171-F3: a blocking socket op interrupted by a pending kill -> EINTR.
+        net::SocketError::Interrupted => SyscallError::EINTR,
     }
 }
 
@@ -4662,6 +4726,15 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
     let parent = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
     loop {
+        // R171-F3 FIX: a pending kill interrupts wait() with EINTR instead of
+        // re-blocking on children. Restore Ready + clear the waiting_child marker
+        // so the scheduler/teardown sees a runnable task (not a stuck Blocked one).
+        if wait_should_abort(pid) {
+            let mut proc = parent.lock();
+            proc.state = ProcessState::Ready;
+            proc.waiting_child = None;
+            return Err(SyscallError::EINTR);
+        }
         // 【关键修复】先标记为等待状态，再扫描子进程，避免 lost wake-up
         // 如果子进程在我们标记之后、扫描之前退出，terminate_process 会看到我们的等待状态
         // 如果子进程在我们扫描时/之后退出，我们会在扫描中发现它的 Zombie 状态
@@ -5583,7 +5656,11 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
             }
 
             // 确实没有数据，完成等待（让出 CPU）
-            stdin_finish_wait();
+            // R171-F3: a pending kill interrupts the blocking stdin read (EINTR);
+            // stdin_finish_wait() already dequeued us + restored Ready.
+            if stdin_finish_wait() {
+                return Err(SyscallError::EINTR);
+            }
             // 被唤醒后继续循环尝试读取
         }
     }
@@ -7464,6 +7541,8 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
 
     // 使用基于当前 CR3 的页表管理器进行取消映射
     // R23-3 fix: 使用两阶段方法 - 先收集帧、做 TLB shootdown、再释放
+    // 使用基于当前 CR3 的页表管理器进行取消映射
+    // R23-3 fix: 使用两阶段方法 - 先收集帧、做 TLB shootdown、再释放
     let unmap_result: Result<(), SyscallError> = unsafe {
         with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
             use alloc::vec::Vec;
@@ -8495,14 +8574,14 @@ fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFil
 static STRICT_FILTER_ID: spin::Once<u64> = spin::Once::new();
 
 fn current_seccomp_mode(state: &seccomp::SeccompState) -> usize {
-    if state.filters.is_empty() {
+    if state.filters().is_empty() {
         return SECCOMP_MODE_DISABLED;
     }
 
-    let strict_id = *STRICT_FILTER_ID.call_once(|| seccomp::strict_filter().id);
-    if state.filters.len() == 1 {
-        if let Some(filter) = state.filters.first() {
-            if filter.id == strict_id {
+    let strict_id = *STRICT_FILTER_ID.call_once(|| seccomp::strict_filter().id());
+    if state.filters().len() == 1 {
+        if let Some(filter) = state.filters().first() {
+            if filter.id() == strict_id {
                 return SECCOMP_MODE_STRICT;
             }
         }
@@ -8581,13 +8660,17 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             // R26-3 FIX: Mark installation in progress
             proc.seccomp_installing = true;
 
-            // Installing any filter sets no_new_privs (sticky, one-way)
-            proc.seccomp_state.no_new_privs = true;
+            // R171-CG2x1 FIX: failure-atomic install — run the now-cap-fallible
+            // add_filter FIRST; commit the sticky no_new_privs only on success so
+            // a reject leaves no seccomp state drift.
             // R159-6 FIX: Fallible add_filter.
             if proc.seccomp_state.add_filter(filter).is_err() {
                 proc.seccomp_installing = false;
                 return Err(SyscallError::ENOMEM);
             }
+
+            // Installing any filter sets no_new_privs (sticky, one-way)
+            proc.seccomp_state.no_new_privs = true;
 
             // R26-3 FIX: Mark installation complete
             proc.seccomp_installing = false;
@@ -8656,18 +8739,23 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             // R26-3 FIX: Mark installation in progress
             proc.seccomp_installing = true;
 
-            // Installing filter sets no_new_privs (sticky, one-way)
-            proc.seccomp_state.no_new_privs = true;
-
-            // If LOG flag is set, enable violation logging
-            if filter.flags.contains(seccomp::SeccompFlags::LOG) {
-                proc.seccomp_state.log_violations = true;
-            }
-
+            // R171-CG2x1 FIX: make the install failure-atomic. Capture the LOG
+            // intent, run the now-cap-fallible add_filter FIRST, and commit the
+            // sticky no_new_privs / log_violations state ONLY on success — so a
+            // chain-cap reject (ENOMEM) leaves no observable seccomp state drift
+            // (previously log_violations/no_new_privs were flipped before the
+            // fallible add_filter, persisting on a now attacker-reachable reject).
+            let wants_log = filter.flags().contains(seccomp::SeccompFlags::LOG);
             // R159-6 FIX: Fallible add_filter.
             if proc.seccomp_state.add_filter(filter).is_err() {
                 proc.seccomp_installing = false;
                 return Err(SyscallError::ENOMEM);
+            }
+
+            // Installing a filter sets no_new_privs (sticky, one-way).
+            proc.seccomp_state.no_new_privs = true;
+            if wants_log {
+                proc.seccomp_state.log_violations = true;
             }
 
             // R26-3 FIX: Mark installation complete
@@ -8676,7 +8764,7 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             klog!(Info,
                 "[sys_seccomp] PID={} installed FILTER mode (total filters: {})",
                 pid,
-                proc.seccomp_state.filters.len()
+                proc.seccomp_state.filters().len()
             );
             Ok(0)
         }
@@ -10794,6 +10882,8 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
                         net::WaitOutcome::Closed => return Err(SyscallError::ECONNABORTED),
                         net::WaitOutcome::NoProcess => return Err(SyscallError::ESRCH),
                         net::WaitOutcome::TimedOut => continue,
+                        // R171-F3: pending kill — interrupt the blocking accept.
+                        net::WaitOutcome::Interrupted => return Err(SyscallError::EINTR),
                     }
                 } else {
                     return Err(SyscallError::EINVAL);

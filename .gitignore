@@ -8,6 +8,7 @@ Cargo.lock
 # Binaries
 /.vscode
 /.claude
+/scripts
 /esp
 /bootloader-target
 /kernel-target

@@ -207,6 +207,8 @@ fn pipe_error_to_syscall(err: PipeError) -> SyscallError {
         PipeError::InvalidPipe | PipeError::InvalidOperation => SyscallError::EBADF,
         PipeError::PipeIdExhausted => SyscallError::ENOMEM,
         PipeError::NoCurrentProcess => SyscallError::ESRCH,
+        // R171-F2: pending kill interrupted the blocking pipe op -> EINTR.
+        PipeError::Interrupted => SyscallError::EINTR,
     }
 }
 
@@ -326,6 +328,8 @@ fn futex_callback(
                 FutexError::InvalidOperation => SyscallError::EINVAL,
                 FutexError::TimedOut => SyscallError::ETIMEDOUT,
                 FutexError::OwnerDied => SyscallError::EOWNERDEAD,
+                // R171-F3: pending kill interrupted the futex wait -> EINTR.
+                FutexError::Interrupted => SyscallError::EINTR,
             })
         }
         futex::FUTEX_WAKE => Ok(futex_wake(tgid, uaddr, val as usize)),
@@ -338,6 +342,8 @@ fn futex_callback(
                 FutexError::InvalidOperation => SyscallError::EINVAL,
                 FutexError::TimedOut => SyscallError::ETIMEDOUT,
                 FutexError::OwnerDied => SyscallError::EOWNERDEAD,
+                // R171-F3: pending kill interrupted the futex wait -> EINTR.
+                FutexError::Interrupted => SyscallError::EINTR,
             })
         }
         // E.4 PI: FUTEX_UNLOCK_PI - 带优先级继承的互斥锁解锁
@@ -348,6 +354,8 @@ fn futex_callback(
             FutexError::InvalidOperation => SyscallError::EINVAL,
             FutexError::TimedOut => SyscallError::ETIMEDOUT,
             FutexError::OwnerDied => SyscallError::EOWNERDEAD,
+            // R171-F3: pending kill interrupted the futex wait -> EINTR.
+            FutexError::Interrupted => SyscallError::EINTR,
         }),
         _ => Err(SyscallError::EINVAL),
     }

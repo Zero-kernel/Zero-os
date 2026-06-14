@@ -462,6 +462,13 @@ impl Drop for NetNamespace {
             // never reused). Pure-leaf mutexes, locked one at a time — see
             // the lock-context proof on `drain_ns_counters` itself.
             net::socket_table().drain_ns_counters(self.id);
+            // R171-G4-2 FIX: drain the 6th per-ns map the R170-7 backstop missed —
+            // conntrack's per-namespace flow rows + entry-count. `ct_drain_ns`
+            // removes every (ns, *) flow and drops the ns's CT_MAX_ENTRIES_PER_NS
+            // counter row, so a destroyed namespace reclaims its conntrack budget +
+            // global table slots immediately (ns ids are never reused; otherwise
+            // the row + flows leak until each flow individually times out).
+            net::conntrack::ct_drain_ns(self.id.0);
             NET_NS_COUNT.fetch_sub(1, Ordering::SeqCst);
         }
     }

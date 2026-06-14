@@ -2953,6 +2953,28 @@ pub fn get_process(pid: ProcessId) -> Option<Arc<Mutex<Process>>> {
     table.get(pid).and_then(|slot| slot.clone())
 }
 
+/// R171-G5-1 FIX: non-blocking `PROCESS_TABLE` lookup for IRQ / timer-tick context.
+///
+/// Mirrors [`get_process`] but acquires `PROCESS_TABLE` with `try_lock`, so a
+/// caller running in IRQ context (the socket-timeout tick scan in
+/// `SocketWaiters::check_timeouts`, the timed-wait timer scan in
+/// `WaitQueue::timeout_wake`) never blocks on the table lock — closing the same
+/// self-deadlock class as R169-2 / R170-1 (a writer holding `PROCESS_TABLE`
+/// while the timer IRQ fires on the same CPU and re-enters the table).
+///
+/// Tri-state result (the contended case is DISTINCT from "process gone"):
+/// - `None`            — the table was contended; the caller MUST defer (retry on
+///                       a later tick) and MUST NOT treat this as "process gone".
+/// - `Some(None)`      — the lock was taken and there is no live PCB for `pid`.
+/// - `Some(Some(arc))` — the lock was taken and the live PCB was cloned out.
+///
+/// Only clones an `Arc` under the (briefly held) lock — no allocation — so it is
+/// safe on the IRQ tick path.
+pub fn try_get_process(pid: ProcessId) -> Option<Option<Arc<Mutex<Process>>>> {
+    let table = PROCESS_TABLE.try_lock()?;
+    Some(table.get(pid).and_then(|slot| slot.clone()))
+}
+
 /// 注册调度器的清理回调，用于在 PCB 删除时同步调度器状态
 pub fn register_cleanup_notifier(callback: SchedulerCleanupCallback) {
     *SCHEDULER_CLEANUP.lock() = Some(callback);
@@ -3178,6 +3200,39 @@ pub fn is_pending_irq_kill(pid: ProcessId) -> bool {
     false
 }
 
+/// R171 FIX (F2/F3): process-context kill predicate for INTERRUPTIBLE blocking
+/// syscalls (accept/recv/pipe/stdin/wait/futex). True iff `pid` has a pending
+/// kill that a blocking wait must observe and abort on (return EINTR /
+/// self-terminate) instead of re-parking forever (the "unkillable blocked task"
+/// class).
+///
+/// Predicate = `pending_kill` ONLY. `pending_kill` is set by
+/// `request_process_exit` / `exit_group` (request_exit_group_atomic) BEFORE the
+/// target is unblocked, so a woken blocked task observes it; the syscall
+/// epilogue's `take_pending_process_exit` then turns it into REAL termination.
+/// This is the ONLY kill path that reaches a task BLOCKED in a syscall.
+///
+/// We deliberately DO NOT consult `is_pending_irq_kill` (the IRQ-deferred path):
+/// its tasks are reaped by `drain_deferred_irq_terminates` (terminate_process)
+/// and skipped by the scheduler — NOT by the syscall epilogue. Returning EINTR
+/// for such a task would unwind to an epilogue that does NOT terminate it
+/// (`take_pending_process_exit` consumes only `pending_kill`), letting it resume
+/// briefly in userspace before the drain reaps it (Codex R171 slice-2 finding).
+/// A blocked-in-syscall task is never the target of `defer_irq_terminate` anyway
+/// (that fires from IRQ context against a RUNNING task), so this is also a
+/// no-op-removal in practice. `thread_group_exiting` is excluded for the same
+/// epilogue-mismatch reason (it would yield a spurious EINTR that never
+/// terminates — a livelock).
+///
+/// Process-context ONLY: it takes PROCESS_TABLE via `get_process`. NEVER call it
+/// from IRQ / timer-tick context (use `try_get_process` there instead).
+pub fn wait_should_abort(pid: ProcessId) -> bool {
+    match get_process(pid) {
+        Some(arc) => arc.lock().pending_kill.load(Ordering::Acquire),
+        None => false,
+    }
+}
+
 pub fn drain_deferred_irq_terminates() {
     if !DEFERRED_IRQ_KILL_PENDING.load(Ordering::Acquire) {
         return;
@@ -3273,6 +3328,12 @@ pub fn terminate_self_and_halt(pid: ProcessId, exit_code: i32) -> ! {
 ///   (safe: no CPU has ever run this process; followed immediately by `cleanup_zombie()`)
 /// - `sys_clone()` no-CLONE_VM PID translation failure — remote, never-scheduled
 ///   (safe: same reasoning; followed immediately by `cleanup_zombie()`)
+/// - `drain_deferred_irq_terminates()` — remote, `current_pid() != pid` (the
+///   draining CPU's current task is NOT the dying pid). R171-S-R170-5-01: because of
+///   this caller class the namespace init-death cascade MUST be deferred-only
+///   (`request_process_exit` / `force_remote_kill`, NEVER `send_signal_inner`'s
+///   no-return self branch) so a cascade victim that happens to be the draining
+///   CPU's current task cannot abandon this teardown before `teardown_done`.
 ///
 /// Pre-scheduler children created via `create_process()` (sys_clone CLONE_VM error paths,
 /// main-path LSM rollback) use `cleanup_unscheduled_process()` instead, which avoids
@@ -3470,8 +3531,11 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
         }
 
         // 将孤儿进程重新分配给 init 进程 (PID 1)
+        // R171-S-R170-5-01 FIX (SLICE 3): pass `pid` (the dying process) so
+        // reparent_orphans excludes it as a reaper candidate (it has already
+        // drained its own children list above).
         if !children_to_reparent.is_empty() {
-            reparent_orphans(&children_to_reparent);
+            reparent_orphans(&children_to_reparent, pid);
         }
 
         // R169-9 FIX: heavy teardown (cgroup detach / pid-ns detach / clear_child_tid
@@ -3521,14 +3585,31 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
 /// Orphans are reparented to the init process of their owning PID namespace,
 /// not necessarily global PID 1. This ensures getppid() returns a valid PID
 /// that is visible within the process's namespace.
-fn reparent_orphans(orphans: &[ProcessId]) {
+fn reparent_orphans(orphans: &[ProcessId], dying_pid: ProcessId) {
     const ROOT_INIT_PID: ProcessId = 1;
+    // Bound on namespace nesting (root + MAX_PID_NS_LEVEL levels) ⇒ heap-free
+    // candidate buffer, so this teardown-path function never allocates.
+    const MAX_REAPER_CANDS: usize = crate::pid_namespace::MAX_PID_NS_LEVEL as usize + 1;
 
     // R160-4 FIX: Single PROCESS_TABLE lock acquisition for the entire
     // reparenting batch. The previous 3-lock-per-orphan pattern had a race:
     // between updating child.ppid and pushing to adopter.children, the adopter
     // could terminate on another CPU → child stuck with ppid pointing to a dead
     // process and never added to any children list → permanent zombie leak.
+    //
+    // R171-S-R170-5-01 FIX (SLICE 3): rewritten to resolve a LIVE reaper.
+    // INVARIANTS (lock discipline — the residual-KILL fix):
+    //   * NEVER hold the child PCB lock and an adopter PCB lock simultaneously.
+    //     Holding both self-deadlocks deterministically when the orphan IS global
+    //     pid 1 (`table.get(1)` returns the same `Arc<Mutex<Process>>` as the
+    //     child), wedging PROCESS_TABLE for every CPU.
+    //   * Skip any adopter candidate equal to the orphan itself (no self-parent)
+    //     or to `dying_pid` (it has already drained its own children list).
+    //   * Adopter liveness is "present AND not Zombie/Terminated", checked under
+    //     the adopter lock in `try_commit_reaper`.
+    // Candidates are the orphan's per-namespace inits, nearest first (leaf → root),
+    // snapshotted under the child lock which is then DROPPED before any adopter is
+    // touched; namespaces that are shutting down are skipped.
     let table = PROCESS_TABLE.lock();
 
     for &child_pid in orphans {
@@ -3537,27 +3618,58 @@ fn reparent_orphans(orphans: &[ProcessId]) {
             None => continue,
         };
 
-        let adopt_pid = {
-            let child = child_arc.lock();
-            let ns_init = crate::pid_namespace::owning_namespace(&child.pid_ns_chain)
-                .and_then(|ns| ns.init_global_pid());
-            ns_init.unwrap_or(ROOT_INIT_PID)
-        };
-
-        // Atomically: set child.ppid AND push to adopter.children under one table lock.
+        // STEP 1: heap-free candidate snapshot (leaf → root); child lock dropped
+        // before any adopter is resolved.
+        let mut cands: [Option<ProcessId>; MAX_REAPER_CANDS] = [None; MAX_REAPER_CANDS];
+        let mut n = 0usize;
         {
-            let mut child = child_arc.lock();
-            child.ppid = adopt_pid;
+            let child = child_arc.lock();
+            for m in child.pid_ns_chain.iter().rev() {
+                if n >= cands.len() {
+                    break;
+                }
+                if m.ns.is_shutting_down() {
+                    continue; // never adopt onto a namespace that is tearing down
+                }
+                if let Some(c) = m.ns.init_global_pid() {
+                    cands[n] = Some(c);
+                    n += 1;
+                }
+            }
+        } // child PCB lock dropped here
+
+        // STEP 2: commit to the first LIVE candidate that is neither the orphan
+        // itself nor the dying parent.
+        let mut committed = false;
+        for slot in cands.iter().take(n) {
+            let cand = match *slot {
+                Some(c) => c,
+                None => continue,
+            };
+            if cand == child_pid || cand == dying_pid {
+                continue;
+            }
+            if try_commit_reaper(&table, &child_arc, child_pid, cand) {
+                committed = true;
+                break;
+            }
         }
 
-        if let Some(Some(adopter_arc)) = table.get(adopt_pid) {
-            let mut adopter_proc = adopter_arc.lock();
-            if !adopter_proc.children.contains(&child_pid) {
-                if adopter_proc.children.try_reserve(1).is_ok() {
-                    adopter_proc.children.push(child_pid);
-                } else {
-                    adopter_proc.children_incomplete = true;
-                }
+        // STEP 3: ROOT_INIT_PID fallback — SAME one-lock-at-a-time protocol.
+        if !committed {
+            if child_pid == ROOT_INIT_PID {
+                // pid 1 can never be its own reaper.
+                reparent_logged_leak(&child_arc, child_pid, ROOT_INIT_PID);
+            } else if !try_commit_reaper(&table, &child_arc, child_pid, ROOT_INIT_PID) {
+                // ROOT_INIT_PID absent / Zombie / Terminated: fail SAFE (deterministic
+                // ppid, no dead-slot push) rather than panic — a panic on the teardown
+                // path would re-open the abandonment class this slice closes. A
+                // guaranteed-live global init is tracked as boot-hardening future work.
+                reparent_logged_leak(&child_arc, child_pid, ROOT_INIT_PID);
+                debug_assert!(
+                    false,
+                    "ROOT_INIT_PID must be a live reaper (boot-hardening pending)"
+                );
             }
         }
     }
@@ -3567,6 +3679,67 @@ fn reparent_orphans(orphans: &[ProcessId]) {
     if !orphans.is_empty() {
         klog!(Info, "Reparented {} orphan process(es)", orphans.len());
     }
+}
+
+/// R171-S-R170-5-01 FIX (SLICE 3): link `child_pid` under live reaper `cand`, then
+/// set the child's ppid — each under its OWN PCB lock, NEVER both held at once (the
+/// residual-KILL fix). Returns false (⇒ advance the candidate cursor) if `cand` is
+/// absent from the table or is not a live reaper (Zombie/Terminated).
+///
+/// The liveness check and the children push are one adopter-lock hold, atomic
+/// against the adopter's own teardown (which sets Zombie and drains its children
+/// list under the same PCB lock): we either push before it drains (our child rides
+/// along and is re-reparented by the adopter) or observe Zombie and skip.
+fn try_commit_reaper(
+    table: &Vec<Option<Arc<Mutex<Process>>>>,
+    child_arc: &Arc<Mutex<Process>>,
+    child_pid: ProcessId,
+    cand: ProcessId,
+) -> bool {
+    let adopter = match table.get(cand) {
+        Some(Some(a)) => a.clone(),
+        _ => return false,
+    };
+    {
+        let mut adopter_proc = adopter.lock();
+        if matches!(
+            adopter_proc.state,
+            ProcessState::Zombie | ProcessState::Terminated
+        ) {
+            return false; // dead/Zombie adopter ⇒ advance the cursor
+        }
+        if !adopter_proc.children.contains(&child_pid) {
+            if adopter_proc.children.try_reserve(1).is_ok() {
+                adopter_proc.children.push(child_pid);
+            } else {
+                adopter_proc.children_incomplete = true;
+            }
+        }
+    } // adopter PCB lock dropped BEFORE the child lock — never both at once
+    {
+        let mut child = child_arc.lock();
+        child.ppid = cand;
+    }
+    true
+}
+
+/// R171-S-R170-5-01 FIX (SLICE 3): no live reaper exists. Set a deterministic ppid
+/// (so getppid is well-defined) WITHOUT pushing into any dead/absent adopter's
+/// children list, and log the orphan as leaked. Child PCB lock alone.
+fn reparent_logged_leak(
+    child_arc: &Arc<Mutex<Process>>,
+    child_pid: ProcessId,
+    fallback_pid: ProcessId,
+) {
+    {
+        let mut child = child_arc.lock();
+        child.ppid = fallback_pid;
+    }
+    klog_force!(
+        "R171-S: orphan {} has no live reaper; ppid set to {} (logged leak)",
+        child_pid,
+        fallback_pid
+    );
 }
 
 /// F.1 PID Namespace: Handle cascade killing when a namespace init dies
@@ -3583,24 +3756,41 @@ fn handle_namespace_init_death(
     dying_pid: ProcessId,
     pid_ns_chain: &[crate::pid_namespace::PidNamespaceMembership],
 ) {
-    // R115-2 FIX: Use kernel-authoritative signal delivery that bypasses POSIX
-    // permission checks. The dying init may lack CAP_KILL or matching UIDs for
-    // namespace members (e.g., setuid grandchild with UID 0), causing the cascade
-    // to silently fail with EPERM. Namespace teardown MUST unconditionally kill
-    // all members regardless of credentials.
-    use crate::signal::{send_signal_kernel, Signal};
+    // R115-2 FIX: Namespace teardown MUST unconditionally kill all members
+    // regardless of credentials (the dying init may lack CAP_KILL / matching UIDs).
+    //
+    // R171-S-R170-5-01 FIX (SLICE 3): This cascade runs mid-teardown of `dying_pid`,
+    // BEFORE `teardown_done` is published. It MUST take NO no-return path. The old
+    // `send_signal_kernel(victim, SIGKILL)` routes a fatal signal through
+    // `send_signal_inner`, whose `current_pid() == victim` arm calls the
+    // never-returning `terminate_self_and_halt`. If a cascade victim is ever the
+    // currently-running task — reachable whenever `terminate_process` is driven for
+    // a NON-current pid (the never-scheduled-child cleanup and, notably, the
+    // `drain_deferred_irq_terminates` path) — that arm abandons this in-flight
+    // teardown: `teardown_done` is never published and the parent is never woken,
+    // leaving a permanently unreapable Zombie + leaked address space/PCB. We
+    // therefore route EVERY victim through the deferred, no-return-free
+    // `force_remote_kill` (built on `request_process_exit`), which merely defers the
+    // current task instead of self-halting it.
 
-    // Check each namespace in the chain (except root, which has no cascade)
+    // SIGKILL's exit code, identical to send_signal_kernel(SIGKILL).
+    let sigkill_code = crate::signal::signal_exit_code(crate::signal::Signal::SIGKILL);
+
+    // Check each namespace in the chain (root has no cascade).
     for membership in pid_ns_chain.iter() {
-        // Skip root namespace - global PID 1 death is handled elsewhere
         if membership.ns.is_root() {
             continue;
         }
 
-        // Check if this process is the init of this namespace
         if membership.ns.is_init(dying_pid) {
-            // Mark namespace as shutting down
+            // mark_shutting_down latches once: only the first init-death cascades.
             if membership.ns.mark_shutting_down() {
+                // R171-S FIX: mark the whole descendant subtree shutting-down up
+                // front so a member joining a nested namespace mid-cascade is never
+                // adopted as a reaper by reparent_orphans (which skips is_shutting_down
+                // namespaces).
+                membership.ns.mark_descendants_shutting_down();
+
                 // R104-2 FIX: Gate to prevent leaking namespace IDs + PIDs.
                 kprintln!(
                     "[PID NS] Init death cascade: namespace {} is shutting down (init pid={})",
@@ -3608,8 +3798,21 @@ fn handle_namespace_init_death(
                     dying_pid
                 );
 
-                // Get all processes to kill (excluding the dying init itself)
-                let victims = crate::pid_namespace::get_cascade_kill_pids(&membership.ns);
+                // R171-S FIX: fallible enumeration — an OOM here must not panic and
+                // abandon teardown; log and skip the cascade (logged leak) instead.
+                let victims = match crate::pid_namespace::get_cascade_kill_pids_fallible(
+                    &membership.ns,
+                ) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        klog_force!(
+                            "R171-S: cascade enumeration OOM for ns {} (init {}); members left un-cascaded (logged leak)",
+                            membership.ns.id().raw(),
+                            dying_pid
+                        );
+                        break;
+                    }
+                };
 
                 if !victims.is_empty() {
                     // R104-2 FIX: Gate namespace cascade logging.
@@ -3620,36 +3823,51 @@ fn handle_namespace_init_death(
                     );
 
                     for victim_pid in victims {
-                        // Skip if victim is the dying process itself
                         if victim_pid == dying_pid {
                             continue;
                         }
-
-                        // R115-2 FIX: Send SIGKILL via kernel-authority path (no permission checks)
-                        match send_signal_kernel(victim_pid, Signal::SIGKILL) {
-                            Ok(_) => {
-                                // R104-2 FIX: Gate victim PID logging.
-                                kprintln!(
-                                    "[PID NS]   SIGKILL sent to PID {} (namespace cascade)",
-                                    victim_pid
-                                );
-                            }
-                            Err(e) => {
-                                // Process may have already exited, ignore errors
-                                // R104-2 FIX: Gate victim PID + error logging.
-                                kprintln!(
-                                    "[PID NS]   Failed to send SIGKILL to PID {}: {:?}",
-                                    victim_pid, e
-                                );
-                                let _ = e; // suppress unused warning in release
-                            }
-                        }
+                        // R171-S FIX: deferred, no-return-free kill for EVERY victim
+                        // (including the current task, which is merely deferred — never
+                        // self-halted from inside this teardown).
+                        force_remote_kill(victim_pid, sigkill_code);
                     }
                 }
             }
             // Only one namespace can have this process as init
             // (processes are init only in their owning namespace)
             break;
+        }
+    }
+}
+
+/// R171-S-R170-5-01 FIX (SLICE 3): Deferred, no-return-free remote kill used by the
+/// namespace init-death cascade. Posts a pending exit (consumed at the victim's next
+/// syscall/IRQ safe point) and applies SIGKILL un-stop semantics so a job-control-
+/// stopped victim is made runnable and actually reaches that safe point — otherwise a
+/// `Stopped` member of a shutting-down namespace would survive the cascade (a live
+/// leak). NEVER calls the no-return self-termination path, so it cannot abandon the
+/// caller's in-flight teardown even if `victim_pid` is the currently-running task.
+fn force_remote_kill(victim_pid: ProcessId, exit_code: i32) {
+    // request_process_exit returns false for a missing / already-Zombie/Terminated
+    // target, and promotes a Blocked target to Ready.
+    if !request_process_exit(victim_pid, exit_code) {
+        return;
+    }
+    // SIGKILL un-stops a job-control-stopped victim. The scheduler only dispatches
+    // `Ready && !stopped` tasks, so clear `stopped` / lift ProcessState::Stopped and
+    // ask the scheduler to resume it; otherwise it never consumes its pending kill.
+    if let Some(arc) = get_process(victim_pid) {
+        let needs_resume = {
+            let mut p = arc.lock();
+            let was_stopped = p.stopped || p.state == ProcessState::Stopped;
+            p.stopped = false;
+            if p.state == ProcessState::Stopped {
+                p.state = ProcessState::Ready;
+            }
+            was_stopped
+        };
+        if needs_resume {
+            crate::signal::kernel_resume_stopped(victim_pid);
         }
     }
 }
