@@ -1,4 +1,12 @@
 [toolchain]
+# M5-1 (reproducibility pin) ATTEMPTED + REVERTED 2026-06-16: pinning a dated nightly
+# (nightly-2025-12-08 = rustc 1.94.0-nightly ba2142a19) is correct in principle, but the
+# authoritative remote build host (40c-devbox-ts) CANNOT install that dated channel — its
+# rustup repeatedly leaves the `rustc` component "not applicable" (mismatched-date
+# components on a slow/flaky dist link), so the default `make build` fails under the pin.
+# A reproducibility pin the build env cannot install is net-negative, so this stays on the
+# working rolling channel until the remote toolchain fetch is fixed (a remote-env task).
+# The workspace IS verified green on this 1.94.0-nightly series (rolling 37aa2135b).
 channel = "nightly"
 components = ["rust-src", "llvm-tools-preview"]
 targets = ["x86_64-unknown-uefi", "x86_64-unknown-none"]
