@@ -7,6 +7,16 @@ description = "Security hardening module for Zero-OS kernel"
 [lib]
 path = "lib.rs"
 
+[features]
+# M5-2: declare the retpoline gate (DEFAULT-OFF). spectre.rs:213
+# `retpoline_compiler: cfg!(feature="retpoline")` is a STATUS field feeding
+# hardened() (branch_protected = ibrs || stibp || retpoline_compiler). There is no
+# real retpoline codegen (no -Zretpoline / target-feature=+retpoline anywhere), so
+# ENABLING this feature would report Spectre-v2 protection WITHOUT it actually
+# existing — a false security claim. Declared-off keeps the report honest and
+# silences the warning. Real retpoline codegen is a separate (build-flag) task.
+retpoline = []
+
 [dependencies]
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }

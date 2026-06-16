@@ -6,6 +6,26 @@ edition = "2021"
 [lib]
 path = "lib.rs"
 
+[features]
+# M5-2: declare kernel_core's own cfg(feature=..) gates so they are not silently
+# always-false (the rustc unexpected_cfgs warning class). BOTH are DEFAULT-OFF.
+# conntrack: gates the outbound-SYN conntrack seed at syscall.rs:11641 (R155-8).
+# Declared OFF (NOT default-on) because that kernel_core PRE-transmit seed is
+# SUPERSEDED by the net egress seed in build_frame_and_transmit (R163-8 FIX,
+# net/src/stack.rs:1196), which creates the conntrack entry AFTER the egress
+# firewall ACCEPT using the real `our_ip` — so the inbound SYN-ACK already matches.
+# Enabling the kernel_core seed (which uses syn_result.src_ip, often the 0.0.0.0
+# placeholder for unbound client sockets, syscall.rs:11622) would create a
+# redundant/wrong-key entry, change the egress firewall's ct_state input
+# (None->New) for the first SYN, AND strand a stray SynSent entry on a
+# firewall-blocked / failed connect — strictly worse than today, zero benefit
+# (Codex 019ecf26 refuted enabling; the egress R163-8 path is the correct seed).
+# Declaring it off silences the warning + keeps the dead seed compiled out
+# (removing the superseded R155-8 seed is a separate follow-up).
+# sched_debug: a debug kprintln macro (sched_affinity_debug!); off keeps it out.
+conntrack = ["net/conntrack"]
+sched_debug = []
+
 [dependencies]
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }

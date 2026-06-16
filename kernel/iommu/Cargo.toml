@@ -13,6 +13,14 @@ default = []
 # UNSAFE: Permits devices to DMA into arbitrary physical memory.
 # Intended for debugging only; release builds must not enable this.
 unsafe_identity_passthrough = []
+# M5-2: declare the audit gate (DEFAULT-OFF). The #[cfg(feature="audit")] block at
+# fault.rs:473 references audit-crate symbols this crate does NOT depend on, and
+# those symbols have bit-rotted (emit_security_event / AuditEventType::IommuFault /
+# AuditSecurityClass::DmaViolation do not exist in the audit crate). Declaring it
+# OFF keeps the code compiled out (the #[cfg(not(feature="audit"))] no-op fallback
+# stays active) and silences the unexpected_cfgs warning. Enabling it is a separate
+# task (needs the audit dep + the symbol fixups), not this quick-win.
+audit = []
 
 [dependencies]
 spin = "0.9"

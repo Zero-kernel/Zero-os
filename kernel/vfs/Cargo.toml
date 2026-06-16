@@ -6,6 +6,13 @@ edition = "2021"
 [lib]
 path = "lib.rs"
 
+[features]
+# M5-2: declare the audit gate (DEFAULT-OFF). mount_namespace.rs's
+# #[cfg(feature="audit")] blocks (327/657/708) call audit-crate symbols this crate
+# does not depend on; declared-off keeps them compiled out and silences the
+# unexpected_cfgs warning. Enabling is a separate task (needs the audit dep).
+audit = []
+
 [dependencies]
 spin = "0.9"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
