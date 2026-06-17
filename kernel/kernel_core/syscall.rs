@@ -2333,6 +2333,28 @@ pub fn syscall_dispatcher(
         ),
         60 => sys_exit(arg0 as i32),
         231 => sys_exit_group(arg0 as i32),
+        // M2-1 SLICE-2 INVARIANT (vfork / syscall 58 scope boundary):
+        // There is intentionally NO `58 =>` arm here. vfork is in the default
+        // seccomp allowlist (seccomp/lib.rs:279, seccomp/types.rs:1131 under
+        // PledgePromises::PROC) but has no dispatch, so syscall 58 falls through
+        // to `_ => Err(ENOSYS)` (line ~2491). vfork is therefore ENOSYS and
+        // CHARGE-NEUTRAL today: it creates no process and no address space, so
+        // it can never pin/charge cgroup memory and cannot strand a mem_pinned
+        // residual (no path exists). If a FUTURE slice wires vfork to real Linux
+        // semantics (child borrows the parent's MmState until exec/exit), the
+        // handler MUST route memory accounting through exactly ONE of:
+        //   (a) fork_inner / sys_fork  -> independent MmState, so the aggregated
+        //       fork charge at fork.rs:240 (try_charge_memory(parent_cgroup_id,
+        //       fork_charge_bytes)) applies and telescopes via the child's exit
+        //       uncharge; OR
+        //   (b) the CLONE_VM shared-MmState path (see line ~3151:
+        //       `if flags & CLONE_VM != 0 { (parent_space, true) }`) which shares
+        //       the parent AS and performs NO independent fork charge.
+        // A vfork handler MUST NOT introduce a THIRD, uncharged AS-creating path:
+        // a shared-MmState process that independently fork-charges would double
+        // the charge (the FA-09 over-count / permanent-undeletability direction),
+        // and an independent-MmState process that skips the fork charge would
+        // strand the child's exit uncharge into a saturating under-count.
         57 => sys_fork(),
         59 => sys_exec(
             arg0 as *const u8,
@@ -4125,10 +4147,35 @@ fn sys_exec(
     // snapshot is used for both load_elf() charging and ExecSpaceGuard
     // rollback, eliminating the TOCTOU where concurrent cgroup migration
     // could cause the guard to uncharge a different cgroup than was charged.
+    // R171 M2-1 SLICE-1 FIX: a RAII guard that clears `exec_in_progress` on EVERY
+    // exit from sys_exec after the snapshot below (success commit OR any rollback).
+    // Declared BEFORE `ExecSpaceGuard` so it drops AFTER the guard's rollback
+    // uncharge — i.e. migration stays blocked through the entire exec window
+    // including the rollback path. Clears under the Process lock (the only mutator).
+    struct ExecInProgressGuard {
+        process: Arc<spin::Mutex<crate::process::Process>>,
+    }
+    impl Drop for ExecInProgressGuard {
+        fn drop(&mut self) {
+            self.process.lock().exec_in_progress = false;
+        }
+    }
+
     let (old_memory_space, old_user_memory_space, exec_cgroup_id) = {
-        let proc = process.lock();
+        let mut proc = process.lock();
+        // R171 M2-1 SLICE-1 FIX: arm the migration block under the Process lock,
+        // BEFORE the lock is dropped for load_elf's lock-dropped charge window. A
+        // concurrent cgroup migration now sees this set and retries (EAGAIN/EBUSY)
+        // instead of snapshotting compute_cgroup_charged_bytes mid-charge and
+        // stranding the in-flight exec charge on `exec_cgroup_id`.
+        proc.exec_in_progress = true;
         proc.mm.lock().exec_pending_bytes = 0; // Clear any stale value
         (proc.memory_space, proc.user_memory_space, proc.cgroup_id)
+    };
+    // Armed: from here every sys_exec exit clears the flag (no gap — the next
+    // statements cannot early-return before this guard exists).
+    let _exec_progress_guard = ExecInProgressGuard {
+        process: process.clone(),
     };
 
     // S-7 fix: RAII guard to rollback address space on error
@@ -4576,6 +4623,28 @@ fn sys_exec(
                 cgroup::uncharge_memory(cgroup_id, pt_bytes);
             }
             mm.pt_charged_bytes = 0;
+            // R171-CG1x0 FIX (M2-1 SLICE-0): the wholesale uncharge above drained
+            // both lanes (INVARIANT I'); clear the frame-identity ledger and reset
+            // the basis so the fresh image starts authoritative with no stale frame
+            // keys (a reused physical frame in the new AS cannot collide).
+            mm.pt_charged_frames.clear();
+            mm.pt_inherited_bytes = 0;
+            mm.pt_ledger_authoritative = true;
+            // M2-1 SLICE-4d: charge + ledger the NEW image's page-table-frame kmem — the
+            // intermediate PT/PD/PDPT frames load_elf built for this fresh AS (recorded by
+            // RecordingFrameAllocator). SOFT/forced charge: the count is knowable only
+            // after load_elf ran (a hard reject would orphan already-built tables uncharged
+            // = a worse bypass). Folded HERE, right after the old image's ledger is cleared,
+            // onto the now-fresh authoritative ledger, under this same Process+MmState
+            // commit (exec_in_progress also blocks migration across the whole exec window).
+            // PT is charged ONLY on this success commit; any earlier exec failure tears down
+            // the new AS via ExecSpaceGuard with PT never charged. record_pt_charge bumps
+            // pt_charged_bytes and preserves INVARIANT I'.
+            let new_pt_bytes = (load_result.pt_frames.len() as u64).saturating_mul(0x1000);
+            if new_pt_bytes > 0 {
+                cgroup::charge_memory_forced(cgroup_id, new_pt_bytes);
+                mm.record_pt_charge(&load_result.pt_frames);
+            }
 
             // R131-6 FIX: Reset per-task charge counter — the old image's charges
             // were fully uncharged above; new ELF image starts with a clean slate.
@@ -6693,9 +6762,15 @@ fn sys_brk(addr: usize) -> SyscallResult {
 
         // R37-5 FIX: Track mapped pages for rollback on partial allocation failure.
         // If allocation fails partway, we must unmap+free pages already mapped in this call.
-        let map_result: Result<(), SyscallError> = unsafe {
-            with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
-                let mut frame_alloc = FrameAllocator::new();
+        let map_result: Result<vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> = unsafe {
+            use x86_64::structures::paging::PhysFrame;
+            with_current_manager(VirtAddr::new(0), |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
+                // M2-1 SLICE-4b: record the intermediate PT/PD/PDPT frames map_page
+                // builds for this heap growth so they are charged + ledgered at the
+                // commit fold (mirrors sys_mmap Phase-2/3). The per-page DATA frame
+                // below goes through the inherent allocate_data_frame (UNrecorded);
+                // only map_page's trait allocate_frame records page-table frames.
+                let mut frame_alloc = RecordingFrameAllocator::new();
                 let flags = PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
                     | PageTableFlags::USER_ACCESSIBLE
@@ -6712,7 +6787,11 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     }
 
                     // 分配物理帧 - with rollback on failure
-                    let frame = match frame_alloc.allocate_frame() {
+                    // M2-1 SLICE-4b: DATA frame via the inherent allocate_data_frame
+                    // (NOT recorded into the PT ledger). LOAD-BEARING split — the
+                    // map_page call below KEEPS `&mut frame_alloc`, so only the
+                    // intermediate tables it pulls are recorded.
+                    let frame = match frame_alloc.allocate_data_frame() {
                         Some(f) => f,
                         None => {
                             // R127-2 FIX: 3-phase rollback pattern —
@@ -6732,6 +6811,18 @@ fn sys_brk(addr: usize) -> SyscallResult {
                                     }
                                 }
                             }
+                            // M2-1 SLICE-4b: reclaim the now-empty intermediate PT/PD
+                            // tables this rolled-back growth left behind (mirrors
+                            // sys_mmap R169-L2; also fixes the pre-existing brk-grow
+                            // rollback table leak). old_top/grow_size spans the whole
+                            // request — mapped_pages is SPARSE (translate_addr skip at
+                            // the top of the loop), and table_empty() leaves a table
+                            // still pinned by a skipped sibling leaf untouched.
+                            manager.prune_empty_tables_in_range(
+                                VirtAddr::new(old_top as u64),
+                                grow_size,
+                                &mut frames_to_free,
+                            );
                             if !frames_to_free.is_empty() {
                                 mm::flush_current_as_range(
                                     VirtAddr::new(old_top as u64),
@@ -6769,6 +6860,15 @@ fn sys_brk(addr: usize) -> SyscallResult {
                                 }
                             }
                         }
+                        // M2-1 SLICE-4b: reclaim now-empty intermediate PT/PD tables
+                        // (mirrors sys_mmap R169-L2; fixes the pre-existing brk-grow
+                        // rollback table leak). old_top/grow_size spans the sparse
+                        // request; table_empty() guards still-pinned tables.
+                        manager.prune_empty_tables_in_range(
+                            VirtAddr::new(old_top as u64),
+                            grow_size,
+                            &mut frames_to_free,
+                        );
                         if !frames_to_free.is_empty() {
                             mm::flush_current_as_range(
                                 VirtAddr::new(old_top as u64),
@@ -6799,6 +6899,15 @@ fn sys_brk(addr: usize) -> SyscallResult {
                                 }
                             }
                         }
+                        // M2-1 SLICE-4b: reclaim now-empty intermediate PT/PD tables
+                        // (mirrors sys_mmap R169-L2; fixes the pre-existing brk-grow
+                        // rollback table leak). old_top/grow_size spans the sparse
+                        // request; table_empty() guards still-pinned tables.
+                        manager.prune_empty_tables_in_range(
+                            VirtAddr::new(old_top as u64),
+                            grow_size,
+                            &mut frames_to_free,
+                        );
                         if !frames_to_free.is_empty() {
                             mm::flush_current_as_range(
                                 VirtAddr::new(old_top as u64),
@@ -6812,43 +6921,74 @@ fn sys_brk(addr: usize) -> SyscallResult {
                     }
                     mapped_pages.push(page);
                 }
-                Ok(())
+                // M2-1 SLICE-4b: yield the recorded PT-frame identities (NOT a count)
+                // for the Step-3 charge + ledger fold. Every Err path above freed its
+                // own DATA leaves AND pruned+freed its own intermediate tables, so this
+                // Vec is meaningful only on this Ok path.
+                Ok(frame_alloc.pt_frames)
             })
         };
 
-        if map_result.is_err() {
-            // 分配失败，返回旧值并回滚内存计费
-            // R144-1 FIX: Clear brk_pending_growth under lock BEFORE
-            // uncharging, and use the *current* cgroup_id (migration may
-            // have changed it while we held no lock).  Clearing pending
-            // first prevents a concurrent sys_cgroup_attach from migrating
-            // a charge that is about to be rolled back.
-            let rollback_cgroup_id = {
-                let proc = process.lock();
-                // R163-9 FIX: saturating_sub to preserve concurrent brk pending.
-                let mut mm = mm_arc.lock();
-                mm.brk_pending_growth = mm.brk_pending_growth.saturating_sub(grow_size as u64);
-                proc.cgroup_id
-            };
-            cgroup::uncharge_memory(rollback_cgroup_id, grow_size as u64);
-            return Ok(old_brk);
-        }
+        // M2-1 SLICE-4b: bind the recorded PT-frame identities on success. The Err arm
+        // is the pre-existing DATA-charge rollback (the Step-2 closure already freed its
+        // own DATA leaves AND pruned+freed its own intermediate tables on every error
+        // path, so no PT uncharge is owed here).
+        let pt_frames = match map_result {
+            Err(_) => {
+                // 分配失败，返回旧值并回滚内存计费
+                // R144-1 FIX: Clear brk_pending_growth under lock BEFORE
+                // uncharging, and use the *current* cgroup_id (migration may
+                // have changed it while we held no lock).  Clearing pending
+                // first prevents a concurrent sys_cgroup_attach from migrating
+                // a charge that is about to be rolled back.
+                let rollback_cgroup_id = {
+                    let proc = process.lock();
+                    // R163-9 FIX: saturating_sub to preserve concurrent brk pending.
+                    let mut mm = mm_arc.lock();
+                    mm.brk_pending_growth = mm.brk_pending_growth.saturating_sub(grow_size as u64);
+                    proc.cgroup_id
+                };
+                cgroup::uncharge_memory(rollback_cgroup_id, grow_size as u64);
+                return Ok(old_brk);
+            }
+            Ok(frames) => frames,
+        };
+        // M2-1 SLICE-4b: the PT-frame charge is exactly the recorded PT/PD/PDPT frame
+        // count (DATA frames went through allocate_data_frame, unrecorded).
+        let pt_bytes = (pt_frames.len() as u64).saturating_mul(0x1000);
 
         // D3-ARC-MM-SHARED: Update brk and charge counters in shared MmState.
-        // R162-2 FIX: Re-verify mm.brk == old_brk at commit. If a concurrent
-        // CLONE_VM thread called sys_brk while our lock was dropped for PT ops,
-        // mm.brk may have advanced. In that case, uncharge the stale growth
-        // and return current brk — our mapped pages overlap with the other
-        // thread's and will be reused (translate_addr skips already-mapped).
+        // R162-2 FIX: Re-verify mm.brk == old_brk at commit.
+        // M2-1 SLICE-4b: hold BOTH the Process and MmState locks across the PT-frame
+        // charge fold (canonical Process -> MmState order, exactly like sys_mmap Phase-3
+        // and mprotect Path-A Step-3). cgroup migration snapshots
+        // compute_cgroup_charged_bytes — which folds pt_charged_bytes — under the Process
+        // lock (R155-5), so charging under mm-only would race sys_cgroup_attach and
+        // strand the PT charge on a stale cgroup. `proc` (the entry guard) was dropped
+        // before the lock-free PT work; this re-acquires a fresh Process lock — no
+        // self-deadlock (the PT work ran with no Process lock held).
         {
+            let proc = process.lock();
             let mut mm = mm_arc.lock();
             if mm.brk != old_brk {
+                // DEAD under the brk reservation: brk_in_progress pins mm.brk to old_brk
+                // for the whole lock-dropped window (a sibling brk early-returns on the
+                // brk_in_progress guard; exec rejects shared-VM; fork is EAGAIN mid-brk).
+                // Retained as R162-2 defense-in-depth — charge NOTHING for PT (Template-C
+                // ride-to-teardown, over-count-safe) and uncharge only the stale DATA
+                // growth. Capture brk + cgroup_id BEFORE drop(mm) (no second MmState
+                // lock); do NOT disarm brk_resv (let BrkReservation::Drop clear the flag).
+                debug_assert!(
+                    false,
+                    "brk moved under reservation — impossible (brk_in_progress pins it)"
+                );
                 // R163-9 FIX: saturating_sub to preserve concurrent brk pending.
                 mm.brk_pending_growth = mm.brk_pending_growth.saturating_sub(grow_size as u64);
+                let current_brk = mm.brk;
+                let rollback_cgroup_id = proc.cgroup_id;
                 drop(mm);
-                let rollback_cgroup_id = process.lock().cgroup_id;
                 cgroup::uncharge_memory(rollback_cgroup_id, grow_size as u64);
-                return Ok(mm_arc.lock().brk);
+                return Ok(current_brk);
             }
             mm.brk = addr;
             // R163-9 FIX: saturating_sub to preserve concurrent brk pending.
@@ -6856,8 +6996,19 @@ fn sys_brk(addr: usize) -> SyscallResult {
             mm.vm_charged_bytes = mm
                 .vm_charged_bytes
                 .saturating_add(grow_size as u64);
-            // R165-1/R165-2 FIX: release the brk reservation under the commit
-            // lock and disarm the guard so Drop does not re-clear it.
+            // M2-1 SLICE-4b: SOFT/forced PT-frame kmem charge, after-the-fact (the PT
+            // count is knowable only after map_page ran — IM-15), migration-atomic under
+            // this Process+MmState hold. record_pt_charge does the per-AS frame-identity
+            // ledger insert + INVARIANT-I' bookkeeping (with OOM fallback to
+            // pt_inherited_bytes). charge_memory_forced/uncharge_memory take only
+            // CGROUP_REGISTRY + atomics (never Process/MmState), so this is deadlock-free
+            // under the held locks (same as sys_mmap Phase-3). The live tables reclaim via
+            // the 4c shrink prune+reconcile or last-exit teardown.
+            if pt_bytes > 0 {
+                cgroup::charge_memory_forced(proc.cgroup_id, pt_bytes);
+                mm.record_pt_charge(&pt_frames);
+            }
+            // R165-1/R165-2 FIX: release the brk reservation under the commit lock.
             mm.brk_in_progress = false;
             brk_resv.armed = false;
         }
@@ -6875,8 +7026,14 @@ fn sys_brk(addr: usize) -> SyscallResult {
         drop(proc);
 
         // R126-1 FIX: 3-phase unmap matching sys_munmap() pattern for COW safety
-        unsafe {
-            with_current_manager(VirtAddr::new(0), |manager| {
+        // M2-1 SLICE-4c: the closure now ALSO yields the reclaimed empty PT/PD TABLE
+        // frames (NOT freed here) so the folded commit below can remove them from the
+        // per-AS ledger BEFORE they are published to the buddy (free-after-remove),
+        // mirroring sys_munmap Phase-2/3. This pairs with SLICE-4b: a brk-grown ledgered
+        // PT frame is now debited here on shrink instead of riding to teardown.
+        let table_frames: alloc::vec::Vec<x86_64::structures::paging::PhysFrame> = unsafe {
+            use x86_64::structures::paging::PhysFrame;
+            with_current_manager(VirtAddr::new(0), |manager| -> alloc::vec::Vec<PhysFrame> {
                 let mut frame_alloc = FrameAllocator::new();
                 // R159-2 FIX: Fallible frames_to_free (same pattern as R159-1/R158-7).
                 let mut frames_to_free = Vec::new();
@@ -6921,42 +7078,119 @@ fn sys_brk(addr: usize) -> SyscallResult {
                         frame_alloc.deallocate_frame(frame);
                     }
                 }
-            });
+
+                // M2-1 SLICE-4c: reclaim the now-empty intermediate PT/PD tables this
+                // shrink emptied — but DO NOT free them here. prune clears the parent
+                // entries + issues the all-CPU paging-structure shootdown under PT_LOCK
+                // (clear -> flush stays in this phase); the carried frames are published
+                // to the buddy strictly AFTER the folded commit removes them from the
+                // per-AS ledger (free-after-remove).
+                let mut table_frames: alloc::vec::Vec<PhysFrame> = alloc::vec::Vec::new();
+                let _ = table_frames.try_reserve((shrink_size / 0x20_0000) + 2);
+                manager.prune_empty_tables_in_range(
+                    VirtAddr::new(new_top as u64),
+                    shrink_size,
+                    &mut table_frames,
+                );
+                table_frames
+            })
+        };
+
+        // M2-1 SLICE-4c: a leak-safe carrier for the reclaimed PT/PD table frames. They
+        // are published to the buddy ONLY after the folded commit removes them from the
+        // per-AS ledger (free-after-remove); on any early-return/panic before the explicit
+        // drain, Drop frees them so a carried frame can never leak (mirrors sys_munmap).
+        struct TableFrameReclaim {
+            frames: alloc::vec::Vec<x86_64::structures::paging::PhysFrame>,
+            drained: bool,
         }
+        impl Drop for TableFrameReclaim {
+            fn drop(&mut self) {
+                if !self.drained && !self.frames.is_empty() {
+                    let mut fa = mm::memory::FrameAllocator::new();
+                    for f in self.frames.drain(..) {
+                        fa.deallocate_frame(f);
+                    }
+                }
+            }
+        }
+        let mut reclaim = TableFrameReclaim {
+            frames: table_frames,
+            drained: false,
+        };
 
         // R164-1 FIX: Re-verify mm.brk == old_brk at shrink commit, matching
-        // the grow path (R162-2). Without this, a concurrent CLONE_VM thread
-        // that grew brk while we held no lock gets its brk value clobbered,
-        // and its cgroup charge becomes orphaned.
+        // the grow path (R162-2).
+        // M2-1 SLICE-4c: fold the DATA uncharge AND the per-AS PT-ledger reconcile into
+        // ONE Process+MmState critical section (canonical Process -> MmState order, exactly
+        // like sys_munmap Phase-3) so both land atomically w.r.t. cgroup migration (which
+        // snapshots compute_cgroup_charged_bytes — including pt_charged_bytes — under the
+        // Process lock, R155-5). The prior code uncharged DATA in a SEPARATE process.lock()
+        // AFTER the mm-only commit, leaving a migration split; folding both closes it.
+        // cgroup uncharge runs with PT_LOCK already dropped (sanctioned under the Process
+        // lock; never under PT_LOCK).
         {
+            let proc = process.lock();
             let mut mm = mm_arc.lock();
+            let cgroup_id = proc.cgroup_id;
+            // PT leg (computed once, applied in whichever arm runs): reconcile the ledger
+            // with the frames prune reclaimed — debit a reclaimed frame IFF this AS charged
+            // it (frame-identity provenance; an UNCHARGED inherited frame is correctly NOT
+            // debited). Skipped while the ledger is non-authoritative (a forked child's
+            // inherited basis rides to teardown). The ledger removal happens HERE, strictly
+            // before the frames are published to the buddy below (free-after-remove).
+            let pt_freed = if mm.pt_ledger_authoritative {
+                let freed = crate::process::pt_ledger_reconcile(
+                    &mut mm.pt_charged_frames,
+                    reclaim.frames.iter().map(|f| f.start_address().as_u64()),
+                );
+                if freed > 0 {
+                    mm.pt_charged_bytes = mm.pt_charged_bytes.saturating_sub(freed);
+                }
+                freed
+            } else {
+                0
+            };
             if mm.brk != old_brk {
-                // Concurrent brk changed mm.brk while we were unmapping.
-                // Our unmapped pages were in [new_top, old_top) which is
-                // below old_brk, so they don't overlap with concurrent growth.
-                // The cgroup charge for these freed pages must still be
-                // released since the frames were already deallocated.
+                // Concurrent brk changed mm.brk while we were unmapping. Our unmapped pages
+                // were in [new_top, old_top) below old_brk, so they don't overlap concurrent
+                // growth. The DATA charge for these freed pages must still be released (the
+                // frames were already deallocated). reclaim stays armed; its Drop publishes
+                // the table frames to the buddy AFTER this ledger removal (free-after-remove).
                 mm.vm_charged_bytes = mm
                     .vm_charged_bytes
                     .saturating_sub(shrink_size as u64);
                 let current_brk = mm.brk;
-                drop(mm);
-                let shrink_cgroup_id = process.lock().cgroup_id;
-                cgroup::uncharge_memory(shrink_cgroup_id, shrink_size as u64);
+                cgroup::uncharge_memory(cgroup_id, shrink_size as u64);
+                if pt_freed > 0 {
+                    cgroup::uncharge_memory(cgroup_id, pt_freed);
+                }
                 return Ok(current_brk);
             }
             mm.brk = addr;
             mm.vm_charged_bytes = mm
                 .vm_charged_bytes
                 .saturating_sub(shrink_size as u64);
+            cgroup::uncharge_memory(cgroup_id, shrink_size as u64);
+            if pt_freed > 0 {
+                cgroup::uncharge_memory(cgroup_id, pt_freed);
+            }
             // R165-1 FIX: release the brk reservation under the commit lock.
             mm.brk_in_progress = false;
             brk_resv.armed = false;
         }
 
-        // R145-1 FIX: Re-read cgroup_id under lock immediately before uncharge.
-        let shrink_cgroup_id = process.lock().cgroup_id;
-        cgroup::uncharge_memory(shrink_cgroup_id, shrink_size as u64);
+        // M2-1 SLICE-4c: NOW publish the reclaimed table frames to the buddy — strictly
+        // AFTER the ledger removal above (free-after-remove). In the window a frame becomes
+        // buddy-reusable it is already gone from the ledger and pt_charged_bytes, so a
+        // concurrent re-allocator that obtains it re-records it fresh.
+        {
+            let mut fa = FrameAllocator::new();
+            for f in reclaim.frames.drain(..) {
+                fa.deallocate_frame(f);
+            }
+            reclaim.drained = true;
+        }
 
         Ok(addr)
     }
@@ -6969,6 +7203,117 @@ fn sys_brk(addr: usize) -> SyscallResult {
         brk_resv.armed = false;
         Ok(addr)
     }
+}
+
+/// R171-CG1x0 FIX (M2-1 SLICE-0; hoisted to module scope by M2-1 SLICE-4a): a
+/// frame-allocator shim that RECORDS THE IDENTITY of every intermediate
+/// PT/PD/PDPT frame `map_to`/`map_page` pulls via `create_next_table`, so the
+/// per-AS provenance ledger (`MmState.pt_charged_frames`) can later uncharge a
+/// reclaimed page-table frame IFF the AS charged it (defeating the cross-origin
+/// `memory.max` bypass).
+///
+/// Hoisted from a `sys_mmap`-local definition so every EAGER PT-building syscall
+/// path (mmap; mprotect Path-A; later brk/exec) shares ONE audited shim. The
+/// DATA/PT split is by CALL PATH, not a counter: the explicit per-page DATA frame
+/// the caller pulls goes through the INHERENT `allocate_data_frame` (never
+/// recorded — it is not page-table memory); the PT/PD/PDPT frames `map_to` pulls
+/// go through the TRAIT `allocate_frame` (recorded by physical address). `map_to`
+/// allocates an intermediate frame ONLY for an `is_unused()` level (the
+/// `create_next_table` guard), so `pt_frames` is EXACTLY the newly-built
+/// page-table frames — frame identity, not a fungible count. The trait body
+/// RESERVES the ledger slot BEFORE pulling from the buddy: on `try_reserve`
+/// failure it returns None WITHOUT allocating, so `map_to` fails and the caller's
+/// existing rollback fires — there is never an unrecorded LIVE PT frame
+/// (fail-closed). `deallocate_frame` never touches `pt_frames` (rollback frees
+/// must not perturb the recorded set; `pt_frames` is consumed only on the Ok
+/// path). Both allocate bodies delegate to `self.inner` (never
+/// `Self::allocate_frame`) to avoid inherent/trait recursion. `inner` is spelled
+/// fully-qualified `mm::memory::FrameAllocator` so it cannot silently resolve to
+/// a different ambient type after the hoist.
+pub(crate) struct RecordingFrameAllocator {
+    inner: mm::memory::FrameAllocator,
+    pt_frames: vec::Vec<x86_64::structures::paging::PhysFrame>,
+}
+impl RecordingFrameAllocator {
+    /// Construct over a fresh buddy frame allocator with an empty PT-frame record.
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: mm::memory::FrameAllocator::new(),
+            pt_frames: vec::Vec::new(),
+        }
+    }
+    /// Explicit DATA-frame allocation (per-page in a map loop): NOT recorded —
+    /// data frames are not page-table kmem and must not enter the ledger.
+    /// M2-1 SLICE-4d: pub(crate) so the ELF loader (a sibling module) can pull DATA
+    /// frames through the SAME audited shim and keep the DATA/PT split intact.
+    pub(crate) fn allocate_data_frame(&mut self) -> Option<x86_64::structures::paging::PhysFrame> {
+        self.inner.allocate_frame()
+    }
+    /// M2-1 SLICE-4d: pub(crate) so the ELF loader's map-fail rollback can free a DATA
+    /// frame through the shim (never perturbs the recorded `pt_frames`).
+    pub(crate) fn deallocate_frame(&mut self, frame: x86_64::structures::paging::PhysFrame) {
+        self.inner.deallocate_frame(frame);
+    }
+    /// M2-1 SLICE-4d: consume the recorder and return the recorded PT/PD/PDPT frame
+    /// identities. A cross-module accessor (the `pt_frames` field stays private) so the
+    /// ELF loader can fold the recorded frames into ElfLoadResult without touching the
+    /// field directly. Call ONLY on the Ok path — every helper frees its own DATA frames
+    /// on error and, on exec failure, the whole new AS (incl. these tables) is torn down
+    /// by free_address_space, so the dropped recorder leaks nothing.
+    pub(crate) fn take_pt_frames(self) -> vec::Vec<x86_64::structures::paging::PhysFrame> {
+        self.pt_frames
+    }
+}
+unsafe impl x86_64::structures::paging::FrameAllocator<x86_64::structures::paging::Size4KiB>
+    for RecordingFrameAllocator
+{
+    fn allocate_frame(
+        &mut self,
+    ) -> Option<x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>>
+    {
+        // Reserve the ledger slot BEFORE pulling a frame from the buddy. On OOM
+        // return None without allocating: `map_to` then fails and the caller's
+        // existing rollback runs — no unrecorded live PT frame can exist (fail-closed).
+        if self.pt_frames.try_reserve(1).is_err() {
+            return None;
+        }
+        let f = self.inner.allocate_frame();
+        if let Some(frame) = f {
+            self.pt_frames.push(frame); // cannot fail: capacity reserved above
+        }
+        f
+    }
+}
+
+/// M2-1 SLICE-4b: regression guard for the LOAD-BEARING DATA/PT split in
+/// `RecordingFrameAllocator`. The inherent `allocate_data_frame` must NOT record (heap /
+/// ELF-segment / stack DATA pages are not page-table kmem), while the trait
+/// `allocate_frame` (the path `map_page` pulls for intermediate tables) MUST record by
+/// frame identity. A mis-wire routing a DATA pull through the trait would record every
+/// data page as a PT frame (~512x over-charge + a corrupt ledger whose data-frame keys a
+/// later `pt_ledger_reconcile` would debit as PT). This guards the brk-grow / exec
+/// DATA/PT swap — the single most error-prone seam of M2-1 SLICE-4. Lives in `syscall.rs`
+/// because it touches the module-private `allocate_data_frame` / `pt_frames`.
+pub fn run_recording_frame_allocator_split_self_test() {
+    let mut fa = RecordingFrameAllocator::new();
+    // DATA frame via the inherent method: must NOT be recorded.
+    let d = fa
+        .allocate_data_frame()
+        .expect("buddy frame for DATA self-test");
+    assert_eq!(fa.pt_frames.len(), 0, "DATA frame must NOT enter the PT ledger");
+    // PT frame via the trait method `map_page` uses: must be recorded by identity.
+    let p = <RecordingFrameAllocator as x86_64::structures::paging::FrameAllocator<
+        x86_64::structures::paging::Size4KiB,
+    >>::allocate_frame(&mut fa)
+    .expect("buddy frame for PT self-test");
+    assert_eq!(fa.pt_frames.len(), 1, "trait allocate_frame MUST record the PT frame");
+    assert_eq!(
+        fa.pt_frames[0], p,
+        "recorded PT frame identity must match the allocation"
+    );
+    // Cleanup: return both frames to the buddy (deallocate_frame never perturbs pt_frames).
+    fa.deallocate_frame(d);
+    fa.deallocate_frame(p);
 }
 
 /// sys_mmap - 内存映射
@@ -7191,58 +7536,22 @@ fn sys_mmap(
     // snapshot an uncharged PENDING_MAP entry. The old standalone charge call
     // and its rollback are no longer needed.
 
-    // J2-9 FIX: A frame-allocator shim that counts every frame handed out — both
-    // the per-page DATA frames the map loop pulls explicitly and the intermediate
-    // PT/PD/PDPT frames x86_64 `map_to` pulls via `create_next_table`. After a
-    // successful map, `count - data_pages` is exactly the number of new page-table
-    // frames, which Phase 3 charges to the cgroup MEMORY controller (page-table
-    // memory is kernel memory and rides `memory.max`). `deallocate_frame` never
-    // touches `count` (rollback frees must not lower the charge basis). Both
-    // allocate bodies delegate to `self.inner` (never `Self::allocate_frame`) to
-    // avoid recursion between the inherent and trait methods.
-    struct CountingFrameAllocator {
-        inner: FrameAllocator,
-        count: u64,
-    }
-    impl CountingFrameAllocator {
-        fn allocate_frame(&mut self) -> Option<x86_64::structures::paging::PhysFrame> {
-            let f = self.inner.allocate_frame();
-            if f.is_some() {
-                self.count = self.count.saturating_add(1);
-            }
-            f
-        }
-        fn deallocate_frame(&mut self, frame: x86_64::structures::paging::PhysFrame) {
-            self.inner.deallocate_frame(frame);
-        }
-    }
-    unsafe impl x86_64::structures::paging::FrameAllocator<x86_64::structures::paging::Size4KiB>
-        for CountingFrameAllocator
-    {
-        fn allocate_frame(
-            &mut self,
-        ) -> Option<x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>>
-        {
-            let f = self.inner.allocate_frame();
-            if f.is_some() {
-                self.count = self.count.saturating_add(1);
-            }
-            f
-        }
-    }
+    // M2-1 SLICE-0 / SLICE-4a: the PT-recording frame allocator is now the
+    // module-level `RecordingFrameAllocator` (hoisted above `fn sys_mmap` so
+    // mprotect Path-A — and later brk/exec — share one audited shim).
 
     // 使用基于当前 CR3 的页表管理器进行映射
     // 使用 tracked vector 记录已映射的页，确保失败时完整回滚，避免帧泄漏
     // J2-9: the closure returns the TOTAL frames allocated (data + page-table) so
     // Phase 3 can charge the page-table-frame kmem AFTER PT_LOCK is dropped (the
     // cgroup charge must never run under PT_LOCK — lock_ordering invariant).
-    let map_result: Result<u64, SyscallError> = unsafe {
+    let map_result: Result<vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> = unsafe {
         use x86_64::structures::paging::PhysFrame;
 
-        with_current_manager(VirtAddr::new(0), |manager| -> Result<u64, SyscallError> {
-            let mut frame_alloc = CountingFrameAllocator {
+        with_current_manager(VirtAddr::new(0), |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
+            let mut frame_alloc = RecordingFrameAllocator {
                 inner: FrameAllocator::new(),
-                count: 0,
+                pt_frames: vec::Vec::new(),
             };
             // 跟踪已成功映射的 (page, frame) 对，用于失败时回滚
             let mut mapped: vec::Vec<(Page, PhysFrame)> = vec::Vec::new();
@@ -7251,7 +7560,10 @@ fn sys_mmap(
                 let page = Page::containing_address(VirtAddr::new((base + offset) as u64));
 
                 // 分配物理帧，失败时回滚所有已映射的页
-                let frame = match frame_alloc.allocate_frame() {
+                // R171-CG1x0 FIX (M2-1 SLICE-0): the DATA frame uses the inherent
+                // `allocate_data_frame` (NOT recorded into the PT ledger); only the
+                // intermediate tables `map_page`/`map_to` pull below are recorded.
+                let frame = match frame_alloc.allocate_data_frame() {
                     Some(f) => f,
                     None => {
                         // R127-2 + R158-12 FIX: 3-phase rollback; immediate free on OOM.
@@ -7363,7 +7675,10 @@ fn sys_mmap(
                 mapped.push((page, frame));
             }
 
-            Ok(frame_alloc.count)
+            // R171-CG1x0 FIX (M2-1 SLICE-0): yield the recorded PT-frame identities
+            // (NOT a count). On every Err path above the closure freed its own
+            // frames, so this Vec is meaningful only on the Ok path.
+            Ok(frame_alloc.pt_frames)
         })
     };
 
@@ -7372,10 +7687,10 @@ fn sys_mmap(
     // R148-2 FIX: Remove reservation under process lock AND capture current
     // cgroup_id, then uncharge with the fresh id. The cached cgroup_id from
     // Phase 1 may be stale if cgroup migration occurred during PT operations.
-    // J2-9: the closure now yields the total frames allocated on success; capture
-    // it for the page-table-kmem charge below (the closure freed its own frames on
-    // every Err path, so the count is only meaningful on Ok).
-    let total_allocs = match map_result {
+    // R171-CG1x0 FIX (M2-1 SLICE-0): the closure now yields the IDENTITIES of the
+    // page-table frames built on success (the closure freed its own frames on every
+    // Err path, so the Vec is meaningful only on Ok).
+    let pt_frames = match map_result {
         Err(e) => {
             let rollback_cgroup_id = {
                 let proc = process.lock();
@@ -7389,16 +7704,15 @@ fn sys_mmap(
             cgroup::uncharge_memory(rollback_cgroup_id, length_aligned as u64);
             return Err(e);
         }
-        Ok(n) => n,
+        Ok(frames) => frames,
     };
 
-    // J2-9: derive the page-table-frame charge. `map_to` pulls ONLY intermediate
-    // tables from the allocator (create_next_table, guarded by is_unused()); the
-    // leaf data frame is set, not allocator-sourced. So the page-table frames are
-    // the total minus the one data frame per mapped page. saturating_sub is
-    // defensive — total_allocs >= data_pages always holds on the success path.
-    let data_pages = (length_aligned / 0x1000) as u64;
-    let pt_bytes = total_allocs.saturating_sub(data_pages).saturating_mul(0x1000);
+    // R171-CG1x0 FIX (M2-1 SLICE-0): the page-table-frame charge is exactly the
+    // number of recorded PT/PD/PDPT frame identities — `RecordingFrameAllocator`
+    // records only the frames `map_to` pulled for intermediate tables; the leaf
+    // DATA frame went through `allocate_data_frame` (unrecorded). No data-page
+    // subtraction is needed (the count is already PT-only, by identity).
+    let pt_bytes = (pt_frames.len() as u64).saturating_mul(0x1000);
 
     // Phase 3: Commit the reservation (clear PENDING_MAP) AND record the
     // page-table-frame kmem in the SAME Process-lock critical section. Doing both
@@ -7438,9 +7752,62 @@ fn sys_mmap(
         // J2-9: record the page-table-frame kmem (forced soft charge) under this
         // same Process lock so the cgroup counter and the per-AS mirror move
         // together and stay consistent with proc.cgroup_id (migration-atomic).
+        //
+        // R171-CG1x0 FIX (M2-1 SLICE-0): BEFORE charging, record each PT frame's
+        // physical identity in the per-AS provenance ledger so a later munmap-prune
+        // uncharges a reclaimed frame IFF this mmap charged it — defeating the
+        // cross-origin memory.max bypass. The ledger insert runs under THIS same
+        // MmState lock that any concurrent munmap of this shared AS must also take,
+        // so a sibling cannot remove an entry mid-install. Reserve up front; on a
+        // reserve OOM (or the never-firing aliasing safety net) fall back to the
+        // untracked `pt_inherited_bytes` basis: those frames then reclaim only at
+        // teardown (over-count-safe — restricts the tenant further, never a bypass),
+        // and INVARIANT I' (pt_charged_bytes == pt_inherited_bytes +
+        // pt_charged_frames.len()*0x1000) is preserved on every branch.
         if pt_bytes > 0 {
+            let ledgered = if mm.pt_charged_frames.try_reserve(pt_frames.len()).is_ok() {
+                let mut all_fresh = true;
+                for f in &pt_frames {
+                    match mm.pt_charged_frames.try_insert(f.start_address().as_u64(), ()) {
+                        Ok(None) => {}
+                        Ok(Some(_)) => {
+                            // A frame the allocator just handed out as is_unused()
+                            // CANNOT already be ledgered unless free-after-remove
+                            // (munmap step) were violated — a never-firing safety
+                            // net, NEVER a silent in-place replace.
+                            debug_assert!(
+                                false,
+                                "pt ledger frame aliased — free-after-remove invariant violated"
+                            );
+                            all_fresh = false;
+                        }
+                        // Unreachable after a successful try_reserve(len); defensive.
+                        Err(_) => {
+                            all_fresh = false;
+                            break;
+                        }
+                    }
+                }
+                all_fresh
+            } else {
+                false
+            };
             cgroup::charge_memory_forced(proc.cgroup_id, pt_bytes);
             mm.pt_charged_bytes = mm.pt_charged_bytes.saturating_add(pt_bytes);
+            if ledgered {
+                // This AS now authoritatively tracks its own PT charges by frame.
+                if !mm.pt_ledger_authoritative {
+                    mm.pt_ledger_authoritative = true;
+                }
+            } else {
+                // OOM / aliasing fallback: drop any partial inserts and carry the
+                // bytes in the untracked basis so the ledger stays consistent with
+                // INVARIANT I' (these frames reclaim wholesale at teardown).
+                for f in &pt_frames {
+                    mm.pt_charged_frames.remove(&f.start_address().as_u64());
+                }
+                mm.pt_inherited_bytes = mm.pt_inherited_bytes.saturating_add(pt_bytes);
+            }
         }
     }
 
@@ -7543,8 +7910,11 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     // R23-3 fix: 使用两阶段方法 - 先收集帧、做 TLB shootdown、再释放
     // 使用基于当前 CR3 的页表管理器进行取消映射
     // R23-3 fix: 使用两阶段方法 - 先收集帧、做 TLB shootdown、再释放
-    let unmap_result: Result<(), SyscallError> = unsafe {
-        with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
+    // R171-CG1x0 FIX (M2-1 SLICE-0): the closure now yields the reclaimed empty
+    // PT/PD TABLE frames (NOT freed here) so Phase 3 can remove them from the per-AS
+    // ledger BEFORE they are published to the buddy (free-after-remove).
+    let unmap_result: Result<alloc::vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> = unsafe {
+        with_current_manager(VirtAddr::new(0), |manager| -> Result<alloc::vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> {
             use alloc::vec::Vec;
             use x86_64::structures::paging::PhysFrame;
 
@@ -7597,47 +7967,122 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
                 }
             }
 
-            Ok(())
+            // R171-CG1x0 FIX (M2-1 SLICE-0): reclaim the now-empty intermediate
+            // PT/PD tables this unmap left behind — but DO NOT free them to the buddy
+            // here. prune clears the parent PDE/PDPTE entries and issues the
+            // all-CPU paging-structure shootdown UNDER PT_LOCK (clear→flush stays in
+            // Phase 2); the carried frames are published to the buddy strictly AFTER
+            // Phase 3 removes them from the per-AS ledger (free-after-remove). Note:
+            // this fires prune on the COMMON munmap-empties-a-table path (previously
+            // only on the rare OOM-rollback paths) — accepted per Safety > Speed.
+            let mut table_frames: Vec<PhysFrame> = Vec::new();
+            let _ = table_frames.try_reserve((length_aligned / 0x20_0000) + 2);
+            manager.prune_empty_tables_in_range(
+                VirtAddr::new(addr as u64),
+                length_aligned,
+                &mut table_frames,
+            );
+
+            Ok(table_frames)
         })
     };
 
-    if let Err(e) = unmap_result {
-        // Roll back the PENDING_UNMAP marker so the region remains usable.
-        // Preserve committed per-region flags (e.g. PROT_NONE).
-        // next-phase #11: `addr` still carries its PENDING_UNMAP marker here, so
-        // this is an in-place replace that cannot allocate; ignore the result so
-        // the original unmap error `e` is the one returned.
-        let _ = mm_arc
-            .lock()
-            .mmap_regions
-            .try_insert(addr, MmapEntry::from_len_flags(recorded_length, committed_flags));
-        return Err(e);
+    let table_frames = match unmap_result {
+        Ok(tf) => tf,
+        Err(e) => {
+            // Roll back the PENDING_UNMAP marker so the region remains usable.
+            // Preserve committed per-region flags (e.g. PROT_NONE).
+            // next-phase #11: `addr` still carries its PENDING_UNMAP marker here, so
+            // this is an in-place replace that cannot allocate; ignore the result so
+            // the original unmap error `e` is the one returned.
+            let _ = mm_arc
+                .lock()
+                .mmap_regions
+                .try_insert(addr, MmapEntry::from_len_flags(recorded_length, committed_flags));
+            return Err(e);
+        }
+    };
+
+    // R171-CG1x0 FIX (M2-1 SLICE-0): a leak-safe carrier for the reclaimed PT/PD
+    // table frames. The frames are published to the buddy ONLY after Phase 3 removes
+    // them from the per-AS ledger (free-after-remove). On any early-return/panic
+    // before the explicit drain, Drop frees them so a carried frame can never leak.
+    struct TableFrameReclaim {
+        frames: alloc::vec::Vec<x86_64::structures::paging::PhysFrame>,
+        drained: bool,
     }
+    impl Drop for TableFrameReclaim {
+        fn drop(&mut self) {
+            if !self.drained && !self.frames.is_empty() {
+                let mut fa = mm::memory::FrameAllocator::new();
+                for f in self.frames.drain(..) {
+                    fa.deallocate_frame(f);
+                }
+            }
+        }
+    }
+    let mut reclaim = TableFrameReclaim {
+        frames: table_frames,
+        drained: false,
+    };
 
-    // D3-ARC-MM-SHARED: Phase 3 — remove region from shared MmState.
-    // Under shared MmState, concurrent CLONE_VM siblings see the same
-    // MmState. The Mutex serializes access, so double-remove is impossible:
-    // the first remover removes the entry; the second sees it gone.
-    let was_present = mm_arc.lock().mmap_regions.remove(&addr).is_some();
-
-    // D3-ARC-MM-SHARED: Decrement per-address-space charge counter.
-    if (committed_flags & MMAP_REGION_FLAG_PROT_NONE) == 0 {
+    // D3-ARC-MM-SHARED + R145-1 + R171-CG1x0 FIX (M2-1 SLICE-0): folded Phase 3 —
+    // ONE Process→MmState critical section (canonical order, matching sys_mmap
+    // Phase 3) so the region removal, the DATA uncharge, AND the per-AS PT-ledger
+    // reconcile all land atomically w.r.t. cgroup migration (which snapshots
+    // compute_cgroup_charged_bytes under the Process lock, R155-5). The cgroup
+    // uncharges run here with PT_LOCK already dropped — lock_ordering sanctions
+    // cgroup helpers under the Process lock; never under PT_LOCK.
+    {
+        let proc = process.lock();
         let mut mm = mm_arc.lock();
-        mm.vm_charged_bytes = mm
-            .vm_charged_bytes
-            .saturating_sub(recorded_length as u64);
-    }
+        // Re-read cgroup_id under the lock — migration may have moved us during the
+        // lock-free Phase 2 PT work.
+        let cgroup_id = proc.cgroup_id;
 
-    // F.2 Cgroup: Uncharge memory only if we were the first to remove.
-    // R123-1 FIX: PROT_NONE reservations never allocated frames or charged
-    // cgroup memory, so skip uncharge to maintain correct accounting.
-    // D3-ARC-MM-SHARED: was_present replaces atomic_remove_mmap_region;
-    // the shared MmState Mutex prevents double-uncharge.
-    // R145-1 FIX: Re-read cgroup_id under lock — migration may have changed
-    // it while we held no lock during Phase 2 PT operations.
-    if was_present && (committed_flags & MMAP_REGION_FLAG_PROT_NONE) == 0 {
-        let cgroup_id = process.lock().cgroup_id;
-        cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
+        // Under shared MmState the first remover wins; a racing CLONE_VM sibling
+        // sees the entry gone (the shared Mutex serializes; no double-remove).
+        let was_present = mm.mmap_regions.remove(&addr).is_some();
+
+        // DATA leg: uncharge the region bytes only on the first remove and only for
+        // a charged (non-PROT_NONE) region.
+        if was_present && (committed_flags & MMAP_REGION_FLAG_PROT_NONE) == 0 {
+            mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_sub(recorded_length as u64);
+            cgroup::uncharge_memory(cgroup_id, length_aligned as u64);
+        }
+
+        // PT leg: reconcile the ledger with the frames prune reclaimed. Uncharge a
+        // reclaimed frame IFF this AS charged it (on mmap or mprotect Path-A;
+        // frame-identity provenance) — never a guessed constant, so an UNCHARGED
+        // brk/ELF frame that prune happened to reclaim is correctly NOT debited (defeats the
+        // cross-origin memory.max bypass). Skipped while the ledger is
+        // non-authoritative (a forked child's inherited basis: empty ledger →
+        // nothing to remove; the basis rides to teardown, over-count-safe).
+        if mm.pt_ledger_authoritative {
+            let pt_freed = crate::process::pt_ledger_reconcile(
+                &mut mm.pt_charged_frames,
+                reclaim.frames.iter().map(|f| f.start_address().as_u64()),
+            );
+            if pt_freed > 0 {
+                mm.pt_charged_bytes = mm.pt_charged_bytes.saturating_sub(pt_freed);
+                cgroup::uncharge_memory(cgroup_id, pt_freed);
+            }
+        }
+    } // Process + MmState locks dropped here.
+
+    // R171-CG1x0 FIX (M2-1 SLICE-0): NOW publish the reclaimed table frames to the
+    // buddy — STRICTLY AFTER the ledger removal above. In the window a frame becomes
+    // buddy-reusable it is already gone from the ledger and from pt_charged_bytes, so
+    // a concurrent re-allocator that obtains it re-records it fresh (mmap Phase-3
+    // try_insert ⇒ Ok(None)); there is no window where a live table is
+    // buddy-free-and-charged or live-and-uncharged. The free runs lock-free (buddy
+    // internal lock only) — zero new lock-ordering edge.
+    {
+        let mut fa = FrameAllocator::new();
+        for f in reclaim.frames.drain(..) {
+            fa.deallocate_frame(f);
+        }
+        reclaim.drained = true;
     }
 
     // R102-10 + R159-17 FIX: Gate address-revealing log behind debug_assertions.
@@ -7960,12 +8405,17 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
 
             // Step 2: Allocate zeroed frames + map pages.
             // Uses same pattern as sys_mmap with 3-phase rollback on failure.
-            let map_result: Result<(), SyscallError> = unsafe {
-                use mm::memory::FrameAllocator;
+            let map_result: Result<vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> = unsafe {
                 use x86_64::structures::paging::PhysFrame;
 
-                with_current_manager(VirtAddr::new(0), |manager| -> Result<(), SyscallError> {
-                    let mut frame_alloc = FrameAllocator::new();
+                // M2-1 SLICE-4a: use the PT-recording allocator (lifted module-level
+                // shim) so the intermediate PT/PD frames map_to builds for this
+                // PROT_NONE -> real materialization are charged + ledgered at the
+                // Step-3 commit, mirroring sys_mmap. The DATA frame uses the inherent
+                // allocate_data_frame (NOT recorded); only map_page's trait
+                // allocate_frame records PT/PD frames.
+                with_current_manager(VirtAddr::new(0), |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
+                    let mut frame_alloc = RecordingFrameAllocator::new();
                     let mut mapped: vec::Vec<(Page, PhysFrame)> = vec::Vec::new();
 
                     for offset in (0..region_len).step_by(0x1000) {
@@ -7973,7 +8423,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                             VirtAddr::new((region_base + offset) as u64),
                         );
 
-                        let frame = match frame_alloc.allocate_frame() {
+                        let frame = match frame_alloc.allocate_data_frame() {
                             Some(f) => f,
                             None => {
                                 // R159-4 FIX: Fallible rollback (same pattern as R158-7).
@@ -8091,27 +8541,38 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         mapped.push((page, frame));
                     }
 
-                    Ok(())
+                    // M2-1 SLICE-4a: yield the recorded PT-frame identities (NOT a
+                    // count) for the Step-3 charge + ledger fold. On every Err path
+                    // above the closure freed its own frames, so this Vec is
+                    // meaningful only on the Ok path.
+                    Ok(frame_alloc.pt_frames)
                 })
             };
 
-            if let Err(e) = map_result {
-                // R146-2 FIX: Re-read cgroup_id under lock before rollback uncharge.
-                // R147-1 FIX: Clear mprotect_pending_bytes before uncharge.
-                let rollback_cgroup_id = {
-                    let proc = process.lock();
-                    let mut mm = mm_arc.lock();
-                    mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
-                        .saturating_sub(region_len as u64);
-                    // R149-6 FIX: Clear the transient mprotect flag on rollback.
-                    if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
-                        entry.clear_pending_mprotect();
-                    }
-                    proc.cgroup_id
-                };
-                cgroup::uncharge_memory(rollback_cgroup_id, region_len as u64);
-                return Err(e);
-            }
+            // M2-1 SLICE-4a: capture the recorded PT-frame identities on success
+            // (consumed by the Step-3 commit fold). The Err arm is the pre-existing
+            // rollback, unchanged: the Step-2 closure already freed its PT frames on
+            // every error path, so there is nothing to uncharge here.
+            let pt_frames = match map_result {
+                Err(e) => {
+                    // R146-2 FIX: Re-read cgroup_id under lock before rollback uncharge.
+                    // R147-1 FIX: Clear mprotect_pending_bytes before uncharge.
+                    let rollback_cgroup_id = {
+                        let proc = process.lock();
+                        let mut mm = mm_arc.lock();
+                        mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
+                            .saturating_sub(region_len as u64);
+                        // R149-6 FIX: Clear the transient mprotect flag on rollback.
+                        if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
+                            entry.clear_pending_mprotect();
+                        }
+                        proc.cgroup_id
+                    };
+                    cgroup::uncharge_memory(rollback_cgroup_id, region_len as u64);
+                    return Err(e);
+                }
+                Ok(frames) => frames,
+            };
 
             // Step 3: Commit bookkeeping — clear PROT_NONE, set prot bits,
             // track charge.
@@ -8121,8 +8582,19 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
             // concurrent munmap that raced before we set the flag — should be
             // impossible with the flag, but defensive), roll back the charge
             // instead of silently re-inserting a ghost entry.
-            let region_end = region_base.saturating_add(region_len);
+            // M2-1 SLICE-4a: the PT-frame kmem charge for the frames map_to built
+            // for this region (frame identity, recorded above by
+            // RecordingFrameAllocator). The fold runs in the committing arm below,
+            // under BOTH the Process and MmState locks (canonical Process -> MmState
+            // order). The PRE-SLICE-4a commit took ONLY mm_arc.lock(); folding a
+            // cgroup charge there would race a concurrent sys_cgroup_attach (which
+            // snapshots compute_cgroup_charged_bytes — INCLUDING pt_charged_bytes —
+            // under the Process lock) and strand the PT charge + its mem_pinned pin
+            // on a stale cgroup. Holding the Process lock across the fold closes that
+            // window — exactly as sys_mmap Phase-3 does.
+            let pt_bytes = (pt_frames.len() as u64).saturating_mul(0x1000);
             let commit_result: Result<MmapEntry, ()> = {
+                let proc = process.lock();
                 let mut mm = mm_arc.lock();
                 match mm.mmap_regions.get(&region_base).copied() {
                     Some(old) if old.is_pending_mprotect() => {
@@ -8142,11 +8614,29 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         // R147-1 FIX: Charge is now reflected in mmap_regions.
                         mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
                             .saturating_sub(region_len as u64);
+                        // M2-1 SLICE-4a: charge + ledger the PT-frame kmem this
+                        // PROT_NONE -> real materialization built, under the SAME
+                        // Process + MmState hold (migration-atomic). charge_memory_forced
+                        // is the SOFT/forced charge (the PT delta is knowable only after
+                        // map_to ran; a hard reject would orphan already-built tables
+                        // uncharged = a worse bypass). record_pt_charge does the per-AS
+                        // ledger + INVARIANT-I' bookkeeping (the unit-tested mirror of
+                        // the sys_mmap Phase-3 fold). Reclaim rides this region's
+                        // eventual munmap Phase-3 fold (pt_ledger_reconcile, frame
+                        // identity) or last-exit teardown.
+                        if pt_bytes > 0 {
+                            cgroup::charge_memory_forced(proc.cgroup_id, pt_bytes);
+                            mm.record_pt_charge(&pt_frames);
+                        }
                         Ok(new_entry)
                     }
                     _ => {
-                        // Entry gone or flag cleared — concurrent munmap removed it.
-                        // Roll back: uncharge the cgroup to prevent permanent leak.
+                        // Entry gone or flag cleared — concurrent munmap removed it
+                        // (defensive: PENDING_MPROTECT blocks that). Roll back the DATA
+                        // charge below. M2-1 SLICE-4a: charge + ledger NOTHING for PT
+                        // here — the map_to-built frames were never ledgered, so a
+                        // concurrent munmap's reconcile debits 0 (no bypass) and they
+                        // ride to teardown (over-count-safe). `pt_frames` is dropped.
                         mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
                             .saturating_sub(region_len as u64);
                         Err(())
@@ -8229,6 +8719,25 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 continue;
             }
 
+            // ---------------------------------------------------------------
+            // M2-1 SLICE-4e (DEFERRED — intentional, NOT an oversight): this
+            // real -> PROT_NONE demotion deliberately does NOT prune the now-empty
+            // intermediate PT/PD tables. The region stays in mmap_regions as
+            // PROT_NONE and its tables stay charged in the per-AS ledger; they are
+            // reclaimed + frame-identity-reconciled later by sys_munmap Phase-3 (the
+            // common path) or wholesale at last-exit / exec teardown
+            // (process::free_process_resources). Pruning here would only churn tables a
+            // later Path-A re-materialization rebuilds. This is OVER-COUNT-SAFE
+            // (charged-but-reserved): never a memory.max bypass and never a leak —
+            // reclamation is by page-table-STRUCTURE walk (prune_empty_tables_in_range)
+            // + frame-identity reconcile (pt_ledger_reconcile), NOT by mmap_regions
+            // membership. See docs/next-phase-plan.md (M2-1 SLICE-4e) for the full
+            // 5-path reclamation proof, incl. the forked-child non-authoritative case
+            // (pt_ledger_authoritative=false skips the munmap-time debit; the inherited
+            // basis rides to wholesale teardown, process.rs free_process_resources).
+            // The DEFER adds zero code under PT_LOCK and zero ledger writes under the
+            // Step-3 Process+MmState hold — migration-atomicity is untouched.
+            // ---------------------------------------------------------------
             // Step 2: Unmap pages and free frames (COW-aware).
             // R158-7 FIX: fallible frames_to_free with immediate free on OOM.
             unsafe {
@@ -11906,6 +12415,17 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     // Between the share_count check and here, exec/clone could have
     // changed memory_space. Return EAGAIN so caller can retry.
     if proc.memory_space != memory_space {
+        return Err(SyscallError::EAGAIN);
+    }
+
+    // R171 M2-1 SLICE-1 FIX: refuse to re-home a task that is mid-`sys_exec`.
+    // exec HARD-charges the new image to its snapshot cgroup inside load_elf with
+    // the Process lock DROPPED; migrating the task in that window would snapshot
+    // compute_cgroup_charged_bytes WITHOUT the in-flight charge and strand it on the
+    // snapshot cgroup. Checked here UNDER the held Process lock, BEFORE migrate_task,
+    // so the membership move and the exec charge are mutually exclusive. The exec
+    // window is bounded and self-clears → EAGAIN (retry) is the correct response.
+    if proc.exec_in_progress {
         return Err(SyscallError::EAGAIN);
     }
 

@@ -527,6 +527,19 @@ fn fork_inner(
                 // the parent's) and its last-exit uncharges this; the matching
                 // charge to the parent cgroup is folded into fork_charge_bytes.
                 pt_charged_bytes: parent_mm.pt_charged_bytes,
+                // R171-CG1x0 FIX (M2-1 SLICE-0): the child's whole inherited PT
+                // basis lives in `pt_inherited_bytes` with an EMPTY frame ledger —
+                // the child's page tables are freshly built at DIFFERENT physical
+                // addresses, so cloning the parent's frame keys would risk a
+                // cross-AS uncharge. Non-authoritative until the child's first own
+                // mmap. INVARIANT I' holds at birth: pt_charged_bytes(=P) ==
+                // pt_inherited_bytes(=P) + 0. The child's munmap of an inherited
+                // region therefore uncharges 0 (the basis rides to last-exit,
+                // over-count-safe), preserving today's +P(parent)/-P(child exit)
+                // fork balance with zero new fork PT-recording surface.
+                pt_charged_frames: crate::fallible_map::FallibleOrderedMap::new(),
+                pt_inherited_bytes: parent_mm.pt_charged_bytes,
+                pt_ledger_authoritative: false,
                 // Transient pending counters reset for child — no in-flight
                 // operations can be inherited across fork.
                 brk_pending_growth: 0,

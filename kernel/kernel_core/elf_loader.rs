@@ -102,6 +102,15 @@ pub struct ElfLoadResult {
     /// loading (segments + stack, page-aligned).  The caller uses this to
     /// roll back cgroup accounting if exec fails after load_elf() succeeds.
     pub charged_bytes: u64,
+    /// M2-1 SLICE-4d: the intermediate PT/PD/PDPT frame identities the ELF loader built
+    /// for this fresh address space (segments + stack), recorded by
+    /// `RecordingFrameAllocator`. sys_exec folds these into the new AS's
+    /// `pt_charged_frames` ledger + a forced cgroup PT-kmem charge AT THE SUCCESS COMMIT
+    /// (after the old image's ledger is cleared). On any pre-commit failure the whole new
+    /// AS is torn down by free_address_space and this Vec is simply dropped (the frames
+    /// were never charged). The OTHER load_elf consumer (kernel/src/usermode_test.rs, a
+    /// root-cgroup boot diagnostic) ignores this field — it field-accesses entry/stack.
+    pub pt_frames: Vec<PhysFrame<Size4KiB>>,
 }
 
 /// 为当前进程地址空间加载 ELF 映像
@@ -149,6 +158,12 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
     // and the user stack.  Returned in ElfLoadResult so the caller can
     // uncharge on exec rollback (ExecSpaceGuard::drop).
     let mut charged_bytes: u64 = 0;
+
+    // M2-1 SLICE-4d: accumulate the intermediate PT/PD/PDPT frame identities each helper
+    // records for this fresh AS (segments + stack). sys_exec folds them into the new AS
+    // ledger + a forced PT-kmem charge at the success commit. Bounded by
+    // MAX_ELF_LOAD_SEGMENTS x MAX_ELF_SEGMENT_PAGES; grown fallibly (try_reserve) below.
+    let mut pt_frames_acc: Vec<PhysFrame<Size4KiB>> = Vec::new();
 
     // R154-5 FIX: Limit PT_LOAD segment count to prevent DoS via crafted ELF
     // with thousands of tiny segments (e_phnum allows up to 65535). Each segment
@@ -236,26 +251,40 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
                 }
             }
 
-            let seg_charged = match load_segment_tracked(&elf, &ph, &mut all_mappings, cgroup_id) {
-                Ok(bytes) => bytes,
+            let (seg_charged, seg_pt) = match load_segment_tracked(&elf, &ph, &mut all_mappings, cgroup_id) {
+                Ok(v) => v,
                 Err(e) => {
                     rollback_all_mappings(&mut all_mappings, cgroup_id);
                     return Err(e);
                 }
             };
             charged_bytes = charged_bytes.saturating_add(seg_charged);
+            // M2-1 SLICE-4d: fold this segment's recorded PT frames into the accumulator
+            // (fallible — on OOM tear down the partial AS and fail, mirroring load_elf's
+            // other try_reserve sites).
+            if pt_frames_acc.try_reserve(seg_pt.len()).is_err() {
+                rollback_all_mappings(&mut all_mappings, cgroup_id);
+                return Err(ElfLoadError::OutOfMemory);
+            }
+            pt_frames_acc.extend(seg_pt);
         }
     }
 
     // 分配用户栈
-    let stack_charged = match allocate_user_stack_tracked(&mut all_mappings, cgroup_id) {
-        Ok(bytes) => bytes,
+    let (stack_charged, stack_pt) = match allocate_user_stack_tracked(&mut all_mappings, cgroup_id) {
+        Ok(v) => v,
         Err(e) => {
             rollback_all_mappings(&mut all_mappings, cgroup_id);
             return Err(e);
         }
     };
     charged_bytes = charged_bytes.saturating_add(stack_charged);
+    // M2-1 SLICE-4d: fold the user stack's recorded PT frames into the accumulator.
+    if pt_frames_acc.try_reserve(stack_pt.len()).is_err() {
+        rollback_all_mappings(&mut all_mappings, cgroup_id);
+        return Err(ElfLoadError::OutOfMemory);
+    }
+    pt_frames_acc.extend(stack_pt);
 
     // 计算 brk_start：段末尾向上对齐到页边界
     let brk_start = (highest_segment_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -332,6 +361,9 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
         user_stack_top: initial_rsp,
         brk_start,
         charged_bytes,
+        // M2-1 SLICE-4d: the recorded PT/PD/PDPT frames sys_exec folds into the fresh AS
+        // ledger + a forced PT-kmem charge at the success commit.
+        pt_frames: pt_frames_acc,
     })
 }
 
@@ -388,7 +420,7 @@ fn load_segment_tracked(
     ph: &xmas_elf::program::ProgramHeader,
     tracked: &mut Vec<MappedEntry>,
     cgroup_id: cgroup::CgroupId,
-) -> Result<u64, ElfLoadError> {
+) -> Result<(u64, Vec<PhysFrame<Size4KiB>>), ElfLoadError> {
     let vaddr = ph.virtual_addr() as usize;
     let memsz = ph.mem_size() as usize;
     let filesz = ph.file_size() as usize;
@@ -396,7 +428,7 @@ fn load_segment_tracked(
 
     // 跳过大小为 0 的段
     if memsz == 0 {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
 
     // R93-18 FIX: Reject malformed ELF with p_filesz > p_memsz.
@@ -481,7 +513,11 @@ fn load_segment_tracked(
         cgroup::uncharge_memory(cgroup_id, charge_bytes);
         return Err(ElfLoadError::OutOfMemory);
     }
-    let mut frame_alloc = FrameAllocator::new();
+    // M2-1 SLICE-4d: the PT-recording shim so the intermediate PT/PD/PDPT frames map_page
+    // builds for this segment are recorded (charged + ledgered by sys_exec at the success
+    // commit). DATA frames below use allocate_data_frame (unrecorded); only map_page's
+    // trait allocate_frame records page-table frames.
+    let mut frame_alloc = crate::syscall::RecordingFrameAllocator::new();
 
     // R105-2 FIX: Segment layout diagnostics moved to debug-gated kprintln!.
     kprintln!(
@@ -505,8 +541,10 @@ fn load_segment_tracked(
                 let va = VirtAddr::new((page_base + i * PAGE_SIZE) as u64);
                 let page: Page<Size4KiB> = Page::containing_address(va);
 
+                // M2-1 SLICE-4d: DATA frame via the inherent allocate_data_frame (NOT
+                // recorded); the map_page below records only the intermediate tables.
                 let frame = frame_alloc
-                    .allocate_frame()
+                    .allocate_data_frame()
                     .ok_or(ElfLoadError::OutOfMemory)?;
 
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
@@ -569,7 +607,11 @@ fn load_segment_tracked(
         src_off += len;
     }
 
-    Ok(charge_bytes)
+    // M2-1 SLICE-4d: yield the recorded PT/PD/PDPT frame identities alongside the charged
+    // DATA bytes. On every Err path above the frames ride in the new AS and are reclaimed
+    // wholesale by free_address_space on exec rollback (the recorder is dropped, never
+    // charged); this Ok path hands them to load_elf -> sys_exec's success-commit fold.
+    Ok((charge_bytes, frame_alloc.take_pt_frames()))
 }
 
 /// Z-10 fix: 分配用户栈并追踪映射，便于失败时全局回滚
@@ -587,7 +629,7 @@ fn load_segment_tracked(
 fn allocate_user_stack_tracked(
     tracked: &mut Vec<MappedEntry>,
     cgroup_id: cgroup::CgroupId,
-) -> Result<u64, ElfLoadError> {
+) -> Result<(u64, Vec<PhysFrame<Size4KiB>>), ElfLoadError> {
     let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
     // 【修复】多分配一页，确保 USER_STACK_TOP 所在的页也被映射
     // musl libc 启动时会向上扫描栈查找 auxv 等数据结构
@@ -616,7 +658,9 @@ fn allocate_user_stack_tracked(
     // Z-10 fix: 本段成功映射的页（用于数据清零）
     // R154-14 FIX: Use fallible allocation to avoid panic on heap exhaustion.
     let mut stack_mapped: Vec<MappedEntry> = Vec::new();
-    let mut frame_alloc = FrameAllocator::new();
+    // M2-1 SLICE-4d: PT-recording shim (see load_segment_tracked) — DATA via
+    // allocate_data_frame (unrecorded), intermediate tables recorded by the trait.
+    let mut frame_alloc = crate::syscall::RecordingFrameAllocator::new();
 
     let map_result = unsafe {
         page_table::with_current_manager(VirtAddr::new(0), |mgr| -> Result<(), ElfLoadError> {
@@ -624,8 +668,9 @@ fn allocate_user_stack_tracked(
                 let va = VirtAddr::new((stack_base + i * PAGE_SIZE) as u64);
                 let page: Page<Size4KiB> = Page::containing_address(va);
 
+                // M2-1 SLICE-4d: DATA frame via allocate_data_frame (NOT recorded).
                 let frame = frame_alloc
-                    .allocate_frame()
+                    .allocate_data_frame()
                     .ok_or(ElfLoadError::OutOfMemory)?;
 
                 // R158-9 FIX: Reserve tracking space BEFORE map_page so a failed
@@ -680,7 +725,8 @@ fn allocate_user_stack_tracked(
         }
     }
 
-    Ok(charge_bytes)
+    // M2-1 SLICE-4d: yield the recorded PT-frame identities alongside the charged bytes.
+    Ok((charge_bytes, frame_alloc.take_pt_frames()))
 }
 
 /// Z-10 fix: 回滚所有已追踪的映射（段 + 栈）

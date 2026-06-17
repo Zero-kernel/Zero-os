@@ -29,6 +29,12 @@ use x86_64::{
 /// 进程ID类型
 pub type ProcessId = usize;
 
+/// R65-19 / M4-1: starvation threshold — a Ready task that waits this many timer ticks
+/// without running earns one dynamic-priority boost level. Lifted to a `pub` module const
+/// (was function-local in `check_and_boost_starved`) so the timer tick can gate on it
+/// without calling the now-deferred boost method in IRQ (M4-1 latch-on-tick).
+pub const STARVATION_THRESHOLD: u64 = 100;
+
 /// 进程优先级（0-139，数值越小优先级越高）
 pub type Priority = u8;
 
@@ -483,17 +489,66 @@ pub struct MmState {
     /// address space's anonymous `mmap()` mappings. Page-table memory is kernel
     /// memory (kmem) and rides `memory.max` (cgroup-v2 folds kmem into
     /// `memory.current`); without this term a tenant bypasses `memory.max` by
-    /// forcing unbounded page-table growth. MONOTONIC during the AS lifetime:
-    /// `sys_munmap` reclaims only leaf data frames, never intermediate tables
-    /// (those are freed solely at last-AS teardown by `free_page_table_level`),
-    /// so this is charged on successful `sys_mmap` and uncharged+zeroed ONLY at
-    /// last exit (`free_process_resources`) and at exec image replacement
-    /// (`sys_exec`, which frees the old AS synchronously). Follows the elf
+    /// forcing unbounded page-table growth. R171-CG1x0 FIX (M2-1 SLICE-0): this is
+    /// NO LONGER monotonic — `sys_munmap` now reclaims the intermediate PT/PD frames
+    /// it empties and uncharges this field per-frame via the `pt_charged_frames`
+    /// ledger (frame identity, see below). Only the non-ledgered remainder
+    /// (`pt_inherited_bytes`: fork-inherited + any Phase-3 OOM-fallback frames) is
+    /// released wholesale at last exit (`free_process_resources`) and at exec image
+    /// replacement (`sys_exec`, which frees the old AS synchronously). Follows the elf
     /// LIFECYCLE (copy-on-fork, parent charged at fork, child last-exit cancels)
     /// — NOT elf's value (the ELF loader charges ZERO page-table frames today).
-    /// SCOPE: mmap-only. brk/mprotect/COW-fault/ELF-image page-table frames are
-    /// NOT yet counted (bounded, teardown-reclaimed, tracked deferred residual).
+    /// SCOPE: mmap + mprotect Path-A (PROT_NONE -> real materialization, M2-1
+    /// SLICE-4a). brk-grow / COW-fault / ELF-image page-table frames are NOT yet
+    /// counted (bounded, teardown-reclaimed, tracked deferred residual: SLICE-4b/4d).
+    ///
+    /// R171-CG1x0 FIX (M2-1 SLICE-0): scoped INVARIANT I' now governs this field:
+    ///   `pt_charged_bytes == pt_inherited_bytes + pt_charged_frames.len() * 0x1000`
+    /// The frame-identity ledger (`pt_charged_frames`) makes `sys_munmap` uncharge
+    /// a reclaimed page-table frame IFF this AS charged it (on mmap or mprotect
+    /// Path-A) — defeating the cross-origin `memory.max` bypass (a naive
+    /// `min(0x1000, pt_charged_bytes)` decrement would debit a real charge for an
+    /// UNCHARGED brk/ELF frame reclaimed by `prune_empty_tables_in_range`).
     pub pt_charged_bytes: u64,
+
+    /// R171-CG1x0 FIX (M2-1 SLICE-0): per-address-space frame-identity provenance
+    /// ledger for the page-table frames charged on `sys_mmap`, keyed by physical
+    /// frame address (`frame.start_address().as_u64()`). `sys_munmap` reclaims a
+    /// pruned PT/PD frame and uncharges `memory_current`/`pt_charged_bytes` for it
+    /// IFF the frame is present here — provenance-correct, never a guessed
+    /// constant. Populated under the Process+MmState hold at mmap Phase 3 (frames
+    /// recorded by `RecordingFrameAllocator`), drained per-frame under the folded
+    /// munmap Phase 3, and `clear()`ed wholesale at last-exit teardown and exec
+    /// image replacement. `FallibleOrderedMap` ⇒ every insert is fallible
+    /// (`try_reserve`); on OOM the frames fall back to `pt_inherited_bytes`
+    /// (over-count-safe — they reclaim at teardown, never a bypass).
+    pub pt_charged_frames: crate::fallible_map::FallibleOrderedMap<u64, ()>,
+
+    /// R171-CG1x0 FIX (M2-1 SLICE-0): the portion of `pt_charged_bytes` that is
+    /// NOT individually tracked in `pt_charged_frames` and therefore reclaims only
+    /// at last-exit teardown / exec replacement, never per-munmap. Two sources:
+    /// (1) fork inheritance — a child is born with `pt_inherited_bytes ==
+    /// parent.pt_charged_bytes` and an EMPTY ledger (the child builds its own
+    /// frames with different physical addresses, so parent frame keys are
+    /// meaningless); (2) a Phase-3 ledger `try_reserve` OOM fallback. Keeping these
+    /// in a separate basis preserves INVARIANT I' exactly across the fork seam (the
+    /// naive single-field form would falsely fire I' the instant a forked child's
+    /// first own mmap lands).
+    pub pt_inherited_bytes: u64,
+
+    /// R171-CG1x0 FIX (M2-1 SLICE-0): gates whether `sys_munmap` consults the
+    /// `pt_charged_frames` ledger for THIS address space. `true` once the AS may hold
+    /// its own ledgered mmap PT charges — it is a SKIP-the-known-empty-ledger gate,
+    /// NOT a proof that every own PT charge is ledgered: a Phase-3 `try_reserve` OOM
+    /// keeps the AS authoritative while parking those bytes in `pt_inherited_bytes`
+    /// (safe — munmap simply won't find them in the ledger and they reclaim at
+    /// teardown). A fresh AS is authoritative (empty ledger == no own charges). A
+    /// forked child starts NON-authoritative (its whole `pt_charged_bytes` basis
+    /// lives in `pt_inherited_bytes`, untracked by frame), flipping to authoritative
+    /// on its first own `sys_mmap`. While non-authoritative the munmap PT leg skips
+    /// the (empty) ledger scan; the inherited basis rides to teardown
+    /// (over-count-safe). Reset to true at teardown / exec replacement.
+    pub pt_ledger_authoritative: bool,
 
     /// Transient: bytes charged to cgroup via sys_brk growth not yet
     /// reflected in `brk`. Non-zero only while MmState lock is dropped
@@ -532,10 +587,81 @@ impl MmState {
             vm_charged_bytes: 0,
             elf_charged_bytes: 0,
             pt_charged_bytes: 0,
+            // R171-CG1x0 FIX (M2-1 SLICE-0): fresh AS — empty ledger, no inherited
+            // basis, authoritative (INVARIANT I' holds: 0 == 0 + 0).
+            pt_charged_frames: crate::fallible_map::FallibleOrderedMap::new(),
+            pt_inherited_bytes: 0,
+            pt_ledger_authoritative: true,
             brk_pending_growth: 0,
             mprotect_pending_bytes: 0,
             exec_pending_bytes: 0,
             brk_in_progress: false,
+        }
+    }
+
+    /// M2-1 SLICE-4a: record `pt_frames` (the intermediate PT/PD frames a
+    /// `map_to` / `map_page` call just built for an EAGER mapping) into this
+    /// address space's frame-identity ledger and bump `pt_charged_bytes`,
+    /// preserving INVARIANT I'
+    /// (`pt_charged_bytes == pt_inherited_bytes + pt_charged_frames.len() * 0x1000`).
+    ///
+    /// The caller pairs this with `cgroup::charge_memory_forced(cgroup_id,
+    /// pt_frames.len() * 0x1000)` under the SAME `Process -> MmState` lock hold
+    /// (the cgroup side-effect stays at the call site, so this method is pure over
+    /// `self` and unit-testable). This is the extracted, unit-tested form of the
+    /// inline `sys_mmap` Phase-3 fold (kernel/kernel_core/syscall.rs ~7525); the
+    /// mmap site KEEPS that fold inline and the two MUST stay in sync (a future
+    /// slice may switch mmap to this method once brk/exec also adopt it).
+    ///
+    /// On ledger-reserve OOM (or the never-firing aliasing safety net) the frames
+    /// fall back to the untracked `pt_inherited_bytes` basis: they then reclaim
+    /// only at teardown (over-count-safe — restricts the tenant further, never a
+    /// `memory.max` bypass), and INVARIANT I' is preserved on EVERY branch.
+    pub(crate) fn record_pt_charge(&mut self, pt_frames: &[PhysFrame<Size4KiB>]) {
+        let pt_bytes = (pt_frames.len() as u64).saturating_mul(0x1000);
+        if pt_bytes == 0 {
+            return;
+        }
+        let ledgered = if self.pt_charged_frames.try_reserve(pt_frames.len()).is_ok() {
+            let mut all_fresh = true;
+            for f in pt_frames {
+                match self.pt_charged_frames.try_insert(f.start_address().as_u64(), ()) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => {
+                        // A frame the allocator just handed out as is_unused() CANNOT
+                        // already be ledgered unless free-after-remove were violated —
+                        // a never-firing safety net, NEVER a silent in-place replace.
+                        debug_assert!(
+                            false,
+                            "pt ledger frame aliased — free-after-remove invariant violated"
+                        );
+                        all_fresh = false;
+                    }
+                    // Unreachable after a successful try_reserve(len); defensive.
+                    Err(_) => {
+                        all_fresh = false;
+                        break;
+                    }
+                }
+            }
+            all_fresh
+        } else {
+            false
+        };
+        self.pt_charged_bytes = self.pt_charged_bytes.saturating_add(pt_bytes);
+        if ledgered {
+            // This AS now authoritatively tracks its own PT charges by frame.
+            if !self.pt_ledger_authoritative {
+                self.pt_ledger_authoritative = true;
+            }
+        } else {
+            // OOM / aliasing fallback: drop any partial inserts and carry the bytes
+            // in the untracked basis so the ledger stays consistent with I' (these
+            // frames reclaim wholesale at teardown).
+            for f in pt_frames {
+                self.pt_charged_frames.remove(&f.start_address().as_u64());
+            }
+            self.pt_inherited_bytes = self.pt_inherited_bytes.saturating_add(pt_bytes);
         }
     }
 
@@ -880,6 +1006,21 @@ pub struct Process {
     /// limits based on this membership.
     pub cgroup_id: crate::cgroup::CgroupId,
 
+    /// R171 M2-1 SLICE-1 FIX: true while this task is inside `sys_exec` between the
+    /// cgroup snapshot (`exec_cgroup_id` captured under the Process lock) and the
+    /// commit/rollback. `sys_exec` HARD-charges the new image's memory to that
+    /// snapshot cgroup inside `load_elf` with the Process lock DROPPED (lock-ordering
+    /// forbids holding it across the PT work); arming `exec_pending_bytes` only
+    /// afterward leaves a window where a concurrent cgroup migration would snapshot
+    /// `compute_cgroup_charged_bytes` WITHOUT the in-flight charge and strand it on
+    /// the snapshot cgroup (the 4 mem-leg exec KILLs). Both migration front doors
+    /// (`sys_cgroup_attach`, cgroupfs `cgroup.procs`) refuse to re-home a task whose
+    /// `exec_in_progress` is set (EAGAIN/EBUSY retry, checked under the Process lock
+    /// BEFORE `migrate_task`), making the exec charge migration-atomic by mutual
+    /// exclusion — no held-Arc, no compute change, no FA-04. Set/cleared ONLY under
+    /// the Process lock; a RAII guard clears it on every `sys_exec` exit.
+    pub exec_in_progress: bool,
+
     /// R170-3 FIX: contention-deferred CPU-quota debt (ns) not yet landed on
     /// `cpu_quota_debt_cgid`'s quota windows. `on_clock_tick` folds TICK_NS in
     /// here when `charge_cpu_quota` returns `ContentionDeferred` (which
@@ -934,6 +1075,16 @@ pub struct Process {
     /// the deferred `terminate_process` has actually torn it down (cgroup / pid-ns
     /// / futex / FPU-owner / watchdog), which would strand those charges (BREAK #1).
     pub teardown_done: core::sync::atomic::AtomicBool,
+
+    /// M4-1: latched starvation-boost request. Set TRUE on the timer tick (IRQ) when this
+    /// Ready task crosses `STARVATION_THRESHOLD` — NO priority mutation in IRQ (that would
+    /// drift the ready-queue bucket key away from `dynamic_priority` and corrupt
+    /// steal/select/pop). The actual boost (`base_dynamic_priority -= 1` + recompute +
+    /// bucket move) is APPLIED later under the queue lock in process context
+    /// (`reschedule_now` drain), or consumed when the task is claimed-to-Run / migrated.
+    /// The PCB marker — not the per-CPU hint buffer — is the source of truth, so an
+    /// overflowed buffer never loses a boost.
+    pub pending_starve_boost: bool,
 }
 
 impl Process {
@@ -955,6 +1106,7 @@ impl Process {
             priority,
             dynamic_priority: priority,
             base_dynamic_priority: priority, // E.4 PI: starts same as dynamic_priority
+            pending_starve_boost: false,     // M4-1: no latched starvation boost at birth
             pi_boosts: BTreeMap::new(),       // E.4 PI: no boosts initially
             waiting_on_futex: None,           // E.4 PI: not waiting on any futex
             time_slice: calculate_time_slice(priority),
@@ -1036,6 +1188,8 @@ impl Process {
             user_ns_for_children: crate::user_namespace::ROOT_USER_NAMESPACE.clone(),
             // F.2: Cgroup v2 - default to root cgroup
             cgroup_id: 0,
+            // R171 M2-1 SLICE-1: not mid-exec at construction.
+            exec_in_progress: false,
             // Seccomp/Pledge 沙箱 (默认无限制)
             seccomp_state: SeccompState::new(),
             pledge_state: None,
@@ -1343,9 +1497,7 @@ impl Process {
     ///
     /// Now operates on base_dynamic_priority and recomputes effective priority.
     pub fn check_and_boost_starved(&mut self) {
-        // 饥饿阈值：100个tick（约100ms，假设1ms/tick）
-        const STARVATION_THRESHOLD: u64 = 100;
-
+        // 饥饿阈值：STARVATION_THRESHOLD ticks（约100ms，假设1ms/tick）
         if self.wait_ticks >= STARVATION_THRESHOLD {
             // R66-4 FIX: Only boost if base > static (never boost beyond static)
             // This prevents low-priority processes from gaining realtime priority
@@ -1356,6 +1508,27 @@ impl Process {
             }
             // 重置等待计数器
             self.wait_ticks = 0;
+        }
+    }
+
+    /// M4-1: apply a latched starvation boost (see `pending_starve_boost`). Idempotent —
+    /// clears the marker, and if the task still has headroom below its static priority
+    /// (the R66-4 cap) decrements `base_dynamic_priority` by one level and recomputes the
+    /// effective `dynamic_priority` (which folds in any CURRENT PI boosts via
+    /// `recompute_effective_priority` = min(base, pi_boosts)). Returns whether the
+    /// effective priority changed, so the caller re-buckets the task IFF `true`. Touches
+    /// ONLY `base` + the marker — never `pi_boosts` — so PI semantics are untouched and a
+    /// concurrent PI boost in the gap is correctly composed at apply time.
+    pub fn apply_pending_starve_boost(&mut self) -> bool {
+        if !self.pending_starve_boost {
+            return false;
+        }
+        self.pending_starve_boost = false;
+        if self.base_dynamic_priority > self.priority {
+            self.base_dynamic_priority -= 1;
+            self.recompute_effective_priority()
+        } else {
+            false
         }
     }
 
@@ -1452,6 +1625,16 @@ lazy_static::lazy_static! {
 /// PID 0 is never assigned, so 0 is a safe sentinel.
 static CURRENT_PID: cpu_local::CpuLocal<AtomicUsize> =
     cpu_local::CpuLocal::new(|| AtomicUsize::new(0));
+
+/// M4-1 (force-init): pre-allocate the `CURRENT_PID` per-CPU slab in process context
+/// before IRQs are enabled. `current_pid()` is called from the raw timer ISR
+/// (arch/interrupts.rs) BEFORE `on_scheduler_tick`; without this the first AP timer IRQ
+/// would lazily `Box::new_uninit_slice` the CpuLocal slab while the heap lock may be
+/// held, deadlocking in IRQ (the R151-5 class). Call on the BSP before `start_aps()`;
+/// the single global `Once` covers every CPU.
+pub fn force_init_current_pid() {
+    CURRENT_PID.force_init();
+}
 
 /// R106-11 (P0-4): Next PID allocation hint for circular scan.
 ///
@@ -4274,11 +4457,23 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTree
         // task holding this MmState (!keep_address_space && !mm_shared) uncharges,
         // exactly once. The non-last CLONE_VM exit (the else-if below) is a pt
         // no-op — surviving siblings still own the shared page-table frames.
+        //
+        // R171-CG1x0 FIX (M2-1 SLICE-0): by INVARIANT I' this single wholesale
+        // uncharge of `pt_charged_bytes` (== pt_inherited_bytes + |ledger|*0x1000)
+        // drains BOTH lanes at once — the per-frame munmap path only ever touched
+        // the ledger lane (and already decremented pt_charged_bytes for it), so this
+        // neither double-uncharges nor strands. The never-ledgered ELF/brk/KPTI
+        // frames that free_page_table_level reclaims are correctly NOT uncharged
+        // (they were never charged). Reset all three fields so a reused physical
+        // frame in the next process can never collide with a stale ledger entry.
         let pt_bytes = mm.pt_charged_bytes;
         if pt_bytes > 0 {
             crate::cgroup::uncharge_memory(cgroup_id, pt_bytes);
             mm.pt_charged_bytes = 0;
         }
+        mm.pt_charged_frames.clear();
+        mm.pt_inherited_bytes = 0;
+        mm.pt_ledger_authoritative = true;
     } else if (keep_address_space || mm_shared) && proc.memory_space != 0 {
         // Non-last CLONE_VM exit keeps the shared address space and MmState.
         // Do NOT uncharge — pages remain mapped in the shared page tables.
@@ -4699,6 +4894,158 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
         .saturating_add(pending_exec)
         .saturating_add(elf_bytes)
         .saturating_add(pt_bytes)
+}
+
+/// R171-CG1x0 FIX (M2-1 SLICE-0): reconcile the per-AS page-table provenance ledger
+/// against the frames a `sys_munmap` prune reclaimed. Returns the bytes to uncharge
+/// = `0x1000 * |reclaimed ∩ ledger|` and REMOVES the matched frames from the ledger.
+///
+/// This is the load-bearing anti-bypass primitive: a reclaimed table frame is debited
+/// IFF this address space charged it (frame identity — on `sys_mmap` or mprotect
+/// Path-A), so a frame that `prune_empty_tables_in_range` happened to reclaim but was
+/// built UNCHARGED by brk/ELF (absent from the ledger) is correctly NOT debited — closing
+/// the cross-origin `memory.max` under-count. Pure and side-effect-scoped to `ledger`
+/// so the property is unit-testable without a live process context.
+pub fn pt_ledger_reconcile<I: Iterator<Item = u64>>(
+    ledger: &mut crate::fallible_map::FallibleOrderedMap<u64, ()>,
+    reclaimed_phys: I,
+) -> u64 {
+    let mut pt_freed: u64 = 0;
+    for fa in reclaimed_phys {
+        if ledger.remove(&fa).is_some() {
+            pt_freed = pt_freed.saturating_add(0x1000);
+        }
+    }
+    pt_freed
+}
+
+/// In-kernel self-test for the R171-CG1x0 frame-identity PT ledger reconcile (the
+/// anti-bypass core of M2-1 SLICE-0). Panics on failure; detected by `make test` /
+/// `make boot-check` via the serial log. The full mmap/munmap integration (Phase-3
+/// fold + free-after-remove ordering) is exercised by reaching userspace under
+/// `boot-check`; this asserts the provenance arithmetic the syscall path relies on.
+pub fn run_pt_ledger_self_test() {
+    use crate::fallible_map::FallibleOrderedMap;
+    const PT: u64 = 0x1000;
+
+    // Ledger holds three CHARGED mmap PT frames (A, B, C by physical address).
+    let (a, b, c) = (0x10_0000u64, 0x20_0000u64, 0x30_0000u64);
+    // Two UNCHARGED frames (built by brk/ELF — mprotect Path-A is charged as of
+    // SLICE-4a): X, Y — never ledgered.
+    let (x, y) = (0x40_0000u64, 0x50_0000u64);
+
+    let mut ledger: FallibleOrderedMap<u64, ()> = FallibleOrderedMap::new();
+    ledger.try_reserve(3).expect("reserve pt ledger");
+    assert!(ledger.try_insert(a, ()).expect("ins a").is_none());
+    assert!(ledger.try_insert(b, ()).expect("ins b").is_none());
+    assert!(ledger.try_insert(c, ()).expect("ins c").is_none());
+    assert_eq!(ledger.len(), 3, "ledger holds three charged frames");
+
+    // A munmap reclaims {A, X, Y}: only A is in the ledger ⇒ debit exactly 0x1000.
+    // X and Y are UNCHARGED — debiting them would be the cross-origin memory.max
+    // bypass. This is the property's whole point.
+    let freed = pt_ledger_reconcile(&mut ledger, [a, x, y].into_iter());
+    assert_eq!(freed, PT, "reclaim {{A,X,Y}} debits ONLY the charged frame A");
+    assert_eq!(ledger.len(), 2, "A removed; B,C remain");
+    assert!(ledger.get(&a).is_none(), "A gone from ledger");
+
+    // Re-reclaiming A (e.g. a buggy double-free) debits nothing (already removed) —
+    // saturating / idempotent in the safe direction.
+    let again = pt_ledger_reconcile(&mut ledger, core::iter::once(a));
+    assert_eq!(again, 0, "double-reclaim of A debits nothing (no under-count)");
+
+    // Reclaiming the rest {B, C} drains the ledger exactly: 2 * 0x1000.
+    let rest = pt_ledger_reconcile(&mut ledger, [b, c].into_iter());
+    assert_eq!(rest, 2 * PT, "reclaim {{B,C}} debits both remaining charged frames");
+    assert_eq!(ledger.len(), 0, "ledger empty after all charged frames reclaimed");
+
+    // A reclaim against an empty/non-authoritative ledger (e.g. a forked child's
+    // inherited region) debits nothing — the basis rides to teardown (over-count-safe).
+    let none = pt_ledger_reconcile(&mut ledger, [x, y, a, b].into_iter());
+    assert_eq!(none, 0, "empty ledger debits nothing");
+}
+
+/// M2-1 SLICE-4a: in-kernel self-test for `MmState::record_pt_charge` — the
+/// extracted, unit-tested PT-charge fold that `sys_mprotect` Path-A now uses to
+/// charge the page-table frames a `PROT_NONE -> real` materialization builds
+/// (mirror of the inline `sys_mmap` Phase-3 fold). Validates INVARIANT I' on the
+/// ledgered-success branch, the data/PT split guard (charge == frame count, NOT
+/// region bytes), and the telescoping round-trip through the REAL
+/// `pt_ledger_reconcile` (the munmap reclaim path). Panics on failure; detected
+/// by `make test` / `make boot-check` via the serial log. (The OOM-fallback
+/// branch — `pt_inherited_bytes` — is not unit-forced here, same as the mmap
+/// fold; it is over-count-safe by construction and exercised only under heap
+/// exhaustion.)
+pub fn run_record_pt_charge_self_test() {
+    use x86_64::structures::paging::PhysFrame;
+    const PT: u64 = 0x1000;
+
+    let frame = |pa: u64| -> PhysFrame<Size4KiB> {
+        PhysFrame::containing_address(x86_64::PhysAddr::new(pa))
+    };
+    // INVARIANT I': pt_charged_bytes == pt_inherited_bytes + |ledger| * 0x1000.
+    let inv = |mm: &MmState| -> bool {
+        mm.pt_charged_bytes
+            == mm.pt_inherited_bytes + (mm.pt_charged_frames.len() as u64) * PT
+    };
+
+    // Fresh AS: authoritative, all zero (I' holds: 0 == 0 + 0).
+    let mut mm = MmState::new(0);
+    assert!(inv(&mm), "fresh AS satisfies I'");
+    assert_eq!(mm.pt_charged_bytes, 0);
+    assert!(mm.pt_ledger_authoritative);
+
+    // 1) LEDGERED-SUCCESS branch: record 3 distinct PT frames (as mprotect Path-A
+    //    does for a freshly-materialized region). pt_charged_bytes rises by
+    //    EXACTLY 3 * PT — NOT the region's DATA bytes: this is the guard against
+    //    the allocate_data_frame mis-wire that would route DATA pages through the
+    //    recording trait and over-charge ~100%. The ledger grows by 3 (frame
+    //    identity), the inherited basis is untouched, authoritative stays true.
+    let (a, b, c) = (0x10_0000u64, 0x20_0000u64, 0x30_0000u64);
+    mm.record_pt_charge(&[frame(a), frame(b), frame(c)]);
+    assert_eq!(mm.pt_charged_bytes, 3 * PT, "charged the PT-frame COUNT, not data bytes");
+    assert_eq!(mm.pt_charged_frames.len(), 3, "three frames ledgered by identity");
+    assert_eq!(mm.pt_inherited_bytes, 0, "ledgered branch leaves the inherited basis at 0");
+    assert!(mm.pt_ledger_authoritative, "AS stays authoritative");
+    assert!(inv(&mm), "I' holds after the ledgered charge");
+
+    // 2) Empty record is a no-op (the pt_bytes == 0 fast path).
+    mm.record_pt_charge(&[]);
+    assert_eq!(mm.pt_charged_bytes, 3 * PT, "empty record is a no-op");
+    assert!(inv(&mm));
+
+    // 3) TELESCOPING round-trip: reclaim the exact frames via the REAL
+    //    pt_ledger_reconcile (the munmap reclaim path mprotect Path-A regions ride).
+    //    Each charged frame debits exactly PT; draining pt_charged_bytes leaves I'
+    //    holding at 0 == 0 + 0 — charge == reclaim, the whole point of SLICE-4a.
+    let freed = pt_ledger_reconcile(&mut mm.pt_charged_frames, [a, b, c].into_iter());
+    assert_eq!(freed, 3 * PT, "reconcile debits exactly the three charged frames");
+    mm.pt_charged_bytes = mm.pt_charged_bytes.saturating_sub(freed);
+    assert_eq!(mm.pt_charged_bytes, 0, "pt_charged_bytes telescopes to 0 on matched reclaim");
+    assert_eq!(mm.pt_charged_frames.len(), 0, "ledger empty after reclaim");
+    assert!(inv(&mm), "I' holds after the matched reclaim");
+
+    // 4) Cross-origin guard: reclaiming frames NOT in the ledger debits 0 — an
+    //    uncharged brk/ELF frame is never debited (the anti-bypass property the
+    //    frame-identity ledger exists for, here for the mprotect lane).
+    let (x, y) = (0x40_0000u64, 0x50_0000u64);
+    let none = pt_ledger_reconcile(&mut mm.pt_charged_frames, [x, y].into_iter());
+    assert_eq!(none, 0, "reclaim of unledgered frames debits nothing (no bypass)");
+
+    // 5) INHERITED-basis coexistence: an AS born with a fork-inherited basis that
+    //    then records its OWN mprotect-materialized frames keeps I' across BOTH
+    //    lanes (inherited wholesale + own frame-identity).
+    let mut child = MmState::new(0);
+    child.pt_inherited_bytes = 5 * PT; // simulate fork inheritance basis
+    child.pt_charged_bytes = 5 * PT; // I' holds: 5PT == 5PT + 0
+    child.pt_ledger_authoritative = false;
+    assert!(inv(&child), "inherited-only child satisfies I'");
+    child.record_pt_charge(&[frame(a), frame(b)]);
+    assert_eq!(child.pt_charged_bytes, 7 * PT, "inherited 5PT + own 2PT");
+    assert_eq!(child.pt_charged_frames.len(), 2, "own frames ledgered by identity");
+    assert_eq!(child.pt_inherited_bytes, 5 * PT, "inherited basis untouched by ledgered charge");
+    assert!(child.pt_ledger_authoritative, "child flips authoritative once it tracks own frames");
+    assert!(inv(&child), "I' holds across inherited + ledgered lanes");
 }
 
 /// 进程统计信息

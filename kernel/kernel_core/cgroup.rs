@@ -74,6 +74,34 @@ pub const MAX_CGROUP_DEPTH: u32 = 8;
 /// unlimited cgroups to exhaust kernel memory.
 pub const MAX_CGROUPS: usize = 4096;
 
+/// M2-1 SLICE-2: process-wide MEMORY over-uncharge tripwire (in bytes).
+///
+/// Incremented (by the clamped surplus) whenever an origin MEMORY unpin
+/// (`CgroupStats::unpin_origin_mem`) finds its pre-value `< n` and the saturating
+/// floor therefore silently absorbs `n - pre` bytes — i.e. an over-uncharge
+/// (Σunpin > Σpin). It exists because the SLICE-3 delete-gate witness
+/// (`mem_pinned == 0`) is, under saturating unpin, satisfiable by BOTH a true
+/// telescope AND an over-uncharge bug; this counter distinguishes the two. It
+/// MUST read 0 across every MATCHED charge/uncharge sequence. Production behavior
+/// is unchanged — the unpin still saturates; this is a pure observability /
+/// proof-artifact aid (asserted by `run_cgroup_pt_kmem_self_test`). It is NEVER
+/// sampled by the delete-gate and is reset by the self-test via
+/// `mem_unpin_underflow_take`.
+static MEM_UNPIN_UNDERFLOW: AtomicU64 = AtomicU64::new(0);
+
+/// M2-1 SLICE-2: read-and-clear the MEMORY over-uncharge tripwire. Used by the
+/// self-test to assert a matched sequence left it 0 (true telescope) before the
+/// deliberate saturation demonstration. Returns the absorbed-surplus byte total
+/// accumulated since the last take.
+pub fn mem_unpin_underflow_take() -> u64 {
+    MEM_UNPIN_UNDERFLOW.swap(0, Ordering::SeqCst)
+}
+
+/// M2-1 SLICE-2: read the MEMORY over-uncharge tripwire WITHOUT clearing it.
+pub fn mem_unpin_underflow_peek() -> u64 {
+    MEM_UNPIN_UNDERFLOW.load(Ordering::SeqCst)
+}
+
 // ============================================================================
 // Controller Flags
 // ============================================================================
@@ -238,6 +266,43 @@ pub struct CgroupStats {
     /// charged_cgroup` stores the bare leaf id while a NET-disabled leaf's
     /// `ports_current` is permanently 0.
     pub ports_pinned: AtomicU64,
+    /// M2-1 SLICE-2: number of live MEMORY charges (in bytes) KEYED to this
+    /// cgroup id — controller-INDEPENDENT origin pin (twin of `fds_pinned`/
+    /// `ports_pinned`). Incremented at the charge ORIGIN by every
+    /// `try_charge_memory`/`charge_memory_forced` and decremented by every
+    /// `uncharge_memory`, REGARDLESS of this node's MEMORY controller bit — so a
+    /// MEMORY-disabled leaf whose display counter `memory_current` is permanently
+    /// 0 still records its live keyed charges here. Pinning EVERY mutation inside
+    /// the three primitives (not just the fork lump) makes the pin telescope on
+    /// SUM equality (Σpin == Σunpin), defeating the historical FA-04 objection
+    /// recorded at the delete-gate (which assumed a naive fork-only pin).
+    ///
+    /// NOT exposed in cgroupfs / the stats snapshot (display semantics stay
+    /// byte-identical, exactly like `fds_pinned`/`ports_pinned`).
+    ///
+    /// SLICE-3 (DONE): the `delete_cgroup` resource gate NOW samples THIS field
+    /// (origin-keyed, controller-independent — exactly like `fds_pinned`/
+    /// `ports_pinned`), NOT the display counter `memory_current`. HARD
+    /// `memory.max` enforcement still rides `memory_current`; `mem_pinned` is the
+    /// delete-gate witness only (display / cgroupfs stay byte-identical). The flip
+    /// was justified by the telescoping proof in `run_cgroup_pt_kmem_self_test`
+    /// (Σpin == Σunpin with `MEM_UNPIN_UNDERFLOW == 0` across every matched
+    /// charge/uncharge sequence) — see `run_cgroup_mem_pinned_delete_gate_self_test`
+    /// for the gate behavior itself.
+    ///
+    /// SATURATION CAVEAT (M2-1 SLICE-2, lens "SATURATING-UNPIN-MASKING"):
+    /// unpin is `saturating_sub`, so `mem_pinned == 0` is NECESSARY but NOT
+    /// SUFFICIENT to prove reconciliation — it is satisfied by BOTH a true
+    /// telescope (Σpin == Σunpin) AND an over-uncharge bug (Σunpin > Σpin), whose
+    /// surplus the floor silently absorbs. Saturation is the SAFE (transiently
+    /// LENIENT / never-permanently-blocked) direction for the gate, so it stays
+    /// in production; but to make `mem_pinned == 0` a SOUND witness the
+    /// debug-only `MEM_UNPIN_UNDERFLOW` tripwire (see `unpin_origin_mem`) fires
+    /// whenever an unpin's pre-value `< n`. The SLICE-3 gate flip (DONE) was
+    /// gated on the self-test asserting that tripwire stayed 0 across every
+    /// MATCHED charge/uncharge sequence — NOT merely on observing
+    /// `mem_pinned == 0`.
+    pub mem_pinned: AtomicU64,
     /// J2-10: Current bytes of VFS directory-enumeration memory charged to this cgroup.
     pub vfs_dir_current: AtomicU64,
     /// J2-9: Current bytes of kernel memory charged to this cgroup (observability;
@@ -268,6 +333,8 @@ impl CgroupStats {
             // R170-2: origin-keyed pinned counters (delete-gate, not display).
             fds_pinned: AtomicU64::new(0),
             ports_pinned: AtomicU64::new(0),
+            // M2-1 SLICE-2: origin-keyed MEMORY pin (delete-gate, not display).
+            mem_pinned: AtomicU64::new(0),
             vfs_dir_current: AtomicU64::new(0),
             kmem_current: AtomicU64::new(0),
         }
@@ -406,6 +473,43 @@ impl CgroupStats {
         let _ = pinned.fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
             Some(current.saturating_sub(n))
         });
+    }
+
+    /// M2-1 SLICE-2: saturating unpin for the MEMORY family with an over-uncharge
+    /// TRIPWIRE. Production behavior is IDENTICAL to `unpin_origin` (saturating —
+    /// the safe, transiently-lenient direction the delete-gate relies on), but in
+    /// addition it observes — in the SAME atomic CAS as the subtract — whether the
+    /// pre-value was `< n` (i.e. the saturating floor actually clamped, silently
+    /// absorbing `n - pre` bytes of unpin). When it did, `MEM_UNPIN_UNDERFLOW` is
+    /// incremented by the clamped surplus.
+    ///
+    /// WHY a dedicated MEMORY wrapper (not a generic tripwire in `unpin_origin`):
+    /// for the fds/ports families a saturating over-uncharge IS the documented,
+    /// accepted leniency direction and would trip spuriously. The MEMORY pin is
+    /// the one whose `== 0` value is the SLICE-3 delete-gate
+    /// witness, and under saturation `mem_pinned == 0` is satisfiable by BOTH a
+    /// true telescope (Σpin == Σunpin) AND an over-uncharge bug (Σunpin > Σpin).
+    /// This tripwire is what distinguishes the two: across any MATCHED
+    /// charge/uncharge sequence it MUST stay 0; a nonzero value is an accounting
+    /// regression (e.g. a future double-uncharge) that `mem_pinned == 0` alone
+    /// would mask. It does NOT change the production floor — saturation still
+    /// protects against permanent un-deletability (FA-04).
+    #[inline]
+    fn unpin_origin_mem(&self, n: u64) {
+        let res = self.mem_pinned.fetch_update(
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(n)),
+        );
+        if let Ok(pre) = res {
+            if pre < n {
+                // The subtract clamped at 0: `n - pre` bytes of unpin had no live
+                // pin to cancel ⇒ over-uncharge. Record the absorbed surplus so a
+                // matched-sequence self-test can prove Σunpin == Σpin (tripwire 0)
+                // rather than merely Σunpin >= Σpin (mem_pinned floored to 0).
+                MEM_UNPIN_UNDERFLOW.fetch_add(n - pre, Ordering::Relaxed); // lint-fetch-add: allow (debug tripwire)
+            }
+        }
     }
 
     /// J2-8: Records a ports.max exceeded event.
@@ -1819,18 +1923,38 @@ pub fn delete_cgroup(id: CgroupId) -> Result<(), CgroupError> {
     // uncharge of that key, so "gate passes ⇒ no live charge references this
     // id" now holds by construction for both families.
     //
-    // MEMORY deliberately stays on the DISPLAY counter: the memory family's
-    // charge/uncharge is NOT amount/origin-symmetric (fork charges one
-    // aggregated lump to the parent's cgroup while the child's exit uncharges
-    // four independently recomputed sums; migration re-snapshots
-    // compute_cgroup_charged_bytes) with documented over-count-biased
-    // residuals — an origin-pinned memory counter would convert that benign,
-    // diffuse drift into a PERMANENTLY-undeletable cgroup (the FA-04
-    // direction). The controller-disabled-leaf memory window therefore
-    // remains a DOCUMENTED latent residual (reachability requires the
-    // exit-ordering race, unlike the port instance which needs no race),
-    // tracked for closure once the memory tallies are made amount-symmetric
-    // (R171 obligation / D-R170-DELETE-GATE-LEAF).
+    // M2-1 SLICE-3 FIX (closes R171-S-R170-2-01 / D-R170-DELETE-GATE-LEAF): the
+    // MEMORY leg now ALSO samples the origin-keyed PINNED counter `mem_pinned`,
+    // the twin of `ports_pinned`/`fds_pinned`. The identical leak class applied:
+    // `memory_current` is the controller-gated DISPLAY counter (the charge walk
+    // pushes it only to MEMORY-controller ancestors), so a MEMORY-DISABLED leaf's
+    // `memory_current` is permanently 0 while live charges are keyed to its bare
+    // origin id — the gate passed, the leaf was removed, and the later
+    // `uncharge_memory(id, ..) -> lookup_cgroup(id) == None` became a SILENT
+    // no-op, permanently stranding the ancestor over-count (eventual memory.max
+    // self-DoS). `mem_pinned` is incremented at the ORIGIN by every
+    // `try_charge_memory`/`charge_memory_forced` (rolled back on rejection),
+    // decremented by every `uncharge_memory`, and re-homed by
+    // `migrate_memory_charges` (= charge-dest + uncharge-source) REGARDLESS of any
+    // node's MEMORY controller bit — so "gate passes ⇒ no live memory charge
+    // references this id" now holds by construction.
+    //
+    // Why this is NOW safe (the historical FA-04 objection is DEFEATED): the old
+    // worry was that the memory tally is amount/origin-asymmetric (fork charges
+    // one aggregated lump to the parent's cgroup; the child's exit uncharges four
+    // recomputed sums; migration re-snapshots compute_cgroup_charged_bytes), so a
+    // NAIVE fork-only pin would drift nonzero on an empty cgroup → permanently
+    // un-deletable. SLICE-2 pins EVERY mutation INSIDE the three primitives (not
+    // just the fork lump) and SLICE-1 made the exec charge migration-atomic, so
+    // for a reconciled cgroup the pin TELESCOPES exactly (Σpin == Σunpin) — proven
+    // by the matched-sequence self-tests that assert `MEM_UNPIN_UNDERFLOW == 0`
+    // (run_cgroup_pt_kmem / _coresidency / _exec_after_migrate / _clone_abort).
+    // Saturation on unpin only ever floors `mem_pinned` DOWNWARD (the lenient,
+    // transiently-leaky direction shared with ports/fds) — it can NEVER drive the
+    // witness above true usage, so it cannot manufacture a stuck-positive →
+    // permanent un-deletability is impossible. The only residual false-delete now
+    // requires a saturating OVER-uncharge (Σunpin > Σpin) to mask a real residual,
+    // strictly narrower than today's no-bug-required disabled-leaf strand.
     //
     // EXCLUDED from the gate: `kmem_current` (a currently-unwired/dead stat
     // field, always 0; J2-9 page-table kmem rides `memory_current`) and
@@ -1847,7 +1971,9 @@ pub fn delete_cgroup(id: CgroupId) -> Result<(), CgroupError> {
     // leniency, today's risk direction) — never permanently block deletion.
     let live_ports = node.stats.ports_pinned.load(Ordering::Acquire);
     let live_fds = node.stats.fds_pinned.load(Ordering::Acquire);
-    let live_mem = node.stats.memory_current.load(Ordering::Acquire);
+    // M2-1 SLICE-3: MEMORY leg now samples the origin-keyed pinned witness
+    // (`mem_pinned`), not the controller-gated display counter `memory_current`.
+    let live_mem = node.stats.mem_pinned.load(Ordering::Acquire);
     if live_ports != 0 || live_fds != 0 || live_mem != 0 {
         node.deleted.store(false, Ordering::Release);
         return Err(CgroupError::NotEmpty);
@@ -2119,6 +2245,16 @@ pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(
     // Collect the chain: target cgroup + ancestors with MEMORY controller.
     let mut depth: u32 = 0;
     let mut cursor = lookup_cgroup(cgroup_id);
+    // M2-1 SLICE-2: pin at the ORIGIN node FIRST, controller-independent — twin
+    // of try_charge_fds' pin (see CgroupStats::mem_pinned). Captured BEFORE the
+    // chain walk consumes `cursor`, and BEFORE any display CAS, so the gate can
+    // never observe display motion without the matching pin. The MEMORY family
+    // is NOT root-exempt (unlike fds/ports): root.mem_pinned moves too — matching
+    // the display counter, which also charges root.
+    let origin: Option<Arc<CgroupNode>> = cursor.clone();
+    if let Some(o) = &origin {
+        o.stats.pin_origin(&o.stats.mem_pinned, allocation_bytes);
+    }
     let mut chain: Vec<Arc<CgroupNode>> = Vec::new();
     while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::MEMORY) {
@@ -2132,7 +2268,11 @@ pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(
     }
 
     if chain.is_empty() {
-        return Ok(()); // No memory controller anywhere in the chain
+        // No MEMORY controller anywhere in the chain: the PIN STAYS (the
+        // per-process tally's exit/migrate uncharge keys to this id and unpins
+        // it symmetrically — uncharge_memory unpins the origin BEFORE its own
+        // controller walk). Mirrors try_charge_fds' controller-less chain.
+        return Ok(());
     }
 
     // Snapshot limits to avoid holding multiple locks during CAS charging.
@@ -2187,6 +2327,16 @@ pub fn try_charge_memory(cgroup_id: CgroupId, allocation_bytes: u64) -> Result<(
                     );
                 }
 
+                // M2-1 SLICE-2: roll back the ORIGIN pin too (the whole charge is
+                // rejected, nothing was keyed). Omitting this would strand a
+                // permanent pin on every rejected charge (FA-04 undeletability).
+                // Mirrors try_charge_fds:2402-2405. The matched-rollback unpin
+                // routes through the tripwire so a concurrent over-uncharge that
+                // raced our pin below allocation_bytes is still caught.
+                if let Some(o) = &origin {
+                    o.stats.unpin_origin_mem(allocation_bytes);
+                }
+
                 return Err(CgroupError::MemoryLimitExceeded);
             }
         }
@@ -2210,6 +2360,15 @@ pub fn uncharge_memory(cgroup_id: CgroupId, bytes: u64) {
 
     let mut depth: u32 = 0;
     let mut cursor = lookup_cgroup(cgroup_id);
+    // M2-1 SLICE-2: unpin at the ORIGIN node FIRST, controller-independent,
+    // symmetric with the try_charge_memory / charge_memory_forced origin pin
+    // (saturating; the tripwire variant records any over-uncharge surplus). This
+    // single unpin reverses BOTH primitives' pins (one shared mem_pinned key).
+    // Placed BEFORE the controller walk so a controller-less / MEMORY-disabled
+    // origin still telescopes (mirrors uncharge_fds:2426-2428).
+    if let Some(o) = &cursor {
+        o.stats.unpin_origin_mem(bytes);
+    }
     while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::MEMORY) {
             let _ = cgroup.stats.memory_current.fetch_update(
@@ -2248,6 +2407,15 @@ pub fn charge_memory_forced(cgroup_id: CgroupId, bytes: u64) {
 
     let mut depth: u32 = 0;
     let mut cursor = lookup_cgroup(cgroup_id);
+    // M2-1 SLICE-2: pin at the ORIGIN node FIRST, controller-independent —
+    // unconditional saturating add matching the unconditional saturating display
+    // charge. The FORCED primitive NEVER rejects, so there is no rollback path
+    // and hence NO rollback-unpin here. Its symmetric unpin is supplied by the
+    // ordinary uncharge_memory of the same pt lane (munmap / exit). MUST pin, or
+    // that later unpin saturates the pin to 0 and under-counts.
+    if let Some(o) = &cursor {
+        o.stats.pin_origin(&o.stats.mem_pinned, bytes);
+    }
     while let Some(cgroup) = cursor {
         if cgroup.controllers.contains(CgroupControllers::MEMORY) {
             // fetch_update (never fetch_add — lint-fetch-add) with a closure that
@@ -3373,6 +3541,82 @@ pub fn run_cgroup_disabled_leaf_gate_self_test() {
     let _ = delete_cgroup(p_id);
 }
 
+/// M2-1 SLICE-3: in-kernel self-test for the MEMORY delete-gate flip — the
+/// memory twin of `run_cgroup_disabled_leaf_gate_self_test` (ports/fds).
+///
+/// Proves the `delete_cgroup` resource gate now keys deletion on the
+/// origin-pinned `mem_pinned` witness, NOT the controller-gated display counter
+/// `memory_current`. The decisive configuration is a MEMORY-controller-DISABLED
+/// leaf C under a MEMORY-bearing parent P: a charge keyed to C lands its DISPLAY
+/// on P (and root) but its PIN on C, so `memory_current(C)` stays permanently 0.
+/// Under the OLD gate (`live_mem = memory_current`) the delete of C would have
+/// SUCCEEDED while a live ancestor charge was still keyed to C's bare id — the
+/// later `uncharge_memory(C, ..)` would then find no node and silently strand
+/// P's `+N` forever (the R171-S-R170-2-01 / D-R170-DELETE-GATE-LEAF leak). Under
+/// the SLICE-3 gate (`live_mem = mem_pinned`) the leaf is held undeletable until
+/// every keyed charge is reconciled, then deletes cleanly. The matched
+/// charge/uncharge sequence telescopes exactly, so `MEM_UNPIN_UNDERFLOW` stays 0
+/// (a SOUND `mem_pinned == 0` witness, not a saturating-floored one).
+pub fn run_cgroup_mem_pinned_delete_gate_self_test() {
+    const PAGE: u64 = 0x1000;
+    let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
+    let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
+
+    // Clear the shared tripwire so any over-uncharge surplus is attributable to
+    // THIS test's matched sequence.
+    let _ = mem_unpin_underflow_take();
+
+    // P carries MEMORY (with a generous memory.max) + PIDS; C is a MEMORY-DISABLED
+    // leaf under P (new_child rejects an empty controller set, so PIDS-only =
+    // "MEMORY-disabled for the family the gate samples" — the exact blind config).
+    let p = create_cgroup(0, CgroupControllers::MEMORY | CgroupControllers::PIDS)
+        .expect("create P");
+    let p_id = p.id();
+    p.set_limit(CgroupLimits {
+        memory_max: Some(4096 * PAGE),
+        ..Default::default()
+    })
+    .expect("set P.memory.max");
+    let c = create_cgroup(p_id, CgroupControllers::PIDS).expect("create C");
+    let c_id = c.id();
+    let bytes = 7 * PAGE;
+
+    // 1) Charge keyed to C: the DISPLAY lands on P (the MEMORY ancestor) only;
+    //    the PIN lands on the ORIGIN node C. C's own display stays 0.
+    try_charge_memory(c_id, bytes).expect("charge bytes keyed to MEMORY-disabled leaf C");
+    assert_eq!(mem(&c), 0, "C display memory stays 0 (MEMORY controller off)");
+    assert_eq!(pin(&c), bytes, "C mem_pinned tracks the live origin-keyed charge");
+    assert_eq!(mem(&p), bytes, "P (MEMORY ancestor) display absorbs C's charge");
+    assert_eq!(pin(&p), 0, "P is NOT origin-pinned by a C-keyed charge (pin is origin-keyed)");
+
+    // 2) THE SLICE-3 FIX: the delete-gate must REJECT C while it is pinned, even
+    //    though every display counter on C is 0 — the exact configuration that
+    //    silently leaked under the pre-SLICE-3 `memory_current` gate.
+    assert_eq!(
+        delete_cgroup(c_id),
+        Err(CgroupError::NotEmpty),
+        "pinned MEMORY-disabled leaf must be undeletable (gate keys on mem_pinned)"
+    );
+    assert!(lookup_cgroup(c_id).is_some(), "C still registry-resident after refused delete");
+
+    // 3) Uncharge keyed to C: unpins the ORIGIN C and drains P's display — exactly
+    //    the reconciliation the pre-SLICE-3 gate let the delete skip forever.
+    uncharge_memory(c_id, bytes);
+    assert_eq!(pin(&c), 0, "C unpinned after memory uncharge");
+    assert_eq!(mem(&p), 0, "P display memory drained after C's charge is uncharged");
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "matched charge/uncharge telescopes exactly (Σpin == Σunpin, floor never fires)"
+    );
+
+    // 4) The reconciled leaf now deletes cleanly; P (never origin-pinned, now
+    //    childless) deletes after it.
+    delete_cgroup(c_id).expect("delete reconciled C");
+    delete_cgroup(p_id).expect("delete P");
+    let _ = mem_unpin_underflow_take();
+}
+
 /// J2-9: in-kernel self-test for the page-table-frame kmem accounting. The pt
 /// charge rides the MEMORY controller (try_charge_memory / uncharge_memory /
 /// migrate_memory_charges) EXACTLY like the mmap DATA charge, so this exercises
@@ -3382,9 +3626,30 @@ pub fn run_cgroup_disabled_leaf_gate_self_test() {
 /// INV-5 trap that the MEMORY controller (unlike files/ports/vfs_dir) does NOT
 /// exempt the root cgroup. Root counters carry live boot charges, so root
 /// assertions use DELTAS; fresh task-less children start at 0 (absolute).
+///
+/// M2-1 SLICE-2 EXTENSION: every step now ALSO asserts the origin-keyed
+/// `mem_pinned` (the controller-independent delete-gate counter) telescopes in
+/// lockstep — origin-only on charge, re-homed on migrate, telescoped to 0 on the
+/// fork-lump↔child-exit pair and on rollback, root-non-exempt. The PROOF artifact
+/// that gated the SLICE-3 gate flip was the over-uncharge TRIPWIRE assertion: steps
+/// 1-7 (all MATCHED sequences) must leave `MEM_UNPIN_UNDERFLOW == 0`, proving
+/// Σunpin == Σpin (a SOUND `mem_pinned == 0` witness) rather than merely
+/// Σunpin >= Σpin (which saturating unpin would otherwise mask); step 8's
+/// deliberate over-uncharge then MUST trip it, proving the tripwire detects the
+/// masking it guards against.
 pub fn run_cgroup_pt_kmem_self_test() {
     const PAGE: u64 = 0x1000;
     let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
+    // M2-1 SLICE-2: origin-pin reader (controller-independent delete-gate
+    // counter, twin of fds_pinned/ports_pinned).
+    let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
+
+    // M2-1 SLICE-2 (lens SATURATING-UNPIN-MASKING): clear the process-wide
+    // over-uncharge tripwire so this test's MATCHED charge/uncharge sequences can
+    // PROVE Σunpin == Σpin (tripwire stays 0), not merely Σunpin >= Σpin (which
+    // mem_pinned == 0 alone admits under saturating unpin). A nonzero tripwire at
+    // any matched-step assertion below is an over-uncharge accounting regression.
+    let _ = mem_unpin_underflow_take();
 
     // Fresh, empty, task-less MEMORY cgroups under root:
     // A(memory.max=64 pages) ⊃ B(memory.max=8 pages), sibling C(memory.max=64 pages).
@@ -3407,6 +3672,12 @@ pub fn run_cgroup_pt_kmem_self_test() {
     charge_memory_forced(b_id, 6 * PAGE);
     assert_eq!(mem(&b), 6 * PAGE, "B after forced PT charge");
     assert_eq!(mem(&a), 6 * PAGE, "A (ancestor) after forced PT charge under B");
+    // M2-1 SLICE-2: the forced charge PINS the ORIGIN (B) — and ONLY the origin,
+    // controller-independently. The pin does NOT propagate to the ancestor A
+    // (unlike the display counter, which the controller walk pushes up the
+    // chain). This is the origin-keyed semantics the delete-gate now samples.
+    assert_eq!(pin(&b), 6 * PAGE, "B mem_pinned after forced PT charge (origin)");
+    assert_eq!(pin(&a), 0, "A mem_pinned stays 0 (pin is origin-keyed, not hierarchical)");
 
     // 2) SOFT overshoot: a forced PT charge NEVER rejects, even past memory.max.
     //    6 + 4 = 10 > B.max(8) is ALLOWED — the frames physically exist, and
@@ -3415,6 +3686,7 @@ pub fn run_cgroup_pt_kmem_self_test() {
     charge_memory_forced(b_id, 4 * PAGE);
     assert_eq!(mem(&b), 10 * PAGE, "B forced past memory.max (soft, over-count-safe)");
     assert_eq!(mem(&a), 10 * PAGE, "A after forced overshoot under B");
+    assert_eq!(pin(&b), 10 * PAGE, "B mem_pinned tracks the soft overshoot (origin)");
 
     // 3) The HARD gate RE-ENFORCES on the NEXT data-style allocation: now that B is
     //    over its max, try_charge_memory (the Phase-1 DATA gate) rejects — so the
@@ -3425,16 +3697,27 @@ pub fn run_cgroup_pt_kmem_self_test() {
         "hard DATA gate re-enforces memory.max after pt overshoot",
     );
     assert_eq!(mem(&b), 10 * PAGE, "B unchanged after rejected hard charge");
+    // M2-1 SLICE-2: ROLLBACK-UNPIN proof. The rejected hard charge pinned the
+    // origin FIRST, then unpinned the full allocation in its Err arm — so B's pin
+    // is UNCHANGED (10 pages), NOT 11. Omitting the rollback-unpin would leave a
+    // permanent +1-page pin here (FA-04 undeletability) — caught by this assert.
+    assert_eq!(pin(&b), 10 * PAGE, "B mem_pinned unchanged after rejected hard charge (rollback-unpin)");
 
     // 4) ROOT NOT EXEMPT (INV-5 trap): unlike files/ports/vfs_dir, the MEMORY
     //    controller charges the root cgroup. A root-targeted forced charge MUST
     //    move root.memory_current — asserted via delta (root carries live charges).
     let root = lookup_cgroup(0).expect("root");
     let root_before = mem(&root);
+    // M2-1 SLICE-2: root mem_pinned carries permanent boot pins, so use a DELTA.
+    // The MEMORY pin (unlike fds/ports, which short-circuit id==0) MUST move for
+    // root too — both pin AND unpin are id==0-non-exempt, so root telescopes.
+    let root_pin_before = pin(&root);
     charge_memory_forced(0, 5 * PAGE);
     assert_eq!(mem(&root), root_before + 5 * PAGE, "root IS charged (no exemption)");
+    assert_eq!(pin(&root), root_pin_before + 5 * PAGE, "root mem_pinned moves (no id==0 exemption)");
     uncharge_memory(0, 5 * PAGE);
     assert_eq!(mem(&root), root_before, "root PT uncharge restores baseline");
+    assert_eq!(pin(&root), root_pin_before, "root mem_pinned telescopes back (no id==0 exemption)");
 
     // 5) MIGRATION TRANSFER (compute_cgroup_charged_bytes path): move B's 10 PT
     //    pages B → C. B's chain (B, A) drops by 10; C's chain (C, A) gains 10. The
@@ -3443,29 +3726,637 @@ pub fn run_cgroup_pt_kmem_self_test() {
     assert_eq!(mem(&b), 0, "B drained after PT migrate");
     assert_eq!(mem(&c), 10 * PAGE, "C charged after PT migrate");
     assert_eq!(mem(&a), 10 * PAGE, "A (shared ancestor) net unchanged by sibling migrate");
+    // M2-1 SLICE-2: the pin RE-HOMES via the primitive composition
+    // (try_charge_memory(C) pins C, uncharge_memory(B) unpins B) — no bespoke
+    // migrate-level pin code. Source pin telescopes to EXACTLY 0 (the migrated
+    // `bytes` == B's entire live pin), destination gains it. The shared ancestor
+    // A was never pinned (origin-keyed), so it stays 0 across the sibling move.
+    assert_eq!(pin(&b), 0, "B mem_pinned drained to 0 by migrate source-unpin");
+    assert_eq!(pin(&c), 10 * PAGE, "C mem_pinned gained by migrate dest-pin");
+    assert_eq!(pin(&a), 0, "A mem_pinned stays 0 (origin-keyed, not hierarchical)");
 
     // 6) EXIT BALANCE: last-exit uncharge of C's PT returns the chain to baseline.
     uncharge_memory(c_id, 10 * PAGE);
     assert_eq!(mem(&c), 0, "C drained after exit uncharge");
     assert_eq!(mem(&a), 0, "A drained after C exit uncharge");
+    assert_eq!(pin(&c), 0, "C mem_pinned telescopes to 0 after exit uncharge");
 
     // 7) FORK == EXIT balance (per-process +X / -X): fork charges the inherited
     //    child PT to the PARENT cgroup with the HARD gate (the value is known
     //    pre-fork ⇒ hard per IM-14); the child's last-exit uncharge cancels it.
     try_charge_memory(a_id, 6 * PAGE).expect("fork: charge inherited child PT to parent cgroup");
     assert_eq!(mem(&a), 6 * PAGE, "A after fork PT charge");
+    // M2-1 SLICE-2: the fork lump pins the PARENT-cgroup origin (here a_id).
+    assert_eq!(pin(&a), 6 * PAGE, "A mem_pinned after fork PT charge (parent-cgroup origin)");
     uncharge_memory(a_id, 6 * PAGE); // child last-exit
     assert_eq!(mem(&a), 0, "A back to baseline: fork PT charge cancelled by child exit");
+    // M2-1 SLICE-2: the fork-lump pin telescopes to 0 against the child's exit
+    // uncharge AT THE SAME ORIGIN — proving the amount-asymmetry (1 lump add vs
+    // N exit subs) is harmless for a COUNTER (telescopes on Σ equality), refuting
+    // the historical FA-04 objection at the delete-gate (cgroup.rs:1822-1833).
+    assert_eq!(pin(&a), 0, "A mem_pinned telescopes to 0: fork lump cancelled by child exit");
 
-    // 8) SATURATING uncharge: over-uncharge floors at 0 (never drives memory_current
-    //    below true usage → never a downstream memory.max bypass).
+    // ── M2-1 SLICE-2 PROOF CHECKPOINT (lens SATURATING-UNPIN-MASKING) ──
+    // EVERY step above (1-7) was a MATCHED charge/uncharge sequence. If the pin
+    // truly telescopes (Σunpin == Σpin) then NO unpin ever clamped at the floor,
+    // so the over-uncharge tripwire MUST read 0. This distinguishes a genuine
+    // telescope from a masked over-uncharge — which `mem_pinned == 0` alone
+    // CANNOT do under saturating unpin. Assert-then-CLEAR so the deliberate
+    // step-8 saturation below starts from a known-zero tripwire.
+    //
+    // The tripwire is process-wide; like the absolute `mem(&x)==0` assertions on
+    // fresh cgroups already in this test, it relies on the boot-quiescent
+    // single-CPU init context (no concurrent memory uncharge from userspace,
+    // which has not started yet). This is the same contract every cgroup
+    // self-test here already assumes.
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "M2-1 SLICE-2: matched charge/uncharge sequences (steps 1-7) telescoped \
+         WITHOUT any saturating over-uncharge — mem_pinned==0 is a SOUND witness, \
+         not merely a saturation artifact",
+    );
+
+    // 8) SATURATING uncharge (DELIBERATE over-uncharge): over-uncharge floors
+    //    memory_current AND mem_pinned at 0 (never drives them below true usage →
+    //    never a downstream memory.max bypass; for the pin, the transiently-LENIENT
+    //    direction — never the FA-04 permanently-blocked direction). A starts
+    //    reconciled at 0, so uncharging 999 pages is a pure saturation demo.
     uncharge_memory(a_id, 999 * PAGE);
     assert_eq!(mem(&a), 0, "A saturates at 0 on over-uncharge");
+    assert_eq!(pin(&a), 0, "A mem_pinned saturates at 0 on over-uncharge (lenient direction)");
+    // M2-1 SLICE-2: and CRUCIALLY — the tripwire FIRED on this deliberate
+    // over-uncharge (pre-value 0 < 999 pages ⇒ the whole amount was absorbed by
+    // the floor). This proves the tripwire actually DETECTS the masking that
+    // step-8 demonstrates: had a real double-uncharge bug existed in steps 1-7 it
+    // would have been caught above, NOT silently floored to mem_pinned==0.
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        999 * PAGE,
+        "M2-1 SLICE-2: the tripwire detects the deliberate step-8 over-uncharge \
+         (mem_pinned==0 ALONE would have masked it)",
+    );
 
     // Cleanup: delete children before parents (no tasks attached).
     let _ = delete_cgroup(b_id);
     let _ = delete_cgroup(c_id);
     let _ = delete_cgroup(a_id);
+}
+
+/// M2-1 SLICE-2 (co-residency GAP closure): in-kernel self-test that the
+/// origin-keyed `mem_pinned` aggregate is PER-PROCESS-EXACT under MULTI-PROCESS
+/// CO-RESIDENCY, and that the saturating-unpin floor NEVER fires when ONE of N
+/// co-resident processes migrates out.
+///
+/// WHY THIS IS THE LOAD-BEARING CASE the rest of the suite does NOT cover:
+/// `run_cgroup_pt_kmem_self_test` migrates a cgroup that holds EXACTLY the
+/// migrated amount (one notional process), so its source unpin drains the source
+/// to 0 — it can never reveal whether the migration unpin is *bounded by the
+/// migrating process's share* or whether it over-unpins and floors. The ONLY
+/// configuration where the saturating floor (`saturating_sub` in
+/// `unpin_origin_mem`) could MASK a real residual is `mem_pinned(S) > 0` AFTER a
+/// migration: if migration unpinned MORE than the migrating process's
+/// `compute(P)`, it would clamp S's aggregate LOW and silently strand the
+/// co-resident processes' pins — and (post SLICE-3 gate flip) let S be deleted
+/// while live charges keyed to it remain (the FA-09-adjacent under-count
+/// failure). This test proves that does NOT happen: migration unpins EXACTLY
+/// `compute(P)` (== the `bytes` arg, `<= mem_pinned(S)`), so `mem_pinned(S)`
+/// lands on the precise residual `Σ_{j≠i} compute(proc_j)`, the floor never
+/// fires, and the `MEM_UNPIN_UNDERFLOW` tripwire stays 0.
+///
+/// MODEL: two "processes" X and Y co-resident in source S (two independent
+/// `try_charge_memory(s_id, ·)` calls, exactly as two live PIDs each charge their
+/// own footprint to their shared current cgroup). Migrate ONLY X to D, then drain
+/// each surviving process via its own last-exit `uncharge_memory`. Every step
+/// asserts the origin pin, the controller-walked display counter, AND the
+/// over-uncharge tripwire, so a future implementation that over-unpins on
+/// migration (the masked-residual bug) FAILS here instead of silently passing a
+/// `mem_pinned == 0` witness.
+pub fn run_cgroup_mem_pinned_coresidency_self_test() {
+    const PAGE: u64 = 0x1000;
+    let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
+    let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
+
+    // Clear the shared tripwire so any over-uncharge surplus is attributable to
+    // THIS test (read-and-cleared at each matched-sequence checkpoint below).
+    let _ = mem_unpin_underflow_take();
+
+    // Fresh, task-less MEMORY hierarchy under root:
+    //   A (parent, generous memory.max) ⊃ { S (source), D (dest) }  — siblings.
+    // A is the SHARED ancestor: every charge to S or D also moves A's display, so
+    // A is exactly where a co-resident over-unpin would corrupt the shared total.
+    let a = create_cgroup(0, CgroupControllers::MEMORY).expect("create A");
+    let a_id = a.id();
+    a.set_limit(CgroupLimits { memory_max: Some(1024 * PAGE), ..Default::default() })
+        .expect("set A.memory.max");
+    let s = create_cgroup(a_id, CgroupControllers::MEMORY).expect("create S");
+    let s_id = s.id();
+    s.set_limit(CgroupLimits { memory_max: Some(512 * PAGE), ..Default::default() })
+        .expect("set S.memory.max");
+    let d = create_cgroup(a_id, CgroupControllers::MEMORY).expect("create D");
+    let d_id = d.id();
+    d.set_limit(CgroupLimits { memory_max: Some(512 * PAGE), ..Default::default() })
+        .expect("set D.memory.max");
+
+    // Two DISTINCT per-process footprints (X != Y so a residual of the WRONG
+    // process is detectable — a same-size pair could alias an over-unpin).
+    let x: u64 = 7 * PAGE; // "process X" compute
+    let y: u64 = 11 * PAGE; // "process Y" compute (co-resident with X in S)
+
+    // 1) CO-RESIDENCY: charge BOTH processes to S (two separate charges, exactly
+    //    as two live PIDs in one cgroup each charge their own footprint). The
+    //    origin pin AGGREGATES: mem_pinned(S) == x + y.
+    try_charge_memory(s_id, x).expect("charge process X to S");
+    try_charge_memory(s_id, y).expect("charge process Y to S");
+    assert_eq!(pin(&s), x + y, "S pin AGGREGATES both co-resident processes");
+    assert_eq!(mem(&s), x + y, "S display aggregates both processes");
+    assert_eq!(mem(&a), x + y, "A (shared ancestor) display aggregates both");
+    assert_eq!(pin(&d), 0, "D not yet pinned");
+    assert_eq!(mem(&d), 0, "D display still 0");
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "no over-uncharge during co-resident charge"
+    );
+
+    // 2) MIGRATE ONLY PROCESS X: S -> D, transferring exactly compute(X) == x.
+    //    migrate_memory_charges(x, s, d) = try_charge_memory(d, x) +
+    //    uncharge_memory(s, x). The source unpin subtracts x from S's AGGREGATE
+    //    pin (x + y). Because x <= x + y, the saturating floor does NOT engage:
+    //    mem_pinned(S) lands on EXACTLY y.
+    migrate_memory_charges(x, s_id, d_id).expect("migrate process X: S -> D");
+
+    // THE GAP ASSERTIONS — per-process-exact unpin, floor never fires:
+    assert_eq!(
+        pin(&s),
+        y,
+        "S pin == Y: the co-resident process's share SURVIVES (NOT 0, NOT floored)"
+    );
+    assert_ne!(pin(&s), 0, "S must NOT be drained to 0 by a single-process migrate");
+    assert_eq!(pin(&d), x, "D pin == X (exactly the migrated process's share)");
+    // Display counters telescope identically (S loses x, D gains x; shared A
+    // unchanged — a sibling migrate nets 0 on the common ancestor).
+    assert_eq!(mem(&s), y, "S display drops to Y after X migrates out");
+    assert_eq!(mem(&d), x, "D display rises to X after X migrates in");
+    assert_eq!(mem(&a), x + y, "A (shared ancestor) net unchanged by sibling migrate");
+    // THE FLOOR-NEVER-FIRED PROOF: the migration's source unpin
+    // (uncharge_memory(s, x)) saw pre-value x + y >= x, so unpin_origin_mem never
+    // clamped. The tripwire (fires IFF a saturating unpin absorbed a surplus) is
+    // 0 — so mem_pinned(S) == y is a TRUE residual, not a floored one. This is
+    // the exact distinction the `mem_pinned == 0` witness alone CANNOT make.
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "single-process migrate out of a co-resident cgroup NEVER over-unpins (floor never fires)"
+    );
+
+    // 3) DRAIN PROCESS Y (its last-exit) from S: uncharge_memory(s, y) unpins the
+    //    EXACT residual. S telescopes to 0 cleanly — and only NOW, because Y's pin
+    //    was preserved across X's migration. A floored S in step 2 would have made
+    //    this exit a NO-OP and stranded Y's display on the ancestor; instead it
+    //    reconciles.
+    uncharge_memory(s_id, y);
+    assert_eq!(pin(&s), 0, "S fully reconciled after its last process (Y) exits");
+    assert_eq!(mem(&s), 0, "S display drained after Y exits");
+    assert_eq!(mem(&a), x, "A retains only the migrated process X (now keyed to D)");
+
+    // 4) DRAIN PROCESS X (its last-exit) from D: uncharge_memory(d, x).
+    uncharge_memory(d_id, x);
+    assert_eq!(pin(&d), 0, "D reconciled after migrated process X exits");
+    assert_eq!(mem(&d), 0, "D display drained");
+    assert_eq!(mem(&a), 0, "A (shared ancestor) fully drained: every process exited");
+    // Σpin (x + y for the two charges, + x for the migrate dest charge) ==
+    // Σunpin (x migrate source + y Y-exit + x X-exit). Tripwire confirms NO
+    // saturating clamp anywhere in the matched sequence.
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "co-residency charge/migrate/dual-exit telescopes exactly (Σpin == Σunpin, no floor)"
+    );
+
+    // 5) EXACT-RESIDUAL BOUNDARY: re-charge two co-resident processes to S, then
+    //    migrate BOTH out one at a time. After the SECOND migrate the source unpin
+    //    is uncharge_memory(s, y) with pre-value EXACTLY y — the boundary case
+    //    where residual == unpin amount, which must still NOT trip the floor
+    //    (pre == n, not pre < n).
+    try_charge_memory(s_id, x).expect("re-charge X to S");
+    try_charge_memory(s_id, y).expect("re-charge Y to S");
+    assert_eq!(pin(&s), x + y, "S re-aggregates both processes");
+    migrate_memory_charges(x, s_id, d_id).expect("migrate X out (1st)");
+    assert_eq!(pin(&s), y, "S == Y after first co-resident migrate");
+    migrate_memory_charges(y, s_id, d_id).expect("migrate Y out (2nd, exact-residual boundary)");
+    assert_eq!(pin(&s), 0, "S == 0 after BOTH migrate out (exact telescope, pre == n)");
+    assert_eq!(pin(&d), x + y, "D now holds both migrated processes");
+    assert_eq!(mem(&a), x + y, "A still holds both (both now keyed to D)");
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "exact-residual boundary migrate (pre == n) does NOT trip the floor"
+    );
+    // Drain D of both and confirm full reconciliation.
+    uncharge_memory(d_id, x + y);
+    assert_eq!(pin(&d), 0, "D drained of both migrated processes");
+    assert_eq!(mem(&a), 0, "A fully drained again");
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "final drain telescopes exactly (no floor)"
+    );
+
+    // Cleanup: children before parent (no tasks attached). Leave the shared
+    // tripwire as we found it (0).
+    let _ = delete_cgroup(s_id);
+    let _ = delete_cgroup(d_id);
+    let _ = delete_cgroup(a_id);
+    let _ = mem_unpin_underflow_take();
+}
+
+/// M2-1 SLICE-2 (exec/exit-AFTER-migrate GAP closure): in-kernel self-test that
+/// the exec image-replace OLD-image uncharge (syscall.rs:4562-4602), the
+/// ExecSpaceGuard rollback (syscall.rs:4247), and the process-exit uncharge
+/// (process.rs:4318-4358) — all of which unpin at the CURRENT `proc.cgroup_id`
+/// re-read under the Process lock — land on the cgroup the prior migration
+/// RE-HOMED the old image's pin TO, by EXACTLY the migrated amount, with the
+/// saturating floor NEVER firing.
+///
+/// WHY THIS IS THE LOAD-BEARING CASE the rest of the suite does NOT cover:
+/// the production exec-replace path reads `cgroup_id = proc.cgroup_id` (a single
+/// re-read under the held Process lock) and issues FOUR origin uncharges
+/// (mmap-data / heap / elf / pt) against it. Its correctness rests on the
+/// invariant that EVERY prior migration re-homed the old image's pin to that id
+/// (migrate's `try_charge_memory(to) + uncharge_memory(from)` composition). The
+/// existing suite proves the COMPONENTS but never the COMPOSED cross-origin
+/// round in isolation:
+///   * `run_cgroup_pt_kmem_self_test` step 5-6 migrates then uncharges at the
+///     DESTINATION, but only on the FORCED pt lane (not the `try_charge_memory`
+///     DATA/ELF origin the exec image-replace and ExecSpaceGuard actually use),
+///     and it never reads the tripwire IMMEDIATELY after the destination uncharge
+///     — the only matched-sequence tripwire read lumps steps 1-7 together, so an
+///     over-unpin localized to the destination-exit would be diluted.
+///   * `run_cgroup_mem_pinned_coresidency_self_test` migrates ONE of two
+///     co-resident processes, so its migrate SOURCE always retains the other
+///     (pre-value `x + y > x`, a STRICT-inequality case) — it never exercises the
+///     SINGLE-process source that telescopes to EXACTLY 0 (pre == n on the
+///     migrate-source), which is the precise boundary the exec/exit-after-migrate
+///     path hits when the old image is the whole footprint.
+///
+/// So no test proves the CLEAN, ISOLATED `charge X to A -> migrate(X, A->B) ->
+/// exec/exit-uncharge X at B` round where (a) A telescopes to EXACTLY 0 via the
+/// migrate source-unpin (pre == n), (b) B is then unpinned to EXACTLY 0 by the
+/// four-term old-image uncharge keyed to B, and (c) the over-uncharge tripwire is
+/// read == 0 IMMEDIATELY after the destination uncharge — proving B's unpin found
+/// a LIVE pin == X (the re-home LANDED on B), NOT a floored over-unpin masking an
+/// A-vs-B origin mismatch. That distinction (true re-home vs masked over-unpin at
+/// B) is exactly what `mem_pinned == 0` ALONE cannot make under saturating unpin,
+/// and it was the precondition that gated the SLICE-3 delete-gate flip for the
+/// cross-origin exec/exit case.
+///
+/// MODEL: ONE notional process whose OLD image is a FOUR-TERM footprint
+/// (mmap-data via `try_charge_memory`, heap via `try_charge_memory`, elf via
+/// `try_charge_memory`, pt via `charge_memory_forced` — exactly the production
+/// charge primitives per lane). It is charged to A, MIGRATED A->B by the
+/// aggregated `compute` lump (the single `migrate_memory_charges(total, A, B)`
+/// call the real migration makes), and then the OLD image is uncharged at B as
+/// the production exec image-replace does (FOUR separate `uncharge_memory`
+/// calls at `proc.cgroup_id == B`). Asserts pin(A)==0 and pin(B)==0 at each
+/// boundary and the tripwire == 0 at each checkpoint.
+pub fn run_cgroup_mem_pinned_exec_after_migrate_self_test() {
+    const PAGE: u64 = 0x1000;
+    let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
+    let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
+
+    // Clear the shared tripwire so any over-uncharge surplus is attributable to
+    // THIS test (read-and-cleared at each matched-sequence checkpoint below).
+    let _ = mem_unpin_underflow_take();
+
+    // Fresh, task-less MEMORY hierarchy under root:
+    //   ROOT-OF-TEST (RT, generous memory.max) ⊃ { A (source), B (dest) } — siblings.
+    // RT is the SHARED ancestor; A and B are the two distinct origins the old
+    // image's pin must move BETWEEN (A == charge origin, B == post-migration
+    // exec/exit-uncharge origin). Using siblings (not ancestor/descendant) makes
+    // the shared-ancestor display net 0 across the move, isolating the A->B pin
+    // re-home as the ONLY origin-keyed motion.
+    let rt = create_cgroup(0, CgroupControllers::MEMORY).expect("create RT");
+    let rt_id = rt.id();
+    rt.set_limit(CgroupLimits { memory_max: Some(4096 * PAGE), ..Default::default() })
+        .expect("set RT.memory.max");
+    let a = create_cgroup(rt_id, CgroupControllers::MEMORY).expect("create A");
+    let a_id = a.id();
+    a.set_limit(CgroupLimits { memory_max: Some(2048 * PAGE), ..Default::default() })
+        .expect("set A.memory.max");
+    let b = create_cgroup(rt_id, CgroupControllers::MEMORY).expect("create B");
+    let b_id = b.id();
+    b.set_limit(CgroupLimits { memory_max: Some(2048 * PAGE), ..Default::default() })
+        .expect("set B.memory.max");
+
+    // OLD-image FOUR-TERM footprint, each term a DISTINCT size so a swapped /
+    // mis-keyed lane is detectable (an aliased equal-size set could hide a
+    // partial over-unpin). These mirror the four production exec-replace
+    // uncharge terms at syscall.rs:4562-4602.
+    let data: u64 = 13 * PAGE; // Σ non-PROT_NONE mmap region lengths (try_charge_memory)
+    let heap: u64 = 5 * PAGE; // page_align(brk) - page_align(brk_start) (try_charge_memory)
+    let elf: u64 = 9 * PAGE; // mm.elf_charged_bytes — PT_LOAD segs + stack (try_charge_memory)
+    let pt: u64 = 3 * PAGE; // mm.pt_charged_bytes — page-table-frame kmem (charge_memory_forced)
+    let total: u64 = data + heap + elf + pt; // == compute_cgroup_charged_bytes(proc)
+
+    // 1) BUILD the old image AT A, lane-by-lane through the PRODUCTION primitives:
+    //    three HARD `try_charge_memory` legs (data/heap/elf) + one FORCED
+    //    `charge_memory_forced` leg (pt). The origin pin AGGREGATES across all four
+    //    onto A — exactly as a live process's four charge lanes pin its current
+    //    cgroup. (This is the charge side of "charged to cgroup A".)
+    try_charge_memory(a_id, data).expect("old-image mmap-data charge to A");
+    try_charge_memory(a_id, heap).expect("old-image heap charge to A");
+    try_charge_memory(a_id, elf).expect("old-image elf charge to A");
+    charge_memory_forced(a_id, pt); // forced (soft) — pt frame count known post-map_to
+    assert_eq!(pin(&a), total, "A pin AGGREGATES the old image's four lanes (charge origin)");
+    assert_eq!(mem(&a), total, "A display holds the whole old image");
+    assert_eq!(mem(&rt), total, "RT (shared ancestor) display holds it via the chain");
+    assert_eq!(pin(&b), 0, "B not yet touched");
+    assert_eq!(mem(&b), 0, "B display still 0");
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "building the old image (pure charges) never unpins — tripwire clean"
+    );
+
+    // 2) MIGRATE A -> B by the AGGREGATED compute lump (the SINGLE
+    //    migrate_memory_charges(total, A, B) call the real sys_cgroup_attach /
+    //    cgroupfs path makes — bytes == compute_cgroup_charged_bytes(proc) ==
+    //    total here). This is "migrated to cgroup B before the exec uncharge".
+    //
+    //    migrate = try_charge_memory(B, total) + uncharge_memory(A, total). The
+    //    SOURCE unpin sees pre-value EXACTLY `total` (A's entire pin == the whole
+    //    old image == the migrated amount), so it telescopes to EXACTLY 0 with
+    //    pre == n — the boundary case the co-residency test (pre == x + y > n)
+    //    never reaches for a single process. The DEST pin gains exactly `total`.
+    migrate_memory_charges(total, a_id, b_id).expect("migrate old image A -> B (whole footprint)");
+
+    // THE RE-HOME ASSERTIONS — A drains to EXACTLY 0, B gains the whole image:
+    assert_eq!(pin(&a), 0, "A pin telescopes to EXACTLY 0 by the migrate source-unpin (pre == n)");
+    assert_eq!(pin(&b), total, "B pin == total: the old image's pin RE-HOMED to B");
+    assert_eq!(mem(&a), 0, "A display drained by the migrate");
+    assert_eq!(mem(&b), total, "B display holds the re-homed old image");
+    assert_eq!(mem(&rt), total, "RT (shared ancestor) net unchanged by the sibling A->B move");
+    // FLOOR-NEVER-FIRED on the SOURCE migrate: uncharge_memory(A, total) saw
+    // pre-value total >= total, so unpin_origin_mem never clamped. A telescoping
+    // to 0 here is a TRUE re-home, not a floored over-unpin of an aggregate that
+    // happened to already be low.
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "migrate source-unpin (pre == n == total) does NOT trip the floor — true re-home"
+    );
+
+    // 3) EXEC IMAGE-REPLACE at B (the syscall.rs:4562-4602 path): the old image is
+    //    uncharged as FOUR SEPARATE uncharge_memory calls keyed to
+    //    `cgroup_id = proc.cgroup_id`, which the migration MOVED to B. Each leg
+    //    unpins B; together they must drain B's pin to EXACTLY 0. Because the
+    //    re-home in step 2 landed the FULL `total` on B, every one of the four
+    //    unpins finds a LIVE pin to cancel (pre >= n at each step) — the floor
+    //    never fires. THIS is the proof that "the exec uncharge at the CURRENT
+    //    cgroup unpins B (not A) by exactly the migrated amount."
+    uncharge_memory(b_id, data); // exec-replace mmap-data leg (syscall.rs:4570)
+    uncharge_memory(b_id, heap); // exec-replace heap leg (syscall.rs:4580)
+    uncharge_memory(b_id, elf); // exec-replace elf leg (syscall.rs:4588)
+    uncharge_memory(b_id, pt); // exec-replace pt leg (syscall.rs:4601)
+
+    // THE GAP ASSERTIONS — the destination is fully reconciled, the source stays 0:
+    assert_eq!(pin(&b), 0, "B pin telescopes to EXACTLY 0: exec-uncharge at B cancelled the re-homed image");
+    assert_eq!(pin(&a), 0, "A pin STAYS 0: the exec-uncharge did NOT touch the original charge origin");
+    assert_eq!(mem(&b), 0, "B display drained by the exec image-replace uncharge");
+    assert_eq!(mem(&a), 0, "A display still 0");
+    assert_eq!(mem(&rt), 0, "RT (shared ancestor) fully drained: the whole old image released");
+    // THE DISTINGUISHING PROOF — true re-home vs masked over-unpin at B:
+    // if the migration had FAILED to re-home the pin to B (the hazard the gap
+    // flags: the exec uncharge relying on a re-home that didn't happen), B's pin
+    // would have been < total when the four exec-uncharges ran, the saturating
+    // floor would have absorbed the shortfall, and THIS tripwire would be NONZERO.
+    // It reads 0 ⇒ each B-unpin found a LIVE pin == its term ⇒ the re-home landed
+    // on B. mem_pinned(B) == 0 ALONE could not distinguish this from a floored
+    // over-unpin; the tripwire does.
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "M2-1 SLICE-2: every exec-uncharge leg at B found a LIVE re-homed pin == its term \
+         (floor never fired) — the old image's pin TRULY re-homed A -> B, the exec uncharge \
+         at the CURRENT cgroup unpins B by exactly the migrated amount, NOT A"
+    );
+
+    // 4) EXIT-AFTER-MIGRATE variant (process.rs:4318-4358) AND the ExecSpaceGuard
+    //    ROLLBACK variant (syscall.rs:4247) share the identical property: a single
+    //    aggregated uncharge at the post-migration cgroup. Re-run the round with a
+    //    WHOLESALE single uncharge_memory(B, total) (the shape exit / guard-drop
+    //    take after re-reading proc.cgroup_id) to prove the four-vs-one partition
+    //    of the uncharge is irrelevant for a COUNTER (telescopes on Σ equality).
+    try_charge_memory(a_id, data).expect("re-build: mmap-data to A");
+    try_charge_memory(a_id, heap).expect("re-build: heap to A");
+    try_charge_memory(a_id, elf).expect("re-build: elf to A");
+    charge_memory_forced(a_id, pt);
+    assert_eq!(pin(&a), total, "A re-pins the whole image");
+    migrate_memory_charges(total, a_id, b_id).expect("re-migrate A -> B");
+    assert_eq!(pin(&a), 0, "A drains to 0 on re-migrate (pre == n)");
+    assert_eq!(pin(&b), total, "B holds the re-homed image again");
+    // Exit / ExecSpaceGuard-rollback wholesale uncharge at the CURRENT (migrated) id:
+    uncharge_memory(b_id, total);
+    assert_eq!(pin(&b), 0, "B telescopes to 0 on the wholesale exit/rollback uncharge at the migrated id");
+    assert_eq!(pin(&a), 0, "A untouched by the exit/rollback uncharge");
+    assert_eq!(mem(&rt), 0, "RT fully drained after the exit/rollback variant");
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "exit/ExecSpaceGuard wholesale uncharge at the post-migration cgroup telescopes \
+         exactly (pre == n == total, floor never fires) — same re-home property as exec-replace"
+    );
+
+    // Cleanup: children before parent (no tasks attached). Leave the shared
+    // tripwire as we found it (0).
+    let _ = delete_cgroup(a_id);
+    let _ = delete_cgroup(b_id);
+    let _ = delete_cgroup(rt_id);
+    let _ = mem_unpin_underflow_take();
+}
+
+/// M2-1 SLICE-2 (ABNORMAL-CLONE-ABORT teardown GAP closure): in-kernel self-test
+/// that the fork-charge-to-parent pin (fork.rs:240) telescopes to 0 when a
+/// non-CLONE_VM clone child is aborted POST-charge-success via the ABNORMAL
+/// teardown — `terminate_process(child) + cleanup_zombie(child)` — rather than the
+/// ordinary process exit.
+///
+/// THE SEAM (verified by construction at the source):
+/// `sys_clone` without CLONE_VM delegates the AS-creating charge to
+/// `fork::sys_fork()`, which charges `fork_charge_bytes` to `parent_cgroup_id`
+/// (fork.rs:240), pinning the PARENT-cgroup origin. fork_inner already joined the
+/// cpuset and attached the cgroup, so the two POST-charge-success failure arms —
+/// (1) LSM `hook_task_fork` denial (syscall.rs:3196-3205) and (2) namespace-
+/// translation failure (syscall.rs:3216-3243) — deliberately abort the child with
+/// `terminate_process(child_pid, …) + cleanup_zombie(child_pid)` (NOT
+/// `cleanup_unscheduled_process`, whose callers ZERO `memory_space` to suppress
+/// uncharge). `cleanup_zombie` reaps the Zombie through `free_process_resources`
+/// (process.rs:4115), whose uncharge block (process.rs:4310) fires for an
+/// independent-AS clone child because all three gate terms hold:
+///   * `keep_address_space == false` — the COW-forked child has its OWN page-table
+///     root; no other non-Terminated process shares its `memory_space`
+///     (process.rs:4051-4066), so the share scan returns false.
+///   * `mm_shared == false` — `fork_inner` gives the child an INDEPENDENT MmState
+///     Arc (strong_count == 1; process.rs:4270).
+///   * `memory_space != 0` — UNLIKE the `cleanup_unscheduled_process` error paths,
+///     the `terminate_process`/`cleanup_zombie` path does NOT zero `memory_space`.
+/// The four uncharge legs (process.rs:4318/4330/4336/4358) key to
+/// `proc.cgroup_id`, and `child.cgroup_id == parent.cgroup_id == parent_cgroup_id`
+/// (fork.rs:561). Because the child is NEVER scheduled before the abort
+/// (`notify_scheduler_add_process` runs only on the success arm, syscall.rs:3229),
+/// it can never migrate, so its uncharge origin is still EXACTLY the fork-charge
+/// origin. The fork lump therefore telescopes to 0 — NO FA-09 strand, telescoping
+/// NOT broken.
+///
+/// WHY THIS IS THE LOAD-BEARING CASE the rest of the suite does NOT cover:
+/// `run_cgroup_pt_kmem_self_test` step 7 (cgroup.rs:3642-3652) is the ONLY existing
+/// model of the fork-lump↔child-exit pair, and it drains the lump with a BARE
+/// single `uncharge_memory(a_id, 6*PAGE)` comment-labeled "child last-exit" — the
+/// shape of the NORMAL exit, NOT the ABNORMAL `terminate_process`/`cleanup_zombie`
+/// teardown, and (being at the cgroup-primitive layer) it cannot construct a real
+/// Process/clone fixture. So no test exercises the abnormal-abort SITE-PAIR
+/// (fork.rs:240 pin ↔ `free_process_resources` unpin reached via
+/// terminate_process/cleanup_zombie). Identically to the migration-while-pending
+/// gap-fill, the property is closed BY CONSTRUCTION but UNPROVEN by a runtime
+/// assertion — a latent pin!=compute divergence in this teardown window that would
+/// surface under the SLICE-3 gate flip, which relies on `mem_pinned == 0` as the
+/// witness. This test lands that gate-INDEPENDENT runtime witness.
+///
+/// MODEL: charge the inherited fork lump to PARENT cgroup A as the production
+/// `fork::sys_fork()` does (`try_charge_memory(a_id, fork_charge_bytes)`), then
+/// drain it via the EXACT multi-term uncharge shape `free_process_resources` runs
+/// on the abnormal teardown — FOUR separate `uncharge_memory(a_id, ·)` legs
+/// (mmap-data / heap / elf / pt), the same four-call partition as
+/// process.rs:4318/4330/4336/4358 — keyed to the SAME origin (no migration: an
+/// aborted, never-scheduled child cannot migrate). Assert pin(A) telescopes to
+/// EXACTLY 0 AND the over-uncharge tripwire reads 0 IMMEDIATELY after the drain —
+/// proving the four exit unpins found a LIVE pin == the fork lump (the floor never
+/// fired), distinguishing a TRUE telescope from a masked over-unpin that
+/// `mem_pinned == 0` alone cannot tell apart under saturating unpin.
+pub fn run_cgroup_mem_pinned_clone_abort_self_test() {
+    const PAGE: u64 = 0x1000;
+    let mem = |n: &Arc<CgroupNode>| n.stats.memory_current.load(Ordering::SeqCst);
+    let pin = |n: &Arc<CgroupNode>| n.stats.mem_pinned.load(Ordering::SeqCst);
+
+    // Clear the shared tripwire so any over-uncharge surplus is attributable to
+    // THIS test (read-and-cleared at each matched-sequence checkpoint below).
+    let _ = mem_unpin_underflow_take();
+
+    // Fresh, task-less MEMORY hierarchy under root:
+    //   PARENT (P, generous memory.max) ⊃ CHILD-DIAG (CD) — CD is unused here but
+    //   makes the parent a non-leaf, matching the realistic shape where the
+    //   forking parent has descendants. P is the PARENT cgroup the fork charge
+    //   keys to (== parent_cgroup_id == the aborted child's cgroup_id).
+    let p = create_cgroup(0, CgroupControllers::MEMORY).expect("create P");
+    let p_id = p.id();
+    p.set_limit(CgroupLimits { memory_max: Some(4096 * PAGE), ..Default::default() })
+        .expect("set P.memory.max");
+    let cd = create_cgroup(p_id, CgroupControllers::MEMORY).expect("create CD");
+    let cd_id = cd.id();
+    cd.set_limit(CgroupLimits { memory_max: Some(2048 * PAGE), ..Default::default() })
+        .expect("set CD.memory.max");
+
+    // The inherited child footprint, by lane, each a DISTINCT size so a swapped /
+    // mis-keyed exit-uncharge lane is detectable (an aliased equal-size set could
+    // hide a partial over-unpin). These mirror the four terms `fork_charge_bytes`
+    // aggregates (fork.rs:193-237) AND the four `free_process_resources` exit
+    // uncharge legs (process.rs:4318/4330/4336/4358).
+    let data: u64 = 11 * PAGE; // Σ non-PROT_NONE mmap regions (fork.rs:200-207 / process.rs:4312-4320)
+    let heap: u64 = 7 * PAGE; // page_align(brk) - page_align(brk_start) (fork.rs:209-217 / process.rs:4322-4331)
+    let elf: u64 = 4 * PAGE; // parent_mm.elf_charged_bytes (fork.rs:220 / process.rs:4334-4338)
+    let pt: u64 = 2 * PAGE; // parent_mm.pt_charged_bytes (fork.rs:233 / process.rs:4356-4360)
+    // fork_charge_bytes is ONE aggregated lump (the single try_charge_memory call
+    // at fork.rs:240) — the amount-asymmetry seed: 1 charge add vs 4 exit subs.
+    let fork_charge_bytes: u64 = data + heap + elf + pt;
+
+    // 1) FORK CHARGE: `fork::sys_fork()` charges the inherited footprint as ONE
+    //    aggregated lump to the PARENT cgroup (fork.rs:240). The child inherits the
+    //    four MmState fields verbatim and `child.cgroup_id = parent.cgroup_id`
+    //    (fork.rs:561), so the child's compute == fork_charge_bytes and its exit
+    //    origin == this charge origin (P). The lump PINS P.
+    try_charge_memory(p_id, fork_charge_bytes)
+        .expect("fork: charge inherited child footprint to PARENT cgroup (fork.rs:240)");
+    assert_eq!(pin(&p), fork_charge_bytes, "P pin == the fork lump (parent-cgroup origin)");
+    assert_eq!(mem(&p), fork_charge_bytes, "P display holds the fork lump");
+    assert_eq!(pin(&cd), 0, "sibling/descendant CD untouched by the fork charge (origin-keyed)");
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "the fork charge (pure add) never unpins — tripwire clean"
+    );
+
+    // 2) ABNORMAL ABORT TEARDOWN: an LSM `hook_task_fork` denial
+    //    (syscall.rs:3196-3205) or a namespace-translation failure
+    //    (syscall.rs:3216-3243) aborts the never-scheduled child via
+    //    `terminate_process(child) + cleanup_zombie(child)`. `cleanup_zombie` reaps
+    //    through `free_process_resources` (process.rs:4115), whose uncharge gate
+    //    FIRES (keep_address_space == false, mm_shared == false, memory_space != 0
+    //    for an independent-AS, never-`cleanup_unscheduled_process`'d child). The
+    //    four uncharge legs (process.rs:4318/4330/4336/4358) key to
+    //    `proc.cgroup_id == P` (the never-scheduled child never migrated). Model
+    //    the EXACT four-call partition the abnormal teardown runs.
+    //
+    //    THIS is the distinguishing coverage vs step 7 of the pt-kmem self-test:
+    //    that drains the lump with ONE bare uncharge (normal-exit shape); HERE the
+    //    drain is the FOUR-TERM `free_process_resources` shape the abnormal
+    //    terminate_process/cleanup_zombie teardown actually hits, asserted with the
+    //    tripwire read IMMEDIATELY after — so a future regression that mis-keys or
+    //    over-unpins ANY exit leg on the abnormal path fails HERE, not silently at
+    //    the SLICE-3 gate flip.
+    uncharge_memory(p_id, data); // free_process_resources mmap-data leg (process.rs:4318)
+    uncharge_memory(p_id, heap); // free_process_resources heap leg (process.rs:4330)
+    uncharge_memory(p_id, elf); // free_process_resources elf leg (process.rs:4336)
+    uncharge_memory(p_id, pt); // free_process_resources pt leg (process.rs:4358)
+
+    // THE GAP ASSERTIONS — the fork lump telescopes to EXACTLY 0 at the parent
+    // origin via the ABNORMAL four-term teardown drain:
+    assert_eq!(
+        pin(&p), 0,
+        "P pin telescopes to EXACTLY 0: the fork lump (1 add) is cancelled by the abnormal \
+         four-term terminate_process/cleanup_zombie teardown drain (4 subs) at the SAME origin \
+         — amount-asymmetry harmless for a COUNTER (Σadd == Σsub)"
+    );
+    assert_eq!(mem(&p), 0, "P display drained by the abnormal teardown uncharge");
+    // THE DISTINGUISHING PROOF — true telescope vs masked over-unpin:
+    // if ANY exit leg had mis-keyed (e.g. uncharged a cgroup the child had NOT
+    // charged, the FA-09 cross-origin hazard) or the lump had been under-pinned,
+    // some unpin would have found pre-value < its term, the saturating floor would
+    // have absorbed the shortfall, and THIS tripwire would be NONZERO. It reads 0
+    // ⇒ each leg found a LIVE pin == its term ⇒ the abnormal teardown unpinned the
+    // SAME live fork-lump pin. mem_pinned(P) == 0 ALONE could not distinguish this
+    // from a floored over-unpin; the tripwire does. This is the gate-INDEPENDENT
+    // witness the SLICE-3 flip requires for the abnormal-clone-abort window.
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "M2-1 SLICE-2: every abnormal-teardown exit leg found a LIVE fork-lump pin == its term \
+         (floor never fired) — the fork-charge-to-parent pin telescopes to 0 across the \
+         terminate_process/cleanup_zombie teardown, NO FA-09 strand"
+    );
+
+    // 3) WHOLESALE-DRAIN VARIANT: the four-vs-one partition of the exit uncharge is
+    //    irrelevant for a COUNTER. Re-run with the lump charged then drained by a
+    //    SINGLE aggregated uncharge (the degenerate shape an empty-mmap child with
+    //    only a heap/elf footprint would collapse to), proving telescoping on Σ
+    //    equality regardless of leg count.
+    try_charge_memory(p_id, fork_charge_bytes).expect("re-charge fork lump to P");
+    assert_eq!(pin(&p), fork_charge_bytes, "P re-pins the whole fork lump");
+    uncharge_memory(p_id, fork_charge_bytes); // wholesale abnormal-teardown drain
+    assert_eq!(pin(&p), 0, "P telescopes to 0 on the wholesale abnormal-teardown drain (pre == n)");
+    assert_eq!(mem(&p), 0, "P display fully drained by the wholesale variant");
+    assert_eq!(
+        mem_unpin_underflow_take(),
+        0,
+        "wholesale abnormal-teardown drain (pre == n == fork_charge_bytes) telescopes exactly — \
+         floor never fires; the 4-vs-1 uncharge partition is irrelevant for a COUNTER"
+    );
+
+    // Cleanup: children before parent (no tasks attached). Leave the shared
+    // tripwire as we found it (0).
+    let _ = delete_cgroup(cd_id);
+    let _ = delete_cgroup(p_id);
+    let _ = mem_unpin_underflow_take();
 }
 
 // ============================================================================

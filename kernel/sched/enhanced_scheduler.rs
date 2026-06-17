@@ -23,7 +23,7 @@
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::cmp;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cpu_local::{current_cpu, current_cpu_id, max_cpus, num_online_cpus, CpuLocal, NO_FPU_OWNER};
 use kernel_core::cgroup;
 use kernel_core::process::{self, Priority, Process, ProcessId, ProcessState};
@@ -158,6 +158,50 @@ lazy_static! {
 
 /// Load balancing tick counter (only driven on CPU0 to reduce contention)
 static BALANCE_TICKER: AtomicU64 = AtomicU64::new(0);
+
+// ============================================================================
+// M4-1: zero-alloc timer-IRQ — starvation rebucket buffer + load-balance flag
+// ============================================================================
+
+/// M4-1: per-CPU fixed capacity for the starvation-rebucket fast-path hint buffer.
+const STARVE_BUF_PIDS: usize = 64;
+
+/// M4-1: per-CPU staging for starvation re-bucket HINTS, recorded on the timer tick (IRQ,
+/// alloc-free) and drained under the queue lock in `reschedule_now` (process context). A
+/// CONST-static `[_; max_cpus()]` (NOT a `CpuLocal`) so there is ZERO lazy first-touch
+/// alloc in IRQ and no force-init seam needed; !Sync-safe via the `UnsafeCell` newtype with
+/// manual `Send`/`Sync` (the `ContextShadow` precedent), written + read ONLY by the owning
+/// CPU with interrupts disabled. The PCB `pending_starve_boost` marker is the source of
+/// truth, so `overflow` just triggers a marker-driven full-queue scan at drain — a boost is
+/// never lost even if the buffer fills.
+struct StarveBufInner {
+    pids: [Pid; STARVE_BUF_PIDS],
+    len: usize,
+    overflow: bool,
+}
+struct StarveBuf(UnsafeCell<StarveBufInner>);
+// Safety: only the owning CPU ever touches its slot, always with interrupts disabled.
+unsafe impl Send for StarveBuf {}
+unsafe impl Sync for StarveBuf {}
+impl StarveBuf {
+    const fn new() -> Self {
+        StarveBuf(UnsafeCell::new(StarveBufInner {
+            pids: [0; STARVE_BUF_PIDS],
+            len: 0,
+            overflow: false,
+        }))
+    }
+}
+static REBUCKET_BUF: [StarveBuf; cpu_local::max_cpus()] =
+    [const { StarveBuf::new() }; cpu_local::max_cpus()];
+// Compile-time guard: the buffer's outer dimension MUST equal the CpuLocal slot bound so
+// REBUCKET_BUF[current_cpu_id()] is always in range.
+const _: () = assert!(REBUCKET_BUF.len() == cpu_local::max_cpus());
+
+/// M4-1: set on CPU0 by the timer tick when the 64-tick load-balance interval elapses;
+/// consumed (`swap(false)`) in `reschedule_now`'s prologue, where the allocating
+/// `balance_queues` now runs in process context instead of in the IRQ tick.
+static BALANCE_DUE: AtomicBool = AtomicBool::new(false);
 
 /// 调度器统计信息
 pub struct SchedulerStats {
@@ -519,6 +563,27 @@ impl Scheduler {
         }
     }
 
+    /// Remove `pid` from whichever priority bucket of `queue` actually holds it — MEMBERSHIP
+    /// based. NEVER key the removal off `pcb.dynamic_priority`: a futex PI boost
+    /// (`Process::apply_pi_boost`) mutates `dynamic_priority` WITHOUT rebucketing the ready
+    /// task (it only `request_resched`es — see ipc/futex.rs), so the live priority can drift
+    /// away from the bucket key the task was inserted under. A priority-keyed remove would
+    /// then silently miss the real bucket; if the caller still enqueues the task elsewhere
+    /// (work-stealing), the SAME PCB ends up double-queued across two CPUs — the exact
+    /// corruption class `drain_starve_rebucket` guards against with its `old_key` remove.
+    /// Returns the removed PCB (the queue's own `Arc`), or `None` if `pid` was not present.
+    fn remove_pid_from_queue(queue: &mut ReadyQueues, pid: Pid) -> Option<ProcessControlBlock> {
+        let key = queue
+            .iter()
+            .find_map(|(&k, bucket)| if bucket.contains_key(&pid) { Some(k) } else { None })?;
+        let bucket = queue.get_mut(&key)?;
+        let pcb = bucket.remove(&pid);
+        if bucket.is_empty() {
+            queue.remove(&key);
+        }
+        pcb
+    }
+
     /// Enqueue a process on a specific CPU's queue
     fn enqueue_on_cpu(pcb: ProcessControlBlock, priority: Priority, cpu_id: usize) {
         let queue =
@@ -614,17 +679,23 @@ impl Scheduler {
                 pcb.state = ProcessState::Running;
                 pcb.reset_time_slice();
                 pcb.reset_wait_ticks();
+                pcb.pending_starve_boost = false; // M4-1: claimed to Run -> boost goal met
                 let mem_space = pcb.memory_space;
                 drop(pcb);
-                // Remove from source queue
-                if let Some(bucket) = guard.get_mut(&priority) {
-                    bucket.remove(&pid);
-                    if bucket.is_empty() {
-                        guard.remove(&priority);
-                    }
+                // R171-M4-1 FIX: remove from the source queue by MEMBERSHIP, NOT by the
+                // (possibly PI-drifted) `priority` above. Keying the remove off
+                // `pcb.dynamic_priority` could miss the real bucket and leave the PCB in the
+                // source queue while the caller (`select_next_process`) inserts it locally —
+                // double-queuing one PCB across two CPUs. Only steal if the remove succeeded.
+                if let Some(stolen) = Self::remove_pid_from_queue(&mut guard, pid) {
+                    drop(guard);
+                    // The stolen task lands on the destination at its CURRENT effective
+                    // priority (`priority`), which is the correct fresh bucket key there.
+                    return Some((pid, stolen, mem_space, priority));
                 }
-                drop(guard);
-                return Some((pid, proc_arc.clone(), mem_space, priority));
+                // Unreachable under the held queue lock (we just selected `pid` from it), but
+                // fail safe: never report a steal we could not actually remove.
+                candidate = Self::select_next_locked(&guard, Some(pid));
             } else {
                 candidate = Self::select_next_locked(&guard, Some(pid));
             }
@@ -632,17 +703,9 @@ impl Scheduler {
         None
     }
 
-    /// Periodic load balancing (only run on CPU0 to reduce contention)
-    fn maybe_balance() {
-        if current_cpu_id() != 0 {
-            return;
-        }
-        let tick = BALANCE_TICKER.fetch_add(1, Ordering::Relaxed) + 1;
-        if tick % LOAD_BALANCE_INTERVAL_TICKS != 0 {
-            return;
-        }
-        Self::balance_queues();
-    }
+    // M4-1: `maybe_balance` was REMOVED — its cheap CPU0 cadence check is inlined into
+    // on_clock_tick (which now only sets BALANCE_DUE), and the allocating `balance_queues`
+    // it called runs from reschedule_now's prologue in process context (off the IRQ tick).
 
     /// Migrate a ready task from the busiest CPU to the idlest CPU
     fn balance_queues() {
@@ -695,28 +758,33 @@ impl Scheduler {
             Self::pop_ready_process(&mut guard)
         };
 
-        if let Some((pid, pcb, priority)) = candidate {
+        if let Some((pid, pcb, _priority)) = candidate {
             // R69-3 FIX: Check CPU affinity before migration
             // E.5: Use effective_allowed_cpus for cpuset-aware migration
-            let allowed_cpus = {
+            // M4-1: consume any latched starvation boost HERE (PCB-only block, before any
+            // queue re-lock — preserves the queue->PCB lock order). The migrated task then
+            // lands in its CORRECT (boosted) bucket on the destination CPU; eff_prio replaces
+            // the stale pop `priority`, and the now-cleared flag on the source CPU is harmless.
+            let (allowed_cpus, eff_prio) = {
                 let mut proc = pcb.lock();
                 proc.state = ProcessState::Ready;
                 proc.reset_wait_ticks();
-                Self::effective_allowed_cpus(&proc)
+                let _ = proc.apply_pending_starve_boost();
+                (Self::effective_allowed_cpus(&proc), proc.dynamic_priority)
             };
 
             // Check if destination CPU is allowed by effective mask
             if !Self::cpu_allowed(dst_cpu, allowed_cpus) {
-                // Destination CPU not in affinity mask, put task back
+                // Destination CPU not in affinity mask, put task back (at its effective prio)
                 let mut src_guard = src_queue.lock();
-                src_guard.entry(priority).or_default().insert(pid, pcb);
+                src_guard.entry(eff_prio).or_default().insert(pid, pcb);
                 return;
             }
 
             let target =
                 Self::ready_queue_for_cpu(dst_cpu).unwrap_or_else(|| Self::current_ready_queue());
             let mut dst_guard = target.lock();
-            dst_guard.entry(priority).or_default().insert(pid, pcb);
+            dst_guard.entry(eff_prio).or_default().insert(pid, pcb);
         }
     }
 
@@ -750,6 +818,7 @@ impl Scheduler {
                         pcb.state = ProcessState::Running;
                         pcb.reset_time_slice();
                         pcb.reset_wait_ticks();
+                        pcb.pending_starve_boost = false; // M4-1: claimed to Run -> boost goal met
                         claimed_memory_space = pcb.memory_space;
                         drop(pcb);
                         claimed_proc = Some(proc_arc.clone());
@@ -901,6 +970,18 @@ impl Scheduler {
                             // The lock will be released after this block, but select_next_locked()
                             // won't select Blocked tasks. enqueue_on_cpu() will set state to Ready.
                             proc.state = ProcessState::Blocked;
+                            // R171-M4-1 FIX: consume any latched starvation boost HERE, before
+                            // reading `dynamic_priority` for the (possibly cross-CPU) re-enqueue.
+                            // A task can be `stopped` while still `Ready` with
+                            // `pending_starve_boost` set (latched on its prior CPU just before
+                            // the stop). Re-enqueuing it on a DIFFERENT CPU without applying the
+                            // boost would STRAND the marker: the destination drain's fast-path
+                            // only scans when ITS OWN REBUCKET_BUF has entries, so the boost would
+                            // never apply there. Applying it now (mirrors `migrate_one_ready`)
+                            // both enqueues at the correct boosted bucket key AND upholds the
+                            // invariant that a set marker on a queued task is recorded in that
+                            // CPU's buffer (which makes the drain fast-path sound).
+                            let _ = proc.apply_pending_starve_boost();
                             (
                                 true,
                                 proc.dynamic_priority,
@@ -1079,14 +1160,23 @@ impl Scheduler {
                 }
             }
 
-            // R65-19 FIX: 饥饿防止 - 增加等待进程的等待计数并检查饥饿
-            // R152-3 FIX: Collect re-bucketing operations during iteration,
-            // then apply after iteration to keep BTreeMap keys consistent.
+            // R65-19 / M4-1: starvation DECISION on the tick (alloc-free). Increment
+            // wait_ticks and, on threshold-cross, LATCH a per-PCB pending_starve_boost
+            // marker + record the pid into THIS CPU's const-static hint buffer. NO priority
+            // mutation and NO BTreeMap mutation in IRQ — the bucket MOVE is applied later
+            // under the queue lock in reschedule_now (process context). This keeps the
+            // bucket-key == dynamic_priority invariant intact for steal/select/pop (a
+            // deferred-mutate-in-IRQ form would drift it and double-queue). The marker is
+            // the source of truth; the buffer is only a fast-path hint, so overflow just
+            // sets a flag that triggers a marker-driven full scan at drain (no boost lost).
             {
-                let mut rebucket: alloc::vec::Vec<(Pid, ProcessControlBlock, u8, u8)> =
-                    alloc::vec::Vec::new();
+                let cpu = current_cpu_id();
+                // Safety: this CPU is the SOLE accessor of its REBUCKET_BUF slot and IRQs
+                // are disabled (on_clock_tick runs inside without_interrupts), so there is
+                // no aliasing with the same-CPU drain in reschedule_now.
+                let buf = unsafe { &mut *REBUCKET_BUF[cpu].0.get() };
                 let queue = ready_queue.lock();
-                for (&priority, bucket) in queue.iter() {
+                for (_priority, bucket) in queue.iter() {
                     for (&pid, pcb) in bucket.iter() {
                         // 跳过当前运行的进程
                         if Some(pid) == current_pid {
@@ -1095,44 +1185,33 @@ impl Scheduler {
                         let mut proc = pcb.lock();
                         if proc.state == ProcessState::Ready && !proc.stopped {
                             // R98-1 FIX: Only count non-stopped ready processes for starvation
-                            let old_prio = proc.dynamic_priority;
-                            // 增加等待时间
                             proc.increment_wait_ticks();
-                            // 检查并提升饥饿进程的优先级
-                            proc.check_and_boost_starved();
-                            let new_prio = proc.dynamic_priority;
-                            // R152-3 FIX: Record if priority changed for re-bucketing
-                            if new_prio != old_prio {
-                                rebucket.push((pid, pcb.clone(), priority, new_prio));
+                            if proc.wait_ticks >= kernel_core::process::STARVATION_THRESHOLD {
+                                // R66-4: only a task with headroom below its static priority
+                                // can boost; latch it (the actual boost is APPLIED under the
+                                // queue lock at drain, never here in IRQ).
+                                if proc.base_dynamic_priority > proc.priority
+                                    && !proc.pending_starve_boost
+                                {
+                                    proc.pending_starve_boost = true;
+                                    if buf.len < STARVE_BUF_PIDS {
+                                        buf.pids[buf.len] = pid;
+                                        buf.len += 1;
+                                    } else {
+                                        // Buffer full: the PCB marker still carries the boost;
+                                        // flag a marker-driven full scan at the next drain.
+                                        buf.overflow = true;
+                                    }
+                                }
+                                // Re-arm exactly as check_and_boost_starved does — the reset
+                                // is OUTSIDE the base>priority guard (so a floored / already-
+                                // latched task re-counts cleanly instead of spamming the buf).
+                                proc.wait_ticks = 0;
                             }
                         }
                     }
                 }
                 drop(queue);
-
-                // R152-3 FIX: Apply re-bucketing outside the immutable iteration.
-                // Codex review: Only insert into new bucket if removal from old
-                // bucket succeeded, to prevent double-queueing after migration.
-                if !rebucket.is_empty() {
-                    let mut queue = ready_queue.lock();
-                    for (pid, pcb, old_prio, new_prio) in rebucket {
-                        // Remove from old bucket — if not found, task was
-                        // migrated by load balancer; skip insert to avoid
-                        // double-scheduling on two CPUs.
-                        let removed = if let Some(bucket) = queue.get_mut(&old_prio) {
-                            let r = bucket.remove(&pid).is_some();
-                            if r && bucket.is_empty() {
-                                queue.remove(&old_prio);
-                            }
-                            r
-                        } else {
-                            false
-                        };
-                        if removed {
-                            queue.entry(new_prio).or_default().insert(pid, pcb);
-                        }
-                    }
-                }
             }
 
             // 最后更新 SCHEDULER_STATS
@@ -1141,8 +1220,16 @@ impl Scheduler {
                 stats.total_ticks += 1;
             }
 
-            // R69-1 FIX: Periodic load balancing (only on CPU0)
-            Self::maybe_balance();
+            // M4-1 (PART B): keep the cheap, IRQ-safe load-balance CADENCE on the tick; the
+            // ALLOCATING work (balance_queues Vec + migrate_one_ready BTreeMap inserts) now
+            // runs from reschedule_now's prologue in process context. Just flag CPU0 when the
+            // 64-tick interval elapses (wall-clock cadence preserved).
+            if current_cpu_id() == 0 {
+                let t = BALANCE_TICKER.fetch_add(1, Ordering::Relaxed) + 1; // lint-fetch-add: allow (coarse cadence)
+                if t % LOAD_BALANCE_INTERVAL_TICKS == 0 {
+                    BALANCE_DUE.store(true, Ordering::Relaxed);
+                }
+            }
         });
         // 注意：不再在中断上下文中调用 schedule()
         // 真正的上下文切换需要在受控路径中执行（如系统调用返回或显式调度点）
@@ -1309,8 +1396,77 @@ impl Scheduler {
     /// If not preemptible, defers the reschedule by setting need_resched flag.
     ///
     /// **警告**: 此函数可能不会返回（如果发生上下文切换）
+    /// M4-1: apply this CPU's latched starvation boosts (recorded on the timer tick) to the
+    /// ready queue, in process context under the queue lock. The per-PCB
+    /// `pending_starve_boost` marker is the SOURCE OF TRUTH; the per-CPU buffer is only a
+    /// fast-path hint (so an overflowed buffer never loses a boost). The MARKER-DRIVEN full
+    /// local-queue scan (NOT a blind key-mismatch rescan) applies a boost IFF the marker is
+    /// set: a PI-only-drifted proc (marker false, `dynamic_priority` != bucket key by design)
+    /// is correctly LEFT in place, and a foreign-latched marker (set on CPU X then migrated
+    /// here) is also reconciled. The bucket-REMOVE is keyed off the MEMBERSHIP/iteration key,
+    /// NEVER `pcb.dynamic_priority` (which a PI boost can drift), so the remove never
+    /// silently misses and double-queues. The queue lock is scoped to this fn so it is
+    /// DROPPED before `reschedule_now`'s `schedule()` re-locks the same non-reentrant Mutex.
+    fn drain_starve_rebucket() {
+        let cpu = current_cpu_id();
+        // Safety: same-CPU sole accessor, IRQs disabled (reschedule_now's without_interrupts).
+        let buf = unsafe { &mut *REBUCKET_BUF[cpu].0.get() };
+        if buf.len == 0 && !buf.overflow {
+            return; // fast path: nothing latched on this CPU; no queue lock taken.
+        }
+        // The marker scan below is the authority; consume the buffer header now.
+        buf.len = 0;
+        buf.overflow = false;
+
+        let queue_ref = Self::current_ready_queue();
+        let mut queue = queue_ref.lock();
+        // Collect-then-apply: cannot remove/insert a BTreeMap during its own iteration.
+        // staged = (OLD membership bucket key, pid, NEW effective priority).
+        let mut staged: alloc::vec::Vec<(Priority, Pid, Priority)> = alloc::vec::Vec::new();
+        for (&bucket_key, bucket) in queue.iter() {
+            for (&pid, pcb) in bucket.iter() {
+                let mut p = pcb.lock();
+                if p.apply_pending_starve_boost() {
+                    staged.push((bucket_key, pid, p.dynamic_priority));
+                }
+            }
+        }
+        for (old_key, pid, new_eff) in staged {
+            // Only re-insert if the remove from the OLD (membership) bucket succeeded — guards
+            // against a task the balancer concurrently migrated away (R152-3 `removed` guard).
+            let removed = if let Some(bucket) = queue.get_mut(&old_key) {
+                let pcb = bucket.remove(&pid);
+                if bucket.is_empty() {
+                    queue.remove(&old_key);
+                }
+                pcb
+            } else {
+                None
+            };
+            if let Some(pcb) = removed {
+                queue.entry(new_eff).or_default().insert(pid, pcb);
+            }
+        }
+    }
+
     pub fn reschedule_now(force: bool) {
         interrupts::without_interrupts(|| {
+            // M4-1: drain this CPU's deferred starvation re-buckets + run any DUE load
+            // balance, in process context. IRQs are disabled here, but this is NOT an IRQ
+            // handler — the timer IRQ no longer allocates, so the global allocator lock can
+            // never be held by an interrupted context on this CPU, making allocation here
+            // safe (the whole point of M4-1). Placed BEFORE the need_resched early-return so
+            // an idle CPU (whose idle loop calls reschedule_if_needed -> reschedule_now every
+            // iteration) keeps draining + balancing even when no switch is needed. SAFE on
+            // the force_reschedule IRQ-return path too: that path is gated on returning_to_user
+            // (RPL==3), so the interrupted context was ring-3 and cannot hold the kernel heap
+            // lock. (A future KERNEL-MODE force_reschedule-in-IRQ caller would reintroduce a
+            // Vec-alloc-in-IRQ deadlock here — that RPL==3 precondition is load-bearing.)
+            Self::drain_starve_rebucket();
+            if current_cpu_id() == 0 && BALANCE_DUE.swap(false, Ordering::Relaxed) {
+                Self::balance_queues();
+            }
+
             // R67-4 FIX: Check and clear this CPU's need_resched flag
             if !force && !current_cpu().clear_need_resched() {
                 return;
@@ -1557,8 +1713,22 @@ impl Scheduler {
     }
 }
 
+/// M4-1: force-init the scheduler's per-CPU CpuLocal statics (READY_QUEUE,
+/// CURRENT_PROCESS, NEXT_CONTEXT_SHADOW) so the first AP timer tick never lazily
+/// heap-allocates a slab in IRQ (the R151-5 deadlock class). Called from init() BEFORE
+/// register_timer_callback wires on_clock_tick — the only path that touches these statics.
+fn force_init_sched_locals() {
+    READY_QUEUE.force_init();
+    CURRENT_PROCESS.force_init();
+    NEXT_CONTEXT_SHADOW.force_init();
+}
+
 /// 初始化调度器
 pub fn init() {
+    // M4-1 (force-init): pre-allocate the scheduler per-CPU statics BEFORE
+    // register_timer_callback (below) wires on_clock_tick into the timer ISR.
+    force_init_sched_locals();
+
     // 注册进程清理回调，确保进程终止时调度器同步更新
     process::register_cleanup_notifier(Scheduler::remove_process);
 

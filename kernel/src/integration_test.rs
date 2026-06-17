@@ -154,6 +154,61 @@ pub fn test_cgroup_pt_kmem() {
     kernel_core::cgroup::run_cgroup_pt_kmem_self_test();
     klog_always!("    ✓ forced soft-cap PT charge + ancestor propagation + bounded overshoot");
     klog_always!("    ✓ hard DATA gate re-enforces + root NOT exempt + migration transfer + fork==exit + saturating");
+    klog_always!("    ✓ M2-1 SLICE-2: mem_pinned origin-pin telescopes (charge/migrate/rollback/fork==exit) + over-uncharge tripwire (matched seq==0, step-8 trips)");
+    // M2-1 SLICE-2 (co-residency GAP): the migration source-unpin is
+    // PER-PROCESS-EXACT when >1 process shares the source cgroup — migrating ONE
+    // leaves the others' pins intact (mem_pinned(S)==Y, not 0, not floored), and
+    // the saturating floor NEVER fires (over-uncharge tripwire stays 0). This is
+    // the only case where a floored aggregate could mask a stranded co-resident.
+    kernel_core::cgroup::run_cgroup_mem_pinned_coresidency_self_test();
+    klog_always!("    ✓ M2-1 SLICE-2 co-residency: single-process migrate out of N co-resident PIDs unpins EXACTLY its share (floor never fires, tripwire==0)");
+    // M2-1 SLICE-2 (exec/exit-AFTER-migrate GAP): the old image charged to A,
+    // migrated A->B, is uncharged at B (proc.cgroup_id re-read post-migration) by
+    // EXACTLY the migrated amount — the migrate source drains A to 0 (pre==n) and
+    // the four-term exec-replace / wholesale exit / ExecSpaceGuard-rollback unpin
+    // finds a LIVE re-homed pin at B (tripwire==0), proving B's unpin found a live
+    // pin == X — a TRUE re-home, not a floored over-unpin masking an A-vs-B mismatch.
+    kernel_core::cgroup::run_cgroup_mem_pinned_exec_after_migrate_self_test();
+    klog_always!("    ✓ M2-1 SLICE-2 exec/exit-after-migrate: charge A -> migrate A->B -> uncharge X at B unpins B (not A) by exactly X (4-term + wholesale, floor never fires)");
+    // M2-1 SLICE-2 (abnormal-clone-abort teardown GAP): a non-CLONE_VM clone child
+    // aborted POST-fork-charge via terminate_process + cleanup_zombie (LSM-fork
+    // denial / namespace-translation failure, syscall.rs:3196-3243) drains the
+    // fork-charge-to-parent lump through free_process_resources' four-term exit
+    // uncharge (process.rs:4318/4330/4336/4358) at proc.cgroup_id == parent_cgroup_id
+    // (the never-scheduled child never migrated). The fork lump (1 add) telescopes
+    // to 0 against the abnormal four-term teardown (4 subs) at the SAME origin, and
+    // the over-uncharge tripwire stays 0 — proving each exit leg found a LIVE pin
+    // == its term (NO FA-09 strand), the gate-independent witness the SLICE-3 flip
+    // requires for this teardown window.
+    kernel_core::cgroup::run_cgroup_mem_pinned_clone_abort_self_test();
+    klog_always!("    ✓ M2-1 SLICE-2 abnormal-clone-abort: fork lump charged to parent -> terminate_process/cleanup_zombie 4-term drain telescopes to 0 (floor never fires, tripwire==0)");
+    // M2-1 SLICE-3 (R171-S-R170-2-01 / D-R170-DELETE-GATE-LEAF closure): the
+    // delete_cgroup MEMORY leg now samples the origin-keyed `mem_pinned` witness,
+    // not the controller-gated display counter `memory_current`. A MEMORY-disabled
+    // leaf with a live keyed charge (memory_current==0 but mem_pinned>0) is held
+    // undeletable until reconciled, then deletes cleanly — closing the silent
+    // bare-id ancestor strand. Matched sequence telescopes (tripwire==0).
+    kernel_core::cgroup::run_cgroup_mem_pinned_delete_gate_self_test();
+    klog_always!("    ✓ M2-1 SLICE-3 delete-gate: MEMORY-disabled leaf pins origin (display 0) + delete EBUSY until uncharge -> then deletes (tripwire==0)");
+    // R171-CG1x0 (M2-1 SLICE-0): the frame-identity ledger reconcile — the
+    // anti-bypass core that makes sys_munmap uncharge a reclaimed PT frame IFF
+    // this AS charged it (an UNCHARGED brk/ELF frame is never debited; mprotect
+    // Path-A is charged as of M2-1 SLICE-4a).
+    kernel_core::process::run_pt_ledger_self_test();
+    klog_always!("    ✓ R171-CG1x0 PT ledger: debit IFF charged (no cross-origin memory.max bypass) + saturating double-reclaim + empty-ledger no-op");
+    // M2-1 SLICE-4a: mprotect Path-A (PROT_NONE->real) now charges + ledgers the
+    // PT/PD frames it materializes, via MmState::record_pt_charge (the unit-tested
+    // mirror of the sys_mmap Phase-3 fold). Asserts I' on the ledgered branch +
+    // the telescoping round-trip through the real pt_ledger_reconcile.
+    kernel_core::process::run_record_pt_charge_self_test();
+    klog_always!("    ✓ M2-1 SLICE-4a: record_pt_charge folds PT charge (I' preserved, charge==reclaim telescope, inherited-basis coexist) — mprotect Path-A PT kmem now on-budget");
+    // M2-1 SLICE-4b: the LOAD-BEARING DATA/PT split in RecordingFrameAllocator — the
+    // inherent allocate_data_frame leaves the ledger untouched (heap / ELF DATA pages),
+    // while the trait allocate_frame (map_page's intermediate-table path) records by
+    // frame identity. Guards the brk-grow / exec DATA/PT swap against a ~512x over-charge
+    // + ledger corruption (the single most error-prone seam of SLICE-4).
+    kernel_core::syscall::run_recording_frame_allocator_split_self_test();
+    klog_always!("    ✓ M2-1 SLICE-4b: RecordingFrameAllocator DATA/PT split (allocate_data_frame unrecorded, trait allocate_frame records by identity) — brk-grow PT kmem now on-budget");
 }
 
 /// Test the Phase J.2 item 8 per-cgroup ephemeral-port budget (`ports.max`).

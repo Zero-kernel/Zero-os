@@ -698,16 +698,43 @@ impl CgroupCtrlInode {
                 // physical memory still mapped, enabling memory.max bypass.
                 // Note: must NOT hold proc.lock() when calling
                 // address_space_share_count (it acquires PROCESS_TABLE lock).
+                let memory_space = proc.lock().memory_space;
+                if memory_space != 0
+                    && process::address_space_share_count(memory_space) > 1
                 {
-                    let memory_space = proc.lock().memory_space;
-                    if memory_space != 0
-                        && process::address_space_share_count(memory_space) > 1
-                    {
-                        return Err(FsError::Busy);
-                    }
+                    return Err(FsError::Busy);
                 }
 
-                // Migrate task from old cgroup to this cgroup (atomic detach+attach)
+                // R171 M2-1 SLICE-1 FIX + migrate_task lock-discipline
+                // (cgroup.rs:1909 "hold the target Process lock across migrate_task"):
+                // hold the Process lock across the ENTIRE migration window
+                // (re-verify + exec gate + migrate_task + charge transfer + cgroup_id
+                // update), mirroring sys_cgroup_attach (R155-5). The prior code called
+                // migrate_task BEFORE taking proc_guard, which (a) violated
+                // migrate_task's documented contract and (b) let a cgroup re-home
+                // interleave an exec's lock-dropped load_elf charge window (the SLICE-1
+                // bug). Hold the snapshot+update under one lock as before; just acquire
+                // it one step earlier so the membership move is covered too.
+                let mut proc_guard = proc.lock();
+                // Re-verify memory_space under the held lock — exec/clone could have
+                // changed it between the share-count check (lock-free) and here.
+                if proc_guard.memory_space != memory_space {
+                    return Err(FsError::Busy);
+                }
+                // SLICE-1: refuse to re-home a task mid-`sys_exec`. Its load_elf
+                // charge (to the exec-time snapshot cgroup, Process lock dropped) must
+                // not race this membership move. Bounded exec window → retry.
+                // NOTE: this surfaces as EBUSY (FsError has no EAGAIN variant), where
+                // the sibling `sys_cgroup_attach` syscall path returns EAGAIN for the
+                // same condition — both are transient "retry" signals; the differing
+                // errno is a pre-existing cgroupfs-vs-syscall vocabulary split, not a
+                // semantic difference.
+                if proc_guard.exec_in_progress {
+                    return Err(FsError::Busy);
+                }
+
+                // Migrate task from old cgroup to this cgroup (atomic detach+attach),
+                // now UNDER the held Process lock.
                 cgroup::migrate_task(pid_num, old_cgroup_id, self.cgroup_id)
                     .map_err(|e| match e {
                         CgroupError::PidsLimitExceeded => FsError::NoSpace,
@@ -720,13 +747,8 @@ impl CgroupCtrlInode {
                 // destination cgroup. Without this, exit-time uncharge targets
                 // the wrong cgroup (destination instead of source), causing
                 // permanent memory_current leak in the source and undercount
-                // in the destination.
-                //
-                // Hold the process lock across both charge snapshot and
-                // cgroup_id update to prevent the target process from changing
-                // its memory footprint (mmap/munmap/brk/exec) between the two
-                // operations (Codex review finding: mutation race window).
-                let mut proc_guard = proc.lock();
+                // in the destination. The snapshot + transfer + cgroup_id update
+                // stay under the SAME `proc_guard` acquired above.
                 let total_charged_bytes =
                     process::compute_cgroup_charged_bytes(&proc_guard);
 
