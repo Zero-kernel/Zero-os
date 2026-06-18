@@ -1085,6 +1085,32 @@ pub struct Process {
     /// The PCB marker — not the per-CPU hint buffer — is the source of truth, so an
     /// overflowed buffer never loses a boost.
     pub pending_starve_boost: bool,
+
+    /// M4-1b: per-PCB socket-wait timeout marker (replaces the global heap
+    /// `SocketWaiters.timed_out: BTreeMap` whose `insert` allocated a node in
+    /// TIMER-IRQ context — the R151-5 deadlock class). Packed encoding:
+    /// `0` == no marker; otherwise `(generation << 1) | 1` (low tag bit makes 0
+    /// an unambiguous sentinel). SET (`store(packed, Release)`) strictly BEFORE
+    /// `state = Ready`, both inside the SAME held proc-lock critical section, by
+    /// the timer-IRQ / inline path that itself performs the Blocked->Ready wake.
+    /// CONSUMED by the waiter's own epilogue via `swap(0, AcqRel)` under the proc
+    /// lock. The proc-lock release/acquire hand-off — NOT the atomic ordering — is
+    /// the marker-before-wake synchronizing edge (every `state` reader holds the
+    /// proc lock). Re-zeroed at every wait ENTRY (born-clean), so a marker for one
+    /// wait can never surface in the next wait of the same PCB. RESIDUAL: the
+    /// `(gen<<1)|1` pack aliases generations differing by exactly 2^63 (top bit
+    /// shifted out) — unreachable within a sub-tick consume window.
+    pub socket_timeout_marker: AtomicU64,
+
+    /// M4-1b: per-PCB WaitQueue timeout marker — twin of `socket_timeout_marker`
+    /// for the `ipc::sync::WaitQueue` path (replaces the per-queue heap
+    /// `WaitQueue.timed_out: Mutex<BTreeMap>` whose IRQ `insert` allocated). A
+    /// SEPARATE field because the two subsystems own INDEPENDENT, non-comparable
+    /// generation counters (socket `next_generation` starts at 1; per-queue
+    /// `wait_generation` starts at 0); a task blocks on exactly one primitive so
+    /// the two fields are never both live. Same encoding / ordering / entry-clear
+    /// contract as `socket_timeout_marker`.
+    pub wq_timeout_marker: AtomicU64,
 }
 
 impl Process {
@@ -1107,6 +1133,8 @@ impl Process {
             dynamic_priority: priority,
             base_dynamic_priority: priority, // E.4 PI: starts same as dynamic_priority
             pending_starve_boost: false,     // M4-1: no latched starvation boost at birth
+            socket_timeout_marker: AtomicU64::new(0), // M4-1b: born-clean, no timeout pending
+            wq_timeout_marker: AtomicU64::new(0),     // M4-1b: born-clean, no timeout pending
             pi_boosts: BTreeMap::new(),       // E.4 PI: no boosts initially
             waiting_on_futex: None,           // E.4 PI: not waiting on any futex
             time_slice: calculate_time_slice(priority),
@@ -3414,6 +3442,138 @@ pub fn wait_should_abort(pid: ProcessId) -> bool {
         Some(arc) => arc.lock().pending_kill.load(Ordering::Acquire),
         None => false,
     }
+}
+
+/// M4-1b: pack a wait generation into a per-PCB timeout marker.
+///
+/// `0` is the "no marker" sentinel; a live marker is `(generation << 1) | 1`.
+/// The low tag bit makes `0` unambiguous even when the generation itself is 0
+/// (the `ipc::sync::WaitQueue` `wait_generation` counter starts at 0). The top
+/// bit is shifted out, so two generations differing by exactly 2^63 alias —
+/// unreachable within the sub-tick window a marker lives.
+#[inline]
+pub fn pack_timeout_marker(generation: u64) -> u64 {
+    (generation << 1) | 1
+}
+
+/// M4-1b: atomically read-and-clear a per-PCB timeout marker, applying the exact
+/// generation semantics of the retired `consume_timeout` / `consume_timeout_flag`
+/// BTreeMap helpers.
+///
+/// `swap(0, AcqRel)` is a single op (no load-then-store TOCTOU): it ALWAYS clears
+/// any residue — reproducing the old `stored <= expected => remove` stale-drop —
+/// and reports a timeout ONLY on an exact `(packed >> 1) == expected` match
+/// (a stored generation `> expected` is impossible: one in-flight wait per PCB).
+/// The caller MUST hold the proc lock across this swap (it is the synchronizing
+/// edge that pairs with the IRQ-side store-under-proc-lock); any future lock-free
+/// reader of the field must add its own Acquire.
+#[inline]
+fn consume_timeout_marker(field: &AtomicU64, expected: u64) -> bool {
+    let raw = field.swap(0, Ordering::AcqRel);
+    if raw & 1 == 0 {
+        return false; // no marker
+    }
+    (raw >> 1) == expected
+}
+
+/// M4-1b: consume the per-PCB SOCKET-wait timeout marker for `pid`.
+///
+/// Process-context ONLY: it takes PROCESS_TABLE via `get_process` and then the
+/// proc lock. NEVER call from IRQ / timer-tick context — a blocking PROCESS_TABLE
+/// acquire in IRQ is the very R151-5 deadlock class this item is reducing. All
+/// callers are socket-wait epilogues (process context). Returns true iff a
+/// timeout for exactly this `(pid, expected)` wait was pending; clears the marker
+/// either way.
+pub fn consume_socket_timeout(pid: ProcessId, expected: u64) -> bool {
+    match get_process(pid) {
+        Some(arc) => consume_timeout_marker(&arc.lock().socket_timeout_marker, expected),
+        None => false,
+    }
+}
+
+/// M4-1b: consume the per-PCB WaitQueue timeout marker for `pid` (twin of
+/// `consume_socket_timeout`). Process-context ONLY — same PROCESS_TABLE-in-IRQ
+/// prohibition. All callers are `WaitQueue::wait_with_timeout` epilogues.
+pub fn consume_wq_timeout(pid: ProcessId, expected: u64) -> bool {
+    match get_process(pid) {
+        Some(arc) => consume_timeout_marker(&arc.lock().wq_timeout_marker, expected),
+        None => false,
+    }
+}
+
+/// M4-1b: in-kernel self-test for the per-PCB timeout-marker mechanism. The
+/// marker logic is invisible to a green build/boot (no boot test drives a real
+/// timeout-vs-wake cross-field race), so this is the tripwire for the high-value
+/// mis-wires: a bare-generation encoding that aliases wq-gen-0 with "no marker",
+/// a missing `swap` on some exit path (a leak across waits), a wrong-field read,
+/// or a broken exact-generation compare. Panics on failure; surfaced by
+/// `make test` / `make boot-check` via the serial log.
+pub fn run_timeout_marker_self_test() {
+    // (1) ENCODING / SENTINEL: pack(0) must NOT be 0 (else wq generation 0 would
+    // be indistinguishable from "no marker"); the tag bit must round-trip.
+    assert_eq!(pack_timeout_marker(0), 1, "pack(0) must set the tag bit, != 0");
+    assert_eq!(pack_timeout_marker(5), 11, "pack(5) == (5<<1)|1");
+    assert_eq!(pack_timeout_marker(0) >> 1, 0, "decode(pack(0)) == 0");
+    assert_eq!(pack_timeout_marker(5) >> 1, 5, "decode(pack(5)) == 5");
+
+    let field = AtomicU64::new(0);
+
+    // (2) EXACT-GEN + TOTAL STALE-DROP (reproduces old `<=`-clears + `==`-reports):
+    field.store(pack_timeout_marker(5), Ordering::Relaxed);
+    assert!(!consume_timeout_marker(&field, 7), "stored 5, expect 7 => not timed out");
+    assert_eq!(field.load(Ordering::Relaxed), 0, "stale-low residue is cleared by swap");
+    field.store(pack_timeout_marker(5), Ordering::Relaxed);
+    assert!(consume_timeout_marker(&field, 5), "stored 5, expect 5 => timed out");
+    assert_eq!(field.load(Ordering::Relaxed), 0, "exact match clears the marker");
+    field.store(pack_timeout_marker(5), Ordering::Relaxed);
+    assert!(!consume_timeout_marker(&field, 3), "stored 5, expect 3 => not timed out (no panic)");
+    assert_eq!(field.load(Ordering::Relaxed), 0, "stale-high-than-expected residue cleared");
+
+    // (3) NO MARKER: a never-set field consumes to false without underflow.
+    assert!(!consume_timeout_marker(&field, 0), "absent marker => false (gen 0)");
+    assert!(!consume_timeout_marker(&field, 42), "absent marker => false");
+
+    // (4) NO-LEAK ACROSS SEQUENTIAL WAITS: wait A times out and is consumed;
+    // wait B never times out and MUST observe a clean field (Woken, not a stale
+    // TimedOut from A).
+    field.store(pack_timeout_marker(100), Ordering::Relaxed); // wait A's timer fires
+    assert!(consume_timeout_marker(&field, 100), "wait A reports TimedOut");
+    assert!(!consume_timeout_marker(&field, 101), "wait B (no timer) reports Woken, no leak");
+
+    // (5) ENTRY-CLEAR neutralizes any residue (the born-clean belt).
+    field.store(pack_timeout_marker(7), Ordering::Relaxed);
+    field.store(0, Ordering::Relaxed); // entry-clear
+    assert_eq!(field.load(Ordering::Relaxed), 0, "entry-clear zeroes the field");
+    assert!(!consume_timeout_marker(&field, 7), "post entry-clear: no timeout");
+
+    // (6) TWO-FIELD ISOLATION: consuming the socket field must NOT disturb the wq
+    // field — catches a copy-paste wrong-field read between the two markers.
+    let socket_field = AtomicU64::new(pack_timeout_marker(9));
+    let wq_field = AtomicU64::new(pack_timeout_marker(9));
+    assert!(consume_timeout_marker(&socket_field, 9), "socket field consumes");
+    assert_eq!(socket_field.load(Ordering::Relaxed), 0, "socket field cleared");
+    assert_eq!(
+        wq_field.load(Ordering::Relaxed),
+        pack_timeout_marker(9),
+        "wq field UNTOUCHED by socket consume (two independent fields)"
+    );
+    assert!(consume_timeout_marker(&wq_field, 9), "wq field still consumable");
+
+    // (7) FORK CLEANLINESS: a freshly constructed PCB is born-clean on both fields
+    // (defends the fork.rs explicit-zero + Process::new default).
+    let child = Process::new(424242, 1, String::from("m4_1b_selftest"), 10);
+    assert_eq!(
+        child.socket_timeout_marker.load(Ordering::Relaxed),
+        0,
+        "child socket marker born-clean"
+    );
+    assert_eq!(
+        child.wq_timeout_marker.load(Ordering::Relaxed),
+        0,
+        "child wq marker born-clean"
+    );
+
+    kprintln!("[selftest] run_timeout_marker_self_test: OK (M4-1b)");
 }
 
 pub fn drain_deferred_irq_terminates() {

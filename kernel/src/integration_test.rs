@@ -209,6 +209,14 @@ pub fn test_cgroup_pt_kmem() {
     // + ledger corruption (the single most error-prone seam of SLICE-4).
     kernel_core::syscall::run_recording_frame_allocator_split_self_test();
     klog_always!("    ✓ M2-1 SLICE-4b: RecordingFrameAllocator DATA/PT split (allocate_data_frame unrecorded, trait allocate_frame records by identity) — brk-grow PT kmem now on-budget");
+    // M4-1b: the per-PCB wait-timeout markers that replaced the two TIMER-IRQ-
+    // allocating `timed_out` BTreeMaps (check_socket_timeouts + WaitQueue::timeout_wake).
+    // Exercises the (gen<<1)|1 sentinel (wq gen-0 disambiguation), the swap-to-clear
+    // exact-generation consume (stale-drop + exact-report), no-leak-across-waits,
+    // entry-clear, two-field isolation, and fork born-clean — the mis-wires a green
+    // build/boot cannot catch (no test drives a real timeout-vs-wake cross-field race).
+    kernel_core::process::run_timeout_marker_self_test();
+    klog_always!("    ✓ M4-1b: per-PCB timeout markers (packed sentinel + swap-to-clear exact-gen + no-leak + entry-clear + two-field isolation + fork born-clean) — IRQ marker INSERT alloc removed from both timer callbacks");
 }
 
 /// Test the Phase J.2 item 8 per-cgroup ephemeral-port budget (`ports.max`).
