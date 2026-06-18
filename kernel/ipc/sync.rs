@@ -7,7 +7,7 @@
 //!
 //! 这些原语是管道、消息队列阻塞操作的基础
 
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel_core::process::{self, ProcessId, ProcessState};
@@ -66,8 +66,10 @@ static WAITQUEUE_TIMER_INIT: AtomicBool = AtomicBool::new(false);
 ///
 /// # R39-6 FIX: 超时支持
 ///
-/// 添加 `timed_out` 集合记录因超时被唤醒的进程，
-/// 用于区分正常唤醒与超时唤醒。
+/// 超时唤醒与正常唤醒的区分通过每-PCB 的 `Process.wq_timeout_marker`
+/// 标记完成（M4-1b：取代了原先在定时器 IRQ 中分配堆节点的 `timed_out`
+/// 集合）。标记在 `timeout_wake` 的 Blocked->Ready 过程中、持有 proc 锁时
+/// 写入，由等待者自身的 epilogue 经 `process::consume_wq_timeout` 消费。
 pub struct WaitQueue {
     /// 等待的进程ID列表
     /// R165-4 FIX: Each waiter is tagged with the `wait_with_timeout` generation
@@ -78,10 +80,13 @@ pub struct WaitQueue {
     waiters: Mutex<VecDeque<(ProcessId, u64)>>,
     /// 当为 true 时不再接受新的等待者（用于端点销毁时取消阻塞）
     closed: AtomicBool,
-    /// R164-10 FIX: Timeout entries tagged with (PID, generation) to prevent
-    /// PID reuse misclassification. A stale entry from a dead process whose
-    /// PID was recycled cannot match the new process's generation.
-    timed_out: Mutex<BTreeMap<ProcessId, u64>>,
+    // M4-1b: the former `timed_out: Mutex<BTreeMap<ProcessId, u64>>` was removed —
+    // its `insert` allocated a node in TIMER-IRQ context (`timeout_wake`, the
+    // R151-5 deadlock class). The timeout marker now lives per-PCB in
+    // `Process.wq_timeout_marker`, set under the proc lock at the Blocked->Ready
+    // transition and consumed by the waiter's epilogue via
+    // `process::consume_wq_timeout`. The marker dies with the PCB, so no per-queue
+    // map and no exit-time prune are needed.
     /// Monotonic generation counter, incremented on each wait_with_timeout call.
     wait_generation: AtomicU64,
 }
@@ -92,7 +97,6 @@ impl WaitQueue {
         WaitQueue {
             waiters: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
-            timed_out: Mutex::new(BTreeMap::new()),
             wait_generation: AtomicU64::new(0),
         }
     }
@@ -187,6 +191,20 @@ impl WaitQueue {
             // 将进程状态设为阻塞
             if let Some(proc_arc) = process::get_process(pid) {
                 let mut proc = proc_arc.lock();
+                // M4-1b: entry-clear (born-clean). The prior wait's epilogue swap
+                // should already have zeroed this; the debug_assert is the tripwire
+                // and the store is the belt so a future exit path that forgets to
+                // consume can never leak a stale incomparable generation (the wq
+                // marker is one field shared across ALL WaitQueues, each with its own
+                // gen counter) into THIS wait. Must precede Blocked (the IRQ
+                // timeout-set only fires on a Blocked, still-queued entry); the whole
+                // enqueue+block runs under IRQs-off, so no marker can be set between
+                // the enqueue above and this clear.
+                debug_assert!(
+                    proc.wq_timeout_marker.load(Ordering::Relaxed) == 0,
+                    "M4-1b: wq_timeout_marker not born-clean at wait entry"
+                );
+                proc.wq_timeout_marker.store(0, Ordering::Relaxed);
                 proc.state = ProcessState::Blocked;
             }
 
@@ -287,16 +305,26 @@ impl WaitQueue {
                         // stale entry.
                         let was_blocked = proc.state == ProcessState::Blocked;
                         if was_blocked {
+                            // M4-1b: SET the per-PCB wq marker (Release) STRICTLY
+                            // BEFORE state=Ready, both inside THIS held proc-lock
+                            // critical section — the proc-lock release/acquire hand-off
+                            // (NOT the Release on the atomic) is the marker-before-wake
+                            // edge every `state` reader honors. Replaces the
+                            // IRQ-allocating `self.timed_out.lock().insert` (R151-5
+                            // heap-alloc-in-IRQ class) that previously ran AFTER
+                            // drop(proc), which ALSO closes the old Ready-before-marker
+                            // visibility gap. Tagged with the waiter's OWN generation
+                            // (from the timer record); the epilogue consume requires an
+                            // exact match.
+                            proc.wq_timeout_marker.store(
+                                process::pack_timeout_marker(generation),
+                                Ordering::Release,
+                            );
                             proc.state = ProcessState::Ready;
                         }
                         drop(proc);
                         waiters.remove(pos);
                         drop(waiters);
-                        if was_blocked {
-                            // Tag with the waiter's OWN generation (from the timer
-                            // record); consume_timeout_flag requires an exact match.
-                            self.timed_out.lock().insert(pid, generation);
-                        }
                         true
                     } else {
                         // Contended (e.g. a concurrent wake holds the process lock).
@@ -314,15 +342,15 @@ impl WaitQueue {
     // it without reporting a timeout. A stored generation greater than expected
     // is impossible (a single PID cannot have two concurrent waits). Tightening
     // R164-10's `>=` to `==` closes the spurious-ETIMEDOUT path.
+    //
+    // M4-1b: the marker now lives per-PCB in `Process.wq_timeout_marker`;
+    // `process::consume_wq_timeout` does the swap-to-clear with the SAME exact-gen
+    // semantics (stored != expected => false + cleared; == => true). It is
+    // process-context-only (blocking PROCESS_TABLE); all callers below are wait
+    // epilogues. The proc lock it takes is the synchronizing edge that pairs with
+    // the IRQ-side store-under-proc-lock.
     fn consume_timeout_flag(&self, pid: ProcessId, expected_gen: u64) -> bool {
-        let mut set = self.timed_out.lock();
-        if let Some(&stored_gen) = set.get(&pid) {
-            if stored_gen <= expected_gen {
-                set.remove(&pid);
-                return stored_gen == expected_gen;
-            }
-        }
-        false
+        process::consume_wq_timeout(pid, expected_gen)
     }
 
     /// R156-6 FIX: Remove stale entries for an exiting process.
@@ -330,8 +358,9 @@ impl WaitQueue {
         interrupts::without_interrupts(|| {
             let mut waiters = self.waiters.lock();
             waiters.retain(|&(p, _)| p != pid);
-            drop(waiters);
-            self.timed_out.lock().remove(&pid);
+            // M4-1b: no `timed_out` map to prune — the per-PCB `wq_timeout_marker`
+            // dies with the PCB. The `waiters` membership retain stays (a stale
+            // deque entry for a dead PID is still reachable by wake_one/timeout_wake).
         });
     }
 
@@ -973,9 +1002,19 @@ const MAX_TIMEOUTS_PER_TICK: usize = 16;
 ///
 /// # Codex Review Fix
 ///
-/// Use fixed-size stack array instead of Vec to avoid heap allocation
-/// in IRQ context. MAX_TIMEOUTS_PER_TICK limits how many timeouts
-/// are processed per tick; excess will be caught in next tick.
+/// Uses fixed-size stack arrays (`expired` / `retry`) instead of a per-tick Vec
+/// to bound IRQ work; MAX_TIMEOUTS_PER_TICK caps timeouts per tick (excess is
+/// caught next tick).
+///
+/// # M4-1b RESIDUAL (out of scope, tracked as M4-1c)
+///
+/// This is NOT yet fully alloc-free in IRQ: the retry re-insertion below
+/// (`waits.push(*w)` into the `TIMED_WAITERS: Vec`) can grow-realloc under the
+/// global heap lock when a `timeout_wake` defers on proc-lock contention — the
+/// same R151-5 dealloc/alloc-in-IRQ class. M4-1b only removed the per-timeout
+/// marker INSERT (the deleted `WaitQueue.timed_out` BTreeMap). M4-1c will
+/// pre-reserve `TIMED_WAITERS` to a high-water cap in the process-context
+/// register path so this re-push never reallocs.
 fn process_waitqueue_timeouts(now_ticks: u64) {
     let mut expired: [Option<TimedWaiter>; MAX_TIMEOUTS_PER_TICK] = [None; MAX_TIMEOUTS_PER_TICK];
     let count = {
