@@ -197,6 +197,11 @@ pub fn reschedule_if_needed() {
     // R149-1 FIX: Drain deferred stdin wakes from keyboard/serial IRQ.
     crate::syscall::drain_deferred_stdin_wakes();
 
+    // M4-1c: reap empty socket wait-queue BTreeMap nodes that the timer IRQ
+    // (check_timeouts) deferred out of IRQ context (R151-5 dealloc class). Lock-free
+    // fast-path + try_lock, so this is cheap when nothing emptied and never blocks.
+    crate::syscall::drain_socket_waiter_cleanup();
+
     // R155-6 FIX: Drain deferred IRQ terminations in process context.
     crate::process::drain_deferred_irq_terminates();
 

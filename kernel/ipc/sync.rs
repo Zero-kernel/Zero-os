@@ -9,7 +9,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use kernel_core::process::{self, ProcessId, ProcessState};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
@@ -998,63 +998,265 @@ fn cancel_timed_wait(queue: usize, pid: ProcessId) {
 /// Maximum number of timeouts to process per tick (prevents allocation in IRQ context)
 const MAX_TIMEOUTS_PER_TICK: usize = 16;
 
-/// 处理超时的等待者
+/// M4-1c: rotating scan cursor for `drain_expired_timeouts`.
 ///
-/// # Codex Review Fix
+/// Round-robin starting offset so that under sustained `timeout_wake` contention
+/// the same front-of-`TIMED_WAITERS` entries are not re-tried every tick while
+/// later expired waiters starve. This preserves the fairness the old
+/// remove-then-repush-to-tail had (Codex requirement-align A2), without the
+/// IRQ-context `Vec::push`. Accessed ONLY under the `TIMED_WAITERS` lock (Phase 1),
+/// so plain `Relaxed` is sound (the lock orders it). Kept bounded < 2*len by the
+/// `% len` on load and the `start + examined` store (both < len each).
+static WQ_TIMEOUT_SCAN_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+/// M4-1c: pure, testable core of the WaitQueue timeout drain (copy-don't-remove).
 ///
-/// Uses fixed-size stack arrays (`expired` / `retry`) instead of a per-tick Vec
-/// to bound IRQ work; MAX_TIMEOUTS_PER_TICK caps timeouts per tick (excess is
-/// caught next tick).
+/// # Codex Review Fix (M4-1b) + M4-1c CLOSURE
 ///
-/// # M4-1b RESIDUAL (out of scope, tracked as M4-1c)
+/// Uses fixed-size stack arrays (`expired` / `woke`) instead of a per-tick Vec to
+/// bound IRQ work; `MAX_TIMEOUTS_PER_TICK` caps timeouts per tick (excess is caught
+/// the next tick). M4-1c closes the last IRQ heap residual: the former Phase-3
+/// retry `waits.push(*w)` could grow-REALLOC `TIMED_WAITERS: Vec` under the global
+/// heap lock in the timer IRQ (R151-5 alloc-in-IRQ). The drain now COPIES expired
+/// entries (no removal) in Phase 1, wakes them in Phase 2, and removes ONLY the
+/// completed ones by exact `(queue, pid, generation)` via `Vec::retain` in Phase 3.
+/// The timer-IRQ path therefore performs NO `Vec::push` and NO dealloc —
+/// `Vec::retain`/`Vec::remove` never shrink capacity (std guarantee) and
+/// `TimedWaiter` is `Copy`. The only Vec growth is the process-context
+/// `register_timed_wait` push.
 ///
-/// This is NOT yet fully alloc-free in IRQ: the retry re-insertion below
-/// (`waits.push(*w)` into the `TIMED_WAITERS: Vec`) can grow-realloc under the
-/// global heap lock when a `timeout_wake` defers on proc-lock contention — the
-/// same R151-5 dealloc/alloc-in-IRQ class. M4-1b only removed the per-timeout
-/// marker INSERT (the deleted `WaitQueue.timed_out` BTreeMap). M4-1c will
-/// pre-reserve `TIMED_WAITERS` to a high-water cap in the process-context
-/// register path so this re-push never reallocs.
-fn process_waitqueue_timeouts(now_ticks: u64) {
+/// `wake(tw) -> true` means the waiter completed (woken / stale / process-gone) and
+/// must be removed; `false` means defer (proc-lock / PROCESS_TABLE contention) — the
+/// entry is left in place and re-evaluated next tick (deadline still <= now).
+///
+/// # Lock order (LOAD-BEARING)
+///
+/// `TIMED_WAITERS` MUST be DROPPED across the `wake` call. The wake path nests
+/// `WaitQueue.waiters -> TIMED_WAITERS` (`wake_all`/`wake_n`/`cancel_wait` hold
+/// `self.waiters` across `cancel_timed_wait`, which takes `TIMED_WAITERS`); holding
+/// `TIMED_WAITERS` across `wake` (which itself takes `WaitQueue.waiters` inside
+/// `timeout_wake`) would invert that to ABBA on SMP. Phase 1 scopes the lock to the
+/// copy block and releases BEFORE Phase 2; Phase 3 re-acquires ALONE and its
+/// `retain` closure touches ONLY the Vec — never `WaitQueue.waiters` / `proc`.
+fn drain_expired_timeouts(
+    waits: &Mutex<Vec<TimedWaiter>>,
+    cursor: &AtomicUsize,
+    now_ticks: u64,
+    mut wake: impl FnMut(&TimedWaiter) -> bool,
+) {
+    // Phase 1: COPY up to MAX expired entries (rotating start), no removal.
     let mut expired: [Option<TimedWaiter>; MAX_TIMEOUTS_PER_TICK] = [None; MAX_TIMEOUTS_PER_TICK];
     let count = {
-        let mut waits = TIMED_WAITERS.lock();
-        let mut expired_count = 0;
-        let mut i = 0;
-        while i < waits.len() && expired_count < MAX_TIMEOUTS_PER_TICK {
-            if waits[i].deadline_tick <= now_ticks {
-                expired[expired_count] = Some(waits.remove(i));
-                expired_count += 1;
-            } else {
-                i += 1;
+        let waits = waits.lock();
+        let len = waits.len();
+        if len == 0 {
+            return;
+        }
+        let start = cursor.load(Ordering::Relaxed) % len;
+        let mut n = 0;
+        let mut examined = 0;
+        while examined < len && n < MAX_TIMEOUTS_PER_TICK {
+            let waiter = waits[(start + examined) % len];
+            examined += 1;
+            if waiter.deadline_tick <= now_ticks {
+                expired[n] = Some(waiter);
+                n += 1;
             }
         }
-        expired_count
+        // Advance the cursor past the examined window so the next tick continues the
+        // round-robin sweep (bounded latency for every waiter even under contention).
+        cursor.store(start + examined, Ordering::Relaxed);
+        n
     };
 
-    // R155-2 FIX: Track failed wakes for re-insertion
-    let mut retry: [Option<TimedWaiter>; MAX_TIMEOUTS_PER_TICK] = [None; MAX_TIMEOUTS_PER_TICK];
-    let mut retry_count = 0;
-
+    // Phase 2: wake each expired waiter WITHOUT holding TIMED_WAITERS; record the
+    // completed ones (woke_count <= count <= MAX, so the stack array never overflows).
+    let mut woke: [Option<TimedWaiter>; MAX_TIMEOUTS_PER_TICK] = [None; MAX_TIMEOUTS_PER_TICK];
+    let mut woke_count = 0;
     for waiter in expired.iter().take(count).flatten() {
-        unsafe {
-            if let Some(queue) = (waiter.queue as *const WaitQueue).as_ref() {
-                if !queue.timeout_wake(waiter.pid, waiter.generation) {
-                    if retry_count < MAX_TIMEOUTS_PER_TICK {
-                        retry[retry_count] = Some(*waiter);
-                        retry_count += 1;
-                    }
-                }
-            }
+        if wake(waiter) {
+            woke[woke_count] = Some(*waiter);
+            woke_count += 1;
         }
     }
 
-    // Re-insert failed wakes so the next tick retries
-    if retry_count > 0 {
-        let mut waits = TIMED_WAITERS.lock();
-        for w in retry.iter().take(retry_count).flatten() {
-            waits.push(*w);
+    // Phase 3: remove the completed waiters by EXACT (queue, pid, generation). A
+    // concurrent process-context `register_timed_wait` replaces (queue, pid) with a
+    // NEW generation (replace-semantics), so matching the full triple never drops a
+    // fresh re-registered wait. `Vec::retain` never reallocs/deallocs (capacity
+    // untouched), so this stays alloc-free in IRQ.
+    if woke_count > 0 {
+        let done = &woke[..woke_count];
+        let mut waits = waits.lock();
+        waits.retain(|tw| {
+            !done.iter().flatten().any(|d| {
+                d.queue == tw.queue && d.pid == tw.pid && d.generation == tw.generation
+            })
+        });
+    }
+}
+
+fn process_waitqueue_timeouts(now_ticks: u64) {
+    drain_expired_timeouts(&TIMED_WAITERS, &WQ_TIMEOUT_SCAN_CURSOR, now_ticks, |waiter| {
+        // SAFETY: timed WaitQueue addresses are 'static kernel high-half data
+        // (register_timed_wait debug-asserts addr >= 0xFFFF_FFFF_8000_0000), so the
+        // raw pointer is valid for the program lifetime. `<*const T>::as_ref()`
+        // returns None ONLY for a NULL pointer (defensive; unreachable given the
+        // invariant — NOT a dangling-pointer guard) — treat it as completed so the
+        // stale entry is removed.
+        unsafe {
+            match (waiter.queue as *const WaitQueue).as_ref() {
+                Some(queue) => queue.timeout_wake(waiter.pid, waiter.generation),
+                None => true,
+            }
         }
+    });
+}
+
+/// M4-1c self-test: the WaitQueue timeout drain core (copy-don't-remove + rotating
+/// cursor + exact-(queue,pid,generation) retain). Drives a LOCAL `Vec` + cursor with
+/// a test-controlled fake `wake` — NEVER the global `TIMED_WAITERS` static. Catches
+/// the mis-wires a green build/boot cannot: an IRQ `Vec` realloc, a dropped fresh
+/// re-registered wait, a missed/over-cap timeout, and lost round-robin fairness.
+pub fn run_wq_timeout_drain_self_test() {
+    use core::cell::Cell;
+    let q1: usize = 0xFFFF_FFFF_8000_1000;
+    let q2: usize = 0xFFFF_FFFF_8000_2000;
+    let mk = |queue: usize, pid: ProcessId, generation: u64, deadline_tick: u64| TimedWaiter {
+        queue,
+        pid,
+        deadline_tick,
+        generation,
+    };
+
+    // (1) NO-REALLOC AT IRQ HIGH-WATER: fill to MAX live entries, force every wake to
+    // FAIL (full retry path), assert capacity unchanged. The ONLY assertion that
+    // proves the former IRQ Vec::push realloc is gone.
+    {
+        let waits = Mutex::new(Vec::with_capacity(MAX_TIMEOUTS_PER_TICK));
+        for i in 0..MAX_TIMEOUTS_PER_TICK {
+            waits.lock().push(mk(q1, i, i as u64, 1));
+        }
+        let cap0 = waits.lock().capacity();
+        let cur = AtomicUsize::new(0);
+        drain_expired_timeouts(&waits, &cur, 100, |_| false); // all contended
+        assert!(
+            waits.lock().capacity() == cap0,
+            "M4-1c: TIMED_WAITERS realloc'd in the IRQ drain path"
+        );
+        assert!(
+            waits.lock().len() == MAX_TIMEOUTS_PER_TICK,
+            "M4-1c: contended waiters must be retained (defer-not-drop)"
+        );
+    }
+
+    // (2) RETRY-PRESERVES-MEMBERSHIP: a failed wake leaves the entry with its
+    // ORIGINAL generation + deadline.
+    {
+        let waits = Mutex::new(Vec::new());
+        waits.lock().push(mk(q1, 7, 5, 10));
+        let cur = AtomicUsize::new(0);
+        drain_expired_timeouts(&waits, &cur, 100, |_| false);
+        let v = waits.lock();
+        assert!(
+            v.len() == 1 && v[0].generation == 5 && v[0].deadline_tick == 10,
+            "M4-1c: contended retry must preserve the original entry"
+        );
+    }
+
+    // (3) EXACT-GENERATION RETRY (headline): a concurrent re-register during the wake
+    // replaces (queue, pid) with a NEW generation; Phase 3 must NOT drop it.
+    {
+        let waits = Mutex::new(Vec::new());
+        waits.lock().push(mk(q1, 7, 5, 10));
+        let cur = AtomicUsize::new(0);
+        drain_expired_timeouts(&waits, &cur, 100, |w| {
+            // Simulate register_timed_wait replace-semantics (retain-by-(queue,pid) +
+            // push a new generation) racing between the Phase-1 copy and Phase-3 retain.
+            let mut v = waits.lock();
+            v.retain(|t| !(t.queue == w.queue && t.pid == w.pid));
+            v.push(TimedWaiter {
+                queue: w.queue,
+                pid: w.pid,
+                deadline_tick: 999,
+                generation: 7,
+            });
+            true // the gen-5 wake completes
+        });
+        let v = waits.lock();
+        assert!(
+            v.iter().any(|t| t.queue == q1 && t.pid == 7 && t.generation == 7),
+            "M4-1c: fresh re-registered (gen 7) wait must survive the drain"
+        );
+        assert!(
+            !v.iter().any(|t| t.generation == 5),
+            "M4-1c: the completed gen-5 entry must be removed"
+        );
+    }
+
+    // (4) CAP HONORED + REMAINDER SURVIVES: MAX+3 expired, all wake succeed; one tick
+    // removes exactly MAX, 3 remain (caught next tick).
+    {
+        let waits = Mutex::new(Vec::new());
+        for i in 0..(MAX_TIMEOUTS_PER_TICK + 3) {
+            waits.lock().push(mk(q1, i, i as u64, 1));
+        }
+        let cur = AtomicUsize::new(0);
+        let woke = Cell::new(0usize);
+        drain_expired_timeouts(&waits, &cur, 100, |_| {
+            woke.set(woke.get() + 1);
+            true
+        });
+        assert!(
+            woke.get() == MAX_TIMEOUTS_PER_TICK,
+            "M4-1c: must cap wakes per tick at MAX_TIMEOUTS_PER_TICK"
+        );
+        assert!(
+            waits.lock().len() == 3,
+            "M4-1c: the over-cap expired remainder must survive for the next tick"
+        );
+    }
+
+    // (5) NON-EXPIRED UNTOUCHED: a future-deadline entry is neither woken nor removed.
+    {
+        let waits = Mutex::new(Vec::new());
+        waits.lock().push(mk(q1, 1, 1, 1)); // expired
+        waits.lock().push(mk(q2, 2, 2, 1_000)); // future
+        let cur = AtomicUsize::new(0);
+        let woke = Cell::new(0usize);
+        drain_expired_timeouts(&waits, &cur, 100, |_| {
+            woke.set(woke.get() + 1);
+            true
+        });
+        let v = waits.lock();
+        assert!(woke.get() == 1, "M4-1c: only the expired entry should wake");
+        assert!(
+            v.len() == 1 && v[0].pid == 2,
+            "M4-1c: the future-deadline entry must remain"
+        );
+    }
+
+    // (6) ROUND-ROBIN FAIRNESS: MAX+4 expired, all-contended; over ceil(n/MAX) ticks
+    // the rotating cursor examines EVERY entry (no permanent front starvation).
+    {
+        let total = MAX_TIMEOUTS_PER_TICK + 4;
+        let waits = Mutex::new(Vec::new());
+        for i in 0..total {
+            waits.lock().push(mk(q1, i, i as u64, 1));
+        }
+        let cur = AtomicUsize::new(0);
+        let seen = Cell::new(0u64); // bitmask of examined pids (total < 64)
+        for _ in 0..2 {
+            drain_expired_timeouts(&waits, &cur, 100, |w| {
+                seen.set(seen.get() | (1u64 << w.pid));
+                false // all contended -> nothing removed, Vec stable across ticks
+            });
+        }
+        let full = (1u64 << total) - 1;
+        assert!(
+            seen.get() == full,
+            "M4-1c: the rotating cursor must examine every waiter within ceil(n/MAX) ticks"
+        );
     }
 }
 

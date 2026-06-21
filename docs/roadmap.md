@@ -10,7 +10,9 @@ This document outlines the development roadmap for Zero-OS, a microkernel operat
 
 ## Executive Summary
 
-### Current Status: Phase G IN PROGRESS (Production Readiness)
+### Current Status: Phase G IN PROGRESS (Production Readiness) · Phase U (User Mode & ABI) DESIGN-LOCKED
+
+> **2026-06-18 — User-Mode ABI direction decided: Compat-ZeroABI (converge-later).** A capability-first **native core ABI** + a **de-privileged Linux-compat personality**, realized as a *hybrid* (in-kernel capability/LSM-gated hot path + a userspace server for the cold/dangerous surface). Target: **glibc + full Linux/OCI**, **dynamic linking in scope**. The user-mode foundation (auxv, SysV entry stack, signal delivery, ~30 missing syscalls, exec disambiguation) is being built **first on the existing Linux cABI** (milestone **M0**) and proven by a static-musl conformance gate, *before* the native/personality fork is committed. Decided via a 17-agent analysis workflow (6-dim analysis → 7 adversarial verifications → 3-architect panel). See **Phase U** below and `docs/next-phase-plan.md`.
 
 Zero-OS has completed SMP infrastructure and resource governance:
 - **99 security audits** with 496 issues found, 454 fixed (91.5%)
@@ -91,6 +93,7 @@ Zero-OS has completed SMP infrastructure and resource governance:
 | **Drivers** | 10M+ LOC drivers | VGA/Serial/Keyboard/VirtIO | Driver framework needed |
 | **Containers** | Namespaces/Cgroups | PID ✅, Mount ✅, IPC ✅, Network ✅, User ✅ namespaces; Cgroups v2 PIDs ✅, CPU ✅, Memory ✅, IO ✅, Syscalls ✅, cgroupfs ✅ | ✅ Container foundation complete |
 | **Virtualization** | KVM/QEMU | IOMMU/VT-d ✅ (DMA isolation, device passthrough prep, interrupt remapping, VM domain API) | ✅ IOMMU complete, KVM/hypervisor pending |
+| **User Space / ABI** | glibc/musl + ld.so, full POSIX | Byte-exact Linux x86-64 syscall ABI (~95 real syscalls), working TLS + pthread-join; **no auxv / signal-delivery / dynamic-linking yet** — no real libc binary runs end-to-end | Phase U: M0 foundation → Compat-ZeroABI (native core + Linux personality) |
 
 ---
 
@@ -326,8 +329,8 @@ bitflags! {
 - [x] CapRights bitflags (types.rs)
 - [x] CapEntry with rights and object (types.rs)
 - [x] CapTable with allocate/lookup/revoke (lib.rs)
-- [ ] **Integration**: fd_table -> CapId (NOT connected to syscalls)
-- [ ] **Integration**: Process CapTable field (NOT in PCB)
+- [ ] **Integration**: fd_table -> CapId (NOT connected to syscalls — tracked in Phase U / S2)
+- [x] **Integration**: Process CapTable field (PRESENT in PCB — `cap_table: Arc<CapTable>` at process.rs:830; only the syscall wiring remains)
 - [ ] Delegation with rights restriction
 - [ ] O_PATH/CLOEXEC/CLOFORK semantics
 
@@ -886,6 +889,52 @@ inode flags (NOEXEC/IMMUTABLE/APPEND) → W^X (mmap)
 - Hot patch drill
 - Benchmark and regression
 - Compliance config scan
+
+---
+
+### Phase U: User Mode & ABI [DESIGN-LOCKED 2026-06-18]
+
+**Goal**: Run real user-space software with a security-first ABI. Decision: **Compat-ZeroABI** — a clean capability-first **native core ABI** plus a **de-privileged Linux-compat personality**, reached via a **converge-later** sequencing.
+
+**Priority**: High (the next strategic frontier after Phase G)
+**Dependencies**: Phases A–F (process model, cap/LSM/seccomp, namespaces, cgroups), Phase G observability
+**Status**: Decision locked; **M0 foundation pending** (no real libc binary runs end-to-end yet under any strategy)
+
+#### Why this decision
+
+A 17-agent analysis workflow (6-dimension analysis → 7 adversarial `file:line` verifications → 3-architect judge panel → synthesis) established the load-bearing fact: **the Linux syscall surface looks ~60–70% built but the pieces that let a libc binary *start and run* are structurally absent.** Verified gaps:
+- **No auxv** built on the initial user stack (`sys_exec` stops at the envp NULL; zero `AT_*` symbols) → a real musl/glibc crt cannot start.
+- **No signal-handler delivery** (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigaltstack` all ENOSYS; `SignalAction` has no `Handler` variant, no signal frame, no sigreturn trampoline).
+- **No dynamic linking** (PT_LOAD-only loader, rejects ET_DYN/PIE, no PT_INTERP/ld.so).
+- **`execve(59)` is a raw in-memory-image loader** (confused-deputy: path bytes parsed as ELF), not path-based execve.
+- `cap_table` exists on every PCB but is **unwired** (live surface uses the ambient `fd_table`).
+
+What *does* work and is reused: byte-exact Linux x86-64 numbering, SysV registers, Linux errno, ~95 real syscalls, and a fully-working **TLS + pthread-join** path.
+
+The build-out is unavoidable under any strategy; the only question is *where the messy Linux semantics land*. Compat-ZeroABI keeps them out of the kernel TCB (security-first) while still running unmodified Linux/OCI workloads (enterprise) and finally activating the capability model as a differentiator.
+
+#### Architecture: native core + **hybrid** personality
+
+- **Native core ABI** — small, freezable, capability-first surface in a disjoint syscall block (reserve **600–631**). Five frozen primitives: `native_invoke`, `native_spawn`, `native_endpoint_call` (synchronous call/reply — *does not exist yet*), `native_event_wait`, `native_cap_op`. Wire `cap_table` by making the Linux `fd` an index that resolves to a `CapId` (preserves all fd invariants).
+- **Hybrid personality (honest feasibility verdict)** — a *fully* de-privileged personality is **infeasible today**: IPC is async-only, 4 KiB-capped, no zero-copy (`sys_mmap` ignores flags, `CapObject::Shm` is a stub), so a per-syscall userspace round-trip is untenable on hot paths. Realized form:
+  - **In-kernel, capability/LSM-gated path** for hot/safe syscalls (read/write/lseek/fstat/futex/mmap/clock_gettime).
+  - **De-privileged userspace server** for the cold/dangerous surface only: ld.so/exec brokering, `/proc`, ptrace, signal disposition, ioctl demux, OCI orchestration (jailed in its own namespaces + cgroup + seccomp, holding only delegated caps).
+- **vDSO / TLS / robust-futex stay core mechanism**; ld.so/PT_INTERP/PIE/ASLR/auxv *policy* lives in the personality.
+
+#### Phased roadmap (S0–S3 reversible; **S4 = point of no return**)
+
+- **U.M0 — Universal foundation on the existing cABI** *(gate: static musl hello runs to completion, exit 0)*: auxv builder + SysV entry stack; minimal startup syscalls (clock_gettime/readv/rt_sigprocmask); **musl conformance harness** (`scripts/musl_check.sh`); exec disambiguation; signal delivery end-to-end; ~30-syscall fill (fcntl, poll/select, pread/pwrite, rlimits, mremap, rename/link/symlink/readlink/statx, pipe2, ioctl/termios) with seccomp↔dispatch reconciliation; user-stack guard page + demand-grow.
+- **U.S1** — exec disambiguation hardened (native raw-image spawn vs Linux path-based execve on disjoint numbers).
+- **U.S2** — native core cap-wiring (`fd_table` value → `CapId`; land the 5 native syscalls). Closes the `roadmap.md` B.1 fd→CapId seam.
+- **U.S3** — synchronous IPC + shared memory (the gate); **measure cold-path latency**.
+- **U.S4** — personality stand-up (**point of no return**): cold/dangerous Linux semantics move to the de-privileged server; hot/safe syscalls stay in-kernel.
+- **U.S5** — dynamic linking (ld.so/PT_INTERP/PIE/ASLR + vDSO).
+- **U.S6** — glibc (robust-futex list, TLS, vDSO clock_gettime).
+- **U.S7** — full Linux/OCI (compose with namespaces + cgroups to run unmodified container images).
+
+**Security Requirements**: native ABI minimal and frozen; compat personality runs with least authority; native vs Linux exec/spawn on disjoint entry points; signal-frame and sigreturn paths validate restored RIP/RSP canonically (SROP defense); seccomp/LSM policy reconciled against the actually-dispatched surface.
+
+**Testing Strategy**: a musl/glibc **conformance gate** in CI that boots a real libc binary and asserts a libc-attributable serial marker **and** clean exit 0 (today `make test` always exits 0); extend to a static busybox-style program, then dynamically-linked + a representative runtime as later milestones complete. See `docs/next-phase-plan.md` for the M0 work-item breakdown with `file:line` seams.
 
 ---
 

@@ -726,10 +726,11 @@ impl SocketWaiters {
             }
         }
 
-        // Wake expired waiters and drop entries for dead processes
-        let mut queues_to_clean: [Option<usize>; MAX_TIMEOUTS_PER_TICK] =
-            [None; MAX_TIMEOUTS_PER_TICK];
-        let mut clean_count = 0;
+        // Wake expired waiters and drop entries for dead processes.
+        // M4-1c: empty-queue BTreeMap node frees are deferred OUT of this timer IRQ
+        // (R151-5 dealloc class). We only record THAT a queue emptied; the actual
+        // `self.waiters` node free runs in process context (drain_empty_queues).
+        let mut emptied = false;
 
         for entry in expired.iter().take(count).flatten() {
             let (queue_addr, pid, generation, is_timeout) = *entry;
@@ -790,39 +791,71 @@ impl SocketWaiters {
                         queue.remove(pos);
                     }
 
-                    // Track queues that may need cleanup
-                    if queue.is_empty() && clean_count < MAX_TIMEOUTS_PER_TICK {
-                        queues_to_clean[clean_count] = Some(queue_addr);
-                        clean_count += 1;
+                    // M4-1c: note that this queue emptied; defer the BTreeMap node
+                    // free to process context (no heap dealloc in the timer IRQ).
+                    if queue.is_empty() {
+                        emptied = true;
                     }
                 }
             }
         }
 
-        // Clean up empty queues (separate pass to avoid borrow issues)
-        // M4-1b RESIDUAL (out of scope, tracked as M4-1c): `self.waiters.remove`
-        // is a BTreeMap node free via the global LockedHeap in this timer-IRQ path
-        // — the same R151-5 dealloc class. M4-1b removed only the per-timeout marker
-        // INSERT alloc + this function's former periodic `timed_out.retain` prune
-        // (node deallocs every 100 ticks). The membership-map free below is NOT yet
-        // moved off the IRQ path; M4-1c will defer it to a process-context drain.
-        for addr in queues_to_clean.iter().take(clean_count).flatten() {
-            if let Some(queue) = self.waiters.get(addr) {
-                if queue.is_empty() {
-                    self.waiters.remove(addr);
-                }
-            }
+        // M4-1c CLOSURE: the empty-queue BTreeMap node free that previously ran HERE
+        // (`self.waiters.remove(addr)`, a global-LockedHeap dealloc in this timer
+        // IRQ — the R151-5 dealloc class) is GONE, along with its `queues_to_clean`
+        // tracking array. We only FLAG that a queue emptied; the actual node free is
+        // reaped in process context by `drain_empty_queues`, driven from the
+        // unconditional `reschedule_if_needed` deferred-work drain (gated by
+        // SOCKET_WAITER_CLEANUP_PENDING so the O(n) reap runs only after a tick that
+        // actually emptied a queue). `Release` pairs with the `Acquire` load in
+        // `drain_socket_waiter_cleanup`; the authoritative clear is the
+        // `swap(false)`-under-SOCKET_WAITERS in `drain_empty_queues`.
+        if emptied {
+            SOCKET_WAITER_CLEANUP_PENDING.store(true, AtomicOrdering::Release);
         }
 
         // M4-1b: the per-PCB socket_timeout_marker dies with the PCB, so the former
         // periodic stale-marker prune (PID-reuse cleanup of the deleted `timed_out`
-        // BTreeMap) is no longer needed — its removal also drops a per-100-tick
-        // BTreeMap node-dealloc from this IRQ path.
+        // BTreeMap) is no longer needed.
+    }
+
+    /// M4-1c: pure, testable reap of empty wait-queue nodes. Frees the BTreeMap
+    /// nodes that `check_timeouts` (timer IRQ) intentionally left behind. Returns the
+    /// number of empty queues freed. `BTreeMap::retain` re-checks `is_empty()` under
+    /// the SOCKET_WAITERS lock, so a queue that a concurrent `add_or_refresh_waiter`
+    /// re-populated between the IRQ mark and this reap is KEPT (non-empty) — we never
+    /// cache+blind-remove a queue address.
+    fn reap_empty_queues(&mut self) -> usize {
+        let before = self.waiters.len();
+        self.waiters.retain(|_, queue| !queue.is_empty());
+        before - self.waiters.len()
+    }
+
+    /// M4-1c: process-context drain of empty wait-queue nodes (the BTreeMap node free
+    /// deferred out of the timer IRQ). The caller MUST hold SOCKET_WAITERS. The
+    /// `swap(false)` is the authoritative claim+clear of the pending flag: because
+    /// `check_timeouts` (which sets the flag) and this drain are mutually excluded by
+    /// SOCKET_WAITERS, the swap can never clear a flag that corresponds to an
+    /// un-reaped empty queue (any emptying is either before our `retain` — reaped —
+    /// or after our unlock — its `store(true)` then follows our `swap(false)`).
+    fn drain_empty_queues(&mut self) {
+        if SOCKET_WAITER_CLEANUP_PENDING.swap(false, AtomicOrdering::AcqRel) {
+            let _ = self.reap_empty_queues();
+        }
     }
 }
 
 /// Global socket waiter tracking.
 static SOCKET_WAITERS: spin::Mutex<SocketWaiters> = spin::Mutex::new(SocketWaiters::new());
+
+/// M4-1c: lock-free hint that `check_timeouts` (timer IRQ) emptied at least one wait
+/// queue, so `SocketWaiters.waiters` has empty BTreeMap nodes to reap in process
+/// context. Set under the SOCKET_WAITERS lock (the IRQ holds it via try_lock); the
+/// authoritative clear is the `swap(false)` under the same lock in
+/// `drain_empty_queues`. The lock-free `load` in `drain_socket_waiter_cleanup` is
+/// only a fast-path hint to avoid touching the hot SOCKET_WAITERS lock on every
+/// reschedule when there is nothing to reap.
+static SOCKET_WAITER_CLEANUP_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Kernel implementation of SocketWaitHooks trait.
 ///
@@ -1081,6 +1114,102 @@ pub fn check_socket_timeouts() {
     if let Some(mut waiters) = SOCKET_WAITERS.try_lock() {
         waiters.check_timeouts(current_ticks);
     }
+}
+
+/// M4-1c: process-context drain of deferred empty wait-queue nodes (the BTreeMap
+/// node free moved off the timer IRQ — R151-5 dealloc class).
+///
+/// Called from the UNCONDITIONAL `scheduler_hook::reschedule_if_needed` deferred-work
+/// drain (IRQs ENABLED, runs on every syscall return + nanosleep + BSP/AP idle), so a
+/// quiet system — or a socket dropped without `close()` (SocketState::drop does NOT
+/// `wake_all`, so it never triggers the process-context `wake_all`/`remove_waiter`
+/// node free) — still reclaims the nodes with bounded latency, not only on a future
+/// blocking `wait()`.
+///
+/// The fast path is a lock-free `load`, so the hot SOCKET_WAITERS lock is untouched
+/// when nothing emptied. Uses `try_lock` (NEVER a blocking lock from this hot drain):
+/// a contended tick simply defers to the next reschedule — the pending flag stays set
+/// (we only `swap(false)` it once we actually hold the lock, inside
+/// `drain_empty_queues`), so the reap is never lost. `without_interrupts` so a
+/// same-CPU timer IRQ cannot fire mid-reap (it would `try_lock`-fail and skip a
+/// timeout tick).
+pub fn drain_socket_waiter_cleanup() {
+    if !SOCKET_WAITER_CLEANUP_PENDING.load(AtomicOrdering::Acquire) {
+        return;
+    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(mut waiters) = SOCKET_WAITERS.try_lock() {
+            waiters.drain_empty_queues();
+        }
+    });
+}
+
+/// M4-1c self-test: the deferred empty-queue reap (`reap_empty_queues`). Drives a
+/// LOCAL `SocketWaiters` (same module) — no global, no PROCESS_TABLE. Catches the
+/// mis-wires a green build/boot cannot: a reap that frees a re-populated queue (a
+/// live waiter silently dropped — the headline race), a reap that never drains (slow
+/// node leak), or one that over-reaps live queues.
+pub fn run_socket_waiter_deferred_free_self_test() {
+    let q1: usize = 0xFFFF_FFFF_8000_1000;
+    let q2: usize = 0xFFFF_FFFF_8000_2000;
+    let q3: usize = 0xFFFF_FFFF_8000_3000;
+
+    // (1) IRQ PATH LEAVES THE EMPTY QUEUE IN PLACE (node NOT freed in IRQ): add then
+    // empty a queue's deque — exactly what check_timeouts now does (VecDeque::remove,
+    // no map free). The node must still be present and empty.
+    let mut sw = SocketWaiters::new();
+    sw.add_or_refresh_waiter(q1, 7, 1, None);
+    sw.waiters.get_mut(&q1).unwrap().clear(); // simulate the IRQ removing the last waiter
+    assert!(
+        sw.waiters.contains_key(&q1) && sw.waiters[&q1].is_empty(),
+        "M4-1c: the timer IRQ must leave the empty queue node in place (no IRQ free)"
+    );
+
+    // (2) PROCESS-CONTEXT REAP FREES EXACTLY THE EMPTY NODE.
+    assert!(
+        sw.reap_empty_queues() == 1,
+        "M4-1c: reap must free the one empty queue"
+    );
+    assert!(
+        !sw.waiters.contains_key(&q1),
+        "M4-1c: the empty queue node must be gone after reap"
+    );
+
+    // (3) REAP MUST NOT FREE A RE-POPULATED QUEUE (headline): empty q2, then a NEW
+    // waiter arrives on the same address before the reap — the reap must keep it.
+    sw.add_or_refresh_waiter(q2, 8, 1, None);
+    sw.waiters.get_mut(&q2).unwrap().clear(); // IRQ emptied it
+    sw.add_or_refresh_waiter(q2, 9, 2, None); // a fresh wait re-populates the same addr
+    assert!(
+        sw.reap_empty_queues() == 0,
+        "M4-1c: reap must not free a re-populated queue"
+    );
+    assert!(
+        sw.waiters.contains_key(&q2) && sw.waiters[&q2].iter().any(|&(p, _, _)| p == 9),
+        "M4-1c: the fresh re-registered waiter must survive the reap"
+    );
+
+    // (4) IDEMPOTENT / NO-OP ON A CLEAN MAP.
+    assert!(
+        sw.reap_empty_queues() == 0,
+        "M4-1c: reap on a map with no empty queues is a no-op"
+    );
+
+    // (5) MULTIPLE EMPTY + MULTIPLE LIVE, ONE REAP: q1 + q3 empty, q2 live.
+    sw.add_or_refresh_waiter(q1, 10, 1, None);
+    sw.add_or_refresh_waiter(q3, 11, 1, None);
+    sw.waiters.get_mut(&q1).unwrap().clear();
+    sw.waiters.get_mut(&q3).unwrap().clear();
+    assert!(
+        sw.reap_empty_queues() == 2,
+        "M4-1c: reap must free exactly the empty queues"
+    );
+    assert!(
+        sw.waiters.contains_key(&q2)
+            && !sw.waiters.contains_key(&q1)
+            && !sw.waiters.contains_key(&q3),
+        "M4-1c: live queues must be preserved, empties freed"
+    );
 }
 
 /// 最大参数总字节数（argv + envp 字符串总大小上限）

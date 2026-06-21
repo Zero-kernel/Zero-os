@@ -15,10 +15,9 @@ Cargo.lock
 
 #no_need
 *.md
+*.txt
 *.log
-kernel-security-audit-fix.skill
-kernel-security-audit.skill
-kernel-next-phase.skill
+*.skill
 core
 
 !README.md
