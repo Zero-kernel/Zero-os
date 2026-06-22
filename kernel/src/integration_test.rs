@@ -210,16 +210,18 @@ pub fn test_cgroup_pt_kmem() {
     kernel_core::syscall::run_recording_frame_allocator_split_self_test();
     klog_always!("    ✓ M2-1 SLICE-4b: RecordingFrameAllocator DATA/PT split (allocate_data_frame unrecorded, trait allocate_frame records by identity) — brk-grow PT kmem now on-budget");
     // M4-1b: the per-PCB wait-timeout markers that replaced the two TIMER-IRQ-
-    // allocating `timed_out` BTreeMaps (check_socket_timeouts + WaitQueue::timeout_wake).
+    // allocating `timed_out` BTreeMaps (check_socket_timeouts + the WaitQueue timeout
+    // wake, M1-02-renamed `wq_timeout_wake_by_seq`).
     // Exercises the (gen<<1)|1 sentinel (wq gen-0 disambiguation), the swap-to-clear
     // exact-generation consume (stale-drop + exact-report), no-leak-across-waits,
     // entry-clear, two-field isolation, and fork born-clean — the mis-wires a green
     // build/boot cannot catch (no test drives a real timeout-vs-wake cross-field race).
     kernel_core::process::run_timeout_marker_self_test();
     klog_always!("    ✓ M4-1b: per-PCB timeout markers (packed sentinel + swap-to-clear exact-gen + no-leak + entry-clear + two-field isolation + fork born-clean) — IRQ marker INSERT alloc removed from both timer callbacks");
+    klog_always!("    ✓ M1-02: queue-free WaitQueue timeout — decide_wq_timeout(seq+Blocked) gate, alloc_wait_seq monotonic/distinct, active_wait_seq born-clean — the timer IRQ no longer derefs a WaitQueue (SMP use-after-free CLASS eliminated)");
     // M4-1c: close the LAST timer-IRQ heap residuals M4-1b left (the R151-5
     // alloc/dealloc-in-IRQ class). (A) ipc/sync.rs: the WaitQueue timeout drain is now
-    // copy-don't-remove (Phase-1 copy, Phase-2 wake, Phase-3 exact-(queue,pid,gen)
+    // copy-don't-remove (Phase-1 copy, Phase-2 wake, Phase-3 exact-(pid,seq)
     // retain) + a rotating scan cursor for fairness — NO IRQ Vec::push realloc. (B)
     // kernel_core/syscall.rs: the empty-queue BTreeMap node free is deferred out of
     // check_timeouts to a process-context reap (drain_socket_waiter_cleanup, driven
@@ -227,7 +229,7 @@ pub fn test_cgroup_pt_kmem() {
     // an IRQ realloc, a dropped fresh re-registered wait, an over-cap/missed timeout,
     // lost fairness (A), and a reap freeing a re-populated queue / never draining (B).
     ipc::sync::run_wq_timeout_drain_self_test();
-    klog_always!("    ✓ M4-1c (A): WaitQueue timeout drain copy-don't-remove + rotating cursor + exact-(queue,pid,gen) retain — no IRQ Vec::push realloc, fresh re-register preserved, round-robin fairness");
+    klog_always!("    ✓ M4-1c (A): WaitQueue timeout drain copy-don't-remove + rotating cursor + exact-(pid,seq) retain — no IRQ Vec::push realloc, fresh re-register preserved, round-robin fairness");
     kernel_core::syscall::run_socket_waiter_deferred_free_self_test();
     klog_always!("    ✓ M4-1c (B): SocketWaiters empty-queue BTreeMap free deferred to process-context reap — re-populated queue preserved, exact reap, no IRQ dealloc");
 }

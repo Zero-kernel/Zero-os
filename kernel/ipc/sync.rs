@@ -35,16 +35,20 @@ pub enum WaitOutcome {
 /// R39-6 FIX: 定时等待者记录
 #[derive(Debug, Clone, Copy)]
 struct TimedWaiter {
-    /// 等待队列指针（用于匹配）
-    queue: usize,
     /// 等待的进程ID
     pid: ProcessId,
     /// 超时截止时间（tick）
     deadline_tick: u64,
+    /// M1-02: the globally-unique wait sequence (`process::alloc_wait_seq`) this
+    /// timer belongs to. The timer IRQ matches it against the PCB's
+    /// `active_wait_seq` to wake EXACTLY this wait WITHOUT dereferencing a
+    /// `WaitQueue` — replacing the former `queue: usize` pointer that was the SMP
+    /// use-after-free (the IRQ could deref it after a concurrent `WaitQueue` free).
+    seq: u64,
     /// R165-4 FIX: The exact `wait_with_timeout` generation this timer belongs to.
-    /// Carried through to `timeout_wake` so the recorded timeout flag is tagged
-    /// with the waiter's OWN generation (not a global snapshot), letting
-    /// `consume_timeout_flag` match it exactly and reject stale flags.
+    /// Carried into the per-PCB `wq_timeout_marker` (via `wq_timeout_wake_by_seq`)
+    /// so the wait epilogue's exact-gen `consume_wq_timeout` can match it and reject
+    /// stale flags.
     generation: u64,
 }
 
@@ -68,15 +72,19 @@ static WAITQUEUE_TIMER_INIT: AtomicBool = AtomicBool::new(false);
 ///
 /// 超时唤醒与正常唤醒的区分通过每-PCB 的 `Process.wq_timeout_marker`
 /// 标记完成（M4-1b：取代了原先在定时器 IRQ 中分配堆节点的 `timed_out`
-/// 集合）。标记在 `timeout_wake` 的 Blocked->Ready 过程中、持有 proc 锁时
-/// 写入，由等待者自身的 epilogue 经 `process::consume_wq_timeout` 消费。
+/// 集合）。标记在 `process::wq_timeout_wake_by_seq` 的 Blocked->Ready 过程中、
+/// 持有 proc 锁时写入，由等待者自身的 epilogue 经 `process::consume_wq_timeout`
+/// 消费。M1-02：定时器 IRQ 不再解引用 WaitQueue —— 它仅凭每-PCB 的
+/// `active_wait_seq` 唤醒，从根本上消除了原 `timeout_wake` 的 SMP use-after-free。
 pub struct WaitQueue {
     /// 等待的进程ID列表
     /// R165-4 FIX: Each waiter is tagged with the `wait_with_timeout` generation
     /// that enqueued it (or a fresh generation for the condvar prepare_to_wait
-    /// path). `timeout_wake` only acts on an exact (pid, generation) match, so a
-    /// stale/re-inserted timer cannot wake a different, later wait by the same
-    /// PID — including one blocked on a *different* queue.
+    /// path); the epilogue's exact-gen `consume_wq_timeout` uses it to reject a
+    /// stale timeout marker. M1-02: the timer IRQ no longer matches against this
+    /// deque at all (that membership check was the freed-queue deref) — it wakes by
+    /// the per-PCB `active_wait_seq`, and the timed-out waiter self-dequeues here in
+    /// its own epilogue.
     waiters: Mutex<VecDeque<(ProcessId, u64)>>,
     /// 当为 true 时不再接受新的等待者（用于端点销毁时取消阻塞）
     closed: AtomicBool,
@@ -152,6 +160,11 @@ impl WaitQueue {
             kernel_core::get_ticks().saturating_add(ticks)
         });
 
+        // M1-02: mint the globally-unique wait token ONLY on the timed path (an
+        // untimed wait registers no timer and needs no token — this gating is what
+        // keeps a `wait(None)` from ever stranding a nonzero `active_wait_seq`).
+        let wait_seq = deadline_tick.map(|_| process::alloc_wait_seq());
+
         let mut enqueued = false;
 
         // 在关中断状态下操作，防止竞态条件
@@ -171,10 +184,10 @@ impl WaitQueue {
                 // advance together. If this PID is already queued (a prior wait
                 // whose entry lingered after a non-WaitQueue wake — e.g. a signal
                 // setting the task Ready directly), REFRESH its generation to this
-                // wait's my_gen. Otherwise register_timed_wait would make the new
-                // generation authoritative while the deque still held the old one,
-                // and timeout_wake's exact (pid, generation) check would drop this
-                // wait's timer — a missed legitimate timeout.
+                // wait's my_gen so the epilogue's exact-gen `consume_wq_timeout`
+                // matches this wait. M1-02: `register_timed_wait` also replaces the
+                // PID's timer entry (by pid) and this wait's fresh `active_wait_seq`
+                // is what the IRQ now matches, so the new wait is authoritative.
                 let mut refreshed = false;
                 for entry in waiters.iter_mut() {
                     if entry.0 == pid {
@@ -205,6 +218,16 @@ impl WaitQueue {
                     "M4-1b: wq_timeout_marker not born-clean at wait entry"
                 );
                 proc.wq_timeout_marker.store(0, Ordering::Relaxed);
+                // M1-02: stamp the per-PCB wait token for the timed path in the SAME
+                // proc-lock critical section as `state = Blocked` (the proc-lock
+                // RELEASE below is the publishing edge the IRQ's proc-lock ACQUIRE
+                // pairs with; Relaxed suffices). Gated on `wait_seq` (Some only when
+                // timed) so an untimed wait never stamps a token. The timer IRQ wakes
+                // EXACTLY this wait by matching this seq — never by dereferencing the
+                // WaitQueue (the M1-02 use-after-free fix).
+                if let Some(seq) = wait_seq {
+                    proc.active_wait_seq.store(seq, Ordering::Relaxed);
+                }
                 proc.state = ProcessState::Blocked;
             }
 
@@ -218,12 +241,13 @@ impl WaitQueue {
 
         // R158-1 FIX: register under IRQ-disable to prevent deadlock with
         // process_waitqueue_timeouts() acquiring TIMED_WAITERS from timer IRQ.
-        if let Some(deadline) = deadline_tick {
+        if let (Some(deadline), Some(seq)) = (deadline_tick, wait_seq) {
             ensure_waitqueue_timer_registered();
             interrupts::without_interrupts(|| {
-                // R165-4 FIX: Record this wait's own generation in the timer so a
-                // fired timeout is attributed to this exact wait instance.
-                register_timed_wait(self as *const _ as usize, pid, deadline, my_gen);
+                // M1-02: the timer is keyed by the globally-unique `seq` (no queue
+                // pointer); `my_gen` is carried for the epilogue's exact-gen marker
+                // consume.
+                register_timed_wait(seq, pid, deadline, my_gen);
             });
         }
 
@@ -231,10 +255,20 @@ impl WaitQueue {
         kernel_core::force_reschedule();
 
         // R158-1 FIX: cancel under IRQ-disable (same lock ordering as register).
-        if deadline_tick.is_some() {
+        if wait_seq.is_some() {
             interrupts::without_interrupts(|| {
-                cancel_timed_wait(self as *const _ as usize, pid);
+                cancel_timed_wait(pid);
             });
+            // M1-02: clear the per-PCB wait token in this ONE common epilogue — it
+            // runs BEFORE the abort/timeout/woken branches below, so NO resume path
+            // (normal wake, never-fired timer, or abort) can strand a nonzero seq
+            // that a later timed wait of this PCB would falsely match. The timeout
+            // path already cleared it under the IRQ proc-lock; this is the belt for
+            // the other resume paths. A SEPARATE proc-lock CS — proc stays strictly
+            // leaf, never nested under `self.waiters`.
+            if let Some(proc_arc) = process::get_process(pid) {
+                proc_arc.lock().active_wait_seq.store(0, Ordering::Relaxed);
+            }
         }
 
         // R171-F3 FIX: if a pending kill woke us, interrupt the wait (EINTR)
@@ -256,84 +290,18 @@ impl WaitQueue {
         // R164-10 FIX: Pass generation to consume — only accept if the
         // timed_out entry's generation matches our wait call's generation.
         if self.consume_timeout_flag(pid, my_gen) {
+            // M1-02: the IRQ timeout wake (`wq_timeout_wake_by_seq`) no longer removes
+            // us from `self.waiters` (it cannot — that lives inside the freeable
+            // WaitQueue, the whole point of the fix), so the timed-out waiter must
+            // self-dequeue here, mirroring the abort branch above. `retain` is an
+            // idempotent no-op if a concurrent wake already popped us.
+            interrupts::without_interrupts(|| {
+                self.waiters.lock().retain(|&(p, _)| p != pid);
+            });
             WaitOutcome::TimedOut
         } else {
             WaitOutcome::Woken
         }
-    }
-
-    /// R39-6 FIX: 标记指定进程因超时唤醒（从队列移除并设置为 Ready）
-    ///
-    /// Returns true if the wake completed, false if Process lock was contended
-    /// (caller should retry on next tick).
-    fn timeout_wake(&self, pid: ProcessId, generation: u64) -> bool {
-        interrupts::without_interrupts(|| {
-            // R165-4 FIX: Act only if THIS exact (pid, generation) is still queued
-            // on THIS WaitQueue. A stale timer — re-inserted by a retry that raced
-            // a normal wake, or left over from a finished wait — will not match and
-            // must not wake an unrelated later wait by the same PID (possibly even
-            // one blocked on a different queue). Hold the waiters lock across the
-            // try_lock(proc): try_lock can never deadlock, and waiters->proc is the
-            // same order wake_all uses.
-            let mut waiters = self.waiters.lock();
-            let pos = match waiters
-                .iter()
-                .position(|&(p, g)| p == pid && g == generation)
-            {
-                Some(pos) => pos,
-                None => return true, // not our waiter — let the timer be dropped
-            };
-
-            // R155-2 FIX: try_lock() to avoid deadlock in IRQ context.
-            // R171-G5-1 FIX: try_get_process() so the PROCESS_TABLE lookup itself
-            // also never blocks on the table in this IRQ-reachable scan.
-            match process::try_get_process(pid) {
-                // Contended table: keep membership and retry on the next tick
-                // (same defer-not-drop contract as the proc.try_lock() arm below).
-                None => false,
-                // R155-12 FIX: Process no longer exists (killed). Drop membership;
-                // do NOT insert a timeout flag (no one would consume it).
-                Some(None) => {
-                    waiters.remove(pos);
-                    true
-                }
-                Some(Some(proc_arc)) => {
-                    if let Some(mut proc) = proc_arc.try_lock() {
-                        // R165-4 FIX: Record the timeout only when THIS call performs
-                        // the Blocked->Ready transition. If the task was already Ready
-                        // (a normal wake beat us), recording a timeout flag would be a
-                        // stale entry.
-                        let was_blocked = proc.state == ProcessState::Blocked;
-                        if was_blocked {
-                            // M4-1b: SET the per-PCB wq marker (Release) STRICTLY
-                            // BEFORE state=Ready, both inside THIS held proc-lock
-                            // critical section — the proc-lock release/acquire hand-off
-                            // (NOT the Release on the atomic) is the marker-before-wake
-                            // edge every `state` reader honors. Replaces the
-                            // IRQ-allocating `self.timed_out.lock().insert` (R151-5
-                            // heap-alloc-in-IRQ class) that previously ran AFTER
-                            // drop(proc), which ALSO closes the old Ready-before-marker
-                            // visibility gap. Tagged with the waiter's OWN generation
-                            // (from the timer record); the epilogue consume requires an
-                            // exact match.
-                            proc.wq_timeout_marker.store(
-                                process::pack_timeout_marker(generation),
-                                Ordering::Release,
-                            );
-                            proc.state = ProcessState::Ready;
-                        }
-                        drop(proc);
-                        waiters.remove(pos);
-                        drop(waiters);
-                        true
-                    } else {
-                        // Contended (e.g. a concurrent wake holds the process lock).
-                        // Keep membership and retry on the next tick.
-                        false
-                    }
-                }
-            }
-        })
     }
 
     // R165-4 FIX: Consume the timeout flag only on an EXACT generation match.
@@ -360,7 +328,7 @@ impl WaitQueue {
             waiters.retain(|&(p, _)| p != pid);
             // M4-1b: no `timed_out` map to prune — the per-PCB `wq_timeout_marker`
             // dies with the PCB. The `waiters` membership retain stays (a stale
-            // deque entry for a dead PID is still reachable by wake_one/timeout_wake).
+            // deque entry for a dead PID is still reachable by `wake_one`/`wake_n`).
         });
     }
 
@@ -369,19 +337,37 @@ impl WaitQueue {
     /// 返回被唤醒的进程ID，如果队列为空返回None
     pub fn wake_one(&self) -> Option<ProcessId> {
         interrupts::without_interrupts(|| {
-            let pid = self.waiters.lock().pop_front()?.0;
-            // R39-6 FIX: 取消该进程的定时等待
-            cancel_timed_wait(self as *const _ as usize, pid);
-
-            // 将进程状态设为就绪
-            if let Some(proc_arc) = process::get_process(pid) {
-                let mut proc = proc_arc.lock();
-                if proc.state == ProcessState::Blocked {
-                    proc.state = ProcessState::Ready;
+            // M1-02: pop until a genuinely Blocked waiter is readied (mirrors
+            // `wake_n`'s skip-non-Blocked loop). LOAD-BEARING under the queue-free
+            // timeout: the timer IRQ no longer removes a timed-out waiter from
+            // `self.waiters` (the wakee self-dequeues in its own epilogue), so a
+            // timed-out-but-not-yet-resumed waiter can briefly linger here as
+            // non-Blocked (Ready). The old unconditional pop+return would "spend"
+            // this wake on that phantom and STRAND the next real Blocked waiter (a
+            // lost wakeup).
+            //
+            // M1-02 (Codex KILL fix): the wakers do NOT cancel the woken PID's
+            // timer. `cancel_timed_wait` is now keyed by PID alone (the queue
+            // discriminator is gone with the freed-queue pointer), so cancelling
+            // here could remove an UNRELATED live timer for a RECYCLED pid that
+            // lingers as a stale entry on this queue (the pre-existing kill-without-
+            // cancel_wait producer + PID recycling). It is also unnecessary: the
+            // woken task's own epilogue cancels its timer, and `wq_timeout_wake_by_seq`
+            // refuses to fire once `state != Blocked` (set just below), so no stale
+            // timer can spuriously mark a normally-woken task.
+            let mut waiters = self.waiters.lock();
+            while let Some((pid, _gen)) = waiters.pop_front() {
+                if let Some(proc_arc) = process::get_process(pid) {
+                    let mut proc = proc_arc.lock();
+                    if proc.state == ProcessState::Blocked {
+                        proc.state = ProcessState::Ready;
+                        return Some(pid);
+                    }
                 }
+                // non-Blocked (already woken / timed-out / gone): consumed no real
+                // wake — keep popping for a genuinely blocked waiter.
             }
-
-            Some(pid)
+            None
         })
     }
 
@@ -394,8 +380,10 @@ impl WaitQueue {
             let count = waiters.len();
 
             while let Some((pid, _gen)) = waiters.pop_front() {
-                // R39-6 FIX: 取消该进程的定时等待
-                cancel_timed_wait(self as *const _ as usize, pid);
+                // M1-02 (Codex KILL fix): do NOT cancel the woken PID's timer here —
+                // a PID-only cancel could remove an unrelated recycled-PID timer; the
+                // wakee's epilogue cancels its own timer and the seq+Blocked gate in
+                // `wq_timeout_wake_by_seq` prevents a spurious fire after `Ready`.
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
                     if proc.state == ProcessState::Blocked {
@@ -430,8 +418,9 @@ impl WaitQueue {
 
             while woken < n {
                 if let Some((pid, _gen)) = waiters.pop_front() {
-                    // R39-6 FIX: 取消该进程的定时等待
-                    cancel_timed_wait(self as *const _ as usize, pid);
+                    // M1-02 (Codex KILL fix): no PID-only timer cancel here (could hit
+                    // a recycled-PID's live timer); the wakee's epilogue + the
+                    // seq+Blocked gate handle its timer.
                     if let Some(proc_arc) = process::get_process(pid) {
                         let mut proc = proc_arc.lock();
                         if proc.state == ProcessState::Blocked {
@@ -464,8 +453,9 @@ impl WaitQueue {
             let mut waiters = self.waiters.lock();
             if let Some(pos) = waiters.iter().position(|&(p, _)| p == pid) {
                 waiters.remove(pos);
-                // 取消该进程的定时等待
-                cancel_timed_wait(self as *const _ as usize, pid);
+                // M1-02 (Codex KILL fix): no PID-only timer cancel here (could hit a
+                // recycled-PID's live timer); the wakee's epilogue + the seq+Blocked
+                // gate handle its timer.
                 if let Some(proc_arc) = process::get_process(pid) {
                     let mut proc = proc_arc.lock();
                     if proc.state == ProcessState::Blocked {
@@ -590,7 +580,7 @@ impl WaitQueue {
             if let Some(pos) = waiters.iter().position(|&(p, _)| p == pid) {
                 waiters.remove(pos);
                 // R39-6 FIX: 取消定时等待
-                cancel_timed_wait(self as *const _ as usize, pid);
+                cancel_timed_wait(pid);
 
                 // 恢复进程状态为就绪
                 //
@@ -956,43 +946,38 @@ fn ensure_waitqueue_timer_registered() {
 }
 
 /// 注册定时等待
-fn register_timed_wait(queue: usize, pid: ProcessId, deadline_tick: u64, generation: u64) {
-    // R143-5 FIX: All WaitQueue instances must be 'static (kernel BSS/data).
-    // If a heap/stack WaitQueue were used with timed waits, the raw `usize`
-    // address could dangle after the WaitQueue is dropped. This assert catches
-    // accidental non-static usage in debug builds. Kernel static data lives
-    // in the high-half address space (>= 0xFFFF_FFFF_8000_0000).
-    debug_assert!(
-        queue >= 0xFFFF_FFFF_8000_0000,
-        "R143-5: WaitQueue address 0x{:x} is not in kernel static range — \
-         timed waits require 'static WaitQueue instances",
-        queue
-    );
-    // R154-10 FIX: Deduplicate before pushing. A spurious reschedule or
-    // re-entrant wait path can call register_timed_wait() for the same
-    // (queue, pid) pair, creating duplicate entries that consume extra
-    // timeout slots and may cause double-wakeup.
-    // R165-4 FIX: REPLACE any pre-existing (queue, pid) entry rather than skip.
-    // A given (queue, pid) can have at most one active wait, so any prior entry
-    // is a stale leftover (e.g. a timer-retry that raced a normal wake). Skipping
-    // it (the old behavior) could leave the *new* wait with the *old* generation
-    // — or no timer at all. Replacing makes this wait's generation authoritative;
-    // any still-pending stale timer is harmless because timeout_wake now requires
-    // an exact (pid, generation) membership match.
+///
+/// M1-02: keyed by `pid` (the per-PCB `active_wait_seq` is the timer-IRQ
+/// disambiguator; NO queue pointer is stored — that pointer was the SMP
+/// use-after-free). The old R143-5 `queue >= 0xFFFF_FFFF_8000_0000` debug_assert is
+/// DELETED: it was ineffective (the sole timed registrant, futex, is a HEAP
+/// `Arc<WaitQueue>` whose address IS in the high-half range, so the assert never
+/// fired) and was release-stripped anyway.
+///
+/// INVARIANT VII: at most ONE in-flight timed wait per PCB — a suspended PID is
+/// blocked in exactly one `wait_with_timeout`, and futex (`futex.rs:203`) is the
+/// ONLY `ipc::sync::WaitQueue` timed producer. Dedup/replace by `pid` alone is
+/// therefore exact. A future SECOND timed-wait producer for an already-timed-waiting
+/// PID would need a richer key here (it would otherwise silently drop one timer — a
+/// missed timeout, NOT a UAF).
+fn register_timed_wait(seq: u64, pid: ProcessId, deadline_tick: u64, generation: u64) {
+    // R154-10 / R165-4: REPLACE any pre-existing entry for this PID so this wait's
+    // seq + generation are authoritative (a spurious reschedule or re-entrant wait
+    // can re-register before the prior entry is cleared).
     let mut waiters = TIMED_WAITERS.lock();
-    waiters.retain(|w| !(w.queue == queue && w.pid == pid));
+    waiters.retain(|w| w.pid != pid);
     waiters.push(TimedWaiter {
-        queue,
         pid,
         deadline_tick,
+        seq,
         generation,
     });
 }
 
-/// 取消定时等待
-fn cancel_timed_wait(queue: usize, pid: ProcessId) {
+/// 取消定时等待 (M1-02: keyed by `pid`, one in-flight timed wait per PCB)
+fn cancel_timed_wait(pid: ProcessId) {
     let mut waits = TIMED_WAITERS.lock();
-    waits.retain(|w| !(w.queue == queue && w.pid == pid));
+    waits.retain(|w| w.pid != pid);
 }
 
 /// Maximum number of timeouts to process per tick (prevents allocation in IRQ context)
@@ -1000,7 +985,7 @@ const MAX_TIMEOUTS_PER_TICK: usize = 16;
 
 /// M4-1c: rotating scan cursor for `drain_expired_timeouts`.
 ///
-/// Round-robin starting offset so that under sustained `timeout_wake` contention
+/// Round-robin starting offset so that under sustained timeout-wake contention
 /// the same front-of-`TIMED_WAITERS` entries are not re-tried every tick while
 /// later expired waiters starve. This preserves the fairness the old
 /// remove-then-repush-to-tail had (Codex requirement-align A2), without the
@@ -1019,7 +1004,7 @@ static WQ_TIMEOUT_SCAN_CURSOR: AtomicUsize = AtomicUsize::new(0);
 /// retry `waits.push(*w)` could grow-REALLOC `TIMED_WAITERS: Vec` under the global
 /// heap lock in the timer IRQ (R151-5 alloc-in-IRQ). The drain now COPIES expired
 /// entries (no removal) in Phase 1, wakes them in Phase 2, and removes ONLY the
-/// completed ones by exact `(queue, pid, generation)` via `Vec::retain` in Phase 3.
+/// completed ones by exact `(pid, seq)` via `Vec::retain` in Phase 3.
 /// The timer-IRQ path therefore performs NO `Vec::push` and NO dealloc —
 /// `Vec::retain`/`Vec::remove` never shrink capacity (std guarantee) and
 /// `TimedWaiter` is `Copy`. The only Vec growth is the process-context
@@ -1031,13 +1016,17 @@ static WQ_TIMEOUT_SCAN_CURSOR: AtomicUsize = AtomicUsize::new(0);
 ///
 /// # Lock order (LOAD-BEARING)
 ///
-/// `TIMED_WAITERS` MUST be DROPPED across the `wake` call. The wake path nests
-/// `WaitQueue.waiters -> TIMED_WAITERS` (`wake_all`/`wake_n`/`cancel_wait` hold
-/// `self.waiters` across `cancel_timed_wait`, which takes `TIMED_WAITERS`); holding
-/// `TIMED_WAITERS` across `wake` (which itself takes `WaitQueue.waiters` inside
-/// `timeout_wake`) would invert that to ABBA on SMP. Phase 1 scopes the lock to the
-/// copy block and releases BEFORE Phase 2; Phase 3 re-acquires ALONE and its
-/// `retain` closure touches ONLY the Vec — never `WaitQueue.waiters` / `proc`.
+/// `TIMED_WAITERS` MUST be DROPPED across the `wake` call. M1-02: the wake
+/// (`wq_timeout_wake_by_seq`) now takes ONLY the proc lock — it NEVER touches
+/// `WaitQueue.waiters`, so the timer path can no longer form the
+/// `self.waiters <-> TIMED_WAITERS` ABBA at all (the structural win). The drop is
+/// still required because the process-context wake/cancel paths nest
+/// `WaitQueue.waiters -> TIMED_WAITERS` (`wake_one`/`wake_all`/`wake_n`/`cancel_wait`
+/// hold `self.waiters` across `cancel_timed_wait`, which takes `TIMED_WAITERS`):
+/// holding `TIMED_WAITERS` across `wake` while another CPU holds `self.waiters` and
+/// reaches for `TIMED_WAITERS` would still invert that order. Phase 1 scopes the
+/// lock to the copy block and releases BEFORE Phase 2; Phase 3 re-acquires ALONE and
+/// its `retain` closure touches ONLY the Vec — never `WaitQueue.waiters` / `proc`.
 fn drain_expired_timeouts(
     waits: &Mutex<Vec<TimedWaiter>>,
     cursor: &AtomicUsize,
@@ -1080,52 +1069,46 @@ fn drain_expired_timeouts(
         }
     }
 
-    // Phase 3: remove the completed waiters by EXACT (queue, pid, generation). A
-    // concurrent process-context `register_timed_wait` replaces (queue, pid) with a
-    // NEW generation (replace-semantics), so matching the full triple never drops a
-    // fresh re-registered wait. `Vec::retain` never reallocs/deallocs (capacity
-    // untouched), so this stays alloc-free in IRQ.
+    // Phase 3: remove the completed waiters by EXACT (pid, seq). `seq` is globally
+    // unique per wait, so a concurrent process-context `register_timed_wait` for a
+    // NEW wait of the same PID pushes a NEW seq (replace-semantics) that this retain
+    // never drops. `Vec::retain` never reallocs/deallocs (capacity untouched), so
+    // this stays alloc-free in IRQ.
     if woke_count > 0 {
         let done = &woke[..woke_count];
         let mut waits = waits.lock();
-        waits.retain(|tw| {
-            !done.iter().flatten().any(|d| {
-                d.queue == tw.queue && d.pid == tw.pid && d.generation == tw.generation
-            })
-        });
+        waits.retain(|tw| !done.iter().flatten().any(|d| d.pid == tw.pid && d.seq == tw.seq));
     }
 }
 
 fn process_waitqueue_timeouts(now_ticks: u64) {
+    // M1-02: the wake closure NO LONGER dereferences any WaitQueue — it wakes purely
+    // by per-PCB state (`process::wq_timeout_wake_by_seq`), so the timer IRQ can never
+    // touch a freed WaitQueue (the SMP use-after-free this fix closes). `seq` selects
+    // THE exact pending wait; `generation` is carried into the per-PCB marker for the
+    // epilogue's exact-gen consume.
     drain_expired_timeouts(&TIMED_WAITERS, &WQ_TIMEOUT_SCAN_CURSOR, now_ticks, |waiter| {
-        // SAFETY: timed WaitQueue addresses are 'static kernel high-half data
-        // (register_timed_wait debug-asserts addr >= 0xFFFF_FFFF_8000_0000), so the
-        // raw pointer is valid for the program lifetime. `<*const T>::as_ref()`
-        // returns None ONLY for a NULL pointer (defensive; unreachable given the
-        // invariant — NOT a dangling-pointer guard) — treat it as completed so the
-        // stale entry is removed.
-        unsafe {
-            match (waiter.queue as *const WaitQueue).as_ref() {
-                Some(queue) => queue.timeout_wake(waiter.pid, waiter.generation),
-                None => true,
-            }
-        }
+        process::wq_timeout_wake_by_seq(waiter.pid, waiter.seq, waiter.generation)
     });
 }
 
 /// M4-1c self-test: the WaitQueue timeout drain core (copy-don't-remove + rotating
-/// cursor + exact-(queue,pid,generation) retain). Drives a LOCAL `Vec` + cursor with
+/// cursor + exact-(pid,seq) retain). Drives a LOCAL `Vec` + cursor with
 /// a test-controlled fake `wake` — NEVER the global `TIMED_WAITERS` static. Catches
 /// the mis-wires a green build/boot cannot: an IRQ `Vec` realloc, a dropped fresh
 /// re-registered wait, a missed/over-cap timeout, and lost round-robin fairness.
 pub fn run_wq_timeout_drain_self_test() {
     use core::cell::Cell;
-    let q1: usize = 0xFFFF_FFFF_8000_1000;
-    let q2: usize = 0xFFFF_FFFF_8000_2000;
-    let mk = |queue: usize, pid: ProcessId, generation: u64, deadline_tick: u64| TimedWaiter {
-        queue,
+    // M1-02: q1/q2 are now distinct `seq` values (the queue pointer is gone). The
+    // fake `wake` stays a pure `FnMut(&TimedWaiter) -> bool`, now FAITHFUL to
+    // production (`wq_timeout_wake_by_seq` is also a pure per-PCB callback with no
+    // queue deref).
+    let q1: u64 = 0x1000;
+    let q2: u64 = 0x2000;
+    let mk = |seq: u64, pid: ProcessId, generation: u64, deadline_tick: u64| TimedWaiter {
         pid,
         deadline_tick,
+        seq,
         generation,
     };
 
@@ -1164,33 +1147,34 @@ pub fn run_wq_timeout_drain_self_test() {
         );
     }
 
-    // (3) EXACT-GENERATION RETRY (headline): a concurrent re-register during the wake
-    // replaces (queue, pid) with a NEW generation; Phase 3 must NOT drop it.
+    // (3) EXACT-SEQ RETRY (headline): a concurrent re-register during the wake
+    // replaces the PID's entry with a NEW seq; Phase 3 (keyed by pid+seq) must remove
+    // ONLY the completed original seq and NOT drop the fresh re-registered wait.
     {
         let waits = Mutex::new(Vec::new());
-        waits.lock().push(mk(q1, 7, 5, 10));
+        waits.lock().push(mk(q1, 7, 5, 10)); // seq=q1, pid=7, gen=5
         let cur = AtomicUsize::new(0);
         drain_expired_timeouts(&waits, &cur, 100, |w| {
-            // Simulate register_timed_wait replace-semantics (retain-by-(queue,pid) +
-            // push a new generation) racing between the Phase-1 copy and Phase-3 retain.
+            // Simulate register_timed_wait replace-semantics (retain-by-pid + push a
+            // NEW seq) racing between the Phase-1 copy and the Phase-3 retain.
             let mut v = waits.lock();
-            v.retain(|t| !(t.queue == w.queue && t.pid == w.pid));
+            v.retain(|t| t.pid != w.pid);
             v.push(TimedWaiter {
-                queue: w.queue,
                 pid: w.pid,
                 deadline_tick: 999,
+                seq: 9999, // a fresh, distinct seq for the re-registered wait
                 generation: 7,
             });
-            true // the gen-5 wake completes
+            true // the original (seq=q1) wake completes
         });
         let v = waits.lock();
         assert!(
-            v.iter().any(|t| t.queue == q1 && t.pid == 7 && t.generation == 7),
-            "M4-1c: fresh re-registered (gen 7) wait must survive the drain"
+            v.iter().any(|t| t.pid == 7 && t.seq == 9999 && t.generation == 7),
+            "M1-02: fresh re-registered (new seq) wait must survive the drain"
         );
         assert!(
-            !v.iter().any(|t| t.generation == 5),
-            "M4-1c: the completed gen-5 entry must be removed"
+            !v.iter().any(|t| t.seq == q1),
+            "M1-02: the completed original-seq entry must be removed (retain by pid+seq)"
         );
     }
 

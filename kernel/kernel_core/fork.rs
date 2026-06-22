@@ -602,6 +602,10 @@ fn fork_inner(
         // child's first wait of the matching subsystem).
         child.socket_timeout_marker.store(0, Ordering::Relaxed);
         child.wq_timeout_marker.store(0, Ordering::Relaxed);
+        // M1-02: same born-clean tripwire for the queue-free wait-timeout token — a
+        // child must NOT inherit the parent's active_wait_seq, or a parent stale timer
+        // could falsely match the child's first timed wait.
+        child.active_wait_seq.store(0, Ordering::Relaxed);
 
         child.context.rax = 0; // 子进程返回值 0
         child.state = ProcessState::Ready;

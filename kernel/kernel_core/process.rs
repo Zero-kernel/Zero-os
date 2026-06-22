@@ -1111,6 +1111,18 @@ pub struct Process {
     /// the two fields are never both live. Same encoding / ordering / entry-clear
     /// contract as `socket_timeout_marker`.
     pub wq_timeout_marker: AtomicU64,
+
+    /// M1-02: the globally-unique sequence (`alloc_wait_seq`) of the timed
+    /// `ipc::sync::WaitQueue` wait this PCB is currently blocked in; `0` = none.
+    /// STAMPED under the proc lock in the SAME critical section as the
+    /// `wq_timeout_marker` entry-clear and `state = Blocked` (so the proc-lock
+    /// RELEASE is the publishing edge), and MATCHED by the timer-tick IRQ under the
+    /// proc lock (`wq_timeout_wake_by_seq`) to wake EXACTLY this wait WITHOUT
+    /// dereferencing the `WaitQueue` — the structural fix for the M1-02 timer-IRQ
+    /// use-after-free. Born-clean; cleared to 0 on EVERY wait-exit path. Only ever
+    /// read/written under the proc lock, so `Relaxed` access is sufficient (the lock
+    /// is the synchronizing edge).
+    pub active_wait_seq: AtomicU64,
 }
 
 impl Process {
@@ -1135,6 +1147,7 @@ impl Process {
             pending_starve_boost: false,     // M4-1: no latched starvation boost at birth
             socket_timeout_marker: AtomicU64::new(0), // M4-1b: born-clean, no timeout pending
             wq_timeout_marker: AtomicU64::new(0),     // M4-1b: born-clean, no timeout pending
+            active_wait_seq: AtomicU64::new(0),       // M1-02: born-clean, no active timed wait
             pi_boosts: BTreeMap::new(),       // E.4 PI: no boosts initially
             waiting_on_futex: None,           // E.4 PI: not waiting on any futex
             time_slice: calculate_time_slice(priority),
@@ -1675,6 +1688,31 @@ static NEXT_PID_HINT: Mutex<ProcessId> = Mutex::new(1);
 /// 每个新进程实例（包括 PID 复用场景）获得唯一的 generation 值，
 /// 用于 IPC 授权等需要区分进程身份的场景。u64 空间在实际中不可耗尽。
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// M1-02: global, monotonic per-WAIT sequence allocator for the queue-free
+/// `ipc::sync::WaitQueue` timeout path. Unlike the per-queue `wait_generation`
+/// (which restarts at 0 for every `WaitQueue` and is therefore NOT unique across
+/// queues), this counter is unique across ALL queues and ALL PIDs, so the timer
+/// IRQ can identify THE exact pending timed wait by `(pid, seq)` WITHOUT ever
+/// dereferencing a `WaitQueue`. That deref of a pointer smuggled through the timer
+/// table was a real SMP use-after-free (M1-02): a concurrent `FUTEX_WAKE` +
+/// `cleanup_empty_bucket` could free the heap `Arc<WaitQueue>` between the drain's
+/// lock-dropped Phase-1 copy and the Phase-2 deref. `0` is the reserved "no active
+/// timed wait" sentinel for `Process.active_wait_seq`.
+static NEXT_WAIT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// M1-02: allocate the next globally-unique wait sequence. Skips the reserved `0`
+/// sentinel on the (practically unreachable) u64 wraparound, so an allocated seq
+/// can never collide with the born-clean `active_wait_seq` value.
+#[inline]
+pub fn alloc_wait_seq() -> u64 {
+    loop {
+        let seq = NEXT_WAIT_SEQ.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (wait sequence counter)
+        if seq != 0 {
+            return seq;
+        }
+    }
+}
 
 /// 初始化进程子系统
 ///
@@ -3169,7 +3207,7 @@ pub fn get_process(pid: ProcessId) -> Option<Arc<Mutex<Process>>> {
 /// Mirrors [`get_process`] but acquires `PROCESS_TABLE` with `try_lock`, so a
 /// caller running in IRQ context (the socket-timeout tick scan in
 /// `SocketWaiters::check_timeouts`, the timed-wait timer scan in
-/// `WaitQueue::timeout_wake`) never blocks on the table lock — closing the same
+/// `wq_timeout_wake_by_seq`) never blocks on the table lock — closing the same
 /// self-deadlock class as R169-2 / R170-1 (a writer holding `PROCESS_TABLE`
 /// while the timer IRQ fires on the same CPU and re-enters the table).
 ///
@@ -3501,6 +3539,73 @@ pub fn consume_wq_timeout(pid: ProcessId, expected: u64) -> bool {
     }
 }
 
+/// M1-02: pure decision core for the queue-free timer-IRQ wake — SHARED by
+/// `wq_timeout_wake_by_seq` (production) and `run_timeout_marker_self_test` so the
+/// IRQ wake predicate is unit-testable without an SMP timer race. A timer fires a
+/// wake IFF its `seq` still matches the PCB's currently-blocked timed wait
+/// (`active_wait_seq`) AND the task is still `Blocked` (a normal wake or kill that
+/// already flipped it `Ready` must not be re-timed-out).
+#[inline]
+pub fn decide_wq_timeout(active_seq: u64, timer_seq: u64, blocked: bool) -> bool {
+    active_seq == timer_seq && blocked
+}
+
+/// M1-02: queue-free `ipc::sync::WaitQueue` timeout wake, invoked from the
+/// timer-tick IRQ drain.
+///
+/// REPLACES the deleted `WaitQueue::timeout_wake`, which dereferenced a `WaitQueue`
+/// pointer smuggled through the timer table — a real SMP use-after-free (a
+/// concurrent `FUTEX_WAKE` + `cleanup_empty_bucket` could free the heap
+/// `Arc<WaitQueue>` between the drain's lock-dropped Phase-1 copy and the Phase-2
+/// deref). Here the IRQ touches ONLY per-PCB state (no `WaitQueue`, no
+/// `self.waiters`), so the dangling-pointer class is structurally impossible.
+///
+/// IRQ-safe: `try_get_process` + `try_lock` only — it NEVER blocks PROCESS_TABLE or
+/// the proc lock in IRQ context. The waiter is removed from its `WaitQueue.waiters`
+/// by its OWN epilogue (the wakee self-dequeues on the timeout path), not here.
+///
+/// The marker store-Release precedes `state = Ready`, both inside ONE held proc-lock
+/// critical section: the proc-lock release/acquire hand-off (NOT the atomic) is the
+/// marker-before-wake edge the epilogue honors (the M4-1b lesson). `active_wait_seq`
+/// is only ever accessed under the proc lock, so `Relaxed` is sufficient.
+///
+/// Returns `true` when the timer entry is DONE (woke the exact wait, OR it is stale
+/// / the PCB is gone / already woken) so the drain removes it; returns `false` ONLY
+/// on genuine contention (PROCESS_TABLE or the proc lock held elsewhere) so the
+/// drain defers it to the next tick (deadline still expired). The lock-acquired
+/// seq-mismatch path returning `true` is what makes a duplicate cross-CPU Phase-1
+/// copy idempotent: the first copy clears `active_wait_seq`, the second sees the
+/// mismatch and drops as a no-op.
+pub fn wq_timeout_wake_by_seq(pid: ProcessId, seq: u64, marker_gen: u64) -> bool {
+    match try_get_process(pid) {
+        // PROCESS_TABLE contended — defer, do NOT drop the timer.
+        None => false,
+        // PCB gone (killed / reaped) — drop the stale timer.
+        Some(None) => true,
+        Some(Some(proc_arc)) => {
+            if let Some(mut proc) = proc_arc.try_lock() {
+                if decide_wq_timeout(
+                    proc.active_wait_seq.load(Ordering::Relaxed),
+                    seq,
+                    proc.state == ProcessState::Blocked,
+                ) {
+                    proc.wq_timeout_marker
+                        .store(pack_timeout_marker(marker_gen), Ordering::Release);
+                    proc.state = ProcessState::Ready;
+                    proc.active_wait_seq.store(0, Ordering::Relaxed);
+                }
+                // Lock acquired: an exact hit woke the wait; a mismatch means the
+                // timer is stale / already-woken (a duplicate cross-CPU copy, or a
+                // normal wake beat us). Either way the entry is complete — drop it.
+                true
+            } else {
+                // Proc lock held (e.g. a concurrent wake) — defer to the next tick.
+                false
+            }
+        }
+    }
+}
+
 /// M4-1b: in-kernel self-test for the per-PCB timeout-marker mechanism. The
 /// marker logic is invisible to a green build/boot (no boot test drives a real
 /// timeout-vs-wake cross-field race), so this is the tripwire for the high-value
@@ -3573,7 +3678,42 @@ pub fn run_timeout_marker_self_test() {
         "child wq marker born-clean"
     );
 
-    kprintln!("[selftest] run_timeout_marker_self_test: OK (M4-1b)");
+    // (8) M1-02: queue-free IRQ-wake DECISION CORE. `decide_wq_timeout` is the exact
+    // predicate `wq_timeout_wake_by_seq` uses under the proc lock; table-test it so a
+    // future edit that breaks the seq/Blocked gate (waking the wrong wait, or a stale
+    // timer flipping a non-blocked task Ready) fails HERE, not in an SMP timer-vs-wake
+    // race a green boot never exercises.
+    assert!(decide_wq_timeout(7, 7, true), "match seq + Blocked => fire");
+    assert!(
+        !decide_wq_timeout(7, 8, true),
+        "seq mismatch (stale / other-queue wait) => no fire"
+    );
+    assert!(
+        !decide_wq_timeout(7, 7, false),
+        "already-Ready (normal-woken / killed) => no fire"
+    );
+    assert!(
+        !decide_wq_timeout(0, 5, true),
+        "a no-active-wait PCB (active_seq=0 sentinel) is never matched by an allocated timer (seq>=1)"
+    );
+
+    // (9) M1-02: the global wait-seq allocator is monotonic, distinct per call, and
+    // never returns the reserved 0 sentinel (so an allocated seq can never alias the
+    // born-clean active_wait_seq value).
+    let s1 = alloc_wait_seq();
+    let s2 = alloc_wait_seq();
+    assert!(s1 != 0 && s2 != 0, "alloc_wait_seq never returns the 0 sentinel");
+    assert!(s2 != s1, "alloc_wait_seq is distinct per call");
+
+    // (10) M1-02: a fresh PCB is born-clean on active_wait_seq (no inherited timed-wait
+    // token); pairs with the fork.rs explicit-zero tripwire and Process::new default.
+    assert_eq!(
+        child.active_wait_seq.load(Ordering::Relaxed),
+        0,
+        "child active_wait_seq born-clean"
+    );
+
+    kprintln!("[selftest] run_timeout_marker_self_test: OK (M4-1b + M1-02)");
 }
 
 pub fn drain_deferred_irq_terminates() {
