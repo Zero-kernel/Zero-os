@@ -39,6 +39,14 @@ pub fn test_syscalls() {
     klog_always!("    ✓ System call framework defined");
     klog_always!("    ✓ 50+ system calls enumerated");
     klog_always!("    ✓ Handler infrastructure ready");
+    // M0 #5 (sub-slice 1a): signal-handler delivery. The pure rt_sigframe builder +
+    // SROP validators (layout %16==8, FXSAVE info-leak tail, MXCSR mask, RIP/RSP
+    // canonical+low-half, deliver→sigreturn mcontext round-trip) AND the signal data
+    // model (mask RMW with SIGKILL/SIGSTOP strip, disposition resolver). These cover
+    // the mis-wires a green boot cannot catch.
+    kernel_core::signal_frame::run_signal_frame_self_test();
+    kernel_core::signal::run_signal_self_test();
+    klog_always!("    ✓ M0 #5 signals (1a): rt_sigframe layout/SROP/MXCSR/round-trip + mask RMW + disposition resolver");
 }
 
 /// 测试上下文切换

@@ -437,6 +437,15 @@ fn fork_inner(
         // (~12KB worst case). Accepted risk documented.
         child.cloexec_fds = parent.cloexec_fds.clone();
 
+        // M0 item 5: inherit signal dispositions + blocked mask across fork (POSIX).
+        // `[SigAction; NSIG]` and `u64` are Copy. `saved_blocked`/`in_signal_handler`
+        // are handler scratch state and intentionally stay born-clean in the child
+        // (a fork inside a handler does NOT carry the parent's live frame state). The
+        // "any handler installed" fast-path hint is a monotonic global, so the child
+        // inheriting a parent's handler needs no per-task bookkeeping here.
+        child.sigactions = parent.sigactions;
+        child.blocked = parent.blocked;
+
         // 克隆能力表（尊重 CLOFORK 标志）
         //
         // clone_for_fork() 会过滤掉带有 CLOFORK 标志的能力条目，

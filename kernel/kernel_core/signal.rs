@@ -207,6 +207,151 @@ pub enum SignalAction {
     Continue,
 }
 
+// ============================================================================
+// M0 item 5 (sub-slice 1a): user signal-handler dispositions
+// ============================================================================
+
+/// `sa_handler` sentinel: take the default action.
+pub const SIG_DFL: u64 = 0;
+/// `sa_handler` sentinel: ignore the signal.
+pub const SIG_IGN: u64 = 1;
+
+// `sa_flags` bits (Linux x86-64 ABI). Only SA_RESTORER is load-bearing in slice 1a
+// (required); the rest are stored faithfully but several are inert (documented M0
+// divergences): SA_RESTART (no syscall restart — interrupted syscalls return EINTR),
+// SA_SIGINFO (siginfo is minimally synthesized), SA_ONSTACK (no sigaltstack yet).
+pub const SA_NOCLDSTOP: u64 = 0x0000_0001;
+pub const SA_NOCLDWAIT: u64 = 0x0000_0002;
+pub const SA_SIGINFO: u64 = 0x0000_0004;
+pub const SA_RESTORER: u64 = 0x0400_0000;
+pub const SA_ONSTACK: u64 = 0x0800_0000;
+pub const SA_RESTART: u64 = 0x1000_0000;
+pub const SA_NODEFER: u64 = 0x4000_0000;
+pub const SA_RESETHAND: u64 = 0x8000_0000;
+
+/// The set of `sa_flags` bits this kernel recognizes (others are rejected at install
+/// so an unknown flag can never silently change behavior).
+pub const SA_SUPPORTED_FLAGS: u64 = SA_NOCLDSTOP
+    | SA_NOCLDWAIT
+    | SA_SIGINFO
+    | SA_RESTORER
+    | SA_ONSTACK
+    | SA_RESTART
+    | SA_NODEFER
+    | SA_RESETHAND;
+
+/// Per-signal disposition. `#[repr(C)]` with the Linux `kernel_sigaction` field
+/// order (handler, flags, restorer, mask) so a future shared-table / userspace
+/// `struct sigaction` copy stays layout-aligned. 32 bytes, `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct SigAction {
+    /// `sa_handler` / `sa_sigaction`: SIG_DFL, SIG_IGN, or a user handler VA.
+    pub handler: u64,
+    /// `sa_flags`.
+    pub flags: u64,
+    /// `sa_restorer`: the userspace trampoline that issues `rt_sigreturn(15)`.
+    /// REQUIRED (SA_RESTORER) for a real handler in slice 1a.
+    pub restorer: u64,
+    /// `sa_mask`: additional signals blocked for the duration of the handler.
+    pub mask: u64,
+}
+
+impl SigAction {
+    pub const fn default_action() -> Self {
+        Self { handler: SIG_DFL, flags: 0, restorer: 0, mask: 0 }
+    }
+    /// True when a real user handler is installed (not SIG_DFL / SIG_IGN).
+    #[inline]
+    pub fn is_handler(&self) -> bool {
+        self.handler != SIG_DFL && self.handler != SIG_IGN
+    }
+}
+
+/// Number of entries in the per-task sigaction table (signals 1..=64).
+pub const NSIG: usize = 64;
+
+/// A born-clean sigaction table (every signal → SIG_DFL).
+#[inline]
+pub fn default_sigactions() -> [SigAction; NSIG] {
+    [SigAction::default_action(); NSIG]
+}
+
+/// The mask of signals that can NEVER be blocked or caught (SIGKILL, SIGSTOP).
+#[inline]
+pub fn uncatchable_mask() -> u64 {
+    Signal::SIGKILL.bit() | Signal::SIGSTOP.bit()
+}
+
+/// The effective disposition of a signal under a sigaction table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Run a user handler (slice 1a: only delivered at the syscall-return safe point).
+    Handler { handler: u64, flags: u64, mask: u64 },
+    /// Take the kernel default action.
+    Default(SignalAction),
+    /// Explicitly ignored (SIG_IGN).
+    Ignored,
+}
+
+/// Resolve a signal's disposition from a sigaction table. SIGKILL/SIGSTOP ALWAYS
+/// resolve to their default (uncatchable) regardless of the table — the table can
+/// never hold a handler for them (rt_sigaction rejects that), but this is a
+/// defense-in-depth re-check so an uncatchable signal can never be handler-dispatched.
+pub fn resolve_disposition(sigactions: &[SigAction; NSIG], signal: Signal) -> Disposition {
+    if signal.is_uncatchable() {
+        return Disposition::Default(default_action(signal));
+    }
+    let sa = sigactions[(signal.as_u8() - 1) as usize];
+    if sa.is_handler() {
+        Disposition::Handler { handler: sa.handler, flags: sa.flags, mask: sa.mask }
+    } else if sa.handler == SIG_IGN {
+        Disposition::Ignored
+    } else {
+        Disposition::Default(default_action(signal))
+    }
+}
+
+/// `how` argument values for `rt_sigprocmask` (Linux ABI).
+pub const SIG_BLOCK: i32 = 0;
+pub const SIG_UNBLOCK: i32 = 1;
+pub const SIG_SETMASK: i32 = 2;
+
+/// Pure read-modify-write of the per-task blocked mask. SIGKILL/SIGSTOP are ALWAYS
+/// force-cleared from the result so they can never be blocked (POSIX). Factored out
+/// for self-testing.
+pub fn apply_sigprocmask(old: u64, how: i32, set: u64) -> u64 {
+    let next = match how {
+        SIG_BLOCK => old | set,
+        SIG_UNBLOCK => old & !set,
+        SIG_SETMASK => set,
+        _ => old, // unreachable: callers validate `how` first.
+    };
+    next & !uncatchable_mask()
+}
+
+/// Monotonic global hint: set once ANY process installs a real signal handler. The
+/// per-syscall-return delivery hook reads this LOCK-FREE and skips ALL work while it
+/// is false — and the musl/native-hello gate path never installs a handler, so its
+/// hot path stays a single relaxed atomic load. Monotonic (never reset) so it needs
+/// no fork/exec/exit bookkeeping; the only cost is that after the first handler
+/// install in a boot, every syscall return takes the (uncontended) process lock to
+/// scan for a deliverable signal — acceptable, and never on the no-handler gate.
+static ANY_HANDLER_INSTALLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Record that a real handler was installed (called from `rt_sigaction`).
+#[inline]
+pub fn note_handler_installed() {
+    ANY_HANDLER_INSTALLED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Lock-free fast-path gate for the syscall-return delivery hook.
+#[inline]
+pub fn any_handler_installed() -> bool {
+    ANY_HANDLER_INSTALLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Signal-related errors
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalError {
@@ -361,44 +506,76 @@ fn send_signal_inner(
             return Err(SignalError::NoSuchProcess);
         }
 
-        // Queue the signal
+        // Queue the signal (always — delivery/clear decisions follow).
         proc.pending_signals.set(signal);
 
-        // Execute default action
-        match action {
-            SignalAction::Terminate => {
-                terminate_code = Some(signal_exit_code(signal));
-            }
-            SignalAction::Stop => {
-                // R98-1 FIX: Job-control stop is orthogonal to scheduler state.
-                // Do NOT overwrite Blocked/Sleeping, or we lose the wait condition
-                // and break wait queue invariants (H-34 lost wakeup fix).
-                let was_running = proc.state == ProcessState::Running;
-                proc.stopped = true;
-                // Need to reschedule if stopping current process
-                if was_running && process::current_pid() == Some(pid) {
-                    needs_reschedule = true;
-                }
-            }
-            SignalAction::Continue => {
-                // R98-1 FIX: Handle SIGCONT via scheduler resume callback.
-                // We check if the process is stopped but DO NOT clear the flag here.
-                // The scheduler's resume_stopped() will clear `stopped` and handle
-                // the state transition atomically. This avoids a race where we
-                // clear `stopped` but resume_stopped() sees it already false.
-                //
-                // Note: We check BOTH `stopped` (orthogonal flag) AND `ProcessState::Stopped`
-                // (legacy state) to handle both code paths consistently.
-                if proc.stopped || proc.state == ProcessState::Stopped {
+        // POSIX job-control mutual exclusion (Codex review): generating SIGCONT
+        // DISCARDS any pending stop signals, and generating a stop signal discards a
+        // pending SIGCONT — they are opposite job-control transitions. Without this,
+        // a stop bit left pending (a stop is applied at send time but its bit is not
+        // cleared) could be re-applied at a later syscall-return safe point once the
+        // delivery scan is active, spuriously re-stopping a resumed task.
+        if signal.is_continue() {
+            proc.pending_signals.clear(Signal::SIGSTOP);
+            proc.pending_signals.clear(Signal::SIGTSTP);
+            proc.pending_signals.clear(Signal::SIGTTIN);
+            proc.pending_signals.clear(Signal::SIGTTOU);
+        } else if signal.is_stop() {
+            proc.pending_signals.clear(Signal::SIGCONT);
+        }
+
+        // M0 item 5 (sub-slice 1a): resolve the disposition.
+        //
+        // `resolve_disposition` special-cases SIGKILL/SIGSTOP to their (uncatchable)
+        // DEFAULT before any table consult, so a fatal kill is never diverted to a
+        // handler and the kill leg stays mask-independent — SIGKILL is unblockable by
+        // construction. A catchable signal WITH a user handler is SET-PENDING-ONLY
+        // here and delivered at the target's next syscall-return safe point
+        // (sub-slice 1a does NOT wake a blocked-in-syscall target — that is 1b); its
+        // default action is NOT executed at send time.
+        match resolve_disposition(&proc.sigactions, signal) {
+            Disposition::Handler { .. } => {
+                // Leave the signal pending for safe-point delivery. SIGCONT is the one
+                // job-control case that must still take effect even when caught: a
+                // caught SIGCONT MUST un-stop a stopped target so it can reach a safe
+                // point and run its handler (otherwise it would be stranded stopped
+                // forever). Resume, but DO NOT clear the pending bit — the handler
+                // needs it.
+                if signal.is_continue() && (proc.stopped || proc.state == ProcessState::Stopped) {
                     needs_resume = true;
                 }
-                // Clear the SIGCONT from pending since we handle it immediately
+            }
+            Disposition::Ignored => {
+                // Explicitly ignored — drop it.
                 proc.pending_signals.clear(signal);
             }
-            SignalAction::Ignore => {
-                // Clear the ignored signal from pending
-                proc.pending_signals.clear(signal);
-            }
+            Disposition::Default(default) => match default {
+                SignalAction::Terminate => {
+                    terminate_code = Some(signal_exit_code(signal));
+                }
+                SignalAction::Stop => {
+                    // R98-1 FIX: Job-control stop is orthogonal to scheduler state.
+                    // Do NOT overwrite Blocked/Sleeping, or we lose the wait condition
+                    // and break wait queue invariants (H-34 lost wakeup fix).
+                    let was_running = proc.state == ProcessState::Running;
+                    proc.stopped = true;
+                    if was_running && process::current_pid() == Some(pid) {
+                        needs_reschedule = true;
+                    }
+                }
+                SignalAction::Continue => {
+                    // R98-1 FIX: Handle SIGCONT via the scheduler resume callback.
+                    // Check (but do not clear) `stopped`; resume_stopped() clears it
+                    // atomically. Check BOTH the orthogonal flag and the legacy state.
+                    if proc.stopped || proc.state == ProcessState::Stopped {
+                        needs_resume = true;
+                    }
+                    proc.pending_signals.clear(signal);
+                }
+                SignalAction::Ignore => {
+                    proc.pending_signals.clear(signal);
+                }
+            },
         }
     } // Release process lock before calling scheduler functions
 
@@ -450,6 +627,50 @@ pub fn has_pending_signals(pid: ProcessId) -> bool {
     } else {
         false
     }
+}
+
+/// M0 item 5 (sub-slice 1a): pure self-test of the signal data model — the mask
+/// read-modify-write (with SIGKILL/SIGSTOP force-strip) and the disposition resolver
+/// (handler vs default vs ignored, plus the uncatchable defense-in-depth). Pure; any
+/// failure panics (surfaced by the serial Test Summary). Registered in
+/// `kernel/src/integration_test.rs`.
+pub fn run_signal_self_test() {
+    let kill_stop = uncatchable_mask();
+    assert_eq!(kill_stop, (1u64 << 8) | (1u64 << 18), "uncatchable == SIGKILL|SIGSTOP");
+
+    // apply_sigprocmask: BLOCK adds, always strips SIGKILL/SIGSTOP.
+    let m = apply_sigprocmask(0, SIG_BLOCK, Signal::SIGUSR1.bit() | kill_stop);
+    assert_eq!(m, Signal::SIGUSR1.bit(), "BLOCK adds; SIGKILL/SIGSTOP stripped");
+    // SETMASK replaces, strips uncatchable.
+    let m = apply_sigprocmask(0xFFFF_FFFF, SIG_SETMASK, kill_stop | Signal::SIGTERM.bit());
+    assert_eq!(m, Signal::SIGTERM.bit(), "SETMASK replaces; uncatchable stripped");
+    // UNBLOCK clears only the requested bit.
+    let base = Signal::SIGUSR1.bit() | Signal::SIGUSR2.bit();
+    let m = apply_sigprocmask(base, SIG_UNBLOCK, Signal::SIGUSR1.bit());
+    assert_eq!(m, Signal::SIGUSR2.bit(), "UNBLOCK clears the requested bit only");
+
+    // resolve_disposition: default table => Default; handler => Handler; SIG_IGN =>
+    // Ignored; SIGKILL/SIGSTOP => ALWAYS Default even with a (forbidden) handler.
+    let mut table = default_sigactions();
+    let u1 = (Signal::SIGUSR1.as_u8() - 1) as usize;
+    let u2 = (Signal::SIGUSR2.as_u8() - 1) as usize;
+    assert!(matches!(
+        resolve_disposition(&table, Signal::SIGUSR1),
+        Disposition::Default(SignalAction::Terminate)
+    ));
+    table[u1] = SigAction { handler: 0x40_0000, flags: SA_RESTORER, restorer: 0x40_1000, mask: 0 };
+    assert!(matches!(resolve_disposition(&table, Signal::SIGUSR1), Disposition::Handler { .. }));
+    table[u2] = SigAction { handler: SIG_IGN, flags: 0, restorer: 0, mask: 0 };
+    assert!(matches!(resolve_disposition(&table, Signal::SIGUSR2), Disposition::Ignored));
+    // Defense-in-depth: even a handler-looking SIGKILL entry resolves to Default.
+    let k = (Signal::SIGKILL.as_u8() - 1) as usize;
+    table[k] = SigAction { handler: 0x40_0000, flags: SA_RESTORER, restorer: 0x40_1000, mask: 0 };
+    assert!(
+        matches!(resolve_disposition(&table, Signal::SIGKILL), Disposition::Default(_)),
+        "SIGKILL is never handler-dispatched"
+    );
+    // default_sigactions is born clean.
+    assert!(default_sigactions().iter().all(|s| !s.is_handler()), "default table is all SIG_DFL");
 }
 
 /// Get signal name for debugging

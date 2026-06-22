@@ -1431,6 +1431,72 @@ where
     get_current_syscall_frame().map(f)
 }
 
+// ============================================================================
+// M0 item 5: MUTABLE syscall-frame access (signal-handler delivery)
+// ============================================================================
+
+/// The 512-byte FXSAVE area lives immediately ABOVE the `SyscallFrame` on the
+/// kernel stack (the syscall entry stub `fxsave64`s the user FPU there). The frame
+/// is exactly `size_of::<SyscallFrame>()` (128) bytes.
+const SYSCALL_FRAME_BYTES: usize = core::mem::size_of::<SyscallFrame>();
+
+/// Callback (registered by arch): MUTABLE access to the current syscall frame, gated
+/// by the owner PID. Returns the raw frame pointer or `None` (fail-closed).
+pub type GetSyscallFrameMutCallback = fn(expected_pid: u64) -> Option<*mut SyscallFrame>;
+/// Callback (registered by arch): record the PID owning the current frame.
+pub type SetFrameOwnerCallback = fn(pid: u64);
+
+// LOCK-FREE callback storage. `set_syscall_frame_owner` runs on EVERY syscall entry,
+// so a `Mutex` here would be per-syscall global contention under SMP. The callbacks
+// are registered exactly once during arch boot init and never change, so `spin::Once`
+// (a lock-free atomic-state read after init, no fn-ptr-to-int cast / transmute) fits.
+static SYSCALL_FRAME_MUT_CALLBACK: spin::Once<GetSyscallFrameMutCallback> = spin::Once::new();
+static SET_FRAME_OWNER_CALLBACK: spin::Once<SetFrameOwnerCallback> = spin::Once::new();
+
+/// Register the mutable-frame accessor (arch → kernel_core). Called once at boot.
+pub fn register_syscall_frame_mut_callback(cb: GetSyscallFrameMutCallback) {
+    SYSCALL_FRAME_MUT_CALLBACK.call_once(|| cb);
+}
+/// Register the frame-owner setter (arch → kernel_core). Called once at boot.
+pub fn register_set_frame_owner_callback(cb: SetFrameOwnerCallback) {
+    SET_FRAME_OWNER_CALLBACK.call_once(|| cb);
+}
+
+/// Record `pid` as the owner of the current syscall frame. Called once at the top of
+/// the dispatcher so the mutable accessor can reject a stale cross-task frame.
+/// Lock-free (a `spin::Once::get` is an atomic-state load after init).
+pub fn set_syscall_frame_owner(pid: ProcessId) {
+    if let Some(&cb) = SET_FRAME_OWNER_CALLBACK.get() {
+        cb(pid as u64);
+    }
+}
+
+/// Execute a closure with MUTABLE access to the current syscall frame AND its FPU
+/// save area, but ONLY when the frame is live and owned by `expected_pid` (the
+/// caller's `current_pid()`). Returns `None` (and runs nothing) when no valid frame
+/// is present — e.g. a syscall that blocked-and-resumed (its `frame_ptr` was zeroed),
+/// in which case signal delivery is safely deferred to the next non-blocking return.
+///
+/// The closure receives `(&mut SyscallFrame, &mut [u8; 512] fxsave_area)`.
+///
+/// # Safety
+/// The raw pointer is the live kernel-stack frame; it is valid only during the active
+/// syscall on this CPU. The closure must not let either reference escape.
+pub fn with_current_syscall_frame_mut<F, R>(expected_pid: ProcessId, f: F) -> Option<R>
+where
+    F: FnOnce(&mut SyscallFrame, &mut [u8; 512]) -> R,
+{
+    let cb = *SYSCALL_FRAME_MUT_CALLBACK.get()?;
+    let ptr = cb(expected_pid as u64)?;
+    // SAFETY: arch validated `ptr` is the live frame for `expected_pid` on this CPU;
+    // the FPU area is the 512 bytes immediately above the 128-byte frame.
+    unsafe {
+        let frame = &mut *ptr;
+        let fx = &mut *((ptr as usize + SYSCALL_FRAME_BYTES) as *mut [u8; 512]);
+        Some(f(frame, fx))
+    }
+}
+
 /// 管道创建回调类型
 ///
 /// 由 ipc 模块注册，返回 (read_fd, write_fd) 或错误
@@ -2338,6 +2404,19 @@ pub fn syscall_dispatcher(
             increment_counter(TraceCounter::SyscallExit, 1);
             terminate_self_and_halt(pid, exit_code);
         }
+        // M0 item 5: record this task as the owner of the current syscall frame, so
+        // the MUTABLE frame accessor used by signal-handler delivery at the return
+        // tail can reject a stale cross-task `frame_ptr` (defense-in-depth + the
+        // invariant the future preemptive-IRQ slice relies on). Gated on the
+        // monotonic global handler hint so the no-handler hot path (musl/native gate)
+        // pays only one relaxed atomic load here. A handler for THIS task is always
+        // installed by a PRIOR rt_sigaction syscall (so the hint is already set at a
+        // later syscall's entry); a cross-process install that trips the hint mid-
+        // syscall is harmless (this task has no handler in its own table, so no frame
+        // is ever built and the unset owner is never consulted).
+        if crate::signal::any_handler_installed() {
+            set_syscall_frame_owner(pid);
+        }
     }
 
     // Evaluate seccomp/pledge filters before dispatch
@@ -2520,6 +2599,20 @@ pub fn syscall_dispatcher(
         218 => sys_set_tid_address(arg0 as *mut i32),
         273 => sys_set_robust_list(arg0 as *const u8, arg1 as usize),
         62 => sys_kill(arg0 as ProcessId, arg1 as i32),
+        // M0 item 5: signal-handler delivery (sub-slice 1a).
+        13 => sys_rt_sigaction(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as *mut u8,
+            arg3 as usize,
+        ),
+        14 => sys_rt_sigprocmask(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as *mut u8,
+            arg3 as usize,
+        ),
+        15 => sys_rt_sigreturn(),
         // F.1: Namespace unshare
         272 => sys_unshare(arg0 as u64),
         // F.1: setns for mount namespace
@@ -2701,6 +2794,24 @@ pub fn syscall_dispatcher(
         }
     }
 
+    // Compute the syscall's return value (→ RAX). Captured here because signal
+    // delivery saves it into the sigframe (so `rt_sigreturn` restores the
+    // interrupted context's RAX — the EINTR / partial-op short-count contract: the
+    // FINAL `result` is used verbatim, never recomputed).
+    let ret_val: i64 = match &result {
+        Ok(val) => *val as i64,
+        Err(err) => err.as_i64(),
+    };
+
+    // M0 item 5 (sub-slice 1a): deliver one pending handler signal at this
+    // syscall-return safe point — STRICTLY AFTER the pending-kill check so SIGKILL
+    // always wins. No-op fast path (a single relaxed atomic load) when the process
+    // has no installed handlers (the musl/native-hello gate path). May not return
+    // (fatal SIGSEGV on an unbuildable frame, or a SIGKILL that raced the commit).
+    if let Some(pid) = current_pid() {
+        maybe_deliver_signal(pid, ret_val);
+    }
+
     // 在返回用户态前检查是否需要调度
     // 这是定时器中断设置的 NEED_RESCHED 标志的主要消费点
     crate::reschedule_if_needed();
@@ -2708,10 +2819,7 @@ pub fn syscall_dispatcher(
     // G.1: Count successful syscall exit (after all processing complete)
     increment_counter(TraceCounter::SyscallExit, 1);
 
-    match result {
-        Ok(val) => val as i64,
-        Err(err) => err.as_i64(),
-    }
+    ret_val
 }
 
 // ============================================================================
@@ -5422,6 +5530,470 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
     );
 
     Ok(0)
+}
+
+// ============================================================================
+// 信号掩码 (Signal mask) — Linux x86_64 ABI
+// ============================================================================
+
+/// `how` argument values for rt_sigprocmask (Linux ABI).
+const SIG_BLOCK: i32 = 0;
+const SIG_UNBLOCK: i32 = 1;
+const SIG_SETMASK: i32 = 2;
+
+/// The kernel `sigset_t` is a fixed 64-bit mask on x86_64 (`_NSIG / 8 == 8`).
+/// rt_sigprocmask requires the caller's `sigsetsize` to equal this exactly.
+const LINUX_KERNEL_SIGSET_SIZE: usize = core::mem::size_of::<u64>();
+
+/// Pure validator for rt_sigprocmask arguments, factored out for self-testing.
+///
+/// Linux semantics: `sigsetsize` is checked unconditionally; `how` is validated
+/// ONLY when a new mask is supplied (`set != NULL`). A NULL `set` is a pure
+/// query of the old mask and ignores `how` entirely (so even a bogus `how` is
+/// accepted there) — matching `kernel/signal.c` where `how` is only consulted
+/// inside the `if (nset)` branch.
+fn validate_rt_sigprocmask_args(
+    how: i32,
+    set_is_null: bool,
+    sigsetsize: usize,
+) -> Result<(), SyscallError> {
+    if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+        return Err(SyscallError::EINVAL);
+    }
+    if !set_is_null {
+        match how {
+            SIG_BLOCK | SIG_UNBLOCK | SIG_SETMASK => {}
+            _ => return Err(SyscallError::EINVAL),
+        }
+    }
+    Ok(())
+}
+
+/// sys_rt_sigprocmask - examine/change the blocked-signal mask (syscall 14).
+///
+/// STUB for M0: real per-thread signal-mask state and signal-handler delivery
+/// land in M0 item 5. Until then no signal is ever delivered, so the effective
+/// blocked mask is permanently empty. We fault-validate the inbound `set`
+/// (without applying it) and report an all-zero `oldset`. musl's crt calls this
+/// during startup and only needs a success return plus a zeroed `oldset`.
+fn sys_rt_sigprocmask(
+    how: i32,
+    set: *const u8,
+    oldset: *mut u8,
+    sigsetsize: usize,
+) -> SyscallResult {
+    // M0 item 5 (sub-slice 1a): upgraded from the M0-2 zeroed stub to a REAL per-task
+    // blocked mask. SIGKILL/SIGSTOP are force-stripped from any stored mask (POSIX:
+    // they can never be blocked). A born-clean process starts with blocked == 0, so
+    // the musl crt's startup mask query still observes an all-zero oldset.
+    validate_rt_sigprocmask_args(how, set.is_null(), sigsetsize)?;
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // Read the new mask (if any) BEFORE mutating (fault-before-mutation).
+    let new_set: Option<u64> = if !set.is_null() {
+        let mut b = [0u8; LINUX_KERNEL_SIGSET_SIZE];
+        copy_from_user(&mut b, set)?;
+        Some(u64::from_ne_bytes(b))
+    } else {
+        None
+    };
+    // Preflight the oldset buffer writable before mutating, so a faulting oldset can
+    // never surface AFTER the mask was already installed.
+    if !oldset.is_null() {
+        verify_user_memory(oldset as *const u8, LINUX_KERNEL_SIGSET_SIZE, true)?;
+    }
+
+    // Apply under the lock; capture the previous mask for oldset.
+    let old = {
+        let mut proc = proc_arc.lock();
+        let old = proc.blocked;
+        if let Some(s) = new_set {
+            proc.blocked = crate::signal::apply_sigprocmask(old, how, s);
+        }
+        old
+    };
+
+    if !oldset.is_null() {
+        copy_to_user(oldset, &old.to_ne_bytes())?;
+    }
+    Ok(0)
+}
+
+/// sys_rt_sigaction - install / query a per-task signal disposition (syscall 13).
+///
+/// M0 item 5 (sub-slice 1a). Rejects SIGKILL/SIGSTOP, unknown `sa_flags`, and a real
+/// handler without SA_RESTORER or with a non-canonical / high-half handler/restorer
+/// VA (validated AT INSTALL, mirroring the SYSRET checks). `sa_mask` is stripped of
+/// SIGKILL/SIGSTOP. Installs the action then copies out the previous one (Linux
+/// window, documented). Refreshes the lock-free `has_handlers` delivery hint.
+fn sys_rt_sigaction(
+    signum: i32,
+    act: *const u8,
+    oldact: *mut u8,
+    sigsetsize: usize,
+) -> SyscallResult {
+    use crate::signal::{SigAction, Signal, SA_RESTORER, SA_SUPPORTED_FLAGS, SIG_DFL, SIG_IGN};
+    if sigsetsize != LINUX_KERNEL_SIGSET_SIZE {
+        return Err(SyscallError::EINVAL);
+    }
+    let sig = Signal::from_raw(signum).map_err(|_| SyscallError::EINVAL)?;
+    // SIGKILL/SIGSTOP dispositions cannot be changed (POSIX).
+    if sig.is_uncatchable() {
+        return Err(SyscallError::EINVAL);
+    }
+    let idx = (sig.as_u8() - 1) as usize;
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    const SIGACTION_BYTES: usize = 32;
+    // Parse + validate the new action BEFORE any mutation.
+    let new_act: Option<SigAction> = if !act.is_null() {
+        let mut b = [0u8; SIGACTION_BYTES];
+        copy_from_user(&mut b, act)?;
+        let rd = |o: usize| -> u64 {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&b[o..o + 8]);
+            u64::from_ne_bytes(a)
+        };
+        let handler = rd(0);
+        let flags = rd(8);
+        let restorer = rd(16);
+        let mask = rd(24);
+        // Reject unknown flags so an unrecognized bit can never silently change behavior.
+        if flags & !SA_SUPPORTED_FLAGS != 0 {
+            return Err(SyscallError::EINVAL);
+        }
+        if handler != SIG_DFL && handler != SIG_IGN {
+            // A real handler REQUIRES SA_RESTORER (x86-64 Linux) and canonical low-half
+            // handler + restorer VAs.
+            if flags & SA_RESTORER == 0 {
+                return Err(SyscallError::EINVAL);
+            }
+            if !crate::signal_frame::is_canonical_user_addr(handler) {
+                return Err(SyscallError::EINVAL);
+            }
+            if restorer == 0 || !crate::signal_frame::is_canonical_user_addr(restorer) {
+                return Err(SyscallError::EINVAL);
+            }
+        }
+        // SIGKILL/SIGSTOP can never be auto-blocked via sa_mask.
+        let mask = mask & !crate::signal::uncatchable_mask();
+        Some(SigAction { handler, flags, restorer, mask })
+    } else {
+        None
+    };
+
+    if !oldact.is_null() {
+        verify_user_memory(oldact as *const u8, SIGACTION_BYTES, true)?;
+    }
+
+    // Install + capture the old disposition. If a real handler is installed, trip the
+    // monotonic global delivery hint so the syscall-return hook starts scanning.
+    let old = {
+        let mut proc = proc_arc.lock();
+        let old = proc.sigactions[idx];
+        if let Some(na) = new_act {
+            proc.sigactions[idx] = na;
+            if na.is_handler() {
+                crate::signal::note_handler_installed();
+            }
+        }
+        old
+    };
+
+    if !oldact.is_null() {
+        let mut b = [0u8; SIGACTION_BYTES];
+        b[0..8].copy_from_slice(&old.handler.to_ne_bytes());
+        b[8..16].copy_from_slice(&old.flags.to_ne_bytes());
+        b[16..24].copy_from_slice(&old.restorer.to_ne_bytes());
+        b[24..32].copy_from_slice(&old.mask.to_ne_bytes());
+        copy_to_user(oldact, &b)?;
+    }
+    Ok(0)
+}
+
+/// sys_rt_sigreturn - restore the interrupted context after a handler returns (15).
+///
+/// M0 item 5 (sub-slice 1a). SROP-DEFENDED: validates the restored RIP/RSP (canonical,
+/// low-half), sanitizes RFLAGS, IGNORES the user CS/SS (SYSRET reloads the fixed user
+/// selectors), re-derives the fpstate at a FIXED offset (never trusting the in-frame
+/// pointer) and masks MXCSR so the exit-path `fxrstor64` cannot #GP. Restores the
+/// pre-handler blocked mask from the PCB (never from `uc_sigmask`). ANY failure
+/// terminates with SIGSEGV (139) — a forged context never resumes.
+fn sys_rt_sigreturn() -> SyscallResult {
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let proc_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // Gate: must be inside a live handler frame. A forged rt_sigreturn is fatal.
+    if !proc_arc.lock().in_signal_handler {
+        terminate_self_and_halt(pid, 139);
+    }
+
+    // The ucontext VA == the user RSP at rt_sigreturn entry. Also read the live CPU
+    // MXCSR mask from the kernel's own fxsave area (FXSAVE offset 28). None => no live
+    // frame (should not happen for a non-blocking syscall at its own return) => fatal.
+    let (uc_va, cpu_mxcsr_mask) = match with_current_syscall_frame_mut(pid, |frame, fx| {
+        let mut m = [0u8; 4];
+        m.copy_from_slice(&fx[28..32]);
+        (frame.rsp, u32::from_ne_bytes(m))
+    }) {
+        Some(v) => v,
+        None => terminate_self_and_halt(pid, 139),
+    };
+
+    // One bulk copy of the sigcontext from the user stack; SROP-validate it.
+    let mc_va = uc_va
+        .checked_add(crate::signal_frame::SIGRETURN_MCONTEXT_FROM_UC)
+        .unwrap_or(0);
+    let mut mc = [0u8; crate::signal_frame::MCONTEXT_SIZE];
+    if copy_from_user(&mut mc, mc_va as *const u8).is_err() {
+        terminate_self_and_halt(pid, 139);
+    }
+    let restored = match crate::signal_frame::parse_and_validate_mcontext(&mc) {
+        Ok(r) => r,
+        Err(()) => terminate_self_and_halt(pid, 139),
+    };
+
+    // One bulk copy of the fpstate from the FIXED offset; mask MXCSR.
+    let fp_va = uc_va
+        .checked_add(crate::signal_frame::SIGRETURN_FPSTATE_FROM_UC)
+        .unwrap_or(0);
+    let mut fxbuf = [0u8; 512];
+    if copy_from_user(&mut fxbuf, fp_va as *const u8).is_err() {
+        terminate_self_and_halt(pid, 139);
+    }
+    crate::signal_frame::sanitize_inbound_fxsave(&mut fxbuf, cpu_mxcsr_mask);
+
+    // Restore the interrupted register state into the live frame + the sanitized
+    // fpstate into the exit-path FXSAVE area.
+    let committed = with_current_syscall_frame_mut(pid, |frame, fx| {
+        frame.rax = restored.rax;
+        frame.rbx = restored.rbx;
+        frame.rcx = restored.rip; // SYSRET reads RCX as the user RIP.
+        frame.rdx = restored.rdx;
+        frame.rsi = restored.rsi;
+        frame.rdi = restored.rdi;
+        frame.rbp = restored.rbp;
+        frame.rsp = restored.rsp;
+        frame.r8 = restored.r8;
+        frame.r9 = restored.r9;
+        frame.r10 = restored.r10;
+        frame.r11 = restored.rflags; // SYSRET reads R11 as RFLAGS (already sanitized).
+        frame.r12 = restored.r12;
+        frame.r13 = restored.r13;
+        frame.r14 = restored.r14;
+        frame.r15 = restored.r15;
+        fx.copy_from_slice(&fxbuf[..]);
+    });
+    if committed.is_none() {
+        terminate_self_and_halt(pid, 139);
+    }
+
+    // Restore the pre-handler blocked mask + clear the handler-live state.
+    {
+        let mut proc = proc_arc.lock();
+        proc.blocked = proc.saved_blocked & !crate::signal::uncatchable_mask();
+        proc.saved_blocked = 0;
+        proc.in_signal_handler = false;
+    }
+
+    // Return the interrupted syscall's saved RAX (the exit asm does NOT reload RAX
+    // from the frame — the dispatcher return value becomes RAX).
+    Ok(restored.rax as usize)
+}
+
+/// Apply a DEFAULT-disposition signal at the syscall-return safe point (the current
+/// task IS `pid`). Reached from `maybe_deliver_signal` when a pending bit's CURRENT
+/// disposition is SIG_DFL — e.g. a handler-disposition signal was queued, then reset
+/// to default by `rt_sigaction`/`exec` before the safe point drained it. Mirrors
+/// `send_signal_inner`'s send-time default executor.
+fn apply_default_at_safepoint(pid: ProcessId, sig: crate::signal::Signal) {
+    use crate::signal::{default_action, signal_exit_code, SignalAction};
+    match default_action(sig) {
+        SignalAction::Terminate => {
+            terminate_self_and_halt(pid, signal_exit_code(sig)); // no return
+        }
+        SignalAction::Stop => {
+            if let Some(arc) = get_process(pid) {
+                let mut p = arc.lock();
+                p.stopped = true;
+                p.pending_signals.clear(sig);
+            }
+            crate::scheduler_hook::force_reschedule();
+        }
+        SignalAction::Continue | SignalAction::Ignore => {
+            if let Some(arc) = get_process(pid) {
+                arc.lock().pending_signals.clear(sig);
+            }
+        }
+    }
+}
+
+/// M0 item 5 (sub-slice 1a): deliver ONE pending handler signal at the syscall-return
+/// safe point. `result` is the about-to-be-returned syscall value — saved into the
+/// sigframe so `rt_sigreturn` restores the interrupted context's RAX (the EINTR /
+/// partial-op short-count contract). May not return (fatal SIGSEGV / racing SIGKILL).
+///
+/// Sub-slice 1a delivers only when the mutable frame accessor yields a live frame
+/// (a non-blocking syscall return); a syscall that blocked-and-resumed has a zeroed
+/// `frame_ptr`, so delivery is SAFELY DEFERRED to the task's next non-blocking return
+/// (waking a blocked-in-syscall target is 1b). No blocked-waiter wake here.
+fn maybe_deliver_signal(pid: ProcessId, result: i64) {
+    // Lock-free fast path FIRST: no handler installed anywhere yet => nothing to
+    // deliver. The musl / native-hello gate path takes EXACTLY one relaxed atomic
+    // load and returns — no `get_process`, no lock, zero per-syscall cost on the
+    // no-handler hot path (the global hint never trips on a no-handler boot).
+    if !crate::signal::any_handler_installed() {
+        return;
+    }
+    let proc_arc = match get_process(pid) {
+        Some(a) => a,
+        None => return,
+    };
+
+    // Phase 1 (under the lock): select the lowest-numbered deliverable signal and
+    // snapshot its disposition + the pre-delivery blocked mask.
+    let (sig, handler, restorer, sa_mask, sa_flags, old_blocked) = {
+        let proc = proc_arc.lock();
+        if proc.in_signal_handler {
+            return; // serialize: one live handler frame at a time (slice 1a).
+        }
+        let deliverable = proc.pending_signals.bits() & !proc.blocked;
+        if deliverable == 0 {
+            return;
+        }
+        let bit = deliverable.trailing_zeros() as u8; // signal = bit + 1, lowest first
+        let sig = match crate::signal::Signal::from_index(bit + 1) {
+            Some(s) => s,
+            None => return,
+        };
+        match crate::signal::resolve_disposition(&proc.sigactions, sig) {
+            crate::signal::Disposition::Handler { handler, flags, mask } => {
+                let restorer = proc.sigactions[bit as usize].restorer;
+                (sig, handler, restorer, mask, flags, proc.blocked)
+            }
+            crate::signal::Disposition::Ignored => {
+                // (race: reset to SIG_IGN after queueing.) Drop the bit and stop.
+                drop(proc);
+                if let Some(a) = get_process(pid) {
+                    a.lock().pending_signals.clear(sig);
+                }
+                return;
+            }
+            crate::signal::Disposition::Default(_) => {
+                // (race: reset to SIG_DFL after queueing.) Re-resolve at delivery and
+                // apply the default — NEVER build a frame with a handler of 0.
+                drop(proc);
+                apply_default_at_safepoint(pid, sig); // may not return
+                return;
+            }
+        }
+    };
+
+    // Phase 2 (NO lock held — faultable copy_to_user + heap alloc): snapshot the
+    // interrupted context + FXSAVE, build the sigframe, copy it to the user stack.
+    let snap = with_current_syscall_frame_mut(pid, |frame, fx| {
+        // The SYSCALL path saved user RIP into RCX and user RFLAGS into R11.
+        let ctx = crate::signal_frame::SavedUserContext {
+            rax: result as u64,
+            rbx: frame.rbx,
+            rcx: frame.rcx,
+            rdx: frame.rdx,
+            rsi: frame.rsi,
+            rdi: frame.rdi,
+            rbp: frame.rbp,
+            rsp: frame.rsp,
+            r8: frame.r8,
+            r9: frame.r9,
+            r10: frame.r10,
+            r11: frame.r11,
+            r12: frame.r12,
+            r13: frame.r13,
+            r14: frame.r14,
+            r15: frame.r15,
+            rip: frame.rcx,    // user RIP
+            rflags: frame.r11, // user RFLAGS
+        };
+        let mut fxcopy = [0u8; 512];
+        fxcopy.copy_from_slice(&fx[..]);
+        (ctx, fxcopy)
+    });
+    // None => stale frame_ptr (this syscall blocked-and-resumed) => DEFER delivery to
+    // the next non-blocking return; pending bit and blocked mask untouched.
+    let (ctx, mut fxcopy) = match snap {
+        Some(s) => s,
+        None => return,
+    };
+    crate::signal_frame::sanitize_fxsave_for_export(&mut fxcopy);
+
+    let stack_floor =
+        crate::elf_loader::USER_STACK_TOP as u64 - crate::elf_loader::USER_STACK_SIZE as u64;
+    let layout = match crate::signal_frame::compute_sigframe_layout(ctx.rsp, stack_floor) {
+        Ok(l) => l,
+        // No room for the frame on the user stack: fatal SIGSEGV (Linux force_sigsegv).
+        Err(_) => terminate_self_and_halt(pid, 139),
+    };
+    let buf = match crate::signal_frame::assemble_sigframe(
+        &layout,
+        &ctx,
+        &fxcopy,
+        sig.as_u8() as u32,
+        handler,
+        restorer,
+    ) {
+        Ok(b) => b,
+        Err(_) => terminate_self_and_halt(pid, 139),
+    };
+    // A copy_to_user fault (unmapped / over-grown stack) is fatal SIGSEGV — NEVER
+    // EFAULT back into the interrupted context, and NEVER a catchable SIGSEGV here
+    // (that would recurse). The pending bit is still set; we do not return.
+    if copy_to_user(layout.frame_base as *mut u8, &buf).is_err() {
+        terminate_self_and_halt(pid, 139);
+    }
+
+    // Phase 3: COMMIT — redirect the live frame to the handler. Only AFTER this
+    // succeeds do we mutate the PCB (clear pending, raise the blocked mask, mark
+    // in-handler), so a failed frame mutation leaves pending/blocked untouched.
+    let committed = with_current_syscall_frame_mut(pid, |frame, _fx| {
+        frame.rcx = handler; // user RIP (SYSRET reads RCX)
+        frame.rsp = layout.frame_base; // handler entry RSP (%16 == 8)
+        frame.rdi = sig.as_u8() as u64; // arg0 = signum
+        frame.rsi = layout.siginfo_va; // arg1 = &siginfo
+        frame.rdx = layout.uc_va; // arg2 = &ucontext
+        // Handler-entry RFLAGS: sanitize the interrupted flags (clear DF/TF/IOPL,
+        // force IF). The ORIGINAL flags are saved into the sigframe's mcontext.EFLAGS.
+        frame.r11 = crate::signal_frame::sanitize_user_rflags(ctx.rflags);
+    });
+    if committed.is_none() {
+        // The frame vanished between build and commit (must not happen at the tail):
+        // the sigframe bytes are on the user stack but control flow is unchanged, so
+        // there is no delivery; the pending bit stays set for a later attempt.
+        return;
+    }
+
+    {
+        let mut proc = proc_arc.lock();
+        proc.pending_signals.clear(sig);
+        proc.saved_blocked = old_blocked;
+        let mut newmask = old_blocked | sa_mask;
+        if sa_flags & crate::signal::SA_NODEFER == 0 {
+            newmask |= sig.bit();
+        }
+        proc.blocked = newmask & !crate::signal::uncatchable_mask();
+        proc.in_signal_handler = true;
+        // SA_RESETHAND (Codex review): a one-shot handler resets to SIG_DFL after
+        // this single delivery; the next occurrence takes the default action.
+        if sa_flags & crate::signal::SA_RESETHAND != 0 {
+            proc.sigactions[(sig.as_u8() - 1) as usize] = crate::signal::SigAction::default_action();
+        }
+    }
+
+    // smp-toctou: a SIGKILL could have raced in during the interrupt-enabled build
+    // window. Re-check the pending-kill flag AFTER commit — SIGKILL still wins.
+    if let Some(code) = crate::process::take_pending_process_exit(pid) {
+        terminate_self_and_halt(pid, code);
+    }
 }
 
 /// sys_unshare - Unshare namespaces for the current process

@@ -32,6 +32,7 @@ pub mod rcu;
 pub mod user_namespace;
 pub mod scheduler_hook;
 pub mod signal;
+pub mod signal_frame;
 pub mod syscall;
 pub mod time;
 pub mod usercopy;

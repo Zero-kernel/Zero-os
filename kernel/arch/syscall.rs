@@ -246,6 +246,17 @@ pub struct SyscallPerCpu {
     /// Scratch slot used by the exit trampoline to preserve a user register
     /// during the CR3 switch (currently: RDX).
     pub kpti_tmp: u64,
+
+    /// M0 item 5: the PID that owns the current `frame_ptr`. Set by the syscall
+    /// dispatcher at entry (via `set_frame_owner`) and validated by the MUTABLE
+    /// frame accessor (`get_current_syscall_frame_mut_inner`) so a signal-delivery
+    /// write can never target a STALE cross-task frame. The bare `frame_ptr != 0`
+    /// gate is already sufficient at the syscall-return tail (the tail is always
+    /// preceded by THIS syscall's entry, which sets `frame_ptr`; a block zeroes it
+    /// via `switch_context`), but the owner check is defense-in-depth and the
+    /// invariant the future preemptive-IRQ-delivery slice will rely on (where the
+    /// hook is NOT preceded by a syscall entry). Not touched by the ASM.
+    pub frame_owner_pid: u64,
 }
 
 impl SyscallPerCpu {
@@ -258,6 +269,7 @@ impl SyscallPerCpu {
             kpti_kernel_cr3: 0,
             kpti_user_cr3: 0,
             kpti_tmp: 0,
+            frame_owner_pid: 0,
         }
     }
 }
@@ -315,6 +327,8 @@ pub const PERCPU_KPTI_KERNEL_CR3_OFFSET: usize = 32;
 pub const PERCPU_KPTI_USER_CR3_OFFSET: usize = 40;
 /// H.3 KPTI: Offset of kpti_tmp scratch slot in SyscallPerCpu
 pub const PERCPU_KPTI_TMP_OFFSET: usize = 48;
+/// M0 item 5: Offset of frame_owner_pid in SyscallPerCpu (Rust-only, no ASM use).
+pub const PERCPU_FRAME_OWNER_OFFSET: usize = 56;
 
 // R103-3 FIX: Compile-time assertions that the offsets match the struct layout.
 // If SyscallPerCpu is reordered, these will produce a build error.
@@ -346,6 +360,10 @@ const _: () = {
     assert!(
         core::mem::offset_of!(SyscallPerCpu, kpti_tmp) == PERCPU_KPTI_TMP_OFFSET,
         "PERCPU_KPTI_TMP_OFFSET does not match struct layout"
+    );
+    assert!(
+        core::mem::offset_of!(SyscallPerCpu, frame_owner_pid) == PERCPU_FRAME_OWNER_OFFSET,
+        "PERCPU_FRAME_OWNER_OFFSET does not match struct layout"
     );
 };
 
@@ -596,11 +614,68 @@ where
     get_current_syscall_frame_inner().map(f)
 }
 
+/// M0 item 5: record the PID that owns the current syscall frame.
+///
+/// Called by the kernel_core syscall dispatcher at entry (via a registered callback)
+/// so the MUTABLE frame accessor can reject a STALE cross-task `frame_ptr`. Runs on
+/// the per-CPU GS structure with interrupts effectively disabled for the relevant
+/// window (the dispatcher runs in the task's own context); a plain write is safe
+/// (single writer per CPU, no concurrent reader on the same CPU).
+fn set_frame_owner_inner(pid: u64) {
+    let cpu_id = cpu_local::current_cpu_id();
+    if cpu_id >= SYSCALL_MAX_CPUS {
+        return;
+    }
+    // SAFETY: per-CPU slot, single-writer in this CPU's syscall context.
+    unsafe {
+        SYSCALL_PERCPU[cpu_id].frame_owner_pid = pid;
+    }
+}
+
+/// M0 item 5: MUTABLE access to the current syscall frame, for signal-handler
+/// delivery (it redirects RIP/RSP/args to the handler).
+///
+/// Returns the raw frame pointer ONLY when ALL hold: the CPU index is valid, the GS
+/// `frame_ptr` is non-zero (a live syscall frame is present — zeroed on a blocking
+/// `switch_context`), AND the recorded `frame_owner_pid` equals `expected_pid` (the
+/// caller's `current_pid()`). The owner check rejects a stale `frame_ptr` left by the
+/// Ring-3 schedule path (`save_context` + `enter_usermode`, which does NOT zero it);
+/// at the syscall-return tail the bare non-zero check already suffices, but the owner
+/// check is the invariant a future preemptive-IRQ-delivery slice will rely on.
+///
+/// # Safety contract for the caller
+/// The returned pointer is the live kernel-stack `SyscallFrame`; it is valid only for
+/// the duration of the active syscall on this CPU (the same lifetime contract as
+/// `with_current_syscall_frame`). The FPU save area is the 512 bytes immediately
+/// ABOVE the frame (`frame_ptr + SYSCALL_FRAME_SIZE`), unconditionally `fxsave64`d on
+/// entry and `fxrstor64`d on exit.
+fn get_current_syscall_frame_mut_inner(
+    expected_pid: u64,
+) -> Option<*mut kernel_core::SyscallFrame> {
+    let cpu_id = cpu_local::current_cpu_id();
+    if cpu_id >= SYSCALL_MAX_CPUS {
+        return None;
+    }
+    unsafe {
+        let ptr = SYSCALL_PERCPU[cpu_id].frame_ptr;
+        let owner = SYSCALL_PERCPU[cpu_id].frame_owner_pid;
+        if ptr == 0 || owner != expected_pid {
+            None
+        } else {
+            Some(ptr as *mut kernel_core::SyscallFrame)
+        }
+    }
+}
+
 /// 注册 syscall 帧回调到 kernel_core
 ///
 /// 在 syscall 初始化时调用，让 kernel_core 能访问当前 syscall 帧
 pub fn register_frame_callback() {
     kernel_core::register_syscall_frame_callback(get_current_syscall_frame_inner);
+    // M0 item 5: register the mutable-frame accessor + the owner-setter used by the
+    // syscall-return signal-delivery path.
+    kernel_core::syscall::register_syscall_frame_mut_callback(get_current_syscall_frame_mut_inner);
+    kernel_core::syscall::register_set_frame_owner_callback(set_frame_owner_inner);
 }
 
 /// R67-8 FIX: Initialize per-CPU syscall metadata and kernel GS base.

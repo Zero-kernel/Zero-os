@@ -1,5 +1,6 @@
 use crate::fork::PAGE_REF_COUNT;
 use crate::signal::PendingSignals;
+use crate::signal::{SigAction, NSIG};
 use crate::syscall::{SyscallError, VfsStat};
 use crate::time;
 use alloc::{
@@ -725,6 +726,33 @@ pub struct Process {
     /// 挂起的信号位图（1-64）
     pub pending_signals: PendingSignals,
 
+    // ──────────────────────────────────────────────────────────────────────
+    // M0 item 5 (sub-slice 1a): user signal-handler delivery state.
+    //
+    // PER-TASK storage (a documented M0 DIVERGENCE from Linux, which shares the
+    // disposition table across a CLONE_SIGHAND thread group — same accepted
+    // pattern as the M0-6 per-task `rlimits`). A future CLONE_SIGHAND slice must
+    // NOT silently swap in a shared `Arc<Mutex<..>>` without a Process→table
+    // lock-ordering review.
+    // ──────────────────────────────────────────────────────────────────────
+    /// Per-task blocked-signal mask (signal `n` → bit `1<<(n-1)`). SIGKILL/SIGSTOP
+    /// are structurally never set (`apply_sigprocmask` force-clears them).
+    pub blocked: u64,
+    /// Per-signal disposition table (index = signum-1). Born-clean = all SIG_DFL;
+    /// reset to SIG_DFL for caught signals on exec (SIG_IGN preserved).
+    pub sigactions: [SigAction; NSIG],
+    /// The blocked mask saved when a handler frame is built; restored by
+    /// `rt_sigreturn` from THIS field (never from the user-controlled `uc_sigmask`,
+    /// closing a mask-widening SROP). Cleared on exec.
+    pub saved_blocked: u64,
+    /// Nesting guard: true while a handler frame is live (between delivery and
+    /// `rt_sigreturn`). Caps slice-1a nested delivery at one (a second deliverable
+    /// signal stays pending until `rt_sigreturn` clears this). Cleared on exec.
+    /// (The lock-free "any handler installed" fast-path hint is a MONOTONIC GLOBAL,
+    /// `signal::any_handler_installed()`, not a per-task field — an AtomicBool inside
+    /// this Mutex-guarded struct could not be read lock-free anyway.)
+    pub in_signal_handler: bool,
+
     /// 进程优先级（静态优先级）
     pub priority: Priority,
 
@@ -1141,6 +1169,12 @@ impl Process {
             state: ProcessState::Ready,
             stopped: false, // R98-1 FIX: Job-control stop flag starts cleared
             pending_signals: PendingSignals::new(),
+            // M0 item 5: signal-handler state born clean (no handlers, empty mask,
+            // no live handler frame).
+            blocked: 0,
+            sigactions: crate::signal::default_sigactions(),
+            saved_blocked: 0,
+            in_signal_handler: false,
             priority,
             dynamic_priority: priority,
             base_dynamic_priority: priority, // E.4 PI: starts same as dynamic_priority
