@@ -315,6 +315,22 @@ pub fn test_conntrack_reclaim() {
     klog_always!("    ✓ expired flow swept; ns-drain removes flows + zeroes the per-ns counter");
 }
 
+/// M0 #1: the SysV AMD64 initial-user-stack + auxv builder. Covers the mis-wires a
+/// green build/boot cannot catch: the entry-RSP alignment-parity flip (RSP%16 must be
+/// 0 at `_start`, NOT 8) across every (argc, envc, phdr-present) combination; the
+/// auxv-value whitelist (no auxv entry may embed a kernel/phys address — copy_to_user
+/// validates only the destination range); and the layout contiguity contract musl
+/// walks (argc at [RSP], argv/envp NULLs, AT_NULL-terminated auxv, AT_RANDOM/AT_EXECFN
+/// pointers into a non-zero string area, zero-filled alignment gap). Any failure
+/// panics, detected by `make test` / `make boot-check`.
+pub fn test_user_stack_builder() {
+    klog_always!("  [TEST] Initial User Stack + auxv Builder (M0 #1)...");
+    kernel_core::user_stack::run_user_stack_builder_self_test();
+    klog_always!("    ✓ entry RSP%16==0 sweep (argc/envc/phdr parities) — the alignment-parity flip class eliminated");
+    klog_always!("    ✓ auxv value whitelist (no kernel/phys address leaks via AT_*) + AT_PHDR-triple-iff-phdr!=0");
+    klog_always!("    ✓ layout contiguity: argc@[RSP] + argv/envp NULLs + AT_NULL-terminated auxv + AT_RANDOM/EXECFN ptrs + zero gap");
+}
+
 /// 运行所有集成测试
 pub fn run_all_tests() {
     klog_always!();
@@ -338,6 +354,7 @@ pub fn run_all_tests() {
     test_fragment_perns_budget();
     test_seccomp_chain_cap();
     test_conntrack_reclaim();
+    test_user_stack_builder();
     test_ext2_write();
 
     klog_always!();

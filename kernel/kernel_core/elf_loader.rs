@@ -111,6 +111,17 @@ pub struct ElfLoadResult {
     /// were never charged). The OTHER load_elf consumer (kernel/src/usermode_test.rs, a
     /// root-cgroup boot diagnostic) ignores this field — it field-accesses entry/stack.
     pub pt_frames: Vec<PhysFrame<Size4KiB>>,
+    /// M0 #1 (auxv): user-space virtual address of the `Elf64_Phdr` array (AT_PHDR).
+    ///
+    /// `0` is a sentinel meaning "no usable program-header table" — the auxv builder
+    /// then OMITS the entire AT_PHDR/AT_PHENT/AT_PHNUM triple (musl static tolerates
+    /// its absence; only TLS-via-phdr is skipped). Computed by [`compute_phdr_va`].
+    pub phdr: u64,
+    /// M0 #1 (auxv): `e_phentsize` (AT_PHENT) — size of one program-header entry
+    /// (56 for ELF64). Read directly from the ELF header.
+    pub phent: u16,
+    /// M0 #1 (auxv): `e_phnum` (AT_PHNUM) — number of program-header entries.
+    pub phnum: u16,
 }
 
 /// 为当前进程地址空间加载 ELF 映像
@@ -356,6 +367,14 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
     // 设置 RSP 为最后一个映射页的顶部，减去 16 字节确保 ABI 16字节对齐
     let initial_rsp = USER_STACK_TOP - 16;
 
+    // M0 #1 (auxv): capture program-header info for the SysV auxiliary vector.
+    // `phent`/`phnum` are unconditional header reads; `phdr` (AT_PHDR) uses the
+    // two-tier PT_PHDR / covering-PT_LOAD computation (0 = "omit the triple").
+    // `elf` is borrowed for the whole function, so reading it here is safe.
+    let phdr = compute_phdr_va(&elf);
+    let phent = elf.header.pt2.ph_entry_size();
+    let phnum = elf.header.pt2.ph_count();
+
     Ok(ElfLoadResult {
         entry,
         user_stack_top: initial_rsp,
@@ -364,7 +383,108 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
         // M2-1 SLICE-4d: the recorded PT/PD/PDPT frames sys_exec folds into the fresh AS
         // ledger + a forced PT-kmem charge at the success commit.
         pt_frames: pt_frames_acc,
+        phdr,
+        phent,
+        phnum,
     })
+}
+
+/// M0 #1 (auxv): compute the user-space VA of the program-header table (AT_PHDR).
+///
+/// Returns `0` (the "omit AT_PHDR/AT_PHENT/AT_PHNUM" sentinel) whenever no *validated*
+/// user-space mapping exists. The returned VA is ALWAYS a canonical user address whose
+/// whole `[va, va + e_phentsize*e_phnum)` range is file-backed by a mapped `PT_LOAD`.
+///
+/// Step 1 — derive a candidate VA:
+/// - **Tier 1** — an explicit `PT_PHDR` program header (its `p_vaddr`). `musl-gcc
+///   -static` always emits `PT_PHDR`, so the M0 gate takes this path.
+/// - **Tier 2** — the `PT_LOAD` whose FILE range *fully* contains the table
+///   `[e_phoff, e_phoff + e_phnum*e_phentsize)`; then `va = p_vaddr + (e_phoff -
+///   p_offset)`. The full-table coverage check (not just the start) avoids pointing at
+///   unmapped/zero-filled bytes.
+///
+/// Step 2 — VALIDATE (Codex `019ee8d1` finding 2): a `PT_PHDR` `p_vaddr` is
+/// attacker-controlled, so the candidate is accepted ONLY if its whole VA range lies
+/// inside the file-backed VA range of some mapped `PT_LOAD` AND inside the user image
+/// window `[USER_BASE, USER_STACK_TOP - USER_STACK_SIZE)`. Otherwise the triple is
+/// omitted (return `0`) — a crafted ELF can never push a non-user/unmapped VA into
+/// AT_PHDR. A well-formed static binary keeps its phdrs in the first `PT_LOAD`, so this
+/// rejects only malformed images (musl then merely skips TLS-via-phdr).
+///
+/// `ET_DYN` is rejected by [`validate_elf_header`], so the load bias is always `0` for
+/// accepted images; if PIE support is added, this is the single site that needs
+/// `+ load_bias`.
+fn compute_phdr_va(elf: &ElfFile) -> u64 {
+    // Program-header table size in bytes (e_phentsize * e_phnum).
+    let e_phoff = elf.header.pt2.ph_offset();
+    let table_bytes = match (elf.header.pt2.ph_entry_size() as u64)
+        .checked_mul(elf.header.pt2.ph_count() as u64)
+    {
+        Some(b) if b != 0 => b,
+        _ => return 0, // no program headers (or overflow): omit the triple.
+    };
+
+    // --- Step 1: derive a CANDIDATE user VA for the phdr table. ---
+    let mut candidate: u64 = 0;
+    // Tier 1: explicit PT_PHDR.
+    for ph in elf.program_iter() {
+        if ph.get_type() == Ok(PhType::Phdr) {
+            candidate = ph.virtual_addr();
+            break;
+        }
+    }
+    // Tier 2: the PT_LOAD that file-backs the ENTIRE table.
+    if candidate == 0 {
+        if let Some(table_end) = e_phoff.checked_add(table_bytes) {
+            for ph in elf.program_iter() {
+                if ph.get_type() != Ok(PhType::Load) {
+                    continue;
+                }
+                let seg_off = ph.offset();
+                let seg_file_end = match seg_off.checked_add(ph.file_size()) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                // [e_phoff, table_end) ⊆ [seg_off, seg_file_end).
+                if seg_off <= e_phoff && table_end <= seg_file_end {
+                    candidate = ph.virtual_addr().checked_add(e_phoff - seg_off).unwrap_or(0);
+                    break;
+                }
+            }
+        }
+    }
+    if candidate == 0 {
+        return 0;
+    }
+
+    // --- Step 2: VALIDATE the candidate against file-backed PT_LOAD coverage + user
+    // bounds. Reject (return 0) anything outside, so AT_PHDR is always a real user VA. ---
+    let cand_end = match candidate.checked_add(table_bytes) {
+        Some(e) => e,
+        None => return 0,
+    };
+    let user_floor = USER_BASE as u64;
+    let user_ceiling = USER_STACK_TOP - USER_STACK_SIZE as u64; // strictly below the stack.
+    if candidate < user_floor || cand_end > user_ceiling {
+        return 0;
+    }
+    for ph in elf.program_iter() {
+        if ph.get_type() != Ok(PhType::Load) {
+            continue;
+        }
+        let seg_va = ph.virtual_addr();
+        let seg_va_file_end = match seg_va.checked_add(ph.file_size()) {
+            Some(e) => e,
+            None => continue,
+        };
+        // Whole table VA range must be inside this segment's FILE-backed VA range.
+        if seg_va <= candidate && cand_end <= seg_va_file_end {
+            return candidate;
+        }
+    }
+
+    // Candidate not covered by any file-backed PT_LOAD VA range: omit.
+    0
 }
 
 /// 验证 ELF 头

@@ -338,6 +338,44 @@ pub fn run_usermode_test() -> bool {
         0
     };
 
+    // Step 3.6: M0 #1 — build the SysV AMD64 initial user stack (argc/argv/envp +
+    // auxv) and copy it into the freshly-mapped user stack. MUST run on the target
+    // CR3 (active above) and OUTSIDE the Process lock — the builder does copy_to_user
+    // + security::fill_random; a fault under the Process lock would invert the lock
+    // order against the page-fault handler. THIS boot path (not sys_exec) is what the
+    // M0 musl gate runs through, so the auxv MUST be built here.
+    klog!(Info, "[3.6/5] Building initial user stack (argc/argv/auxv)...");
+    let argv0 = PROCESS_NAME.as_bytes().to_vec();
+    let stack_layout = match kernel_core::build_initial_user_stack(
+        &load_result,
+        core::slice::from_ref(&argv0),
+        &[],
+        &kernel_core::StackCreds { uid: 0, euid: 0, gid: 0, egid: 0, at_secure: false },
+        PROCESS_NAME.as_bytes(),
+    ) {
+        Ok(layout) => {
+            klog!(Info, "      ✓ Initial user stack built (RSP=0x{:x})", layout.rsp);
+            layout
+        }
+        Err(e) => {
+            klog!(Error, "      ✗ Failed to build initial user stack: {:?}", e);
+            // Rollback (order matters — mirrors ExecSpaceGuard::drop): restore the
+            // saved (boot) CR3 FIRST. `free_address_space` requires the AS to no longer
+            // be the active CR3 on any CPU (process.rs:4966); at this point CR3 still
+            // points at `memory_space`, so freeing it before the switch would release
+            // the live page tables. THEN free the fresh KPTI user PML4 + kernel AS.
+            // (The never-scheduled process is left behind — cleanup_unscheduled_process
+            // is unsafe here because create_process(ppid=0) already did the cpuset join;
+            // pre-existing boot-diagnostic residual, out of M0 #1 scope.)
+            kernel_core::process::activate_memory_space(saved_cr3, None);
+            if user_memory_space != 0 {
+                free_kpti_user_pml4(user_memory_space);
+            }
+            kernel_core::process::free_address_space(memory_space);
+            return false;
+        }
+    };
+
     // Step 4: Update process PCB with loaded state
     klog!(Info, "[4/5] Configuring process context...");
     if let Some(process) = get_process(pid) {
@@ -347,12 +385,14 @@ pub fn run_usermode_test() -> bool {
         proc.memory_space = memory_space;
         // Set KPTI user CR3 root (0 if KPTI disabled)
         proc.user_memory_space = user_memory_space;
-        proc.user_stack = Some(x86_64::VirtAddr::new(load_result.user_stack_top));
+        // M0 #1: the entry RSP is the auxv-stack pointer from the builder, not the
+        // loader's raw stack top (which carries no argc/argv/envp/auxv).
+        proc.user_stack = Some(x86_64::VirtAddr::new(stack_layout.rsp));
 
         // Set up context for Ring 3 execution
         proc.context.rip = load_result.entry;
-        proc.context.rsp = load_result.user_stack_top;
-        proc.context.rbp = load_result.user_stack_top;
+        proc.context.rsp = stack_layout.rsp;
+        proc.context.rbp = stack_layout.rsp;
 
         // User-mode segment selectors (Ring 3)
         // CS: 0x23 (user code selector with RPL=3)
@@ -467,13 +507,35 @@ pub unsafe fn test_direct_ring3_jump() -> ! {
         }
     }
 
+    // M0 #1: build the SysV AMD64 initial user stack (argc/argv/envp + auxv) on the
+    // target CR3 (active above), OUTSIDE any Process lock. This direct-jump test has
+    // no PCB rollback; on failure restore CR3 and panic (the machine halts anyway).
+    let argv0 = PROCESS_NAME.as_bytes().to_vec();
+    let stack_layout = match kernel_core::build_initial_user_stack(
+        &load_result,
+        core::slice::from_ref(&argv0),
+        &[],
+        &kernel_core::StackCreds { uid: 0, euid: 0, gid: 0, egid: 0, at_secure: false },
+        PROCESS_NAME.as_bytes(),
+    ) {
+        Ok(layout) => layout,
+        Err(e) => {
+            // This is a dead-code (#[allow(dead_code)]) manual debug entry that builds
+            // with panic=abort, so the panic below HALTS the machine — restoring CR3 is
+            // enough to keep the panic handler sane; freeing the fresh KPTI/user AS is
+            // intentionally omitted (no continuation can leak it).
+            kernel_core::process::activate_memory_space(saved_cr3, None);
+            panic!("Failed to build initial user stack: {:?}", e);
+        }
+    };
+
     klog!(Info, "Jumping to Ring 3...");
     klog!(Info, "  Entry: 0x{:x}", load_result.entry);
-    klog!(Info, "  Stack: 0x{:x}", load_result.user_stack_top);
+    klog!(Info, "  Stack: 0x{:x}", stack_layout.rsp);
 
     // Set TSS RSP0 for syscall return
     arch::set_kernel_stack(arch::default_kernel_stack_top());
 
     // Jump to user mode - this will not return
-    arch::jump_to_usermode(load_result.entry, load_result.user_stack_top);
+    arch::jump_to_usermode(load_result.entry, stack_layout.rsp);
 }

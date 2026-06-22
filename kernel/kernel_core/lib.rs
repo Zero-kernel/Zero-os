@@ -35,9 +35,13 @@ pub mod signal;
 pub mod signal_frame;
 pub mod syscall;
 pub mod time;
+pub mod user_stack;
 pub mod usercopy;
 
 pub use elf_loader::{load_elf, ElfLoadError, ElfLoadResult, USER_STACK_SIZE, USER_STACK_TOP};
+// M0 #1 (auxv): shared SysV AMD64 initial-user-stack builder, used by both sys_exec
+// and the usermode_test boot diagnostic (the real M0 musl gate path).
+pub use user_stack::{build_initial_user_stack, StackCreds, UserStackLayout};
 pub use fork::{
     create_fresh_address_space, create_kpti_user_pml4, free_kpti_user_pml4, sys_fork, ForkError,
     ForkResult, PAGE_REF_COUNT,

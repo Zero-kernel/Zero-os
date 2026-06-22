@@ -1984,7 +1984,10 @@ fn copy_from_user(dest: &mut [u8], user_src: *const u8) -> Result<(), SyscallErr
 ///
 /// # Returns
 /// 复制成功返回 Ok(()), 如果用户内存未映射或不可写返回 EFAULT
-fn copy_to_user(user_dst: *mut u8, src: &[u8]) -> Result<(), SyscallError> {
+// M0 #1 (auxv): widened to pub(crate) so the shared initial-user-stack builder
+// (crate::user_stack::build_initial_user_stack) can perform its single bulk copy
+// into the target address space. Still kernel_core-internal.
+pub(crate) fn copy_to_user(user_dst: *mut u8, src: &[u8]) -> Result<(), SyscallError> {
     if src.is_empty() {
         return Ok(());
     }
