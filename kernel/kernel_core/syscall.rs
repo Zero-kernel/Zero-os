@@ -1547,6 +1547,23 @@ pub type VfsOpenWithResolveCallback =
 /// 参数: (path) -> (size, mode, ino, dev, nlink, uid, gid, rdev, atime, mtime, ctime) 或错误
 pub type VfsStatCallback = fn(&str) -> Result<VfsStat, SyscallError>;
 
+/// M0-4: VFS read-whole-file-by-path-for-exec callback.
+///
+/// Registered by the vfs module. Resolves `path` to ONE inode (following
+/// symlinks + per-component +x traverse), rejects directories (EISDIR) and
+/// non-regular files (EACCES), runs the LSM `hook_file_open` MAC gate, enforces
+/// a DAC permission check requiring BOTH read AND execute (closing the gap where
+/// `open()` only checks read), then reads up to `max` bytes from that SAME inode
+/// into a `try_reserve`'d Vec, capped incrementally at `max` (E2BIG on overrun).
+/// The single resolution feeds the identical bytes to both the LSM hash and
+/// `load_elf`, foreclosing the stat-then-open symlink-swap TOCTOU.
+///
+/// CONTRACT: the caller MUST hold NO Process / PROCESS_TABLE / page-table / COW
+/// lock — this callback acquires those internally (LSM `from_current`, DAC euid).
+/// Absent (unregistered) => ENOSYS; it never panics.
+/// 参数: (path, max_bytes) -> 文件字节 或错误
+pub type VfsReadFileCallback = fn(&str, usize) -> Result<alloc::vec::Vec<u8>, SyscallError>;
+
 /// VFS lseek 回调类型
 ///
 /// 由 vfs 模块注册，处理文件 seek 操作
@@ -1653,6 +1670,8 @@ lazy_static::lazy_static! {
     static ref VFS_OPEN_WITH_RESOLVE_CALLBACK: spin::Mutex<Option<VfsOpenWithResolveCallback>> = spin::Mutex::new(None);
     /// VFS stat 回调
     static ref VFS_STAT_CALLBACK: spin::Mutex<Option<VfsStatCallback>> = spin::Mutex::new(None);
+    /// M0-4: VFS read-whole-file-for-exec 回调
+    static ref VFS_READ_FILE_CALLBACK: spin::Mutex<Option<VfsReadFileCallback>> = spin::Mutex::new(None);
     /// VFS lseek 回调
     static ref VFS_LSEEK_CALLBACK: spin::Mutex<Option<VfsLseekCallback>> = spin::Mutex::new(None);
     /// VFS 创建回调
@@ -1705,6 +1724,11 @@ pub fn register_vfs_open_with_resolve_callback(cb: VfsOpenWithResolveCallback) {
 /// 注册 VFS stat 回调
 pub fn register_vfs_stat_callback(cb: VfsStatCallback) {
     *VFS_STAT_CALLBACK.lock() = Some(cb);
+}
+
+/// M0-4: 注册 VFS read-whole-file-for-exec 回调
+pub fn register_vfs_read_file_callback(cb: VfsReadFileCallback) {
+    *VFS_READ_FILE_CALLBACK.lock() = Some(cb);
 }
 
 /// 注册 VFS lseek 回调
@@ -1813,6 +1837,14 @@ const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
 /// exhaust the heap and trigger the alloc_error_handler panic — a deterministic
 /// kernel crash from unprivileged userspace.
 const MAX_EXEC_IMAGE_SIZE: usize = 512 * 1024;
+
+// M0-4 (exec disambiguation) limits.
+/// First-line scan window for a `#!` shebang (Linux BINPRM_BUF_SIZE-class).
+const MAX_SHEBANG_LINE: usize = 256;
+/// Interpreter-chain depth cap for nested shebangs; exceeding it returns ELOOP.
+const MAX_SHEBANG_DEPTH: usize = 4;
+/// Hard cap (PATH_MAX-class) on an execve pathname / shebang interpreter token.
+const MAX_EXEC_PATH_LEN: usize = 4096;
 
 /// R41-4 FIX: 用于 LSM 策略检查的 ELF 前缀哈希长度
 ///
@@ -2585,11 +2617,13 @@ pub fn syscall_dispatcher(
         // and an independent-MmState process that skips the fork charge would
         // strand the child's exit uncharge into a saturating under-count.
         57 => sys_fork(),
-        59 => sys_exec(
-            arg0 as *const u8,
-            arg1 as usize,
-            arg2 as *const *const u8,
-            arg3 as *const *const u8,
+        // M0-4: execve is now REAL path-based exec(pathname, argv, envp).
+        // arg0 is a pathname pointer (NOT a raw ELF image) — the confused-deputy
+        // is gone. Native raw-image spawn moved to sys_spawn_image (517).
+        59 => sys_execve(
+            arg0 as *const u8,        // pathname
+            arg1 as *const *const u8, // argv
+            arg2 as *const *const u8, // envp
         ),
         61 => sys_wait(arg0 as *mut i32),
         39 => sys_getpid(),
@@ -2736,6 +2770,16 @@ pub fn syscall_dispatcher(
         513 => sys_cgroup_delegate(arg0 as u64, arg1 as u64),
         // J.2: v2 stats with statx-style size negotiation (writes min(buf_len, sizeof)).
         516 => sys_cgroup_get_stats2(arg0 as u64, arg1 as *mut CgroupStatsBuf, arg2 as usize),
+
+        // M0-4: Zero-OS-private (517) raw in-memory-image spawn — the pre-M0-4
+        // execve(image, image_len, argv, envp) behavior, relocated off 59 so that
+        // execve(59) can be real path-based. arg0 is ALWAYS an image pointer here.
+        517 => sys_spawn_image(
+            arg0 as *const u8,
+            arg1 as usize,
+            arg2 as *const *const u8,
+            arg3 as *const *const u8,
+        ),
 
         // G.3 Compliance syscalls (Zero-OS specific, 505-508)
         505 => sys_compliance_status(arg0 as *mut ComplianceStatusBuf),
@@ -4293,22 +4337,39 @@ fn sys_clone(
 /// # Safety
 ///
 /// 用户指针在切换 CR3 前必须先复制到内核堆，否则地址失效
-fn sys_exec(
-    image: *const u8,
-    image_len: usize,
-    argv: *const *const u8,
-    envp: *const *const u8,
+/// exec_from_bytes — the shared address-space-replacement core for `execve`(59)
+/// and `sys_spawn_image`(517) (M0-4 exec disambiguation).
+///
+/// Receives the FINAL ELF image bytes + kernel-owned argv/envp + the AT_EXECFN
+/// bytes; the two front-ends differ only in how they obtain those (a VFS path
+/// read + shebang resolution for execve; a raw user-image copy for spawn_image).
+/// The front-half user-pointer copy is therefore NOT performed here.
+///
+/// CONTRACT (current-task-only): this REPLACES THE CURRENT TASK's address space —
+/// it switches the running CPU's CR3 (`activate_memory_space`) and reads the
+/// current LSM context (`lsm_current_process_ctx`). `process` MUST be the `Arc`
+/// of the running task; a non-current process would corrupt the live CR3.
+fn exec_from_bytes(
+    process: Arc<spin::Mutex<crate::process::Process>>,
+    elf_data: Vec<u8>,
+    argv_vec: Vec<Vec<u8>>,
+    envp_vec: Vec<Vec<u8>>,
+    execfn: Vec<u8>,
 ) -> SyscallResult {
-    use crate::elf_loader::{load_elf, USER_STACK_SIZE};
+    use crate::elf_loader::load_elf;
     use crate::fork::create_fresh_address_space;
     use crate::process::{
         activate_memory_space, address_space_share_count, current_pid, free_address_space,
-        get_process, thread_group_size, ProcessState,
+        thread_group_size, ProcessState,
     };
 
-    // 获取当前进程
-    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
-    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+    // M0-4 (Codex Fix A): enforce the current-task-only contract. The body below
+    // switches the running CPU's CR3 and uses lsm_current_process_ctx(); a caller
+    // passing a non-running process would corrupt the live address space.
+    debug_assert!(
+        current_pid() == Some(process.lock().pid),
+        "exec_from_bytes must run on the current task"
+    );
 
     // R33-1 FIX: Refuse exec while other threads share this address space.
     // Calling exec in a multithreaded process would free the page tables while
@@ -4322,7 +4383,7 @@ fn sys_exec(
     let thread_count = thread_group_size(tgid);
     if thread_count > 1 {
         kprintln!(
-            "sys_exec: refusing exec in multithreaded process (tgid={}, threads={})",
+            "exec_from_bytes: refusing exec in multithreaded process (tgid={}, threads={})",
             tgid,
             thread_count
         );
@@ -4343,39 +4404,19 @@ fn sys_exec(
     let share_count = address_space_share_count(current_memory_space);
     if share_count > 1 {
         kprintln!(
-            "sys_exec: refusing exec with {} CLONE_VM sibling(s) sharing address space (cr3=0x{:x})",
+            "exec_from_bytes: refusing exec with {} CLONE_VM sibling(s) sharing address space (cr3=0x{:x})",
             share_count - 1,
             current_memory_space
         );
         return Err(SyscallError::EBUSY);
     }
 
-    // 验证参数：非空、合理大小
-    if image.is_null() || image_len == 0 {
-        return Err(SyscallError::EINVAL);
-    }
-    if image_len > MAX_EXEC_IMAGE_SIZE {
-        kprintln!(
-            "sys_exec: ELF size {} exceeds limit {}",
-            image_len, MAX_EXEC_IMAGE_SIZE
-        );
-        return Err(SyscallError::E2BIG);
-    }
-
-    // 【关键】在切换 CR3 前将用户数据复制到内核堆
-    // 切换地址空间后原用户指针将失效
-    // R151-1 FIX: Use fallible allocation to prevent kernel panic on OOM.
-    // The global alloc_error_handler panics; try_reserve_exact returns Err instead.
-    let mut elf_data: Vec<u8> = Vec::new();
-    elf_data
-        .try_reserve_exact(image_len)
-        .map_err(|_| SyscallError::ENOMEM)?;
-    elf_data.resize(image_len, 0);
-    copy_from_user(&mut elf_data, image)?;
-
-    // 复制 argv 和 envp 到内核
-    let argv_vec = copy_user_str_array(argv)?;
-    let envp_vec = copy_user_str_array(envp)?;
+    // M0-4: `elf_data` / `argv_vec` / `envp_vec` arrive as parameters. The
+    // front-half user-pointer validation + copy now lives in the per-syscall
+    // front-ends (sys_spawn_image copies a raw user image; sys_execve reads the
+    // file via VFS + resolves `#!` shebangs), so the confused-deputy where
+    // arg0 could be EITHER a path or an image is gone — arg0's type is fixed per
+    // syscall number.
 
     // R41-4 FIX: LSM hook uses SHA-256 of ELF content instead of argv[0]
     //
@@ -4390,6 +4431,12 @@ fn sys_exec(
             return Err(lsm_error_to_syscall(err));
         }
     }
+
+    // M0-4 (gap g1, Codex Fix): build the comm-style process name HERE — BEFORE
+    // the point of no return — so its fallible allocation can fail cleanly
+    // (ENOMEM) rather than panic in the post-CR3 "no fallible ops" commit window.
+    // It is moved (no allocation) into proc.name during the commit.
+    let comm_name = exec_comm_name(&execfn)?;
 
     // 创建新的地址空间
     let (_new_pml4_frame, new_memory_space) =
@@ -4545,7 +4592,7 @@ fn sys_exec(
     // S-7 fix: Let the guard handle rollback on error
     // R149-3 FIX: Pass exec_cgroup_id captured under lock, not re-read.
     let load_result = load_elf(&elf_data, exec_cgroup_id).map_err(|e| {
-        klog!(Error, "sys_exec: ELF load failed: {:?}", e);
+        klog!(Error, "exec_from_bytes: ELF load failed: {:?}", e);
         SyscallError::ENOEXEC
     })?;
 
@@ -4563,192 +4610,51 @@ fn sys_exec(
     space_guard.set_cgroup_charge(exec_cgroup_id, load_result.charged_bytes);
 
     // =========================================================================
-    // 构建符合 System V AMD64 ABI 的用户栈布局：
+    // M0 #1 (auxv + SysV entry stack): build the System V AMD64 initial user
+    // stack — argc/argv/envp + a full auxiliary vector (auxv) — and copy it into
+    // the freshly-mapped, already-charged user stack. This replaces the old
+    // hand-rolled argv/envp-only layout (which also had the inverted RSP%16==8
+    // alignment bug) with the shared `crate::user_stack::build_initial_user_stack`
+    // builder, used identically by the boot Ring-3 diagnostic (usermode_test).
     //
-    // 高地址 (栈顶方向)
-    //   +------------------+
-    //   | 字符串数据区      |  <- argv[0] 字符串, argv[1] 字符串, ..., envp[0], ...
-    //   +------------------+
-    //   | 16字节对齐填充    |
-    //   +------------------+
-    //   | NULL (envp终止)   |
-    //   | envp[n-1] 指针    |
-    //   | ...              |
-    //   | envp[0] 指针      |
-    //   | NULL (argv终止)   |
-    //   | argv[n-1] 指针    |
-    //   | ...              |
-    //   | argv[0] 指针      |
-    //   | argc             |  <- RSP 指向这里
-    //   +------------------+
-    // 低地址 (栈底方向)
+    // PRECONDITION: we are on the NEW process CR3 (activate_memory_space above)
+    // and hold NO Process / page-table / COW lock here — the builder does
+    // copy_to_user (faultable) + security::fill_random (RNG lock); a fault while
+    // holding the Process lock would invert the lock order against the page-fault
+    // handler. The credential snapshot below takes a SCOPED lock that DROPS before
+    // the builder call.
     // =========================================================================
 
-    let argc = argv_vec.len();
-    let envc = envp_vec.len();
-    let word = mem::size_of::<usize>();
-
-    // 计算字符串总大小
-    let string_bytes: usize = argv_vec
-        .iter()
-        .chain(envp_vec.iter())
-        .map(|s| s.len() + 1) // +1 for '\0'
-        .sum();
-
-    // 指针区大小: argc + argv_ptrs + NULL + envp_ptrs + NULL
-    let pointer_count = 1 + argc + 1 + envc + 1;
-    let pointer_bytes = pointer_count * word;
-
-    // 检查栈空间是否足够
-    let stack_top = load_result.user_stack_top as usize;
-    let stack_base = stack_top
-        .checked_sub(USER_STACK_SIZE)
-        .ok_or(SyscallError::EFAULT)?;
-
-    // R106-4 FIX: Build the entire initial user stack in a kernel buffer first,
-    // then copy to user space via a single `copy_to_user()` call.  This eliminates
-    // the wide `UserAccessGuard` that previously covered ~90 lines of direct
-    // user-pointer writes, minimizing the SMAP-disabled window.
-    // `copy_to_user` internally handles SMAP per-chunk (R65-10 chunked copy).
-
-    let total_needed = string_bytes + pointer_bytes + 16; // +16 for alignment
-    if total_needed > USER_STACK_SIZE {
-        return Err(SyscallError::E2BIG);
-    }
-
-    // ── Phase 1: Compute user-space addresses without touching user memory ──
-
-    let mut sp = stack_top;
-    // R160-15 FIX: Fallible allocation (with_capacity is infallible).
-    let mut argv_ptrs: Vec<usize> = Vec::new();
-    argv_ptrs.try_reserve_exact(argc).map_err(|_| SyscallError::ENOMEM)?;
-    let mut envp_ptrs: Vec<usize> = Vec::new();
-    envp_ptrs.try_reserve_exact(envc).map_err(|_| SyscallError::ENOMEM)?;
-
-    // 1. 计算 argv 字符串位置（从高地址向低地址生长）
-    for s in argv_vec.iter().rev() {
-        let len = s.len();
-        sp = sp.checked_sub(len + 1).ok_or(SyscallError::EFAULT)?;
-        if sp < stack_base {
-            return Err(SyscallError::E2BIG);
+    // Snapshot credentials for the identity auxv entries (AT_UID/EUID/GID/EGID/
+    // SECURE) under a scoped lock released before the builder runs.
+    let stack_creds = {
+        let proc = process.lock();
+        let creds = proc.credentials.read();
+        crate::user_stack::StackCreds {
+            uid: creds.uid,
+            euid: creds.euid,
+            gid: creds.gid,
+            egid: creds.egid,
+            // AT_SECURE reflects an exec-time privilege delta. No setuid/setgid-exec
+            // path is wired yet, so this is 0 in practice; (euid!=uid)||(egid!=gid)
+            // is the forward-compatible, over-conservative (=SAFE) seam.
+            at_secure: (creds.euid != creds.uid) || (creds.egid != creds.gid),
         }
-        argv_ptrs.push(sp);
-    }
-    argv_ptrs.reverse(); // 恢复正序
-
-    // 2. 计算 envp 字符串位置
-    for s in envp_vec.iter().rev() {
-        let len = s.len();
-        sp = sp.checked_sub(len + 1).ok_or(SyscallError::EFAULT)?;
-        if sp < stack_base {
-            return Err(SyscallError::E2BIG);
-        }
-        envp_ptrs.push(sp);
-    }
-    envp_ptrs.reverse();
-
-    // 3. 16 字节对齐
-    sp &= !0xF;
-
-    // 4. 检查指针区空间是否足够
-    if sp < stack_base + pointer_bytes {
-        return Err(SyscallError::E2BIG);
-    }
-
-    // 5. 确保最终 RSP 满足 SysV AMD64 ABI 要求
-    // 进程入口点要求 (RSP % 16) == 8，这样第一个 PUSH 后 RSP 才是 16 字节对齐
-    // 注意：直接跳转到 _start 不经过 CALL，所以 RSP 需要预留 8 字节偏移
-    let tentative_rsp = sp.checked_sub(pointer_bytes).ok_or(SyscallError::EFAULT)?;
-    let needs_abi_pad = (tentative_rsp & 0xF) == 0;
-    // If padding is needed, insert one extra word between pointer area and string area
-    if needs_abi_pad {
-        sp = sp.checked_sub(word).ok_or(SyscallError::EFAULT)?;
-    }
-
-    // Final buf_base is where argc will live (lowest address of the buffer)
-    let buf_base = sp.checked_sub(pointer_bytes).ok_or(SyscallError::EFAULT)?;
-    if buf_base < stack_base {
-        return Err(SyscallError::E2BIG);
-    }
-
-    // ── Phase 2: Assemble stack content in a kernel-side buffer ──
-
-    let buf_len = stack_top.checked_sub(buf_base).ok_or(SyscallError::EFAULT)?;
-    // R156-3 FIX: Fallible allocation for exec stack buffer.
-    let mut stack_buf = Vec::new();
-    stack_buf.try_reserve_exact(buf_len).map_err(|_| SyscallError::ENOMEM)?;
-    stack_buf.resize(buf_len, 0);
-
-    // Helper: write bytes into stack_buf at the position corresponding to `user_addr`
-    let buf_write = |buf: &mut Vec<u8>, user_addr: usize, data: &[u8]| -> Result<(), SyscallError> {
-        let off = user_addr.checked_sub(buf_base).ok_or(SyscallError::EFAULT)?;
-        let end = off.checked_add(data.len()).ok_or(SyscallError::EFAULT)?;
-        if end > buf.len() {
-            return Err(SyscallError::EFAULT);
-        }
-        buf[off..end].copy_from_slice(data);
-        Ok(())
     };
 
-    // Helper: write a native-endian usize value
-    let buf_write_usize = |buf: &mut Vec<u8>, user_addr: usize, val: usize| -> Result<(), SyscallError> {
-        let off = user_addr.checked_sub(buf_base).ok_or(SyscallError::EFAULT)?;
-        let end = off.checked_add(word).ok_or(SyscallError::EFAULT)?;
-        if end > buf.len() {
-            return Err(SyscallError::EFAULT);
-        }
-        buf[off..end].copy_from_slice(&val.to_ne_bytes());
-        Ok(())
-    };
+    // M0-4: AT_EXECFN is the caller-supplied `execfn` (the ORIGINAL execve
+    // pathname, or argv[0]/"/exec" for a raw-image spawn) — threaded UNCHANGED
+    // into the builder, which treats it as an opaque, NUL-free byte sink. The
+    // builder contract is unchanged (shared with the boot Ring-3 / musl gate).
+    let execfn_ref: &[u8] = &execfn;
 
-    // 6. 写入 argv 字符串 + NUL 终止符
-    for (s, &addr) in argv_vec.iter().zip(argv_ptrs.iter()) {
-        buf_write(&mut stack_buf, addr, s)?;
-        // NUL terminator (buffer is zero-initialized, but be explicit)
-        let nul_addr = addr.checked_add(s.len()).ok_or(SyscallError::EFAULT)?;
-        buf_write(&mut stack_buf, nul_addr, &[0u8])?;
-    }
-
-    // 7. 写入 envp 字符串 + NUL 终止符
-    for (s, &addr) in envp_vec.iter().zip(envp_ptrs.iter()) {
-        buf_write(&mut stack_buf, addr, s)?;
-        let nul_addr = addr.checked_add(s.len()).ok_or(SyscallError::EFAULT)?;
-        buf_write(&mut stack_buf, nul_addr, &[0u8])?;
-    }
-
-    // 8. 写入指针区: argc | argv[0..n] | NULL | envp[0..m] | NULL
-    let mut cursor = buf_base;
-
-    // argc
-    buf_write_usize(&mut stack_buf, cursor, argc)?;
-    cursor = cursor.checked_add(word).ok_or(SyscallError::EFAULT)?;
-
-    // argv pointers
-    for &ptr in &argv_ptrs {
-        buf_write_usize(&mut stack_buf, cursor, ptr)?;
-        cursor = cursor.checked_add(word).ok_or(SyscallError::EFAULT)?;
-    }
-    // argv NULL terminator
-    buf_write_usize(&mut stack_buf, cursor, 0)?;
-    cursor = cursor.checked_add(word).ok_or(SyscallError::EFAULT)?;
-
-    // envp pointers
-    for &ptr in &envp_ptrs {
-        buf_write_usize(&mut stack_buf, cursor, ptr)?;
-        cursor = cursor.checked_add(word).ok_or(SyscallError::EFAULT)?;
-    }
-    // envp NULL terminator
-    buf_write_usize(&mut stack_buf, cursor, 0)?;
-
-    // ABI padding word (already zero-initialized in stack_buf, but explicit)
-    if needs_abi_pad {
-        let pad_addr = buf_base.checked_add(pointer_bytes).ok_or(SyscallError::EFAULT)?;
-        buf_write_usize(&mut stack_buf, pad_addr, 0)?;
-    }
-
-    // ── Phase 3: Single copy to user space (SMAP handled internally per chunk) ──
-
-    copy_to_user(buf_base as *mut u8, &stack_buf)?;
+    let stack_layout = crate::user_stack::build_initial_user_stack(
+        &load_result,
+        &argv_vec,
+        &envp_vec,
+        &stack_creds,
+        execfn_ref,
+    )?;
 
     // ── Phase 4: KPTI user PML4 creation ──
     //
@@ -4768,9 +4674,9 @@ fn sys_exec(
     // R118-I1 FIX: Register user PML4 with guard so rollback frees it.
     space_guard.set_new_user_space(new_user_memory_space);
 
-    // Final RSP points to argc (lowest address in the buffer)
-    let final_rsp = buf_base as u64;
-    let argv_base = (buf_base + word) as u64; // argv[0] 的地址
+    // Entry RSP points at argc (lowest address of the on-stack control block),
+    // 16-byte aligned (SysV AMD64: RSP%16==0 at _start). Delivered by the builder.
+    let final_rsp = stack_layout.rsp;
 
     // 更新进程 PCB
     let (old_space, old_user_space, cloexec_removed, cloexec_cgroup_id, cloexec_closed) = {
@@ -4796,7 +4702,9 @@ fn sys_exec(
         proc.memory_space = new_memory_space;
         // H.3 KPTI: Set user PML4 root (0 if KPTI disabled)
         proc.user_memory_space = new_user_memory_space;
-        proc.user_stack = Some(VirtAddr::new(load_result.user_stack_top));
+        // M0 #1: store the actual entry stack pointer (matches the CLONE-with-stack
+        // convention at sys_clone, and what procfs reports), not the loader's top.
+        proc.user_stack = Some(VirtAddr::new(final_rsp));
 
         // 设置上下文
         proc.context.rip = load_result.entry;
@@ -4809,9 +4717,12 @@ fn sys_exec(
         proc.context.ss = 0x1B;
         proc.context.rflags = 0x202;
 
-        // System V AMD64 调用约定：RDI = argc, RSI = argv
-        proc.context.rdi = argc as u64;
-        proc.context.rsi = argv_base;
+        // M0 #1: argc/argv/envp/auxv are delivered ON THE STACK at RSP (SysV AMD64),
+        // not in registers. Drop the legacy RDI=argc / RSI=argv handoff — a real libc
+        // crt1 (musl/glibc) reads argc from [RSP] and ignores these. The native
+        // userspace `_start()` takes no args, so it is unaffected.
+        proc.context.rdi = 0;
+        proc.context.rsi = 0;
 
         // 清零其他寄存器
         proc.context.rax = 0;
@@ -4978,6 +4889,28 @@ fn sys_exec(
 
         proc.state = ProcessState::Ready;
 
+        // M0 item 5: POSIX exec signal semantics. Caught signals (a real handler)
+        // reset to SIG_DFL; SIG_IGN dispositions are PRESERVED; the blocked mask and
+        // the pending set are PRESERVED. The handler scratch state
+        // (saved_blocked / in_signal_handler) is cleared — a live handler frame can
+        // never survive the address-space replacement. (The monotonic global
+        // any-handler hint is intentionally not reset; a stale-true hint only costs a
+        // redundant pending scan, never incorrect delivery.)
+        for sa in proc.sigactions.iter_mut() {
+            if sa.is_handler() {
+                *sa = crate::signal::SigAction::default_action();
+            }
+        }
+        proc.saved_blocked = 0;
+        proc.in_signal_handler = false;
+
+        // M0-4 (gap g1): refresh the process name to the exec'd program's
+        // basename (Linux `comm` semantics, <=15 chars). The pre-M0-4 exec path
+        // never updated this, so /proc would report the pre-exec name forever.
+        // The name was built fallibly BEFORE the point of no return; this is a
+        // pure move (no allocation) under this same already-held Process lock.
+        proc.name = comm_name;
+
         (
             old_space,
             old_user_space,
@@ -5028,11 +4961,387 @@ fn sys_exec(
     // R101-2 FIX: Gate exec entry/rsp/argc debug print behind debug_assertions.
     // These leak user entry point and stack pointer addresses.
     kprintln!(
-        "sys_exec: entry=0x{:x}, rsp=0x{:x}, argc={}",
-        load_result.entry, final_rsp, argc
+        "exec_from_bytes: entry=0x{:x}, rsp=0x{:x}, argc={}",
+        load_result.entry, final_rsp, stack_layout.argc
     );
 
     Ok(0)
+}
+
+// ============================================================================
+// M0-4: exec front-ends + pure helpers (exec disambiguation)
+// ============================================================================
+
+/// M0-4: fallibly clone bytes (no infallible `to_vec`/`clone`, per the kernel's
+/// OOM-no-panic policy — the global alloc_error_handler panics).
+fn try_clone_bytes(src: &[u8]) -> Result<Vec<u8>, SyscallError> {
+    let mut v = Vec::new();
+    v.try_reserve(src.len()).map_err(|_| SyscallError::ENOMEM)?;
+    v.extend_from_slice(src);
+    Ok(v)
+}
+
+/// M0-4: derive a Linux-`comm`-style process name (basename, <=15 bytes) from
+/// the AT_EXECFN bytes. Fully FALLIBLE (try_reserve) and panic-free: any byte that
+/// is not printable ASCII is replaced with '?', so the result is always valid
+/// UTF-8 with no infallible lossy allocation and no char-boundary hazard.
+fn exec_comm_name(execfn: &[u8]) -> Result<alloc::string::String, SyscallError> {
+    use alloc::string::String;
+    let base = match execfn.iter().rposition(|&b| b == b'/') {
+        Some(i) => &execfn[i + 1..],
+        None => execfn,
+    };
+    // Linux comm is 16 bytes including the NUL terminator => 15 usable.
+    let cap = core::cmp::min(base.len(), 15);
+    let mut s = String::new();
+    s.try_reserve(cap).map_err(|_| SyscallError::ENOMEM)?;
+    for &b in &base[..cap] {
+        // Reserved `cap` 1-byte chars => push never reallocs (no infallible alloc).
+        s.push(if (0x20..0x7f).contains(&b) { b as char } else { '?' });
+    }
+    Ok(s)
+}
+
+/// M0-4: validate NUL-free bytes (from `copy_user_cstring`) as a UTF-8 path and
+/// fallibly copy them into an owned String. Non-UTF-8 => EINVAL; allocation
+/// failure => ENOMEM. Never panics.
+fn utf8_path(b: &[u8]) -> Result<alloc::string::String, SyscallError> {
+    let s = core::str::from_utf8(b).map_err(|_| SyscallError::EINVAL)?;
+    let mut out = alloc::string::String::new();
+    out.try_reserve(s.len()).map_err(|_| SyscallError::ENOMEM)?;
+    out.push_str(s);
+    Ok(out)
+}
+
+/// M0-4: read an entire file by path for exec, via the registered VFS callback.
+/// The callback resolves once, enforces +x/DAC/LSM, and bounds the read to
+/// MAX_EXEC_IMAGE_SIZE. MUST be called with NO Process/PT/COW lock held.
+fn exec_read_file(path: &str) -> Result<Vec<u8>, SyscallError> {
+    if path.is_empty() {
+        return Err(SyscallError::ENOENT);
+    }
+    if path.len() > MAX_EXEC_PATH_LEN {
+        return Err(SyscallError::EINVAL);
+    }
+    // The callback fn pointer is `Copy`: dereference it and DROP the table lock
+    // BEFORE the call, so the faultable, lock-taking callback never runs under
+    // the callback-table spinlock.
+    let cb = {
+        let guard = VFS_READ_FILE_CALLBACK.lock();
+        *guard.as_ref().ok_or(SyscallError::ENOSYS)?
+    };
+    cb(path, MAX_EXEC_IMAGE_SIZE)
+}
+
+/// Strip leading spaces/tabs.
+fn strip_leading_blanks(s: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i < s.len() && (s[i] == b' ' || s[i] == b'\t') {
+        i += 1;
+    }
+    &s[i..]
+}
+
+/// Strip trailing spaces/tabs.
+fn strip_trailing_blanks(s: &[u8]) -> &[u8] {
+    let mut j = s.len();
+    while j > 0 && (s[j - 1] == b' ' || s[j - 1] == b'\t') {
+        j -= 1;
+    }
+    &s[..j]
+}
+
+/// M0-4: parse a `#!` interpreter line (Linux fs/binfmt_script.c semantics).
+///
+/// Only the first `MAX_SHEBANG_LINE` bytes are scanned. Returns
+/// (interpreter, optional single argument): the interpreter is the first
+/// blank-delimited token after `#!`; the remainder (blanks stripped on both
+/// ends) is ONE argument with internal spaces preserved, or None if empty.
+/// ENOEXEC if not `#!`, no newline within the scan window, or empty interpreter.
+fn parse_shebang_line(bytes: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), SyscallError> {
+    let window = &bytes[..core::cmp::min(bytes.len(), MAX_SHEBANG_LINE)];
+    if !window.starts_with(b"#!") {
+        return Err(SyscallError::ENOEXEC);
+    }
+    // Require a newline within the scanned window (else the line is too long /
+    // truncated — reject rather than guess).
+    let nl = window
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or(SyscallError::ENOEXEC)?;
+    let line = strip_leading_blanks(&window[2..nl]);
+    let interp_end = line
+        .iter()
+        .position(|&b| b == b' ' || b == b'\t')
+        .unwrap_or(line.len());
+    let interp = &line[..interp_end];
+    if interp.is_empty() {
+        return Err(SyscallError::ENOEXEC);
+    }
+    let rest = strip_trailing_blanks(strip_leading_blanks(&line[interp_end..]));
+    let optarg = if rest.is_empty() {
+        None
+    } else {
+        let mut v = Vec::new();
+        v.try_reserve(rest.len()).map_err(|_| SyscallError::ENOMEM)?;
+        v.extend_from_slice(rest);
+        Some(v)
+    };
+    let mut iv = Vec::new();
+    iv.try_reserve(interp.len()).map_err(|_| SyscallError::ENOMEM)?;
+    iv.extend_from_slice(interp);
+    Ok((iv, optarg))
+}
+
+/// M0-4: rebuild argv for one shebang hop:
+///   [interp, optarg?, script_path] ++ orig[1..]
+/// The original argv[0] is dropped (Linux); an EMPTY `orig` adds no tail.
+/// Re-enforces MAX_ARG_COUNT / MAX_ARG_TOTAL / MAX_ARG_STRLEN (Codex Fix B) — this
+/// path BYPASSES `copy_user_str_array`'s caps — and rejects any embedded NUL
+/// (gap g6: an on-stack NUL would silently truncate an argv entry).
+fn reconstruct_argv(
+    interp: &[u8],
+    optarg: Option<&[u8]>,
+    script_path: &[u8],
+    orig: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>, SyscallError> {
+    fn push_entry(
+        out: &mut Vec<Vec<u8>>,
+        total: &mut usize,
+        e: &[u8],
+    ) -> Result<(), SyscallError> {
+        if e.len() > MAX_ARG_STRLEN {
+            return Err(SyscallError::E2BIG); // Codex Fix B: per-string cap
+        }
+        if e.contains(&0) {
+            return Err(SyscallError::EINVAL); // gap g6: embedded NUL
+        }
+        if out.len() + 1 > MAX_ARG_COUNT {
+            return Err(SyscallError::E2BIG);
+        }
+        *total = total.checked_add(e.len() + 1).ok_or(SyscallError::E2BIG)?;
+        if *total > MAX_ARG_TOTAL {
+            return Err(SyscallError::E2BIG);
+        }
+        out.try_reserve(1).map_err(|_| SyscallError::ENOMEM)?;
+        let mut v = Vec::new();
+        v.try_reserve(e.len()).map_err(|_| SyscallError::ENOMEM)?;
+        v.extend_from_slice(e);
+        out.push(v);
+        Ok(())
+    }
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut total = 0usize;
+    push_entry(&mut out, &mut total, interp)?;
+    if let Some(a) = optarg {
+        push_entry(&mut out, &mut total, a)?;
+    }
+    push_entry(&mut out, &mut total, script_path)?;
+    for e in orig.iter().skip(1) {
+        push_entry(&mut out, &mut total, e)?;
+    }
+    Ok(out)
+}
+
+/// sys_spawn_image (syscall 517) — Zero-OS-private native raw in-memory-image
+/// spawn (the pre-M0-4 `execve` behavior). For native code that legitimately
+/// passes an in-memory ELF image; a real path-based program uses `execve`(59).
+/// `arg0` is ALWAYS an image pointer here (never a path) — the confused-deputy
+/// is gone because the type is fixed per syscall number.
+fn sys_spawn_image(
+    image: *const u8,
+    image_len: usize,
+    argv: *const *const u8,
+    envp: *const *const u8,
+) -> SyscallResult {
+    use crate::process::{current_pid, get_process};
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // Raw-image validation (the verbatim pre-M0-4 sys_exec front-half).
+    if image.is_null() || image_len == 0 {
+        return Err(SyscallError::EINVAL);
+    }
+    if image_len > MAX_EXEC_IMAGE_SIZE {
+        kprintln!(
+            "sys_spawn_image: ELF size {} exceeds limit {}",
+            image_len, MAX_EXEC_IMAGE_SIZE
+        );
+        return Err(SyscallError::E2BIG);
+    }
+    // R151-1 FIX: fallible allocation (the global alloc_error_handler panics).
+    let mut elf_data: Vec<u8> = Vec::new();
+    elf_data
+        .try_reserve_exact(image_len)
+        .map_err(|_| SyscallError::ENOMEM)?;
+    elf_data.resize(image_len, 0);
+    copy_from_user(&mut elf_data, image)?;
+
+    let argv_vec = copy_user_str_array(argv)?;
+    let envp_vec = copy_user_str_array(envp)?;
+
+    // execfn = argv[0] when present, else "/exec" (no pathname for a raw image).
+    // Fallibly cloned (no infallible `cloned()`/`to_vec()`).
+    let execfn: Vec<u8> = match argv_vec.get(0) {
+        Some(a0) => try_clone_bytes(a0)?,
+        None => try_clone_bytes(b"/exec")?,
+    };
+
+    // The EBUSY multithread/CLONE_VM gate runs INSIDE exec_from_bytes (first work),
+    // so it is unbypassable on every entry path.
+    exec_from_bytes(process, elf_data, argv_vec, envp_vec, execfn)
+}
+
+/// sys_execve (syscall 59) — real path-based `execve(pathname, argv, envp)`.
+///
+/// Reads the file via VFS (single-resolution, +x/DAC/LSM-gated), resolves `#!`
+/// shebang interpreters ITERATIVELY (depth cap `MAX_SHEBANG_DEPTH`), then
+/// replaces the address space EXACTLY ONCE at the resolved ELF leaf. This kills
+/// the confused-deputy where the old `execve(59)` treated `arg0` as a raw ELF
+/// image instead of a path. AT_EXECFN is the ORIGINAL pathname.
+fn sys_execve(
+    pathname: *const u8,
+    argv: *const *const u8,
+    envp: *const *const u8,
+) -> SyscallResult {
+    use crate::process::{current_pid, get_process};
+    let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+    let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
+
+    // FRONT-HALF user copy — runs EXACTLY ONCE; after this, kernel buffers only.
+    let path_bytes = copy_user_cstring(pathname)?; // NULL ptr => EFAULT
+    let orig_path = utf8_path(&path_bytes)?; // non-UTF-8 => EINVAL
+    if orig_path.is_empty() {
+        return Err(SyscallError::ENOENT);
+    }
+    if orig_path.len() > MAX_EXEC_PATH_LEN {
+        return Err(SyscallError::EINVAL);
+    }
+    // M0-4 scope note: there is no per-process cwd yet (sys_getcwd is hardcoded to
+    // "/"), so VFS `normalize_path` resolves a RELATIVE pathname from "/" — i.e.
+    // exactly as a cwd of "/" would, which is internally consistent and
+    // Linux-faithful given the fixed cwd. True cwd-relative resolution is deferred
+    // to the per-PCB-cwd slice (it is NOT silently wrong, just rooted at "/").
+    let argv_vec = copy_user_str_array(argv)?;
+    let envp_vec = copy_user_str_array(envp)?;
+    // AT_EXECFN = the ORIGINAL pathname, threaded UNCHANGED through any shebang.
+    let execfn: Vec<u8> = path_bytes;
+
+    // Resolve the entire shebang chain to the FINAL ELF bytes BEFORE touching the
+    // address space, so a mid-chain error (ENOENT/EACCES/ELOOP/parse) returns to
+    // the caller with its image INTACT (Linux semantics). exec_from_bytes — the
+    // point of no return — is reached EXACTLY ONCE, at the leaf.
+    let mut cur_path = orig_path;
+    let mut cur_argv = argv_vec;
+    let mut depth: usize = 0;
+    let elf_bytes: Vec<u8> = loop {
+        let bytes = exec_read_file(&cur_path)?;
+        if bytes.starts_with(b"\x7FELF") {
+            break bytes; // ELF leaf
+        }
+        if !bytes.starts_with(b"#!") {
+            // Not a shebang and not ELF — let load_elf reject it (ENOEXEC) inside
+            // the core, after a single clean entry.
+            break bytes;
+        }
+        depth += 1;
+        if depth > MAX_SHEBANG_DEPTH {
+            return Err(SyscallError::ELOOP);
+        }
+        let (interp, optarg) = parse_shebang_line(&bytes)?;
+        let interp_path = utf8_path(&interp)?;
+        if interp_path.is_empty() || interp_path.len() > MAX_EXEC_PATH_LEN {
+            return Err(SyscallError::EINVAL);
+        }
+        // argv = [interp, optarg?, cur_path] ++ cur_argv[1..]; drop cur_argv[0].
+        cur_argv = reconstruct_argv(&interp, optarg.as_deref(), cur_path.as_bytes(), &cur_argv)?;
+        cur_path = interp_path; // next hop reads the interpreter file
+        // `bytes` drops here => at most one MAX_EXEC_IMAGE_SIZE buffer is live.
+    };
+
+    exec_from_bytes(process, elf_bytes, cur_argv, envp_vec, execfn)
+}
+
+/// M0-4: pure self-test for the exec-disambiguation helpers. Covers the logic a
+/// green boot cannot exercise: the `#!` shebang parser, argv reconstruction (the
+/// re-enforced MAX_ARG_* caps + embedded-NUL rejection), the UTF-8 path
+/// validator, and the comm-name basename truncation. A failure panics the boot
+/// (caught by the serial "Test Summary" gate, not the make-test exit code).
+pub fn run_exec_disambiguation_self_test() {
+    // --- parse_shebang_line (Linux fs/binfmt_script.c semantics) ---
+    let (i, a) = parse_shebang_line(b"#!/bin/sh\n").expect("shebang: simple");
+    assert_eq!(i, b"/bin/sh".to_vec());
+    assert_eq!(a, None);
+
+    let (i, a) = parse_shebang_line(b"#!/bin/sh -x\n").expect("shebang: one arg");
+    assert_eq!(i, b"/bin/sh".to_vec());
+    assert_eq!(a, Some(b"-x".to_vec()));
+
+    let (i, a) = parse_shebang_line(b"#!  /usr/bin/env python3\n").expect("shebang: env");
+    assert_eq!(i, b"/usr/bin/env".to_vec());
+    assert_eq!(a, Some(b"python3".to_vec()));
+
+    // single argument keeps internal spaces, strips trailing blanks.
+    let (i, a) = parse_shebang_line(b"#!/x  a b   \n").expect("shebang: internal space");
+    assert_eq!(i, b"/x".to_vec());
+    assert_eq!(a, Some(b"a b".to_vec()));
+
+    assert!(parse_shebang_line(b"#!\n").is_err()); // empty interpreter
+    assert!(parse_shebang_line(b"#!   \n").is_err()); // blanks-only interpreter
+    assert!(parse_shebang_line(b"#!/bin/sh").is_err()); // no newline in window
+    assert!(parse_shebang_line(b"#x\n").is_err()); // not a shebang
+    assert!(parse_shebang_line(b"\x7FELF").is_err()); // ELF magic, not a shebang
+
+    // --- reconstruct_argv ---
+    let orig = alloc::vec![b"prog".to_vec(), b"a1".to_vec(), b"a2".to_vec()];
+    let out = reconstruct_argv(b"/bin/sh", None, b"/script", &orig).expect("rebuild: basic");
+    assert_eq!(
+        out,
+        alloc::vec![
+            b"/bin/sh".to_vec(),
+            b"/script".to_vec(),
+            b"a1".to_vec(),
+            b"a2".to_vec()
+        ]
+    );
+
+    let out = reconstruct_argv(b"/bin/sh", Some(b"-x"), b"/script", &orig).expect("rebuild: optarg");
+    assert_eq!(
+        out,
+        alloc::vec![
+            b"/bin/sh".to_vec(),
+            b"-x".to_vec(),
+            b"/script".to_vec(),
+            b"a1".to_vec(),
+            b"a2".to_vec()
+        ]
+    );
+
+    // empty original argv => no argv[0] drop, no tail (gap g9).
+    let out = reconstruct_argv(b"/bin/sh", None, b"/script", &[]).expect("rebuild: empty orig");
+    assert_eq!(out, alloc::vec![b"/bin/sh".to_vec(), b"/script".to_vec()]);
+
+    // embedded NUL => EINVAL (gap g6).
+    assert!(reconstruct_argv(b"/bin/sh", None, b"/scr\0ipt", &[]).is_err());
+    // per-string cap (Codex Fix B) => E2BIG.
+    let big = alloc::vec![b'a'; MAX_ARG_STRLEN + 1];
+    assert!(reconstruct_argv(&big, None, b"/script", &[]).is_err());
+
+    // --- utf8_path ---
+    assert_eq!(utf8_path(b"/bin/sh").expect("utf8: ok"), "/bin/sh");
+    assert!(utf8_path(&[0xff, 0xfe]).is_err());
+
+    // --- exec_comm_name (basename, <=15 bytes, ASCII-sanitized) ---
+    assert_eq!(exec_comm_name(b"/usr/bin/python3").expect("comm"), "python3");
+    assert_eq!(exec_comm_name(b"noslash").expect("comm"), "noslash");
+    assert_eq!(
+        exec_comm_name(b"/a/abcdefghijklmnopqrstuvwxyz")
+            .expect("comm")
+            .len(),
+        15
+    );
+    // non-printable / non-ASCII byte => '?' (never a lossy alloc or a panic).
+    assert_eq!(exec_comm_name(&[b'/', 0xff, b'a']).expect("comm"), "?a");
 }
 
 /// sys_wait - 等待子进程

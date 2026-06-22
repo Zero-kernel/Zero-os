@@ -83,8 +83,15 @@ pub const SYS_CHDIR: u64 = 80;
 /// Create child process (copy-on-write)
 pub const SYS_FORK: u64 = 57;
 
-/// Execute new program
+/// Execute a new program by PATH (M0-4: real path-based
+/// `execve(pathname, argv, envp)`). Pre-M0-4 this syscall took a raw in-memory
+/// ELF image; that behavior moved to `SYS_SPAWN_IMAGE` (517).
 pub const SYS_EXEC: u64 = 59;
+
+/// Zero-OS-private raw in-memory-image spawn (non-Linux):
+/// `(image_ptr, image_len, argv, envp)`. No in-tree caller today; provided for
+/// native code that legitimately passes an in-memory ELF image rather than a path.
+pub const SYS_SPAWN_IMAGE: u64 = 517;
 
 /// Terminate current process
 pub const SYS_EXIT: u64 = 60;

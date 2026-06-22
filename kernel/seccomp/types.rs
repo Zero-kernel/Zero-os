@@ -29,6 +29,13 @@ pub(crate) const SYS_FORK: u64 = 57;
 pub(crate) const SYS_VFORK: u64 = 58;
 pub(crate) const SYS_CLONE: u64 = 56;
 pub(crate) const SYS_EXECVE: u64 = 59;
+/// M0-4: Zero-OS-private (non-Linux) raw in-memory-image spawn. INTENTIONALLY
+/// NOT in any pledge/seccomp allowlist until M0 item 6 (seccomp↔dispatch
+/// reconcile); seccomp is opt-in so a non-pledged process is unaffected. If it is
+/// ever allowlisted it MUST be added to BOTH `pledge_to_filter` (lib.rs) AND
+/// `promise_allows_syscall` (below) identically (R150-3). The 512-bit FastAllowSet
+/// cannot represent 517, so it is always interpreted/default — never fast-allowed.
+pub(crate) const SYS_SPAWN_IMAGE: u64 = 517;
 pub(crate) const SYS_WAIT4: u64 = 61;
 pub(crate) const SYS_WAITID: u64 = 247;
 pub(crate) const SYS_KILL: u64 = 62;

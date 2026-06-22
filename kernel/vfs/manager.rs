@@ -977,6 +977,72 @@ impl Vfs {
         Ok(stat)
     }
 
+    /// M0-4: read an entire regular file by path for exec.
+    ///
+    /// Single path resolution (`lookup_path` follows symlinks + enforces
+    /// per-component +x during traversal); rejects directories (EISDIR) and
+    /// non-regular files (EACCES); runs the LSM `hook_file_open` MAC gate; then
+    /// enforces a DAC check requiring BOTH read AND execute permission — the
+    /// execute bit closes the gap where `open()` (V-1 fix, ~line 932) only checks
+    /// read. The bytes are read from the SAME inode the checks ran on, so the
+    /// caller's LSM hash and `load_elf` cannot diverge via a symlink swap. The
+    /// read loop is incrementally bounded by `max` and NEVER trusts `stat.size`
+    /// (a concurrent grow/shrink TOCTOU), terminating on the first short/zero read.
+    ///
+    /// CONTRACT: the caller (the exec front-end) MUST hold no Process / page-table
+    /// / COW lock — this resolves paths and runs LSM/DAC against the current task.
+    /// The returned buffer is uncharged transient kernel memory bounded by `max`;
+    /// it is NEVER routed through cgroup charging (it is dropped before the new
+    /// image's charges are taken).
+    ///
+    /// Returns `SyscallError` directly (not `FsError`) because the `max` cap must
+    /// surface E2BIG, which `FsError` cannot express; `FsError` cases are mapped
+    /// via the in-module `fs_error_to_syscall`.
+    pub fn read_file_for_exec(&self, path: &str, max: usize) -> Result<Vec<u8>, SyscallError> {
+        let path = normalize_path(path).map_err(fs_error_to_syscall)?;
+        let inode = self.lookup_path(&path).map_err(fs_error_to_syscall)?;
+        let stat = inode.stat().map_err(fs_error_to_syscall)?;
+        if inode.is_dir() {
+            return Err(SyscallError::EISDIR);
+        }
+        if !inode.is_file() {
+            // /proc, /dev, char/block/fifo/socket nodes are not executable images.
+            return Err(SyscallError::EACCES);
+        }
+        // MAC gate (mirrors open() at ~line 926-930).
+        if let Some(task) = LsmProcessCtx::from_current() {
+            let file_ctx = LsmFileCtx::new(stat.ino, stat.mode.to_raw(), hash_path(&path));
+            lsm::hook_file_open(&task, stat.ino, LsmOpenFlags(0), &file_ctx)
+                .map_err(|_| SyscallError::EACCES)?;
+        }
+        // DAC: exec requires BOTH read (to load the image) AND execute. open() at
+        // ~line 932 passes need_exec=false; an exec-specific read must demand +x.
+        if !check_access_permission(&stat, true, false, true) {
+            return Err(SyscallError::EACCES);
+        }
+        // Incremental read on the SAME inode; the loop bound is `max`, never stat.size.
+        let mut out: Vec<u8> = Vec::new();
+        let mut off: u64 = 0;
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = inode.read_at(off, &mut chunk).map_err(fs_error_to_syscall)?;
+            if n == 0 {
+                break; // EOF / short-read terminator
+            }
+            if n > chunk.len() {
+                // A misbehaving filesystem must never make us read past the buffer.
+                return Err(SyscallError::EIO);
+            }
+            if out.len().saturating_add(n) > max {
+                return Err(SyscallError::E2BIG);
+            }
+            out.try_reserve(n).map_err(|_| SyscallError::ENOMEM)?;
+            out.extend_from_slice(&chunk[..n]);
+            off = off.saturating_add(n as u64);
+        }
+        Ok(out)
+    }
+
     /// Read directory entries
     pub fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
         let inode = self.lookup_path(path)?;
@@ -1507,11 +1573,67 @@ fn vfs_lseek_callback(
     }
 }
 
+/// M0-4: VFS read-whole-file-for-exec callback for syscall registration.
+///
+/// Called by `sys_execve` (via `exec_read_file`) to load an executable's bytes
+/// by path with a single +x/DAC/LSM-gated resolution. Trivial passthrough —
+/// `read_file_for_exec` already returns a `SyscallError`.
+fn vfs_read_file_callback(path: &str, max: usize) -> Result<Vec<u8>, SyscallError> {
+    VFS.read_file_for_exec(path, max)
+}
+
+/// M0-4: self-test for the exec-read VFS leg (`read_file_for_exec`) — the new VFS
+/// code the pure kernel_core helper tests cannot reach. The error-path checks
+/// (missing => ENOENT, directory => EISDIR) always run and are
+/// privilege-independent (they resolve before any DAC check). The happy path
+/// stages a small file in the root ramfs and reads it back through the exec leg
+/// (proving the incremental read loop + the size cap); if staging fails in the
+/// boot context it SKIPS loudly rather than panic, so it can never destabilize
+/// the boot.
+pub fn run_exec_read_file_self_test() {
+    assert!(matches!(
+        VFS.read_file_for_exec("/zeroos_m04_definitely_absent", 4096),
+        Err(SyscallError::ENOENT)
+    ));
+    assert!(matches!(
+        VFS.read_file_for_exec("/", 4096),
+        Err(SyscallError::EISDIR)
+    ));
+
+    let path = "/zeroos_m04_exec_read_test";
+    let content: &[u8] = b"\x7FELF M0-4 exec-read self-test payload (one-chunk incremental read)";
+    let create = OpenFlags::new(OpenFlags::O_CREAT | OpenFlags::O_WRONLY);
+    let staged = VFS.open(path, create, 0o755).is_ok()
+        && VFS
+            .lookup_path(path)
+            .and_then(|ino| ino.write_at(0, content).map(|_| ()))
+            .is_ok();
+    if staged {
+        let got = VFS
+            .read_file_for_exec(path, 1 << 20)
+            .expect("read_file_for_exec happy path");
+        assert_eq!(got.as_slice(), content);
+        // Size cap => E2BIG.
+        assert!(matches!(
+            VFS.read_file_for_exec(path, content.len() - 1),
+            Err(SyscallError::E2BIG)
+        ));
+        klog_always!(
+            "    \u{2713} M0 #4 read_file_for_exec: ENOENT/EISDIR + staged read + E2BIG cap"
+        );
+    } else {
+        klog_always!(
+            "    \u{26a0} M0 #4 read_file_for_exec: ENOENT/EISDIR ok; happy-path SKIPPED (no ramfs stage)"
+        );
+    }
+}
+
 /// Register VFS callbacks with kernel_core
 pub fn register_syscall_callbacks() {
     kernel_core::register_vfs_open_callback(vfs_open_callback);
     kernel_core::register_vfs_open_with_resolve_callback(vfs_open_with_resolve_callback);
     kernel_core::register_vfs_stat_callback(vfs_stat_callback);
+    kernel_core::register_vfs_read_file_callback(vfs_read_file_callback); // M0-4
     kernel_core::register_vfs_lseek_callback(vfs_lseek_callback);
     kernel_core::register_vfs_create_callback(vfs_create_callback);
     kernel_core::register_vfs_unlink_callback(vfs_unlink_callback);

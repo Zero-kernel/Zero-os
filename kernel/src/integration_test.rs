@@ -39,6 +39,16 @@ pub fn test_syscalls() {
     klog_always!("    ✓ System call framework defined");
     klog_always!("    ✓ 50+ system calls enumerated");
     klog_always!("    ✓ Handler infrastructure ready");
+    // M0 #4: the pure helpers behind exec disambiguation — the `#!` shebang
+    // parser, argv reconstruction (re-enforced MAX_ARG_* caps + embedded-NUL
+    // rejection), the UTF-8 path validator, and comm-name basename truncation.
+    kernel_core::syscall::run_exec_disambiguation_self_test();
+    klog_always!("    ✓ M0 #4 exec disambig: shebang parse + argv rebuild caps/NUL + utf8_path + comm-name basename");
+    // M0 #4: the new VFS exec-read leg (read_file_for_exec) end-to-end over the
+    // real root ramfs — path resolution + dir/missing rejection + (best-effort)
+    // the incremental read loop and size cap. VFS is initialized well before the
+    // integration tests run.
+    vfs::manager::run_exec_read_file_self_test();
     // M0 #5 (sub-slice 1a): signal-handler delivery. The pure rt_sigframe builder +
     // SROP validators (layout %16==8, FXSAVE info-leak tail, MXCSR mask, RIP/RSP
     // canonical+low-half, deliver→sigreturn mcontext round-trip) AND the signal data
