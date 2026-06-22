@@ -284,7 +284,12 @@ impl VirtQueue {
     /// Push a descriptor chain to the available ring.
     unsafe fn push_avail(&self, head: u16) {
         // R156-15 + R157-8 FIX: Runtime bounds check (defense-in-depth).
-        assert!(head < self.size, "push_avail: head {} >= size {}", head, self.size);
+        assert!(
+            head < self.size,
+            "push_avail: head {} >= size {}",
+            head,
+            self.size
+        );
         let avail = &mut *self.avail;
         let idx = read_volatile(&avail.idx);
         let ring_idx = (idx % self.size) as usize;
@@ -335,7 +340,10 @@ impl VirtQueue {
                 kprintln!(
                     "[virtio-blk] R66-5 SECURITY: invalid used.idx jump detected! \
                      used_idx={}, last={}, pending={}, size={}",
-                    used_idx, last, pending, self.size
+                    used_idx,
+                    last,
+                    pending,
+                    self.size
                 );
                 // Reset last_used_idx to used_idx to prevent infinite loop
                 // but don't process any entries
@@ -353,7 +361,8 @@ impl VirtQueue {
             if elem.id >= self.size as u32 {
                 kprintln!(
                     "[virtio-blk] R66-5 SECURITY: invalid used.id={} exceeds queue size={}",
-                    elem.id, self.size
+                    elem.id,
+                    self.size
                 );
                 // Skip this invalid entry
                 self.last_used_idx
@@ -369,9 +378,15 @@ impl VirtQueue {
     }
 
     /// Get descriptor at index.
+    #[allow(clippy::mut_from_ref)] // virtio ring descriptor: &self->&mut via raw pointer is the deliberate unsafe contract
     unsafe fn desc(&self, idx: u16) -> &mut VringDesc {
         // R150-I2 FIX: Catch out-of-bounds descriptor access in debug builds.
-        debug_assert!(idx < self.size, "blk desc: idx {} >= size {}", idx, self.size);
+        debug_assert!(
+            idx < self.size,
+            "blk desc: idx {} >= size {}",
+            idx,
+            self.size
+        );
         &mut *self.desc.add(idx as usize)
     }
 }
@@ -736,17 +751,10 @@ impl VirtioBlkDevice {
             } => {
                 // For successful reads on non-abandoned requests, copy data back
                 // R94-13 FIX: Use data_len (actual buffer size) not data_dma.size() (page-aligned)
-                if !abandoned
-                    && status == blk_status::VIRTIO_BLK_S_OK
-                    && !is_write
-                    && data_len > 0
+                if !abandoned && status == blk_status::VIRTIO_BLK_S_OK && !is_write && data_len > 0
                 {
                     unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            data_dma.virt_ptr(),
-                            data_buf,
-                            data_len,
-                        );
+                        core::ptr::copy_nonoverlapping(data_dma.virt_ptr(), data_buf, data_len);
                     }
                 }
 
@@ -794,7 +802,8 @@ impl VirtioBlkDevice {
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
             kprintln!(
                 "[virtio-blk] late completion for abandoned request head={} status={}",
-                head, status
+                head,
+                status
             );
             return None;
         }
@@ -817,7 +826,10 @@ impl VirtioBlkDevice {
         // Block new I/O immediately.
         self.device_failed.store(true, Ordering::Release);
 
-        kprintln!("[virtio-blk] R106-3: initiating device reset for {}", self.name);
+        kprintln!(
+            "[virtio-blk] R106-3: initiating device reset for {}",
+            self.name
+        );
 
         // VirtIO spec §2.1.1: writing 0 to status register resets the device.
         unsafe {
@@ -914,11 +926,10 @@ impl VirtioBlkDevice {
 
         // Decrement global leaked counter for resources we recovered.
         if recovered_leaked != 0 {
-            let _ = TIMEOUT_LEAKED_REQUESTS.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| v.checked_sub(recovered_leaked),
-            );
+            let _ =
+                TIMEOUT_LEAKED_REQUESTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    v.checked_sub(recovered_leaked)
+                });
         }
 
         // Re-initialize the device: ACKNOWLEDGE → DRIVER → features → FEATURES_OK → queue → DRIVER_OK.
@@ -932,7 +943,8 @@ impl VirtioBlkDevice {
             self.transport.write_driver_features(driver_features);
 
             let status = self.transport.status();
-            self.transport.set_status(status | VIRTIO_STATUS_FEATURES_OK);
+            self.transport
+                .set_status(status | VIRTIO_STATUS_FEATURES_OK);
 
             let status = self.transport.status();
             if status & VIRTIO_STATUS_FEATURES_OK == 0 {
@@ -946,8 +958,11 @@ impl VirtioBlkDevice {
             if self.queue.size == 0 || self.queue.size > queue_size_max {
                 let status = self.transport.status();
                 self.transport.set_status(status | VIRTIO_STATUS_FAILED);
-                kprintln!("[virtio-blk] R106-3: queue size {} exceeds max {} after reset",
-                    self.queue.size, queue_size_max);
+                kprintln!(
+                    "[virtio-blk] R106-3: queue size {} exceeds max {} after reset",
+                    self.queue.size,
+                    queue_size_max
+                );
                 return Err(BlockError::NotSupported);
             }
 
@@ -968,7 +983,8 @@ impl VirtioBlkDevice {
         self.device_failed.store(false, Ordering::Release);
         kprintln!(
             "[virtio-blk] R106-3: device {} reset successful, recovered {} abandoned requests",
-            self.name, recovered_leaked
+            self.name,
+            recovered_leaked
         );
         Ok(())
     }
@@ -1067,7 +1083,10 @@ impl VirtioBlkDevice {
                 let buffers = self.req_buffers.lock();
                 buffers[buf_idx].header
             };
-            core::ptr::write(header_status_dma.virt_ptr() as *mut VirtioBlkReqHeader, header);
+            core::ptr::write(
+                header_status_dma.virt_ptr() as *mut VirtioBlkReqHeader,
+                header,
+            );
             core::ptr::write(header_status_dma.virt_ptr().add(header_size), 0xFFu8);
         }
         let header_phys = header_status_dma.phys();
@@ -1438,7 +1457,10 @@ impl BlockDevice for VirtioBlkDevice {
                 let buffers = self.req_buffers.lock();
                 buffers[buf_idx].header
             };
-            core::ptr::write(header_status_dma.virt_ptr() as *mut VirtioBlkReqHeader, header);
+            core::ptr::write(
+                header_status_dma.virt_ptr() as *mut VirtioBlkReqHeader,
+                header,
+            );
             core::ptr::write(header_status_dma.virt_ptr().add(header_size), 0xFFu8);
         }
         let header_phys = header_status_dma.phys();

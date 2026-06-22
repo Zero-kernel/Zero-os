@@ -302,7 +302,8 @@ unsafe fn map_pci_mmio(phys_base: u64, size: usize) -> Result<i64, NetError> {
     let virt_addr = NET_MMIO_VIRT_BASE + offset;
     let virt_offset = virt_addr as i64 - phys_base as i64;
 
-    klog!(Info, 
+    klog!(
+        Info,
         "      [NET MMIO] Mapping phys {:#x} -> virt {:#x} (size {:#x})",
         phys_base,
         virt_addr,
@@ -423,7 +424,7 @@ pub fn init(iommu_required: bool) -> usize {
 
                     match register_device(device) {
                         Ok(_) => {
-                            klog!(Info, 
+                            klog!(Info,
                                 "      ✓ {} @ {:02x}:{:02x}.{} MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={}",
                                 name,
                                 pci_dev.slot.bus,
@@ -437,9 +438,11 @@ pub fn init(iommu_required: bool) -> usize {
                         Err(e) => {
                             // R82-4 FIX: Disable bus mastering on registration failure
                             pci::disable_bus_master(&pci_dev.slot);
-                            klog!(Error,
+                            klog!(
+                                Error,
                                 "      ! Failed to register {}: {:?} (bus master disabled)",
-                                name, e
+                                name,
+                                e
                             );
                         }
                     }

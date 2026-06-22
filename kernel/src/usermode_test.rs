@@ -43,9 +43,13 @@ fn dump_page_table_for_addr(addr: u64) {
     let pd_idx = ((addr >> 21) & 0x1FF) as usize;
     let pt_idx = ((addr >> 12) & 0x1FF) as usize;
 
-    klog!(Info, 
+    klog!(
+        Info,
         "  Indices: PML4[{}] PDPT[{}] PD[{}] PT[{}]",
-        pml4_idx, pdpt_idx, pd_idx, pt_idx
+        pml4_idx,
+        pdpt_idx,
+        pd_idx,
+        pt_idx
     );
 
     // Get current CR3
@@ -61,7 +65,8 @@ fn dump_page_table_for_addr(addr: u64) {
         let pml4_virt = (phys_offset + pml4_phys) as *const PageTable;
         let pml4 = &*pml4_virt;
         let pml4_entry = &pml4[pml4_idx];
-        klog!(Info, 
+        klog!(
+            Info,
             "  PML4[{}]: flags=0x{:x}, addr=0x{:x}, USER={}",
             pml4_idx,
             pml4_entry.flags().bits(),
@@ -79,7 +84,8 @@ fn dump_page_table_for_addr(addr: u64) {
         let pdpt_virt = (phys_offset + pdpt_phys) as *const PageTable;
         let pdpt = &*pdpt_virt;
         let pdpt_entry = &pdpt[pdpt_idx];
-        klog!(Info, 
+        klog!(
+            Info,
             "  PDPT[{}]: flags=0x{:x}, addr=0x{:x}, USER={}",
             pdpt_idx,
             pdpt_entry.flags().bits(),
@@ -102,7 +108,8 @@ fn dump_page_table_for_addr(addr: u64) {
         let pd_virt = (phys_offset + pd_phys) as *const PageTable;
         let pd = &*pd_virt;
         let pd_entry = &pd[pd_idx];
-        klog!(Info, 
+        klog!(
+            Info,
             "  PD[{}]: flags=0x{:x}, addr=0x{:x}, USER={}, HUGE={}",
             pd_idx,
             pd_entry.flags().bits(),
@@ -126,7 +133,8 @@ fn dump_page_table_for_addr(addr: u64) {
         let pt_virt = (phys_offset + pt_phys) as *const PageTable;
         let pt = &*pt_virt;
         let pt_entry = &pt[pt_idx];
-        klog!(Info, 
+        klog!(
+            Info,
             "  PT[{}]: flags=0x{:x}, addr=0x{:x}, USER={}, NX={}",
             pt_idx,
             pt_entry.flags().bits(),
@@ -140,7 +148,11 @@ fn dump_page_table_for_addr(addr: u64) {
             return;
         }
 
-        klog!(Info, "  -> Final physical page: 0x{:x}", pt_entry.addr().as_u64());
+        klog!(
+            Info,
+            "  -> Final physical page: 0x{:x}",
+            pt_entry.addr().as_u64()
+        );
     }
     klog!(Info, "");
 }
@@ -288,7 +300,11 @@ pub fn run_usermode_test() -> bool {
     let load_result = match load_elf(elf_data, 0) {
         Ok(result) => {
             klog!(Info, "      ✓ ELF loaded at entry 0x{:x}", result.entry);
-            klog!(Info, "      ✓ User stack top at 0x{:x}", result.user_stack_top);
+            klog!(
+                Info,
+                "      ✓ User stack top at 0x{:x}",
+                result.user_stack_top
+            );
 
             // R119-5 FIX: Page table dumps print physical addresses; debug-only.
             #[cfg(debug_assertions)]
@@ -321,10 +337,7 @@ pub fn run_usermode_test() -> bool {
                 // Re-sync per-CPU KPTI context with the newly created dual page table roots.
                 // CR3 hasn't changed, but the per-CPU GS-relative fields need to know
                 // about the user CR3 so that syscall entry/exit assembly switches correctly.
-                kernel_core::process::activate_memory_space(
-                    memory_space,
-                    Some(user_phys),
-                );
+                kernel_core::process::activate_memory_space(memory_space, Some(user_phys));
                 klog!(Info, "      ✓ KPTI user PML4 at phys 0x{:x}", user_phys);
                 user_phys
             }
@@ -344,17 +357,30 @@ pub fn run_usermode_test() -> bool {
     // + security::fill_random; a fault under the Process lock would invert the lock
     // order against the page-fault handler. THIS boot path (not sys_exec) is what the
     // M0 musl gate runs through, so the auxv MUST be built here.
-    klog!(Info, "[3.6/5] Building initial user stack (argc/argv/auxv)...");
+    klog!(
+        Info,
+        "[3.6/5] Building initial user stack (argc/argv/auxv)..."
+    );
     let argv0 = PROCESS_NAME.as_bytes().to_vec();
     let stack_layout = match kernel_core::build_initial_user_stack(
         &load_result,
         core::slice::from_ref(&argv0),
         &[],
-        &kernel_core::StackCreds { uid: 0, euid: 0, gid: 0, egid: 0, at_secure: false },
+        &kernel_core::StackCreds {
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            at_secure: false,
+        },
         PROCESS_NAME.as_bytes(),
     ) {
         Ok(layout) => {
-            klog!(Info, "      ✓ Initial user stack built (RSP=0x{:x})", layout.rsp);
+            klog!(
+                Info,
+                "      ✓ Initial user stack built (RSP=0x{:x})",
+                layout.rsp
+            );
             layout
         }
         Err(e) => {
@@ -451,9 +477,20 @@ pub fn run_usermode_test() -> bool {
     kernel_core::process::activate_memory_space(saved_cr3, None);
 
     klog!(Info, "\n✓ Ring 3 test process ready!");
-    klog!(Info, "  KPTI: {}", if user_memory_space != 0 { "dual-root (exercised)" } else { "single-root" });
+    klog!(
+        Info,
+        "  KPTI: {}",
+        if user_memory_space != 0 {
+            "dual-root (exercised)"
+        } else {
+            "single-root"
+        }
+    );
     klog!(Info, "  The process will execute when scheduled.");
-    klog!(Info, "  Expected output: \"Hello from Ring 3!\" followed by PID\n");
+    klog!(
+        Info,
+        "  Expected output: \"Hello from Ring 3!\" followed by PID\n"
+    );
 
     true
 }
@@ -494,10 +531,7 @@ pub unsafe fn test_direct_ring3_jump() -> ! {
     if security::is_kpti_enabled() {
         match create_kpti_user_pml4(memory_space) {
             Ok((_user_pml4_frame, user_phys)) => {
-                kernel_core::process::activate_memory_space(
-                    memory_space,
-                    Some(user_phys),
-                );
+                kernel_core::process::activate_memory_space(memory_space, Some(user_phys));
                 klog!(Info, "KPTI user PML4 created at phys 0x{:x}", user_phys);
             }
             Err(e) => {
@@ -515,7 +549,13 @@ pub unsafe fn test_direct_ring3_jump() -> ! {
         &load_result,
         core::slice::from_ref(&argv0),
         &[],
-        &kernel_core::StackCreds { uid: 0, euid: 0, gid: 0, egid: 0, at_secure: false },
+        &kernel_core::StackCreds {
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            at_secure: false,
+        },
         PROCESS_NAME.as_bytes(),
     ) {
         Ok(layout) => layout,

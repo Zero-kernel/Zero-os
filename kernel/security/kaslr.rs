@@ -272,7 +272,10 @@ fn generate_kstack_slide() -> u64 {
     match rng::random_range(max_slots) {
         Ok(slot0) => slot0.saturating_add(1) * KSTACK_SLIDE_GRANULARITY,
         Err(_) => {
-            klog!(Warn, "WARNING: kernel stack ASLR RNG failure — using static kstack base");
+            klog!(
+                Warn,
+                "WARNING: kernel stack ASLR RNG failure — using static kstack base"
+            );
             0
         }
     }
@@ -676,7 +679,11 @@ impl KptiContext {
         let cr3 = self.user_cr3 & !0xFFF;
         if self.pcid != 0 {
             debug_assert_eq!(self.user_cr3 & 0xFFF, 0, "user_cr3 must be 4 KiB aligned");
-            debug_assert!(self.pcid <= 0xFFF, "PCID out of 12-bit range: {}", self.pcid);
+            debug_assert!(
+                self.pcid <= 0xFFF,
+                "PCID out of 12-bit range: {}",
+                self.pcid
+            );
             cr3 | (self.pcid as u64 & 0xFFF)
         } else {
             cr3
@@ -695,8 +702,16 @@ impl KptiContext {
     pub fn kernel_cr3_with_pcid(&self) -> u64 {
         let cr3 = self.kernel_cr3 & !0xFFF;
         if self.pcid != 0 {
-            debug_assert_eq!(self.kernel_cr3 & 0xFFF, 0, "kernel_cr3 must be 4 KiB aligned");
-            debug_assert!(self.pcid <= 0xFFF, "PCID out of 12-bit range: {}", self.pcid);
+            debug_assert_eq!(
+                self.kernel_cr3 & 0xFFF,
+                0,
+                "kernel_cr3 must be 4 KiB aligned"
+            );
+            debug_assert!(
+                self.pcid <= 0xFFF,
+                "PCID out of 12-bit range: {}",
+                self.pcid
+            );
             cr3 | (self.pcid as u64 & 0xFFF)
         } else {
             cr3
@@ -804,7 +819,8 @@ pub fn install_kpti_context(ctx: KptiContext) {
 
     // Step 2: Write the three context fields.
     pcpu.kpti_user_cr3.store(ctx.user_cr3, Ordering::Release);
-    pcpu.kpti_kernel_cr3.store(ctx.kernel_cr3, Ordering::Release);
+    pcpu.kpti_kernel_cr3
+        .store(ctx.kernel_cr3, Ordering::Release);
     pcpu.kpti_pcid.store(ctx.pcid as u64, Ordering::Release);
 
     // Step 3: Publish the completed write by advancing kpti_seq to the
@@ -1026,15 +1042,11 @@ pub fn text_kaslr_status() -> TextKaslrStatus {
 /// * `feature` - The feature to enable
 pub fn enable_partial_kaslr(feature: PartialKaslrFeature) {
     match feature {
-        PartialKaslrFeature::HeapBase => {
-            PARTIAL_KASLR_HEAP.store(true, Ordering::SeqCst)
-        }
+        PartialKaslrFeature::HeapBase => PARTIAL_KASLR_HEAP.store(true, Ordering::SeqCst),
         PartialKaslrFeature::KernelStacks => {
             PARTIAL_KASLR_KERNEL_STACKS.store(true, Ordering::SeqCst)
         }
-        PartialKaslrFeature::UserspaceAslr => {
-            PARTIAL_KASLR_USERSPACE.store(true, Ordering::SeqCst)
-        }
+        PartialKaslrFeature::UserspaceAslr => PARTIAL_KASLR_USERSPACE.store(true, Ordering::SeqCst),
     }
 }
 
@@ -1307,12 +1319,30 @@ fn generate_kaslr_slide() -> u64 {
             }
             // R101-8 FIX: Warn loudly instead of silent fallback
             // Must be visible to operators even in release builds.
-            klog!(Warn, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-            klog!(Warn, "!! WARNING: KASLR RNG failure - KASLR IS DISABLED   !!");
-            klog!(Warn, "!! The kernel is booting with a DETERMINISTIC memory !!");
-            klog!(Warn, "!! layout. This severely weakens exploit mitigation. !!");
-            klog!(Warn, "!! Ensure hardware RNG (RDRAND) is available.        !!");
-            klog!(Warn, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            klog!(
+                Warn,
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            );
+            klog!(
+                Warn,
+                "!! WARNING: KASLR RNG failure - KASLR IS DISABLED   !!"
+            );
+            klog!(
+                Warn,
+                "!! The kernel is booting with a DETERMINISTIC memory !!"
+            );
+            klog!(
+                Warn,
+                "!! layout. This severely weakens exploit mitigation. !!"
+            );
+            klog!(
+                Warn,
+                "!! Ensure hardware RNG (RDRAND) is available.        !!"
+            );
+            klog!(
+                Warn,
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            );
             0
         }
     }
@@ -1417,10 +1447,14 @@ pub fn init(boot_slide: Option<u64>) {
             #[cfg(debug_assertions)]
             kprintln!(
                 "  ! KASLR slide mismatch: bootloader=0x{:x}, runtime=0x{:x}",
-                expected, layout.kaslr_slide
+                expected,
+                layout.kaslr_slide
             );
             #[cfg(not(debug_assertions))]
-            klog!(Info, "  ! KASLR slide mismatch detected (details hidden in release mode)");
+            klog!(
+                Info,
+                "  ! KASLR slide mismatch detected (details hidden in release mode)"
+            );
         }
     }
 

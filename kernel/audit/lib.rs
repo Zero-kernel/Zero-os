@@ -681,7 +681,9 @@ fn write_event_payload(hasher: &mut Sha256Writer, prev_hash: [u8; 32], event: &A
 #[inline(never)]
 fn secure_zeroize(buf: &mut [u8]) {
     for b in buf.iter_mut() {
-        unsafe { core::ptr::write_volatile(b, 0); }
+        unsafe {
+            core::ptr::write_volatile(b, 0);
+        }
     }
     core::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
@@ -1825,7 +1827,11 @@ fn current_audit_timestamp() -> u64 {
     if let Some(cb) = cb {
         let ts = cb();
         // Early boot: timer ticks may still be 0 even after registration.
-        if ts != 0 { ts } else { unsafe { core::arch::x86_64::_rdtsc() } }
+        if ts != 0 {
+            ts
+        } else {
+            unsafe { core::arch::x86_64::_rdtsc() }
+        }
     } else {
         // Pre-timer fallback: raw TSC provides monotonic ordering at minimum.
         unsafe { core::arch::x86_64::_rdtsc() }
@@ -1933,7 +1939,8 @@ pub fn set_hmac_key(key: &[u8]) -> Result<(), AuditError> {
         let mut ring = AUDIT_RING.lock();
         if let Some(ref mut r) = *ring {
             r.set_key(key)?;
-            klog!(Info, 
+            klog!(
+                Info,
                 "  Audit HMAC key set ({} bytes) - integrity protection active",
                 key.len()
             );
@@ -2027,8 +2034,17 @@ pub fn emit(
 
     let event = AuditEvent::new(
         // R148-I8 FIX: Auto-fill timestamp when caller passes 0.
-        if timestamp == 0 { current_audit_timestamp() } else { timestamp },
-        kind, outcome, subject, object, args, errno,
+        if timestamp == 0 {
+            current_audit_timestamp()
+        } else {
+            timestamp
+        },
+        kind,
+        outcome,
+        subject,
+        object,
+        args,
+        errno,
     );
 
     // Emit with interrupts disabled to prevent deadlock
@@ -2464,8 +2480,7 @@ fn sha256_trunc64_with_domain(domain: &[u8], data: &[u8]) -> u64 {
     let digest = hasher.finalize();
     // Truncate to 64 bits (first 8 bytes of SHA-256)
     u64::from_be_bytes([
-        digest[0], digest[1], digest[2], digest[3],
-        digest[4], digest[5], digest[6], digest[7],
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
     ])
 }
 

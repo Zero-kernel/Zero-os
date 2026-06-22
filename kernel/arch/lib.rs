@@ -24,7 +24,9 @@ pub use context_switch::{
     save_context, switch_context, validate_kernel_context, Context, FxSaveArea, USER_CODE_SELECTOR,
     USER_DATA_SELECTOR,
 };
-pub use cpu_protection::{check_cpu_features, enable_protections, require_smap_support, CpuProtectionStatus};
+pub use cpu_protection::{
+    check_cpu_features, enable_protections, require_smap_support, CpuProtectionStatus,
+};
 pub use cpu_protection::{
     detect_hypervisor, hypervisor_present, is_software_emulated, is_virtualized, HypervisorType,
 };

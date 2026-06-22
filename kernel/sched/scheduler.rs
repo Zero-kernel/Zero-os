@@ -300,7 +300,10 @@ pub fn run() -> ! {
                 let proc = process.lock();
                 kprintln!(
                     "Running process: PID={}, Name={}, Priority={}, TimeSlice={}ms",
-                    pid, proc.name, proc.dynamic_priority, proc.time_slice
+                    pid,
+                    proc.name,
+                    proc.dynamic_priority,
+                    proc.time_slice
                 );
             }
 

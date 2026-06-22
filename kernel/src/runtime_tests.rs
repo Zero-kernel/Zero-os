@@ -634,8 +634,8 @@ impl NetworkLoopbackTest {
 
     /// Test UDP packet processing through the network stack
     fn test_udp_loopback(&self) -> Result<(), String> {
-        use net::{arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult};
         use cap::NamespaceId;
+        use net::{arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult};
 
         // Setup test addresses
         let our_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
@@ -682,18 +682,21 @@ impl NetworkLoopbackTest {
             }) => Ok(()),
             ProcessResult::Dropped(reason) => {
                 // Parse errors, explicit rule drops, or other unexpected reasons indicate test failure
-                Err(alloc::format!("UDP packet dropped for unexpected reason: {:?}", reason))
+                Err(alloc::format!(
+                    "UDP packet dropped for unexpected reason: {:?}",
+                    reason
+                ))
             }
         }
     }
 
     /// Test that TCP packets with invalid flags are dropped
     fn test_invalid_tcp_drop(&self) -> Result<(), String> {
+        use cap::NamespaceId;
         use net::{
             arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult, TCP_FLAG_FIN,
             TCP_FLAG_RST, TCP_FLAG_SYN,
         };
-        use cap::NamespaceId;
 
         let our_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
         let our_ip = Ipv4Addr([10, 0, 0, 1]);
@@ -799,8 +802,8 @@ impl NetworkLoopbackTest {
 
     /// Test valid TCP SYN packet processing
     fn test_tcp_syn(&self) -> Result<(), String> {
-        use net::{arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult, TCP_FLAG_SYN};
         use cap::NamespaceId;
+        use net::{arp::ArpCache, stack::NetStats, EthAddr, Ipv4Addr, ProcessResult, TCP_FLAG_SYN};
 
         let our_mac = EthAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
         let our_ip = Ipv4Addr([10, 0, 0, 1]);
@@ -1092,9 +1095,7 @@ impl RuntimeTest for SmpOnlineTest {
         if online > 1 {
             TestResult::Pass
         } else {
-            TestResult::Warning(String::from(
-                "Only 1 CPU online; SMP tests will be skipped",
-            ))
+            TestResult::Warning(String::from("Only 1 CPU online; SMP tests will be skipped"))
         }
     }
 }
@@ -1118,9 +1119,7 @@ impl RuntimeTest for IpiPingPongTest {
         use mm::tlb_shootdown::is_cpu_online;
 
         if num_online_cpus() <= 1 {
-            return TestResult::Warning(String::from(
-                "Single-core system; skipping IPI ping-pong",
-            ));
+            return TestResult::Warning(String::from("Single-core system; skipping IPI ping-pong"));
         }
 
         let self_cpu = current_cpu_id();
@@ -1239,7 +1238,9 @@ impl RuntimeTest for TlbShootdownCoherencyTest {
         if ack_after <= ack_before {
             TestResult::Fail(alloc::format!(
                 "CPU {} did not acknowledge TLB shootdown (ack_gen: {} -> {})",
-                target, ack_before, ack_after
+                target,
+                ack_before,
+                ack_after
             ))
         } else {
             TestResult::Pass
@@ -1281,7 +1282,8 @@ impl RuntimeTest for CpusetIsolationTest {
         if root_mask != online {
             return TestResult::Fail(alloc::format!(
                 "Root cpuset mask mismatch (root=0x{:016x}, online=0x{:016x})",
-                root_mask, online
+                root_mask,
+                online
             ));
         }
 
@@ -1294,7 +1296,9 @@ impl RuntimeTest for CpusetIsolationTest {
             Err(CpusetError::InvalidParent) => {}
             Ok(id) => {
                 let _ = cpuset::cpuset_destroy(id);
-                return TestResult::Fail(String::from("cpuset_create succeeded with invalid parent"));
+                return TestResult::Fail(String::from(
+                    "cpuset_create succeeded with invalid parent",
+                ));
             }
             Err(e) => {
                 return TestResult::Fail(alloc::format!(
@@ -1365,10 +1369,7 @@ impl RuntimeTest for CpusetIsolationTest {
         let parent_id = match cpuset::cpuset_create(parent_mask, CpusetId::ROOT) {
             Ok(id) => id,
             Err(e) => {
-                return TestResult::Fail(alloc::format!(
-                    "Failed to create parent cpuset: {:?}",
-                    e
-                ))
+                return TestResult::Fail(alloc::format!("Failed to create parent cpuset: {:?}", e))
             }
         };
         created.push(parent_id);
@@ -1378,10 +1379,7 @@ impl RuntimeTest for CpusetIsolationTest {
             Ok(id) => id,
             Err(e) => {
                 let _ = cpuset::cpuset_destroy(parent_id);
-                return TestResult::Fail(alloc::format!(
-                    "Failed to create child cpuset: {:?}",
-                    e
-                ))
+                return TestResult::Fail(alloc::format!("Failed to create child cpuset: {:?}", e));
             }
         };
         created.push(child_id);
@@ -1463,7 +1461,8 @@ impl RuntimeTest for CpusetIsolationTest {
             if let Err(e) = cpuset::cpuset_destroy(id) {
                 return TestResult::Fail(alloc::format!(
                     "Failed to destroy cpuset {:?}: {:?}",
-                    id, e
+                    id,
+                    e
                 ));
             }
         }
@@ -1493,9 +1492,7 @@ impl RuntimeTest for SchedulerAffinityTest {
         use sched::Scheduler;
 
         if num_online_cpus() <= 1 {
-            return TestResult::Warning(String::from(
-                "Single-core system; skipping affinity test",
-            ));
+            return TestResult::Warning(String::from("Single-core system; skipping affinity test"));
         }
 
         // Verify cpu_allowed() helper treats 0 as "all CPUs" (R70-3 fix)
@@ -1505,9 +1502,7 @@ impl RuntimeTest for SchedulerAffinityTest {
         // Find another online CPU
         let target = match (0..max_cpus()).find(|&id| id != self_cpu && is_cpu_online(id)) {
             Some(id) => id,
-            None => {
-                return TestResult::Fail(String::from("No online AP found for affinity test"))
-            }
+            None => return TestResult::Fail(String::from("No online AP found for affinity test")),
         };
 
         // Test 1: allowed_cpus = 0 means all CPUs allowed
@@ -1527,13 +1522,15 @@ impl RuntimeTest for SchedulerAffinityTest {
         if allowed_self_specific {
             return TestResult::Fail(alloc::format!(
                 "CPU {} should NOT be allowed when mask is for CPU {} only",
-                self_cpu, target
+                self_cpu,
+                target
             ));
         }
         if !allowed_target_specific {
             return TestResult::Fail(alloc::format!(
                 "CPU {} should be allowed when mask is for CPU {}",
-                target, target
+                target,
+                target
             ));
         }
 
@@ -1616,7 +1613,9 @@ pub fn run_all_runtime_tests() -> TestReport {
     klog_always!();
     klog_always!(
         "=== Test Summary: {} passed, {} warnings, {} failed ===",
-        passed, warnings, failed
+        passed,
+        warnings,
+        failed
     );
     klog_always!();
 
@@ -1714,13 +1713,15 @@ impl RuntimeTest for BuddyPartialFreeTest {
         // Get stats after attempted partial free
         let stats_after_partial = match get_allocator_stats() {
             Some(s) => s,
-            None => return TestResult::Fail(String::from("Failed to get stats after partial free")),
+            None => {
+                return TestResult::Fail(String::from("Failed to get stats after partial free"))
+            }
         };
 
         // Verify partial free was REJECTED (free count unchanged)
         if stats_after_partial.free_pages != stats_after_alloc.free_pages {
             return TestResult::Fail(String::from(
-                "R74-4 REGRESSION: Partial free was accepted! Order tracking not working."
+                "R74-4 REGRESSION: Partial free was accepted! Order tracking not working.",
             ));
         }
 
@@ -1729,13 +1730,15 @@ impl RuntimeTest for BuddyPartialFreeTest {
 
         let stats_after_correct = match get_allocator_stats() {
             Some(s) => s,
-            None => return TestResult::Fail(String::from("Failed to get stats after correct free")),
+            None => {
+                return TestResult::Fail(String::from("Failed to get stats after correct free"))
+            }
         };
 
         // Verify correct free was ACCEPTED (free count increased by 8)
         if stats_after_correct.free_pages != stats_after_alloc.free_pages + 8 {
             return TestResult::Fail(String::from(
-                "Correct free (order=3) was rejected - allocator bug"
+                "Correct free (order=3) was rejected - allocator bug",
             ));
         }
 
@@ -1800,7 +1803,9 @@ impl RuntimeTest for TcpSynFloodLimitTest {
         // Test 4: Verify limit exists (GLOBAL_MAX_HALF_OPEN = 1024)
         let max_limit = test_get_max_half_open();
         if max_limit == 0 {
-            return TestResult::Fail(String::from("Max half-open limit is 0 - configuration error"));
+            return TestResult::Fail(String::from(
+                "Max half-open limit is 0 - configuration error",
+            ));
         }
 
         // Test 5: Verify atomic behavior - set counter near limit and test rejection
@@ -1821,7 +1826,7 @@ impl RuntimeTest for TcpSynFloodLimitTest {
         // This increment should FAIL (over limit)
         if test_try_inc_half_open() {
             return TestResult::Fail(String::from(
-                "R74-5 REGRESSION: Increment over limit succeeded - atomic enforcement broken"
+                "R74-5 REGRESSION: Increment over limit succeeded - atomic enforcement broken",
             ));
         }
 
@@ -1861,7 +1866,7 @@ impl RuntimeTest for MountNamespaceMaterializeTest {
         // If not registered, materialize_namespace() will panic.
         if !test_is_mount_ns_callback_registered() {
             return TestResult::Fail(String::from(
-                "R74-2 REGRESSION: Mount namespace callback not registered - VFS init incomplete"
+                "R74-2 REGRESSION: Mount namespace callback not registered - VFS init incomplete",
             ));
         }
 
@@ -1906,11 +1911,11 @@ impl RuntimeTest for MultithreadedUnshareTest {
                 // We're running in kernel init context before any process exists
                 // This is fine - the test is about the thread_group_size function
                 // Let's verify it returns 0 for non-existent process
-                let fake_tgid: usize = 99999;  // ProcessId is type alias for usize
+                let fake_tgid: usize = 99999; // ProcessId is type alias for usize
                 let size = thread_group_size(fake_tgid);
                 if size != 0 {
                     return TestResult::Fail(String::from(
-                        "thread_group_size should return 0 for non-existent process"
+                        "thread_group_size should return 0 for non-existent process",
                     ));
                 }
                 // Function works correctly
@@ -1936,7 +1941,7 @@ impl RuntimeTest for MultithreadedUnshareTest {
             // If there were multiple threads, CLONE_NEWNS would be rejected
             // This is the R74-3 fix: prevent namespace divergence
             return TestResult::Warning(String::from(
-                "Multiple threads detected - CLONE_NEWNS would be rejected (R74-3)"
+                "Multiple threads detected - CLONE_NEWNS would be rejected (R74-3)",
             ));
         }
 
@@ -1984,7 +1989,7 @@ impl RuntimeTest for TlbShootdownPcidTest {
         let cpus = num_online_cpus();
         if cpus < 2 {
             return TestResult::Warning(String::from(
-                "TLB shootdown PCID test requires SMP (only 1 CPU online)"
+                "TLB shootdown PCID test requires SMP (only 1 CPU online)",
             ));
         }
 
@@ -2015,9 +2020,7 @@ impl RuntimeTest for MountNamespaceIsolationTest {
     }
 
     fn run(&self) -> TestResult {
-        use kernel_core::{
-            clone_mount_namespace, MountNamespace, ROOT_MNT_NAMESPACE,
-        };
+        use kernel_core::{clone_mount_namespace, MountNamespace, ROOT_MNT_NAMESPACE};
 
         // Test 1: ROOT_MNT_NAMESPACE exists and is level 0
         let root_ns = ROOT_MNT_NAMESPACE.clone();
@@ -2053,9 +2056,7 @@ impl RuntimeTest for MountNamespaceIsolationTest {
         // Test 4: Verify parent relationship
         let parent = match child_ns.parent() {
             Some(p) => p,
-            None => {
-                return TestResult::Fail(String::from("Child namespace should have parent"))
-            }
+            None => return TestResult::Fail(String::from("Child namespace should have parent")),
         };
         if parent.id() != root_ns.id() {
             return TestResult::Fail(String::from("Child's parent should be root namespace"));
@@ -2099,7 +2100,9 @@ impl RuntimeTest for MountNamespaceIsolationTest {
             return TestResult::Fail(String::from("Root namespace should have / mount"));
         }
         if child_mount.is_err() {
-            return TestResult::Fail(String::from("Child namespace should have / mount (inherited)"));
+            return TestResult::Fail(String::from(
+                "Child namespace should have / mount (inherited)",
+            ));
         }
 
         // Test 8: Arc-based reference counting (R112-1: manual refcount removed)
@@ -2126,7 +2129,7 @@ impl RuntimeTest for MountNamespaceIsolationTest {
                         match clone_mount_namespace(ns.clone()) {
                             Ok(_) => {
                                 return TestResult::Fail(String::from(
-                                    "Should fail to create namespace beyond MAX_MNT_NS_LEVEL"
+                                    "Should fail to create namespace beyond MAX_MNT_NS_LEVEL",
                                 ));
                             }
                             Err(kernel_core::MountNsError::MaxDepthExceeded) => {
@@ -2146,7 +2149,8 @@ impl RuntimeTest for MountNamespaceIsolationTest {
                 Err(e) => {
                     return TestResult::Fail(alloc::format!(
                         "Failed to create namespace at level {}: {:?}",
-                        level, e
+                        level,
+                        e
                     ));
                 }
             }
@@ -2189,9 +2193,7 @@ impl RuntimeTest for IpcNamespaceIsolationTest {
     }
 
     fn run(&self) -> TestResult {
-        use kernel_core::{
-            clone_ipc_namespace, IpcNsError, MAX_IPC_NS_LEVEL, ROOT_IPC_NAMESPACE,
-        };
+        use kernel_core::{clone_ipc_namespace, IpcNsError, MAX_IPC_NS_LEVEL, ROOT_IPC_NAMESPACE};
 
         // Test 1: ROOT_IPC_NAMESPACE exists and is level 0
         let root_ns = ROOT_IPC_NAMESPACE.clone();
@@ -2199,7 +2201,9 @@ impl RuntimeTest for IpcNamespaceIsolationTest {
             return TestResult::Fail(String::from("Root IPC namespace should have level 0"));
         }
         if !root_ns.is_root() {
-            return TestResult::Fail(String::from("Root IPC namespace is_root() should return true"));
+            return TestResult::Fail(String::from(
+                "Root IPC namespace is_root() should return true",
+            ));
         }
 
         // Test 2: Create child namespace
@@ -2258,7 +2262,9 @@ impl RuntimeTest for IpcNamespaceIsolationTest {
             return TestResult::Fail(String::from("Child IPC ID should differ from root ID"));
         }
         if grandchild_ns.id() == child_ns.id() {
-            return TestResult::Fail(String::from("Grandchild IPC ID should differ from child ID"));
+            return TestResult::Fail(String::from(
+                "Grandchild IPC ID should differ from child ID",
+            ));
         }
 
         // Test 7: Reference counting
@@ -2283,7 +2289,7 @@ impl RuntimeTest for IpcNamespaceIsolationTest {
                         match clone_ipc_namespace(ns.clone()) {
                             Ok(_) => {
                                 return TestResult::Fail(String::from(
-                                    "Should fail to create IPC namespace beyond MAX_IPC_NS_LEVEL"
+                                    "Should fail to create IPC namespace beyond MAX_IPC_NS_LEVEL",
                                 ));
                             }
                             Err(IpcNsError::MaxDepthExceeded) => {
@@ -2303,7 +2309,8 @@ impl RuntimeTest for IpcNamespaceIsolationTest {
                 Err(e) => {
                     return TestResult::Fail(alloc::format!(
                         "Failed to create IPC namespace at level {}: {:?}",
-                        level, e
+                        level,
+                        e
                     ));
                 }
             }
@@ -2352,9 +2359,7 @@ impl RuntimeTest for NetNamespaceIsolationTest {
     }
 
     fn run(&self) -> TestResult {
-        use kernel_core::{
-            clone_net_namespace, NetNsError, MAX_NET_NS_LEVEL, ROOT_NET_NAMESPACE,
-        };
+        use kernel_core::{clone_net_namespace, NetNsError, MAX_NET_NS_LEVEL, ROOT_NET_NAMESPACE};
 
         // Test 1: ROOT_NET_NAMESPACE exists and is level 0
         let root_ns = ROOT_NET_NAMESPACE.clone();
@@ -2362,7 +2367,9 @@ impl RuntimeTest for NetNamespaceIsolationTest {
             return TestResult::Fail(String::from("Root network namespace should have level 0"));
         }
         if !root_ns.is_root() {
-            return TestResult::Fail(String::from("Root network namespace is_root() should return true"));
+            return TestResult::Fail(String::from(
+                "Root network namespace is_root() should return true",
+            ));
         }
         if !root_ns.has_loopback() {
             return TestResult::Fail(String::from("Root network namespace should have loopback"));
@@ -2401,7 +2408,9 @@ impl RuntimeTest for NetNamespaceIsolationTest {
             }
         };
         if parent.id() != root_ns.id() {
-            return TestResult::Fail(String::from("Child's parent should be root network namespace"));
+            return TestResult::Fail(String::from(
+                "Child's parent should be root network namespace",
+            ));
         }
 
         // Test 5: Create grandchild to verify multi-level hierarchy
@@ -2427,7 +2436,9 @@ impl RuntimeTest for NetNamespaceIsolationTest {
             return TestResult::Fail(String::from("Child network ID should differ from root ID"));
         }
         if grandchild_ns.id() == child_ns.id() {
-            return TestResult::Fail(String::from("Grandchild network ID should differ from child ID"));
+            return TestResult::Fail(String::from(
+                "Grandchild network ID should differ from child ID",
+            ));
         }
 
         // Test 7: Test device management
@@ -2510,7 +2521,8 @@ impl RuntimeTest for NetNamespaceIsolationTest {
                 Err(e) => {
                     return TestResult::Fail(alloc::format!(
                         "Failed to create network namespace at level {}: {:?}",
-                        level, e
+                        level,
+                        e
                     ));
                 }
             }

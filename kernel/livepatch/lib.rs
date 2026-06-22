@@ -479,7 +479,10 @@ impl PatchState {
 
     #[inline]
     fn is_bp_active(self) -> bool {
-        matches!(self, PatchState::Enabling | PatchState::Enabled | PatchState::Disabling)
+        matches!(
+            self,
+            PatchState::Enabling | PatchState::Enabled | PatchState::Disabling
+        )
     }
 }
 
@@ -698,9 +701,7 @@ fn check_no_dependents(slot_index: usize) -> Result<(), Errno> {
 ///
 /// Requires `PATCH_REG_LOCK` to be held by the caller.
 /// Returns `EBUSY` if any slot is in a transitional state.
-fn collect_patch_nodes(
-    table: &'static [PatchSlot],
-) -> Result<Vec<(usize, u64, PatchMeta)>, Errno> {
+fn collect_patch_nodes(table: &'static [PatchSlot]) -> Result<Vec<(usize, u64, PatchMeta)>, Errno> {
     let meta_table = PATCH_META_TABLE.lock();
     let mut nodes = Vec::new();
     for (slot_index, slot) in table.iter().enumerate() {
@@ -1024,12 +1025,14 @@ pub fn rollback_recent_patches(max_age_ticks: u64) -> usize {
         match unsafe { restore_original_byte_inner(slot, ops, false) } {
             Ok(()) => {
                 slot.enabled_tsc.store(0, Ordering::Release);
-                slot.state.store(PatchState::Disabled as u8, Ordering::Release);
+                slot.state
+                    .store(PatchState::Disabled as u8, Ordering::Release);
                 rolled_back += 1;
             }
             Err(_) => {
                 // Restore to Enabled state so INT3 dispatch continues to work.
-                slot.state.store(PatchState::Enabled as u8, Ordering::Release);
+                slot.state
+                    .store(PatchState::Enabled as u8, Ordering::Release);
             }
         }
     }
@@ -1098,11 +1101,8 @@ fn verify_patch_authenticity(img: &PatchImage<'_>) -> Result<(), Errno> {
     let digest = h.finalize();
 
     // Verify against any trusted public key (key rotation support).
-    match ecdsa_p256::verify_prehash_any(
-        TRUSTED_P256_PUBKEYS_UNCOMPRESSED,
-        &digest,
-        img.signature,
-    ) {
+    match ecdsa_p256::verify_prehash_any(TRUSTED_P256_PUBKEYS_UNCOMPRESSED, &digest, img.signature)
+    {
         Ok(()) => Ok(()),
         // Invalid signature = access denied (cryptographic verification failed).
         Err(ecdsa_p256::VerifyError::SignatureInvalid)
@@ -1318,21 +1318,38 @@ fn register_loaded_patch(p: &LoadedPatch) -> Result<u64, Errno> {
             slot.enabled_tsc.store(0, Ordering::Release);
             // P1-4: Store immutable dependency metadata (PATCH_REG_LOCK is held).
             meta_table[slot_index] = Some(p.meta);
-            slot.state.store(PatchState::Registered as u8, Ordering::Release);
+            slot.state
+                .store(PatchState::Registered as u8, Ordering::Release);
             // R110-3 FIX: Log lifecycle event without raw kernel addresses.
             // R120-2 FIX: Gate address detail behind #[cfg(debug_assertions)]
             // to prevent KASLR leaks in release builds. The address-free line
             // provides sufficient operational information; the structured audit
             // log (emit_livepatch_audit) records addresses separately.
-            klog!(Info, "livepatch: loaded id={} deps={}", id, p.meta.dep_count);
+            klog!(
+                Info,
+                "livepatch: loaded id={} deps={}",
+                id,
+                p.meta.dep_count
+            );
             #[cfg(debug_assertions)]
-            klog!(Info, "livepatch: loaded id={} target={:#x} handler={:#x}", id, p.target, p.handler);
+            klog!(
+                Info,
+                "livepatch: loaded id={} target={:#x} handler={:#x}",
+                id,
+                p.target,
+                p.handler
+            );
             // R121-5 FIX: Redact kernel addresses from audit channel in release
             // builds to prevent KASLR slide recovery via CAP_AUDIT_READ.
             // Audit event is still emitted (preserving audit chain integrity)
             // but with zeroed address fields.
             #[cfg(debug_assertions)]
-            emit_livepatch_audit(0, id, p.target as u64, [p.handler as u64, p.meta.dep_count as u64, 0]);
+            emit_livepatch_audit(
+                0,
+                id,
+                p.target as u64,
+                [p.handler as u64, p.meta.dep_count as u64, 0],
+            );
             #[cfg(not(debug_assertions))]
             emit_livepatch_audit(0, id, 0, [0, p.meta.dep_count as u64, 0]);
             return Ok(id);
@@ -1401,7 +1418,8 @@ pub fn kpatch_enable(id: u64) -> Result<(), Errno> {
         Ok(()) => {
             // Record enable timestamp for rollback policy.
             slot.enabled_tsc.store(read_tsc(), Ordering::Release);
-            slot.state.store(PatchState::Enabled as u8, Ordering::Release);
+            slot.state
+                .store(PatchState::Enabled as u8, Ordering::Release);
             // R110-3 FIX: Avoid raw address in profile-visible output.
             // R120-2 FIX: Gate address detail behind #[cfg(debug_assertions)].
             let target = slot.target.load(Ordering::Acquire);
@@ -1467,7 +1485,8 @@ pub fn kpatch_disable(id: u64) -> Result<(), Errno> {
         Ok(()) => {
             // Clear enable timestamp since patch is no longer active.
             slot.enabled_tsc.store(0, Ordering::Release);
-            slot.state.store(PatchState::Disabled as u8, Ordering::Release);
+            slot.state
+                .store(PatchState::Disabled as u8, Ordering::Release);
             // R110-3 FIX: Avoid raw address in profile-visible output.
             // R120-2 FIX: Gate address detail behind #[cfg(debug_assertions)].
             let target = slot.target.load(Ordering::Acquire);
@@ -1570,7 +1589,8 @@ pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
         // Restore the exec addresses so the slot remains valid.
         slot.exec_addr.store(exec_addr, Ordering::Release);
         slot.exec_len.store(exec_len, Ordering::Release);
-        slot.state.store(PatchState::Disabled as u8, Ordering::Release);
+        slot.state
+            .store(PatchState::Disabled as u8, Ordering::Release);
         return Err(Errno::EBUSY);
     }
 
@@ -1604,7 +1624,12 @@ pub fn kpatch_unload(id: u64) -> Result<(), Errno> {
     // R120-2 FIX: Gate address detail behind #[cfg(debug_assertions)].
     klog!(Info, "livepatch: unloaded id={}", id);
     #[cfg(debug_assertions)]
-    klog!(Info, "livepatch: unloaded id={} target={:#x}", id, target_addr);
+    klog!(
+        Info,
+        "livepatch: unloaded id={} target={:#x}",
+        id,
+        target_addr
+    );
     // R121-5 FIX: Redact kernel addresses in release builds.
     #[cfg(debug_assertions)]
     emit_livepatch_audit(3, id, target_addr as u64, [0, 0, 0]);

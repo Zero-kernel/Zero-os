@@ -525,8 +525,7 @@ unsafe fn find_dmar_in_sdt(
             _ => u64::from_le(ptr::read_unaligned(table_ptr.add(off) as *const u64)),
         };
         // A real-but-unreadable (>1 GiB) entry is "present yet uninspectable" → fail closed.
-        let entry_hdr_ptr =
-            phys_window(entry_phys, hdr_size).ok_or(DmarError::InvalidStructure)?;
+        let entry_hdr_ptr = phys_window(entry_phys, hdr_size).ok_or(DmarError::InvalidStructure)?;
         let entry_hdr = ptr::read_unaligned(entry_hdr_ptr as *const AcpiHeader);
         if entry_hdr.signature == DMAR_SIGNATURE {
             return Ok(Some(entry_phys));
@@ -738,7 +737,10 @@ unsafe fn parse_rmrr(ptr: *const u8, length: u16) -> Result<RmrrEntry, DmarError
 }
 
 /// Parse device scope entries.
-unsafe fn parse_device_scopes(ptr: *const u8, remaining: usize) -> Result<Vec<DeviceScope>, DmarError> {
+unsafe fn parse_device_scopes(
+    ptr: *const u8,
+    remaining: usize,
+) -> Result<Vec<DeviceScope>, DmarError> {
     let mut scopes = Vec::new();
     let mut current = ptr;
     let end = ptr.add(remaining);

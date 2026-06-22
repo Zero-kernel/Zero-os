@@ -341,8 +341,8 @@ impl InterruptRemappingTable {
         let pages = (bytes + 4095) / 4096;
 
         // Allocate physical pages
-        let frame = buddy_allocator::alloc_physical_pages(pages)
-            .ok_or(IommuError::PageTableAllocFailed)?;
+        let frame =
+            buddy_allocator::alloc_physical_pages(pages).ok_or(IommuError::PageTableAllocFailed)?;
 
         let phys = frame.start_address().as_u64();
 

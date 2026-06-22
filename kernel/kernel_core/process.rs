@@ -234,7 +234,10 @@ pub fn kernel_stack_slot(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), KernelS
         .checked_add(stack_bytes)
         .ok_or(KernelStackError::AddressOverflow)?;
 
-    Ok((VirtAddr::new(stack_base_addr), VirtAddr::new(stack_top_addr)))
+    Ok((
+        VirtAddr::new(stack_base_addr),
+        VirtAddr::new(stack_top_addr),
+    ))
 }
 
 /// 为指定 PID 分配并映射带守护页的内核栈
@@ -281,9 +284,8 @@ pub fn allocate_kernel_stack(pid: ProcessId) -> Result<(VirtAddr, VirtAddr), Ker
             // (invpcid_all_nonglobal / flush_all_local) 不刷新 GLOBAL 条目。
             // 移除 GLOBAL 可确保 CR3 切换自动清除 stale 条目，
             // 消除 PID 回收后 stale GLOBAL TLB 导致的内核栈 UAF 风险。
-            let flags = PageTableFlags::PRESENT
-                | PageTableFlags::WRITABLE
-                | PageTableFlags::NO_EXECUTE;
+            let flags =
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
 
             // 映射栈页（守护页不映射，自动触发页错误）
             let stack_size = (KSTACK_PAGES as u64 * PAGE_SIZE) as usize;
@@ -626,7 +628,10 @@ impl MmState {
         let ledgered = if self.pt_charged_frames.try_reserve(pt_frames.len()).is_ok() {
             let mut all_fresh = true;
             for f in pt_frames {
-                match self.pt_charged_frames.try_insert(f.start_address().as_u64(), ()) {
+                match self
+                    .pt_charged_frames
+                    .try_insert(f.start_address().as_u64(), ())
+                {
                     Ok(None) => {}
                     Ok(Some(_)) => {
                         // A frame the allocator just handed out as is_unused() CANNOT
@@ -1218,8 +1223,8 @@ impl Process {
         Process {
             pid,
             generation: NEXT_GENERATION.fetch_add(1, Ordering::SeqCst), // lint-fetch-add: allow (generation counter)
-            tid: pid,  // tid == pid (Linux 语义)
-            tgid: pid, // 主线程时 tgid == pid
+            tid: pid,                                                   // tid == pid (Linux 语义)
+            tgid: pid,                                                  // 主线程时 tgid == pid
             ppid,
             is_thread: false,
             name,
@@ -1237,10 +1242,10 @@ impl Process {
             base_dynamic_priority: priority, // E.4 PI: starts same as dynamic_priority
             pending_starve_boost: false,     // M4-1: no latched starvation boost at birth
             socket_timeout_marker: AtomicU64::new(0), // M4-1b: born-clean, no timeout pending
-            wq_timeout_marker: AtomicU64::new(0),     // M4-1b: born-clean, no timeout pending
-            active_wait_seq: AtomicU64::new(0),       // M1-02: born-clean, no active timed wait
-            pi_boosts: BTreeMap::new(),       // E.4 PI: no boosts initially
-            waiting_on_futex: None,           // E.4 PI: not waiting on any futex
+            wq_timeout_marker: AtomicU64::new(0), // M4-1b: born-clean, no timeout pending
+            active_wait_seq: AtomicU64::new(0), // M1-02: born-clean, no active timed wait
+            pi_boosts: BTreeMap::new(),      // E.4 PI: no boosts initially
+            waiting_on_futex: None,          // E.4 PI: not waiting on any futex
             time_slice: calculate_time_slice(priority),
             context: Context::default(),
             fpu_used: false, // Lazy FPU: process hasn't used FPU yet
@@ -1249,11 +1254,13 @@ impl Process {
             user_stack: None,
             memory_space: 0,
             user_memory_space: 0,
-            mm: Arc::new(Mutex::new(MmState::new(security::randomized_mmap_base(DEFAULT_MMAP_BASE)))),
+            mm: Arc::new(Mutex::new(MmState::new(security::randomized_mmap_base(
+                DEFAULT_MMAP_BASE,
+            )))),
             fd_table: BTreeMap::new(),
             cloexec_fds: BTreeSet::new(),
             rlimits: default_rlimits(), // M0-6: POSIX resource limits
-            fds_charged_count: 0, // J2-7: no fds charged at construction
+            fds_charged_count: 0,       // J2-7: no fds charged at construction
 
             cap_table: Arc::new(CapTable::new()),
             exit_code: None,
@@ -1272,7 +1279,7 @@ impl Process {
             cpu_quota_debt_cgid: 0,
             wait_ticks: 0, // R65-19 FIX: Initialize starvation counter
             allowed_cpus: 0xFFFFFFFFFFFFFFFF, // SMP: Allow on all CPUs by default
-            cpuset_id: 0, // Root cpuset (all CPUs)
+            cpuset_id: 0,  // Root cpuset (all CPUs)
             created_at: time::current_timestamp_ms(),
             // R101-1 FIX: Default to unprivileged nobody (uid=65534) credentials.
             //
@@ -1535,7 +1542,8 @@ impl Process {
         let effective = inherited.map_or(base, |p| core::cmp::min(p, base));
         if effective != self.dynamic_priority {
             self.dynamic_priority = effective;
-            self.time_slice = calculate_time_slice_with_cgroup(self.dynamic_priority, self.cgroup_id);
+            self.time_slice =
+                calculate_time_slice_with_cgroup(self.dynamic_priority, self.cgroup_id);
             true
         } else {
             false
@@ -1921,7 +1929,10 @@ struct ChildSlotGuard {
 
 impl ChildSlotGuard {
     fn new(ppid: ProcessId) -> Self {
-        Self { ppid, committed: false }
+        Self {
+            ppid,
+            committed: false,
+        }
     }
     fn commit(&mut self) {
         self.committed = true;
@@ -2002,7 +2013,8 @@ pub fn create_process(
             Err(e) => {
                 kprintln!(
                     "Error: Failed to allocate kernel stack for PID {}: {:?}",
-                    pid, e
+                    pid,
+                    e
                 );
                 return Err(ProcessCreateError::KernelStackAllocFailed(e));
             }
@@ -2164,9 +2176,12 @@ pub fn create_process(
     }
 
     // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-    klog!(Info, 
+    klog!(
+        Info,
         "Created process: PID={}, Name={}, Priority={}",
-        pid, name, priority
+        pid,
+        name,
+        priority
     );
 
     Ok(pid)
@@ -2229,7 +2244,8 @@ pub fn create_process_in_namespace(
             Err(e) => {
                 kprintln!(
                     "Error: Failed to allocate kernel stack for PID {}: {:?}",
-                    pid, e
+                    pid,
+                    e
                 );
                 return Err(ProcessCreateError::KernelStackAllocFailed(e));
             }
@@ -2358,9 +2374,13 @@ pub fn create_process_in_namespace(
     }
 
     // R104-2 FIX: Gate diagnostic println behind debug_assertions.
-    klog!(Info, 
+    klog!(
+        Info,
         "Created process in namespace: PID={}, Name={}, Priority={}, NS={}",
-        pid, name, priority, process.lock().pid_ns_for_children.id().raw()
+        pid,
+        name,
+        priority,
+        process.lock().pid_ns_for_children.id().raw()
     );
 
     Ok(pid)
@@ -2374,7 +2394,11 @@ pub fn create_process_in_namespace(
 /// IRQ handlers (timer ISR profiler sampling) without deadlock risk.
 pub fn current_pid() -> Option<ProcessId> {
     let raw = CURRENT_PID.with(|pid| pid.load(Ordering::Relaxed));
-    if raw == 0 { None } else { Some(raw) }
+    if raw == 0 {
+        None
+    } else {
+        Some(raw)
+    }
 }
 
 /// R106-1 FIX: 获取当前进程的 generation 值。
@@ -3708,7 +3732,11 @@ pub fn wq_timeout_wake_by_seq(pid: ProcessId, seq: u64, marker_gen: u64) -> bool
 pub fn run_timeout_marker_self_test() {
     // (1) ENCODING / SENTINEL: pack(0) must NOT be 0 (else wq generation 0 would
     // be indistinguishable from "no marker"); the tag bit must round-trip.
-    assert_eq!(pack_timeout_marker(0), 1, "pack(0) must set the tag bit, != 0");
+    assert_eq!(
+        pack_timeout_marker(0),
+        1,
+        "pack(0) must set the tag bit, != 0"
+    );
     assert_eq!(pack_timeout_marker(5), 11, "pack(5) == (5<<1)|1");
     assert_eq!(pack_timeout_marker(0) >> 1, 0, "decode(pack(0)) == 0");
     assert_eq!(pack_timeout_marker(5) >> 1, 5, "decode(pack(5)) == 5");
@@ -3717,44 +3745,94 @@ pub fn run_timeout_marker_self_test() {
 
     // (2) EXACT-GEN + TOTAL STALE-DROP (reproduces old `<=`-clears + `==`-reports):
     field.store(pack_timeout_marker(5), Ordering::Relaxed);
-    assert!(!consume_timeout_marker(&field, 7), "stored 5, expect 7 => not timed out");
-    assert_eq!(field.load(Ordering::Relaxed), 0, "stale-low residue is cleared by swap");
+    assert!(
+        !consume_timeout_marker(&field, 7),
+        "stored 5, expect 7 => not timed out"
+    );
+    assert_eq!(
+        field.load(Ordering::Relaxed),
+        0,
+        "stale-low residue is cleared by swap"
+    );
     field.store(pack_timeout_marker(5), Ordering::Relaxed);
-    assert!(consume_timeout_marker(&field, 5), "stored 5, expect 5 => timed out");
-    assert_eq!(field.load(Ordering::Relaxed), 0, "exact match clears the marker");
+    assert!(
+        consume_timeout_marker(&field, 5),
+        "stored 5, expect 5 => timed out"
+    );
+    assert_eq!(
+        field.load(Ordering::Relaxed),
+        0,
+        "exact match clears the marker"
+    );
     field.store(pack_timeout_marker(5), Ordering::Relaxed);
-    assert!(!consume_timeout_marker(&field, 3), "stored 5, expect 3 => not timed out (no panic)");
-    assert_eq!(field.load(Ordering::Relaxed), 0, "stale-high-than-expected residue cleared");
+    assert!(
+        !consume_timeout_marker(&field, 3),
+        "stored 5, expect 3 => not timed out (no panic)"
+    );
+    assert_eq!(
+        field.load(Ordering::Relaxed),
+        0,
+        "stale-high-than-expected residue cleared"
+    );
 
     // (3) NO MARKER: a never-set field consumes to false without underflow.
-    assert!(!consume_timeout_marker(&field, 0), "absent marker => false (gen 0)");
-    assert!(!consume_timeout_marker(&field, 42), "absent marker => false");
+    assert!(
+        !consume_timeout_marker(&field, 0),
+        "absent marker => false (gen 0)"
+    );
+    assert!(
+        !consume_timeout_marker(&field, 42),
+        "absent marker => false"
+    );
 
     // (4) NO-LEAK ACROSS SEQUENTIAL WAITS: wait A times out and is consumed;
     // wait B never times out and MUST observe a clean field (Woken, not a stale
     // TimedOut from A).
     field.store(pack_timeout_marker(100), Ordering::Relaxed); // wait A's timer fires
-    assert!(consume_timeout_marker(&field, 100), "wait A reports TimedOut");
-    assert!(!consume_timeout_marker(&field, 101), "wait B (no timer) reports Woken, no leak");
+    assert!(
+        consume_timeout_marker(&field, 100),
+        "wait A reports TimedOut"
+    );
+    assert!(
+        !consume_timeout_marker(&field, 101),
+        "wait B (no timer) reports Woken, no leak"
+    );
 
     // (5) ENTRY-CLEAR neutralizes any residue (the born-clean belt).
     field.store(pack_timeout_marker(7), Ordering::Relaxed);
     field.store(0, Ordering::Relaxed); // entry-clear
-    assert_eq!(field.load(Ordering::Relaxed), 0, "entry-clear zeroes the field");
-    assert!(!consume_timeout_marker(&field, 7), "post entry-clear: no timeout");
+    assert_eq!(
+        field.load(Ordering::Relaxed),
+        0,
+        "entry-clear zeroes the field"
+    );
+    assert!(
+        !consume_timeout_marker(&field, 7),
+        "post entry-clear: no timeout"
+    );
 
     // (6) TWO-FIELD ISOLATION: consuming the socket field must NOT disturb the wq
     // field — catches a copy-paste wrong-field read between the two markers.
     let socket_field = AtomicU64::new(pack_timeout_marker(9));
     let wq_field = AtomicU64::new(pack_timeout_marker(9));
-    assert!(consume_timeout_marker(&socket_field, 9), "socket field consumes");
-    assert_eq!(socket_field.load(Ordering::Relaxed), 0, "socket field cleared");
+    assert!(
+        consume_timeout_marker(&socket_field, 9),
+        "socket field consumes"
+    );
+    assert_eq!(
+        socket_field.load(Ordering::Relaxed),
+        0,
+        "socket field cleared"
+    );
     assert_eq!(
         wq_field.load(Ordering::Relaxed),
         pack_timeout_marker(9),
         "wq field UNTOUCHED by socket consume (two independent fields)"
     );
-    assert!(consume_timeout_marker(&wq_field, 9), "wq field still consumable");
+    assert!(
+        consume_timeout_marker(&wq_field, 9),
+        "wq field still consumable"
+    );
 
     // (7) FORK CLEANLINESS: a freshly constructed PCB is born-clean on both fields
     // (defends the fork.rs explicit-zero + Process::new default).
@@ -3794,7 +3872,10 @@ pub fn run_timeout_marker_self_test() {
     // born-clean active_wait_seq value).
     let s1 = alloc_wait_seq();
     let s2 = alloc_wait_seq();
-    assert!(s1 != 0 && s2 != 0, "alloc_wait_seq never returns the 0 sentinel");
+    assert!(
+        s1 != 0 && s2 != 0,
+        "alloc_wait_seq never returns the 0 sentinel"
+    );
     assert!(s2 != s1, "alloc_wait_seq is distinct per call");
 
     // (10) M1-02: a fresh PCB is born-clean on active_wait_seq (no inherited timed-wait
@@ -3982,7 +4063,7 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                 lsm_euid = creds.euid;
                 lsm_egid = creds.egid;
             } // Drop creds read guard before mutable access below
-            // F.1: Copy namespace chain for cleanup
+              // F.1: Copy namespace chain for cleanup
             pid_ns_chain = proc.pid_ns_chain.clone();
             // F.2: Copy cgroup_id for detachment
             cgroup_id = proc.cgroup_id;
@@ -4099,7 +4180,8 @@ pub fn terminate_process(pid: ProcessId, exit_code: i32) {
                 // R102-L6 FIX: Gate address-revealing log behind debug_assertions
                 kprintln!(
                     "  Woke {} waiters on clear_child_tid=0x{:x}",
-                    woken, clear_child_tid
+                    woken,
+                    clear_child_tid
                 );
                 let _ = woken; // suppress unused warning in release
             }
@@ -4453,9 +4535,7 @@ pub fn wait_process(pid: ProcessId) -> Option<i32> {
         let proc = process.lock();
         // R169-9: a Zombie is reapable/observable as exited ONLY after teardown
         // has been published — never report exit before teardown ran.
-        if proc.state == ProcessState::Zombie
-            && proc.teardown_done.load(Ordering::Acquire)
-        {
+        if proc.state == ProcessState::Zombie && proc.teardown_done.load(Ordering::Acquire) {
             return proc.exit_code;
         }
     }
@@ -4506,7 +4586,11 @@ pub fn cleanup_zombie(pid: ProcessId) {
     // release; this `if` check prevents silent UAF if a regression reintroduces
     // self-reaping. Cost: single AtomicU32 load (current_pid()).
     if current_pid() == Some(pid) {
-        klog!(Error, "SECURITY: cleanup_zombie called on self (pid={}) — refusing to prevent UAF", pid);
+        klog!(
+            Error,
+            "SECURITY: cleanup_zombie called on self (pid={}) — refusing to prevent UAF",
+            pid
+        );
         return;
     }
     debug_assert!(
@@ -4589,7 +4673,14 @@ pub fn cleanup_zombie(pid: ProcessId) {
                         let ipc_ns_id = proc.ipc_ns.id();
                         let cpuset_id = proc.cpuset_id;
                         drop(proc);
-                        Some((process, keep_address_space, reaped_pid, tgid, ipc_ns_id, cpuset_id))
+                        Some((
+                            process,
+                            keep_address_space,
+                            reaped_pid,
+                            tgid,
+                            ipc_ns_id,
+                            cpuset_id,
+                        ))
                     } else {
                         // Not a zombie anymore (concurrent state change); restore the slot
                         drop(proc);
@@ -4607,9 +4698,7 @@ pub fn cleanup_zombie(pid: ProcessId) {
     // PROCESS_TABLE lock is released here.
 
     // Phase 2: Free resources and run cross-subsystem cleanup WITHOUT holding PROCESS_TABLE.
-    if let Some((process, keep_address_space, reaped_pid, tgid, ipc_ns_id, cpuset_id)) =
-        reap_info
-    {
+    if let Some((process, keep_address_space, reaped_pid, tgid, ipc_ns_id, cpuset_id)) = reap_info {
         // Free kernel-internal resources (stack, mmap, fd_table, address space).
         // This is safe because the Arc we hold is the only remaining reference —
         // the table slot was cleared in Phase 1c.
@@ -4768,7 +4857,10 @@ pub fn cleanup_unscheduled_process(pid: ProcessId) {
 ///
 /// * `proc` - 进程引用
 /// * `keep_address_space` - R24-1 fix: 如果为 true，不释放地址空间（其他线程仍在使用）
-fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTreeMap<i32, FileDescriptor> {
+fn free_process_resources(
+    proc: &mut Process,
+    keep_address_space: bool,
+) -> BTreeMap<i32, FileDescriptor> {
     // D3-ARC-MM-SHARED: Lock the shared MmState to access mmap/brk metadata.
     // For shared MmState (CLONE_VM), Arc::strong_count > 1 means other tasks
     // still reference this mm — non-last exit must NOT uncharge cgroup memory.
@@ -4904,7 +4996,8 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTree
     if fd_count > 0 {
         kprintln!(
             "  Closed {} file descriptors for process {}",
-            fd_count, proc.pid
+            fd_count,
+            proc.pid
         );
     }
 
@@ -4938,7 +5031,8 @@ fn free_process_resources(proc: &mut Process, keep_address_space: bool) -> BTree
             free_address_space(proc.memory_space);
             kprintln!(
                 "  Released page table hierarchy for process {} (root=0x{:x})",
-                proc.pid, _saved_root
+                proc.pid,
+                _saved_root
             );
             proc.memory_space = 0;
         }
@@ -5002,7 +5096,8 @@ pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
         // R104-2 FIX: Gate to prevent leaking kernel RSP in release builds.
         kprintln!(
             "  WARNING: Skip releasing kernel stack for PID {} (in use by current CPU, RSP=0x{:x})",
-            pid, current_rsp
+            pid,
+            current_rsp
         );
         return;
     }
@@ -5044,7 +5139,8 @@ pub fn free_kernel_stack(pid: ProcessId, stack_base: VirtAddr) {
         // R104-2 FIX: Gate to prevent leaking kernel stack address in release builds.
         kprintln!(
             "  Released kernel stack for PID {} at 0x{:x}",
-            pid, stack_base_u64
+            pid,
+            stack_base_u64
         );
     });
 }
@@ -5245,7 +5341,11 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
                 return None;
             }
             let len = crate::syscall::mmap_region_len(len_with_flags) as u64;
-            if len > 0 { Some(len) } else { None }
+            if len > 0 {
+                Some(len)
+            } else {
+                None
+            }
         })
         .sum();
 
@@ -5337,19 +5437,33 @@ pub fn run_pt_ledger_self_test() {
     // X and Y are UNCHARGED — debiting them would be the cross-origin memory.max
     // bypass. This is the property's whole point.
     let freed = pt_ledger_reconcile(&mut ledger, [a, x, y].into_iter());
-    assert_eq!(freed, PT, "reclaim {{A,X,Y}} debits ONLY the charged frame A");
+    assert_eq!(
+        freed, PT,
+        "reclaim {{A,X,Y}} debits ONLY the charged frame A"
+    );
     assert_eq!(ledger.len(), 2, "A removed; B,C remain");
     assert!(ledger.get(&a).is_none(), "A gone from ledger");
 
     // Re-reclaiming A (e.g. a buggy double-free) debits nothing (already removed) —
     // saturating / idempotent in the safe direction.
     let again = pt_ledger_reconcile(&mut ledger, core::iter::once(a));
-    assert_eq!(again, 0, "double-reclaim of A debits nothing (no under-count)");
+    assert_eq!(
+        again, 0,
+        "double-reclaim of A debits nothing (no under-count)"
+    );
 
     // Reclaiming the rest {B, C} drains the ledger exactly: 2 * 0x1000.
     let rest = pt_ledger_reconcile(&mut ledger, [b, c].into_iter());
-    assert_eq!(rest, 2 * PT, "reclaim {{B,C}} debits both remaining charged frames");
-    assert_eq!(ledger.len(), 0, "ledger empty after all charged frames reclaimed");
+    assert_eq!(
+        rest,
+        2 * PT,
+        "reclaim {{B,C}} debits both remaining charged frames"
+    );
+    assert_eq!(
+        ledger.len(),
+        0,
+        "ledger empty after all charged frames reclaimed"
+    );
 
     // A reclaim against an empty/non-authoritative ledger (e.g. a forked child's
     // inherited region) debits nothing — the basis rides to teardown (over-count-safe).
@@ -5377,8 +5491,7 @@ pub fn run_record_pt_charge_self_test() {
     };
     // INVARIANT I': pt_charged_bytes == pt_inherited_bytes + |ledger| * 0x1000.
     let inv = |mm: &MmState| -> bool {
-        mm.pt_charged_bytes
-            == mm.pt_inherited_bytes + (mm.pt_charged_frames.len() as u64) * PT
+        mm.pt_charged_bytes == mm.pt_inherited_bytes + (mm.pt_charged_frames.len() as u64) * PT
     };
 
     // Fresh AS: authoritative, all zero (I' holds: 0 == 0 + 0).
@@ -5395,9 +5508,20 @@ pub fn run_record_pt_charge_self_test() {
     //    identity), the inherited basis is untouched, authoritative stays true.
     let (a, b, c) = (0x10_0000u64, 0x20_0000u64, 0x30_0000u64);
     mm.record_pt_charge(&[frame(a), frame(b), frame(c)]);
-    assert_eq!(mm.pt_charged_bytes, 3 * PT, "charged the PT-frame COUNT, not data bytes");
-    assert_eq!(mm.pt_charged_frames.len(), 3, "three frames ledgered by identity");
-    assert_eq!(mm.pt_inherited_bytes, 0, "ledgered branch leaves the inherited basis at 0");
+    assert_eq!(
+        mm.pt_charged_bytes,
+        3 * PT,
+        "charged the PT-frame COUNT, not data bytes"
+    );
+    assert_eq!(
+        mm.pt_charged_frames.len(),
+        3,
+        "three frames ledgered by identity"
+    );
+    assert_eq!(
+        mm.pt_inherited_bytes, 0,
+        "ledgered branch leaves the inherited basis at 0"
+    );
     assert!(mm.pt_ledger_authoritative, "AS stays authoritative");
     assert!(inv(&mm), "I' holds after the ledgered charge");
 
@@ -5411,9 +5535,16 @@ pub fn run_record_pt_charge_self_test() {
     //    Each charged frame debits exactly PT; draining pt_charged_bytes leaves I'
     //    holding at 0 == 0 + 0 — charge == reclaim, the whole point of SLICE-4a.
     let freed = pt_ledger_reconcile(&mut mm.pt_charged_frames, [a, b, c].into_iter());
-    assert_eq!(freed, 3 * PT, "reconcile debits exactly the three charged frames");
+    assert_eq!(
+        freed,
+        3 * PT,
+        "reconcile debits exactly the three charged frames"
+    );
     mm.pt_charged_bytes = mm.pt_charged_bytes.saturating_sub(freed);
-    assert_eq!(mm.pt_charged_bytes, 0, "pt_charged_bytes telescopes to 0 on matched reclaim");
+    assert_eq!(
+        mm.pt_charged_bytes, 0,
+        "pt_charged_bytes telescopes to 0 on matched reclaim"
+    );
     assert_eq!(mm.pt_charged_frames.len(), 0, "ledger empty after reclaim");
     assert!(inv(&mm), "I' holds after the matched reclaim");
 
@@ -5422,7 +5553,10 @@ pub fn run_record_pt_charge_self_test() {
     //    frame-identity ledger exists for, here for the mprotect lane).
     let (x, y) = (0x40_0000u64, 0x50_0000u64);
     let none = pt_ledger_reconcile(&mut mm.pt_charged_frames, [x, y].into_iter());
-    assert_eq!(none, 0, "reclaim of unledgered frames debits nothing (no bypass)");
+    assert_eq!(
+        none, 0,
+        "reclaim of unledgered frames debits nothing (no bypass)"
+    );
 
     // 5) INHERITED-basis coexistence: an AS born with a fork-inherited basis that
     //    then records its OWN mprotect-materialized frames keeps I' across BOTH
@@ -5434,9 +5568,20 @@ pub fn run_record_pt_charge_self_test() {
     assert!(inv(&child), "inherited-only child satisfies I'");
     child.record_pt_charge(&[frame(a), frame(b)]);
     assert_eq!(child.pt_charged_bytes, 7 * PT, "inherited 5PT + own 2PT");
-    assert_eq!(child.pt_charged_frames.len(), 2, "own frames ledgered by identity");
-    assert_eq!(child.pt_inherited_bytes, 5 * PT, "inherited basis untouched by ledgered charge");
-    assert!(child.pt_ledger_authoritative, "child flips authoritative once it tracks own frames");
+    assert_eq!(
+        child.pt_charged_frames.len(),
+        2,
+        "own frames ledgered by identity"
+    );
+    assert_eq!(
+        child.pt_inherited_bytes,
+        5 * PT,
+        "inherited basis untouched by ledgered charge"
+    );
+    assert!(
+        child.pt_ledger_authoritative,
+        "child flips authoritative once it tracks own frames"
+    );
     assert!(inv(&child), "I' holds across inherited + ledgered lanes");
 }
 

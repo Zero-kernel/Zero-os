@@ -131,13 +131,13 @@ pub mod lvt_bits {
 
 /// LAPIC Timer Divider values (for TIMER_DIVIDE register)
 pub mod timer_divide {
-    pub const DIV_1: u32 = 0b1011;   // Divide by 1
-    pub const DIV_2: u32 = 0b0000;   // Divide by 2
-    pub const DIV_4: u32 = 0b0001;   // Divide by 4
-    pub const DIV_8: u32 = 0b0010;   // Divide by 8
-    pub const DIV_16: u32 = 0b0011;  // Divide by 16
-    pub const DIV_32: u32 = 0b1000;  // Divide by 32
-    pub const DIV_64: u32 = 0b1001;  // Divide by 64
+    pub const DIV_1: u32 = 0b1011; // Divide by 1
+    pub const DIV_2: u32 = 0b0000; // Divide by 2
+    pub const DIV_4: u32 = 0b0001; // Divide by 4
+    pub const DIV_8: u32 = 0b0010; // Divide by 8
+    pub const DIV_16: u32 = 0b0011; // Divide by 16
+    pub const DIV_32: u32 = 0b1000; // Divide by 32
+    pub const DIV_64: u32 = 0b1001; // Divide by 64
     pub const DIV_128: u32 = 0b1010; // Divide by 128
 }
 
@@ -465,7 +465,10 @@ unsafe fn calibrate_with_hpet() -> Option<u32> {
     lapic_write(lapic::TIMER_INIT, 0);
 
     if elapsed == 0 {
-        klog!(Warn, "[APIC] calibrate_with_hpet: LAPIC timer did not decrement");
+        klog!(
+            Warn,
+            "[APIC] calibrate_with_hpet: LAPIC timer did not decrement"
+        );
         return None;
     }
 
@@ -474,7 +477,10 @@ unsafe fn calibrate_with_hpet() -> Option<u32> {
     let calibrated = per_ms.min(u32::MAX as u64) as u32;
 
     if calibrated == 0 {
-        klog!(Warn, "[APIC] calibrate_with_hpet: computed init count is zero");
+        klog!(
+            Warn,
+            "[APIC] calibrate_with_hpet: computed init count is zero"
+        );
         return None;
     }
 
@@ -509,7 +515,8 @@ unsafe fn calibrate_with_pit() -> Result<u32, &'static str> {
     // Calculate PIT reload value for the calibration window
     let pit_reload = ((PIT_FREQUENCY_HZ as u64 * LAPIC_CALIBRATION_WINDOW_MS as u64) + 500) / 1000;
     if pit_reload == 0 || pit_reload > u16::MAX as u64 {
-        klog!(Warn,
+        klog!(
+            Warn,
             "[APIC] calibrate_lapic_timer: invalid PIT reload value {}",
             pit_reload
         );
@@ -553,7 +560,10 @@ unsafe fn calibrate_with_pit() -> Result<u32, &'static str> {
     pit_gate.write(saved_gate);
 
     if elapsed == 0 {
-        klog!(Warn, "[APIC] calibrate_lapic_timer: LAPIC timer did not decrement");
+        klog!(
+            Warn,
+            "[APIC] calibrate_lapic_timer: LAPIC timer did not decrement"
+        );
         return Err("lapic timer not running");
     }
 
@@ -563,7 +573,10 @@ unsafe fn calibrate_with_pit() -> Result<u32, &'static str> {
     let calibrated = per_ms.min(u32::MAX as u64) as u32;
 
     if calibrated == 0 {
-        klog!(Warn, "[APIC] calibrate_lapic_timer: computed init count is zero");
+        klog!(
+            Warn,
+            "[APIC] calibrate_lapic_timer: computed init count is zero"
+        );
         return Err("calibration result zero");
     }
 
@@ -589,9 +602,7 @@ unsafe fn calibrate_with_pit() -> Result<u32, &'static str> {
 /// - IDT entry for vector 32 must be configured
 /// - Should be called after LAPIC initialization
 pub unsafe fn start_lapic_timer() {
-    let initial_count = LAPIC_TIMER_INIT_COUNT
-        .load(Ordering::Relaxed)
-        .max(1); // Ensure non-zero to actually start the timer
+    let initial_count = LAPIC_TIMER_INIT_COUNT.load(Ordering::Relaxed).max(1); // Ensure non-zero to actually start the timer
 
     // Set divider to 16 for reasonable count range
     lapic_write(lapic::TIMER_DIVIDE, timer_divide::DIV_16);

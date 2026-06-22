@@ -238,7 +238,6 @@ pub struct SyscallPerCpu {
     //
     // Written by `arch_set_kpti_cr3s()` during context switch (interrupts disabled).
     // Read by the syscall entry/exit assembly via GS-relative addressing.
-
     /// CR3 to load on user→kernel transition (full kernel page tables).
     pub kpti_kernel_cr3: u64,
     /// CR3 to load on kernel→user transition (user page tables + trampoline).
@@ -502,7 +501,8 @@ pub unsafe fn init_syscall_msr(syscall_entry: u64) {
         kprintln!("  SFMASK: 0x{:016x}", sfmask);
         kprintln!(
             "  Kernel CS: 0x{:x}, SYSRET base: 0x{:x}",
-            kernel_cs, sysret_base
+            kernel_cs,
+            sysret_base
         );
     }
     #[cfg(not(debug_assertions))]
@@ -1160,7 +1160,8 @@ pub unsafe extern "C" fn syscall_entry_stub() -> ! {
 extern "C" fn syscall_bad_return(user_rip: u64, user_rsp: u64) -> ! {
     kprintln!(
         "syscall: SECURITY - rejecting invalid return RIP=0x{:x} RSP=0x{:x}",
-        user_rip, user_rsp
+        user_rip,
+        user_rsp
     );
 
     // Terminate the current process with SIGSEGV-style exit code

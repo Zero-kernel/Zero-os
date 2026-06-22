@@ -475,11 +475,9 @@ impl<T> LockdepMutex<T> {
         }
         #[cfg(not(debug_assertions))]
         {
-            self.inner.try_lock().map(|guard| {
-                LockdepMutexGuard {
-                    lock: self,
-                    guard: ManuallyDrop::new(guard),
-                }
+            self.inner.try_lock().map(|guard| LockdepMutexGuard {
+                lock: self,
+                guard: ManuallyDrop::new(guard),
             })
         }
     }
@@ -787,7 +785,9 @@ pub mod lock_tracking {
         static GRAPH: Once<Mutex<DependencyGraph>> = Once::new();
 
         fn graph() -> MutexGuard<'static, DependencyGraph> {
-            GRAPH.call_once(|| Mutex::new(DependencyGraph::new())).lock()
+            GRAPH
+                .call_once(|| Mutex::new(DependencyGraph::new()))
+                .lock()
         }
 
         /// Validate that acquiring `new_class` won't create a cycle with held locks.

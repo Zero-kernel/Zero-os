@@ -30,7 +30,12 @@
 //! let global = resolve_pid_in_namespace(&ns, ns_pid);
 //! ```
 
-use alloc::{collections::{BTreeMap, TryReserveError}, sync::{Arc, Weak}, vec, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, TryReserveError},
+    sync::{Arc, Weak},
+    vec,
+    vec::Vec,
+};
 use cap::NamespaceId;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
@@ -309,7 +314,10 @@ impl PidNamespace {
     ///
     /// * `global_pid` - The process's global PID
     pub fn attach_root_pid(&self, global_pid: ProcessId) {
-        debug_assert!(self.is_root(), "attach_root_pid called on non-root namespace");
+        debug_assert!(
+            self.is_root(),
+            "attach_root_pid called on non-root namespace"
+        );
         // Lock in same order as alloc_pid to avoid deadlock
         let mut by_global = self.pid_by_global.lock();
         let mut by_ns = self.pid_by_ns.lock();
@@ -679,7 +687,11 @@ pub fn get_cascade_kill_pids(ns: &Arc<PidNamespace>) -> Vec<ProcessId> {
         // Clean up released children (strong_count == 0)
         children.retain(|w: &Weak<PidNamespace>| w.strong_count() > 0);
         // Add live children to the traversal stack
-        stack.extend(children.iter().filter_map(|w: &Weak<PidNamespace>| w.upgrade()));
+        stack.extend(
+            children
+                .iter()
+                .filter_map(|w: &Weak<PidNamespace>| w.upgrade()),
+        );
     }
 
     pids

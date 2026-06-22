@@ -200,8 +200,7 @@ impl PageTableManager {
         if !pml4e.flags().contains(PageTableFlags::PRESENT) {
             return None;
         }
-        let pdpt: &mut PageTable =
-            unsafe { &mut *phys_to_virt(pml4e.addr()).as_mut_ptr() };
+        let pdpt: &mut PageTable = unsafe { &mut *phys_to_virt(pml4e.addr()).as_mut_ptr() };
 
         // PDPT → PD
         let pdpte = &pdpt[pdpt_idx];
@@ -212,8 +211,7 @@ impl PageTableManager {
         if pdpte_flags.contains(PageTableFlags::HUGE_PAGE) {
             return None; // 1GiB huge page — not a 4KiB leaf
         }
-        let pd: &mut PageTable =
-            unsafe { &mut *phys_to_virt(pdpte.addr()).as_mut_ptr() };
+        let pd: &mut PageTable = unsafe { &mut *phys_to_virt(pdpte.addr()).as_mut_ptr() };
 
         // PD → PT
         let pde = &pd[pd_idx];
@@ -224,8 +222,7 @@ impl PageTableManager {
         if pde_flags.contains(PageTableFlags::HUGE_PAGE) {
             return None; // 2MiB huge page — not a 4KiB leaf
         }
-        let pt: &mut PageTable =
-            unsafe { &mut *phys_to_virt(pde.addr()).as_mut_ptr() };
+        let pt: &mut PageTable = unsafe { &mut *phys_to_virt(pde.addr()).as_mut_ptr() };
 
         // Read leaf PTE
         let pte = &mut pt[pt_idx];

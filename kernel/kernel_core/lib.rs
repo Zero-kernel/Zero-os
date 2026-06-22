@@ -29,19 +29,18 @@ pub mod net_namespace;
 pub mod pid_namespace;
 pub mod process;
 pub mod rcu;
-pub mod user_namespace;
 pub mod scheduler_hook;
 pub mod signal;
 pub mod signal_frame;
 pub mod syscall;
 pub mod time;
+pub mod user_namespace;
 pub mod user_stack;
 pub mod usercopy;
 
 pub use elf_loader::{load_elf, ElfLoadError, ElfLoadResult, USER_STACK_SIZE, USER_STACK_TOP};
 // M0 #1 (auxv): shared SysV AMD64 initial-user-stack builder, used by both sys_exec
 // and the usermode_test boot diagnostic (the real M0 musl gate path).
-pub use user_stack::{build_initial_user_stack, StackCreds, UserStackLayout};
 pub use fork::{
     create_fresh_address_space, create_kpti_user_pml4, free_kpti_user_pml4, sys_fork, ForkError,
     ForkResult, PAGE_REF_COUNT,
@@ -54,19 +53,19 @@ pub use process::{
     // F.1 PID Namespace: create process in specific namespace
     create_process_in_namespace,
     current_cap_table,
+    current_cgroup_id, // F.2: Cgroup ID for resource accounting
     current_credentials,
     current_egid,
     current_euid,
-    current_host_egid,      // R135-1: host-mapped egid for DAC
-    current_host_euid,      // R133-1: host-mapped euid for privilege gates
+    current_host_egid,                 // R135-1: host-mapped egid for DAC
+    current_host_euid,                 // R133-1: host-mapped euid for privilege gates
     current_host_supplementary_groups, // R135-1: host-mapped supplementary groups for DAC
-    current_is_host_root,   // R133-1: host root check for global gates
-    current_ipc_ns,      // F.1: IPC namespace
-    current_ipc_ns_id,   // R75-2: IPC namespace ID for partitioning
-    current_mount_ns,    // F.1: Mount namespace
-    current_net_ns,      // F.1: Network namespace
-    current_net_ns_id,   // R75-1: Network namespace ID for partitioning
-    current_cgroup_id,   // F.2: Cgroup ID for resource accounting
+    current_ipc_ns,                    // F.1: IPC namespace
+    current_ipc_ns_id,                 // R75-2: IPC namespace ID for partitioning
+    current_is_host_root,              // R133-1: host root check for global gates
+    current_mount_ns,                  // F.1: Mount namespace
+    current_net_ns,                    // F.1: Network namespace
+    current_net_ns_id,                 // R75-1: Network namespace ID for partitioning
     current_pid,
     current_supplementary_groups,
     current_umask,
@@ -79,40 +78,41 @@ pub use process::{
     has_seccomp_enabled,
     kernel_stack_slot,
     non_thread_group_vm_share_count,
+    // E.5 Cpuset callback registration
+    register_cpuset_task_joined,
+    register_cpuset_task_left,
     register_ipc_cleanup,
+    // H.3 KPTI: Per-CPU CR3 update callback registration
+    register_kpti_cr3_callback,
     // OOM killer support
     register_oom_callbacks,
     remove_supplementary_group,
     set_current_supplementary_groups,
     set_current_umask,
+    // H.3 KPTI: Re-sync per-CPU KPTI state after PCB user_memory_space update
+    sync_kpti_cr3,
     // Thread group support (R33-1 fix)
     thread_group_size,
     with_current_cap_table,
-    // E.5 Cpuset callback registration
-    register_cpuset_task_joined,
-    register_cpuset_task_left,
     CpusetTaskJoinedCallback,
     CpusetTaskLeftCallback,
-    // H.3 KPTI: Per-CPU CR3 update callback registration
-    register_kpti_cr3_callback,
-    KptiCr3UpdateCallback,
-    // H.3 KPTI: Re-sync per-CPU KPTI state after PCB user_memory_space update
-    sync_kpti_cr3,
     // DAC support
     Credentials,
     FileDescriptor,
     FileOps,
+    // E.4 Priority Inheritance support
+    FutexKey,
     KernelStackError,
+    KptiCr3UpdateCallback,
+    Priority,
+    // Process ID type
+    ProcessId,
     KSTACK_BASE,
     KSTACK_STRIDE,
     MAX_FD,
     NGROUPS_MAX,
-    // E.4 Priority Inheritance support
-    FutexKey,
-    Priority,
-    // Process ID type
-    ProcessId,
 };
+pub use user_stack::{build_initial_user_stack, StackCreds, UserStackLayout};
 // Re-export capability types for convenience
 pub use cap::{
     CapEntry, CapError, CapFlags, CapId, CapObject, CapRights, CapTable, EndpointId, NamespaceId,
@@ -127,18 +127,33 @@ pub use signal::{
     SignalAction, SignalError,
 };
 pub use syscall::{
-    register_fd_close_callback, register_fd_read_callback, register_fd_write_callback,
-    register_futex_callback, register_mount_ns_materialize_callback, register_pipe_callback,
-    register_syscall_frame_callback, register_vfs_create_callback, register_vfs_lseek_callback,
-    register_vfs_open_callback, register_vfs_open_with_resolve_callback,
-    register_vfs_read_file_callback, register_vfs_readdir_callback, register_vfs_stat_callback,
-    register_vfs_truncate_callback,
-    register_vfs_unlink_callback, wake_stdin_waiters, drain_deferred_stdin_wakes, DirEntry, FileType, SyscallError,
-    SyscallFrame, VfsStat,
-    // R74-2 test helper
-    test_is_mount_ns_callback_registered,
+    drain_deferred_stdin_wakes,
     // R144-2 FIX: Decode mmap region flags to permission string for procfs
     mmap_flags_to_perms,
+    register_fd_close_callback,
+    register_fd_read_callback,
+    register_fd_write_callback,
+    register_futex_callback,
+    register_mount_ns_materialize_callback,
+    register_pipe_callback,
+    register_syscall_frame_callback,
+    register_vfs_create_callback,
+    register_vfs_lseek_callback,
+    register_vfs_open_callback,
+    register_vfs_open_with_resolve_callback,
+    register_vfs_read_file_callback,
+    register_vfs_readdir_callback,
+    register_vfs_stat_callback,
+    register_vfs_truncate_callback,
+    register_vfs_unlink_callback,
+    // R74-2 test helper
+    test_is_mount_ns_callback_registered,
+    wake_stdin_waiters,
+    DirEntry,
+    FileType,
+    SyscallError,
+    SyscallFrame,
+    VfsStat,
 };
 pub use time::{current_timestamp_ms, get_ticks, on_timer_tick};
 pub use usercopy::{
@@ -172,51 +187,72 @@ pub use rcu::{
 pub use pid_namespace::{
     assign_pid_chain, detach_pid_chain, get_cascade_kill_pids, is_visible_in_namespace,
     owning_namespace, pid_in_namespace, pid_in_owning_namespace, resolve_pid_in_namespace,
-    PidNamespace, PidNamespaceError, PidNamespaceMembership, ROOT_PID_NAMESPACE,
-    MAX_PID_NS_LEVEL,
+    PidNamespace, PidNamespaceError, PidNamespaceMembership, MAX_PID_NS_LEVEL, ROOT_PID_NAMESPACE,
 };
 // F.1: Mount namespace support
 pub use mount_namespace::{
     clone_namespace as clone_mount_namespace, init as init_mount_namespace,
     print_namespace_info as print_mount_namespace_info, MountFlags, MountNamespace,
-    MountNamespaceFd, MountNsError, ROOT_MNT_NAMESPACE, MAX_MNT_NS_LEVEL,
+    MountNamespaceFd, MountNsError, MAX_MNT_NS_LEVEL, ROOT_MNT_NAMESPACE,
 };
 // F.1: IPC namespace support
 pub use ipc_namespace::{
-    clone_ipc_namespace, init as init_ipc_namespace,
-    print_ipc_namespace_info, IpcNamespace, IpcNamespaceFd, IpcNsError,
-    ROOT_IPC_NAMESPACE, MAX_IPC_NS_LEVEL, CLONE_NEWIPC,
-    test_is_ipc_ns_initialized,
+    clone_ipc_namespace, init as init_ipc_namespace, print_ipc_namespace_info,
+    test_is_ipc_ns_initialized, IpcNamespace, IpcNamespaceFd, IpcNsError, CLONE_NEWIPC,
+    MAX_IPC_NS_LEVEL, ROOT_IPC_NAMESPACE,
 };
 // F.1: Network namespace support
 pub use net_namespace::{
-    clone_net_namespace, init as init_net_namespace,
-    print_net_namespace_info, move_device as move_net_device, NetNamespace,
-    NetNamespaceFd, NetNsError, ROOT_NET_NAMESPACE, MAX_NET_NS_LEVEL, CLONE_NEWNET,
-    test_is_net_ns_initialized,
+    clone_net_namespace, init as init_net_namespace, move_device as move_net_device,
+    print_net_namespace_info, test_is_net_ns_initialized, NetNamespace, NetNamespaceFd, NetNsError,
+    CLONE_NEWNET, MAX_NET_NS_LEVEL, ROOT_NET_NAMESPACE,
 };
 // F.1: User namespace support
 pub use user_namespace::{
-    clone_user_namespace, init as init_user_namespace, root_user_namespace,
-    print_user_namespace_info, user_ns_count, UserNamespace, UserNamespaceFd,
-    UserNsError, UidGidMapping, ROOT_USER_NAMESPACE, MAX_USER_NS_LEVEL,
-    MAX_MAPPINGS, CLONE_NEWUSER,
+    clone_user_namespace, init as init_user_namespace, print_user_namespace_info,
+    root_user_namespace, user_ns_count, UidGidMapping, UserNamespace, UserNamespaceFd, UserNsError,
+    CLONE_NEWUSER, MAX_MAPPINGS, MAX_USER_NS_LEVEL, ROOT_USER_NAMESPACE,
 };
 
 // F.2: Cgroup v2 support
 pub use cgroup::{
-    init as init_cgroup, lookup_cgroup, create_cgroup, delete_cgroup, delegate_cgroup,
-    root_cgroup, cgroup_count, migrate_task,
-    get_effective_cpu_weight, check_fork_allowed, account_cpu_time,
-    // R77-2 FIX: Replaced update_memory_usage with read-only get_memory_usage
-    get_memory_usage, check_memory_allowed, try_charge_memory, uncharge_memory,
+    account_cpu_time,
+    cgroup_count,
     // F.2: CPU quota (cpu.max) enforcement
-    charge_cpu_quota, cpu_quota_is_throttled, CpuQuotaStatus,
+    charge_cpu_quota,
     // F.2: IO throttling (io.max) enforcement
-    charge_io, wait_for_io_window, record_io_completion, IoDirection, IoThrottleStatus,
-    CgroupNode, CgroupId, CgroupControllers, CgroupLimits,
-    CgroupStats, CgroupStatsSnapshot, CgroupError,
-    MAX_CGROUP_DEPTH, MAX_CGROUPS, ROOT_CGROUP, CGROUP_REGISTRY,
+    charge_io,
+    check_fork_allowed,
+    check_memory_allowed,
+    cpu_quota_is_throttled,
+    create_cgroup,
+    delegate_cgroup,
+    delete_cgroup,
+    get_effective_cpu_weight,
+    // R77-2 FIX: Replaced update_memory_usage with read-only get_memory_usage
+    get_memory_usage,
+    init as init_cgroup,
+    lookup_cgroup,
+    migrate_task,
+    record_io_completion,
+    root_cgroup,
+    try_charge_memory,
+    uncharge_memory,
+    wait_for_io_window,
+    CgroupControllers,
+    CgroupError,
+    CgroupId,
+    CgroupLimits,
+    CgroupNode,
+    CgroupStats,
+    CgroupStatsSnapshot,
+    CpuQuotaStatus,
+    IoDirection,
+    IoThrottleStatus,
+    CGROUP_REGISTRY,
+    MAX_CGROUPS,
+    MAX_CGROUP_DEPTH,
+    ROOT_CGROUP,
 };
 
 // ============================================================================

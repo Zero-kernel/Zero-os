@@ -623,8 +623,7 @@ fn default_rules() -> Vec<FirewallRule> {
 /// a `NetNamespace` is dropped, so the map size tracks live namespaces, not
 /// cumulative namespace IDs. Each namespace gets its own rule set, ensuring
 /// that DROP/ALLOW rules in one namespace do not affect other namespaces.
-static FIREWALL_TABLES: RwLock<BTreeMap<u64, Arc<FirewallTable>>> =
-    RwLock::new(BTreeMap::new());
+static FIREWALL_TABLES: RwLock<BTreeMap<u64, Arc<FirewallTable>>> = RwLock::new(BTreeMap::new());
 
 /// Get (and lazily initialize) the firewall table for a specific network namespace.
 ///

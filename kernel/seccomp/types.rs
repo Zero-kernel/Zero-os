@@ -721,7 +721,9 @@ impl SeccompState {
     // clone is just a refcount bump (cheap), but the Vec growth is the issue.
     pub fn try_clone(&self) -> Result<Self, ()> {
         let mut filters = Vec::new();
-        filters.try_reserve_exact(self.filters.len()).map_err(|_| ())?;
+        filters
+            .try_reserve_exact(self.filters.len())
+            .map_err(|_| ())?;
         filters.extend_from_slice(&self.filters);
         Ok(Self {
             filters,
@@ -796,10 +798,7 @@ fn validate_program(prog: &[SeccompInsn]) -> Result<(), SeccompError> {
 /// trusted kernel generators can validate against `MAX_TRUSTED_INSNS` while the
 /// untrusted `sys_seccomp` path keeps the `MAX_INSNS` DoS guard. All other
 /// checks (terminator, jump-target bounds, argument indices) are identical.
-fn validate_program_with_limit(
-    prog: &[SeccompInsn],
-    max_insns: usize,
-) -> Result<(), SeccompError> {
+fn validate_program_with_limit(prog: &[SeccompInsn], max_insns: usize) -> Result<(), SeccompError> {
     if prog.is_empty() {
         return Err(SeccompError::NoTerminator);
     }
@@ -941,10 +940,13 @@ fn compute_filter_id(prog: &[SeccompInsn]) -> u64 {
     fn hash_action(hash: &mut u64, action: SeccompAction) {
         match action {
             SeccompAction::Allow => fnv_byte(hash, 0),
-            SeccompAction::Log   => fnv_byte(hash, 1),
-            SeccompAction::Errno(e) => { fnv_byte(hash, 2); fnv_i32(hash, e); }
-            SeccompAction::Trap  => fnv_byte(hash, 3),
-            SeccompAction::Kill  => fnv_byte(hash, 4),
+            SeccompAction::Log => fnv_byte(hash, 1),
+            SeccompAction::Errno(e) => {
+                fnv_byte(hash, 2);
+                fnv_i32(hash, e);
+            }
+            SeccompAction::Trap => fnv_byte(hash, 3),
+            SeccompAction::Kill => fnv_byte(hash, 4),
         }
     }
 
@@ -953,37 +955,70 @@ fn compute_filter_id(prog: &[SeccompInsn]) -> u64 {
     for insn in prog {
         match *insn {
             SeccompInsn::LdSyscallNr => fnv_byte(&mut hash, 0),
-            SeccompInsn::LdArg(idx)  => { fnv_byte(&mut hash, 1); fnv_byte(&mut hash, idx); }
-            SeccompInsn::LdConst(v)  => { fnv_byte(&mut hash, 2); fnv_u64(&mut hash, v); }
-            SeccompInsn::And(v)      => { fnv_byte(&mut hash, 3); fnv_u64(&mut hash, v); }
-            SeccompInsn::Or(v)       => { fnv_byte(&mut hash, 4); fnv_u64(&mut hash, v); }
-            SeccompInsn::Shr(s)      => { fnv_byte(&mut hash, 5); fnv_byte(&mut hash, s); }
+            SeccompInsn::LdArg(idx) => {
+                fnv_byte(&mut hash, 1);
+                fnv_byte(&mut hash, idx);
+            }
+            SeccompInsn::LdConst(v) => {
+                fnv_byte(&mut hash, 2);
+                fnv_u64(&mut hash, v);
+            }
+            SeccompInsn::And(v) => {
+                fnv_byte(&mut hash, 3);
+                fnv_u64(&mut hash, v);
+            }
+            SeccompInsn::Or(v) => {
+                fnv_byte(&mut hash, 4);
+                fnv_u64(&mut hash, v);
+            }
+            SeccompInsn::Shr(s) => {
+                fnv_byte(&mut hash, 5);
+                fnv_byte(&mut hash, s);
+            }
             SeccompInsn::JmpEq(v, t, f) => {
-                fnv_byte(&mut hash, 6); fnv_u64(&mut hash, v);
-                fnv_byte(&mut hash, t); fnv_byte(&mut hash, f);
+                fnv_byte(&mut hash, 6);
+                fnv_u64(&mut hash, v);
+                fnv_byte(&mut hash, t);
+                fnv_byte(&mut hash, f);
             }
             SeccompInsn::JmpNe(v, t, f) => {
-                fnv_byte(&mut hash, 7); fnv_u64(&mut hash, v);
-                fnv_byte(&mut hash, t); fnv_byte(&mut hash, f);
+                fnv_byte(&mut hash, 7);
+                fnv_u64(&mut hash, v);
+                fnv_byte(&mut hash, t);
+                fnv_byte(&mut hash, f);
             }
             SeccompInsn::JmpLt(v, t, f) => {
-                fnv_byte(&mut hash, 8); fnv_u64(&mut hash, v);
-                fnv_byte(&mut hash, t); fnv_byte(&mut hash, f);
+                fnv_byte(&mut hash, 8);
+                fnv_u64(&mut hash, v);
+                fnv_byte(&mut hash, t);
+                fnv_byte(&mut hash, f);
             }
             SeccompInsn::JmpLe(v, t, f) => {
-                fnv_byte(&mut hash, 9); fnv_u64(&mut hash, v);
-                fnv_byte(&mut hash, t); fnv_byte(&mut hash, f);
+                fnv_byte(&mut hash, 9);
+                fnv_u64(&mut hash, v);
+                fnv_byte(&mut hash, t);
+                fnv_byte(&mut hash, f);
             }
             SeccompInsn::JmpGt(v, t, f) => {
-                fnv_byte(&mut hash, 10); fnv_u64(&mut hash, v);
-                fnv_byte(&mut hash, t); fnv_byte(&mut hash, f);
+                fnv_byte(&mut hash, 10);
+                fnv_u64(&mut hash, v);
+                fnv_byte(&mut hash, t);
+                fnv_byte(&mut hash, f);
             }
             SeccompInsn::JmpGe(v, t, f) => {
-                fnv_byte(&mut hash, 11); fnv_u64(&mut hash, v);
-                fnv_byte(&mut hash, t); fnv_byte(&mut hash, f);
+                fnv_byte(&mut hash, 11);
+                fnv_u64(&mut hash, v);
+                fnv_byte(&mut hash, t);
+                fnv_byte(&mut hash, f);
             }
-            SeccompInsn::Jmp(off) => { fnv_byte(&mut hash, 12); fnv_byte(&mut hash, off); }
-            SeccompInsn::Ret(action) => { fnv_byte(&mut hash, 13); hash_action(&mut hash, action); }
+            SeccompInsn::Jmp(off) => {
+                fnv_byte(&mut hash, 12);
+                fnv_byte(&mut hash, off);
+            }
+            SeccompInsn::Ret(action) => {
+                fnv_byte(&mut hash, 13);
+                hash_action(&mut hash, action);
+            }
         }
     }
 
@@ -1116,10 +1151,7 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
 
     if promises.contains(PledgePromises::WPATH) {
         // R150-3 FIX: Added rename, unlink, symlink to match pledge_to_filter().
-        if matches!(
-            syscall_nr,
-            SYS_RENAME | SYS_UNLINK | SYS_SYMLINK
-        ) {
+        if matches!(syscall_nr, SYS_RENAME | SYS_UNLINK | SYS_SYMLINK) {
             return true;
         }
     }
@@ -1170,8 +1202,12 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
             const CLONE_NEWUSER: u64 = 0x1000_0000;
             const CLONE_NEWPID: u64 = 0x2000_0000;
             const CLONE_NEWNET: u64 = 0x4000_0000;
-            let ns_disallowed =
-                CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+            let ns_disallowed = CLONE_NEWNS
+                | CLONE_NEWUTS
+                | CLONE_NEWIPC
+                | CLONE_NEWUSER
+                | CLONE_NEWPID
+                | CLONE_NEWNET;
 
             // Always reject namespace-creating flags under PROC.
             if (clone_flags & ns_disallowed) != 0 {
@@ -1221,8 +1257,12 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
             const CLONE_NEWUSER: u64 = 0x1000_0000;
             const CLONE_NEWPID: u64 = 0x2000_0000;
             const CLONE_NEWNET: u64 = 0x4000_0000;
-            const NS_DISALLOWED: u64 =
-                CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET;
+            const NS_DISALLOWED: u64 = CLONE_NEWNS
+                | CLONE_NEWUTS
+                | CLONE_NEWIPC
+                | CLONE_NEWUSER
+                | CLONE_NEWPID
+                | CLONE_NEWNET;
             if (clone_flags & NS_DISALLOWED) != 0 {
                 return false;
             }
@@ -1248,10 +1288,7 @@ fn promise_allows_syscall(promises: PledgePromises, syscall_nr: u64, args: &[u64
 
     // R150-3 FIX: FATTR was missing entirely from promise_allows_syscall().
     if promises.contains(PledgePromises::FATTR) {
-        if matches!(
-            syscall_nr,
-            SYS_CHMOD | SYS_CHOWN | SYS_FCHMOD | SYS_FCHOWN
-        ) {
+        if matches!(syscall_nr, SYS_CHMOD | SYS_CHOWN | SYS_FCHMOD | SYS_FCHOWN) {
             return true;
         }
     }

@@ -229,7 +229,10 @@ pub fn cpuset_create(cpus: u64, parent_id: CpusetId) -> Result<CpusetId, CpusetE
     let registry = registry_guard.as_mut().ok_or(CpusetError::NotInitialized)?;
 
     // Get parent cpuset
-    let parent = registry.sets.get(&parent_id).ok_or(CpusetError::InvalidParent)?;
+    let parent = registry
+        .sets
+        .get(&parent_id)
+        .ok_or(CpusetError::InvalidParent)?;
 
     // Validate mask is subset of parent
     let parent_mask = parent.cpus();
@@ -244,7 +247,10 @@ pub fn cpuset_create(cpus: u64, parent_id: CpusetId) -> Result<CpusetId, CpusetE
 
     // Allocate new ID
     let id = CpusetId(registry.next_id);
-    registry.next_id = registry.next_id.checked_add(1).ok_or(CpusetError::TooManySets)?;
+    registry.next_id = registry
+        .next_id
+        .checked_add(1)
+        .ok_or(CpusetError::TooManySets)?;
 
     // Create cpuset node
     let node = Arc::new(CpusetNode::new(id, cpus, Some(Arc::downgrade(parent))));
@@ -272,17 +278,14 @@ pub fn cpuset_destroy(id: CpusetId) -> Result<(), CpusetError> {
 
     // R73-3 FIX: Prevent destroying cpusets that still have children
     // This would leave orphaned cpusets that bypass parent mask constraints
-    let has_children = registry
-        .sets
-        .values()
-        .any(|child| {
-            child
-                .parent
-                .as_ref()
-                .and_then(|w| w.upgrade())
-                .map(|p| p.id == cpuset.id)
-                .unwrap_or(false)
-        });
+    let has_children = registry.sets.values().any(|child| {
+        child
+            .parent
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map(|p| p.id == cpuset.id)
+            .unwrap_or(false)
+    });
     if has_children {
         return Err(CpusetError::NotEmpty); // Reuse NotEmpty - has child cpusets
     }
@@ -358,7 +361,11 @@ pub fn effective_cpus(cpuset_id: CpusetId, task_affinity: u64) -> u64 {
         .unwrap_or(online);
 
     // task_affinity == 0 means "no restriction"
-    let affinity = if task_affinity == 0 { online } else { task_affinity };
+    let affinity = if task_affinity == 0 {
+        online
+    } else {
+        task_affinity
+    };
 
     online & cpuset_mask & affinity
 }
@@ -435,15 +442,15 @@ impl CpusetError {
     /// Convert to errno-style error code.
     pub fn to_errno(&self) -> i32 {
         match self {
-            CpusetError::NotInitialized => -22,  // EINVAL
-            CpusetError::NotFound => -2,         // ENOENT
-            CpusetError::InvalidParent => -22,   // EINVAL
-            CpusetError::InvalidMask => -22,     // EINVAL
-            CpusetError::EmptyMask => -22,       // EINVAL
+            CpusetError::NotInitialized => -22,   // EINVAL
+            CpusetError::NotFound => -2,          // ENOENT
+            CpusetError::InvalidParent => -22,    // EINVAL
+            CpusetError::InvalidMask => -22,      // EINVAL
+            CpusetError::EmptyMask => -22,        // EINVAL
             CpusetError::CannotDestroyRoot => -1, // EPERM
-            CpusetError::NotEmpty => -16,        // EBUSY
-            CpusetError::TooManySets => -12,     // ENOMEM
-            CpusetError::PermissionDenied => -1, // EPERM
+            CpusetError::NotEmpty => -16,         // EBUSY
+            CpusetError::TooManySets => -12,      // ENOMEM
+            CpusetError::PermissionDenied => -1,  // EPERM
         }
     }
 }

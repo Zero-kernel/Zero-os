@@ -70,8 +70,8 @@ pub use types::{DirEntry, FileMode, FileType, FsError, OpenFlags, SeekWhence, St
 
 // Mount namespace re-exports
 pub use mount_namespace::{
-    init as mount_ns_init, clone_namespace, copy_mounts, get_mount, add_mount, remove_mount,
-    Mount, MountFlags, MountNamespace, MountNsError, MAX_MNT_NS_LEVEL, ROOT_MNT_NAMESPACE,
+    add_mount, clone_namespace, copy_mounts, get_mount, init as mount_ns_init, remove_mount, Mount,
+    MountFlags, MountNamespace, MountNsError, MAX_MNT_NS_LEVEL, ROOT_MNT_NAMESPACE,
 };
 
 /// Initialize the VFS subsystem

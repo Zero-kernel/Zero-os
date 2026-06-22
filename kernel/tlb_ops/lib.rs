@@ -180,7 +180,10 @@ pub unsafe fn invpcid_single_context(pcid: u16) {
 /// - System-wide TLB shootdown when per-PCID tracking unavailable
 #[inline(always)]
 pub unsafe fn invpcid_all_nonglobal() {
-    let desc = InvpcidDescriptor { pcid: 0, address: 0 };
+    let desc = InvpcidDescriptor {
+        pcid: 0,
+        address: 0,
+    };
     invpcid(&desc, 2);
 }
 
@@ -207,7 +210,10 @@ pub unsafe fn invpcid_all_nonglobal() {
 /// significantly impacts performance.
 #[inline(always)]
 pub unsafe fn invpcid_all_global() {
-    let desc = InvpcidDescriptor { pcid: 0, address: 0 };
+    let desc = InvpcidDescriptor {
+        pcid: 0,
+        address: 0,
+    };
     invpcid(&desc, 3);
 }
 

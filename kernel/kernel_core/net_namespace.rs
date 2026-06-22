@@ -604,7 +604,10 @@ mod tests {
         assert_eq!(ns.device_count(), 0);
 
         // Remove non-existent fails
-        assert!(matches!(ns.remove_device(1), Err(NetNsError::DeviceNotFound)));
+        assert!(matches!(
+            ns.remove_device(1),
+            Err(NetNsError::DeviceNotFound)
+        ));
     }
 
     #[test]

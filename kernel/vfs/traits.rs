@@ -293,8 +293,7 @@ impl FileOps for FileHandle {
         let inode_stat = self.inode.stat().map_err(SyscallError::from)?;
         let vfs_stat = VfsStat::from(inode_stat);
         if let Some(task) = lsm::ProcessCtx::from_current() {
-            lsm::hook_file_permission(&task, vfs_stat.ino, 0)
-                .map_err(|_| SyscallError::EACCES)?;
+            lsm::hook_file_permission(&task, vfs_stat.ino, 0).map_err(|_| SyscallError::EACCES)?;
         }
         Ok(vfs_stat)
     }

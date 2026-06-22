@@ -23,13 +23,13 @@
 //! - No init/cascade-kill semantics
 //! - Full copy of mount table on CLONE_NEWNS (not shared references)
 
+use alloc::boxed::Box;
 use alloc::{
     format,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
 };
-use alloc::boxed::Box;
 use cap::NamespaceId;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -221,7 +221,6 @@ impl MountNamespace {
     pub fn set_root_path(&self, path: String) {
         *self.root_path.write() = path;
     }
-
 }
 
 /// R140-3 FIX: Decrement mount namespace count when a namespace is dropped.

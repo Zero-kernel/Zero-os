@@ -62,14 +62,14 @@ use crate::stack::transmit_tcp_segment;
 use crate::tcp::{
     build_tcp_segment, build_tcp_segment_with_options, calc_wscale, decode_window, encode_window,
     generate_isn, generate_syn_cookie_isn, handle_ack, handle_retransmission_timeout, initial_cwnd,
-    seq_ge, seq_gt, seq_in_window, syn_cookie_select_mss,
-    update_congestion_control, validate_cwnd_after_idle, validate_syn_cookie, CongestionAction,
-    SackBlock, TcpConnKey, TcpControlBlock, TcpHeader, TcpOptionKind, TcpOptions, TcpSegment,
-    TcpState, TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS, TCP_FIN_TIMEOUT_MS, TCP_FIN_WAIT_2_TIMEOUT_MS,
-    TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN,
-    TCP_MAX_ACCEPT_BACKLOG, TCP_MAX_ACTIVE_CONNECTIONS, TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES,
-    TCP_MAX_RTO_MS, TCP_MAX_SEND_BUFFER_BYTES, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_WINDOW_SCALE, TCP_PROTO,
-    TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
+    seq_ge, seq_gt, seq_in_window, syn_cookie_select_mss, update_congestion_control,
+    validate_cwnd_after_idle, validate_syn_cookie, CongestionAction, SackBlock, TcpConnKey,
+    TcpControlBlock, TcpHeader, TcpOptionKind, TcpOptions, TcpSegment, TcpState,
+    TCP_DEFAULT_WINDOW, TCP_ETHERNET_MSS, TCP_FIN_TIMEOUT_MS, TCP_FIN_WAIT_2_TIMEOUT_MS,
+    TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_MAX_ACCEPT_BACKLOG,
+    TCP_MAX_ACTIVE_CONNECTIONS, TCP_MAX_FIN_RETRIES, TCP_MAX_RETRIES, TCP_MAX_RTO_MS,
+    TCP_MAX_SEND_BUFFER_BYTES, TCP_MAX_SEND_SIZE, TCP_MAX_SYN_BACKLOG, TCP_MAX_WINDOW_SCALE,
+    TCP_PROTO, TCP_SYN_TIMEOUT_MS, TCP_TIME_WAIT_MS,
 };
 use crate::udp::{
     build_udp_datagram, UdpError, EPHEMERAL_PORT_END, EPHEMERAL_PORT_START, UDP_PROTO,
@@ -279,7 +279,9 @@ fn try_charge_port_cgroup(cgid: u64) -> Result<(), SocketError> {
         return Ok(());
     }
     match cgroup_port_hooks() {
-        Some(h) => h.try_charge_ports(cgid, 1).map_err(|_| SocketError::QuotaExceeded),
+        Some(h) => h
+            .try_charge_ports(cgid, 1)
+            .map_err(|_| SocketError::QuotaExceeded),
         None => Ok(()), // unreachable with cgid != 0 (see resolve_port_cgroup)
     }
 }
@@ -639,7 +641,6 @@ fn allow_syn_cookie_ack(now_ms: u64) -> bool {
 // ============================================================================
 // R74-5 FIX: Global TCP Connection Counters
 // ============================================================================
-
 
 /// Global counter for half-open (SYN_RECEIVED) TCP connections.
 ///
@@ -1477,8 +1478,7 @@ impl SocketState {
             received_at,
         };
 
-        self.rx_bytes
-            .fetch_add(pkt_len as u64, Ordering::Relaxed);
+        self.rx_bytes.fetch_add(pkt_len as u64, Ordering::Relaxed);
         self.rx_datagrams.fetch_add(1, Ordering::Relaxed);
         queue.push_back(pkt);
         drop(queue);
@@ -1904,8 +1904,15 @@ impl SocketTable {
         if sack_blocks.is_empty() {
             // Plain ACK — no SACK blocks to report
             return build_tcp_segment(
-                src_ip, dst_ip, src_port, dst_port,
-                tcb.snd_nxt, tcb.rcv_nxt, TCP_FLAG_ACK, window, &[],
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+                tcb.snd_nxt,
+                tcb.rcv_nxt,
+                TCP_FLAG_ACK,
+                window,
+                &[],
             );
         }
 
@@ -1922,8 +1929,16 @@ impl SocketTable {
         ];
 
         build_tcp_segment_with_options(
-            src_ip, dst_ip, src_port, dst_port,
-            tcb.snd_nxt, tcb.rcv_nxt, TCP_FLAG_ACK, window, &opts[..], &[],
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            tcb.snd_nxt,
+            tcb.rcv_nxt,
+            TCP_FLAG_ACK,
+            window,
+            &opts[..],
+            &[],
         )
     }
 
@@ -2079,10 +2094,7 @@ impl SocketTable {
     /// `cleanup_tcp_connection`), so binding the count to map membership HERE is
     /// the only way to keep it leak-free. Replaces the bare
     /// `conns.retain(|_, w| w.strong_count() > 0)`.
-    fn conns_retain_accounted(
-        &self,
-        conns: &mut BTreeMap<TcpLookupKey, Weak<SocketState>>,
-    ) {
+    fn conns_retain_accounted(&self, conns: &mut BTreeMap<TcpLookupKey, Weak<SocketState>>) {
         let mut counts = self.per_ns_conn_counts.lock();
         conns.retain(|key, weak| {
             let keep = weak.strong_count() > 0;
@@ -2235,7 +2247,9 @@ impl SocketTable {
         );
         // Always refund the displaced charge; ptr identity is irrelevant.
         match prev {
-            Some(old) if old.charged_cgroup != 0 => InsertOutcome::DisplacedCharge(old.charged_cgroup),
+            Some(old) if old.charged_cgroup != 0 => {
+                InsertOutcome::DisplacedCharge(old.charged_cgroup)
+            }
             _ => InsertOutcome::FreshGrowth,
         }
     }
@@ -2746,7 +2760,10 @@ impl SocketTable {
             conns.insert((ns_dead, i, 0u16, 0u32, 0u16), Weak::new());
         }
         table.conns_retain_accounted(&mut conns);
-        assert!(conns.is_empty(), "J2-1: all dead-Weak entries must be pruned");
+        assert!(
+            conns.is_empty(),
+            "J2-1: all dead-Weak entries must be pruned"
+        );
         assert!(
             !table.per_ns_conn_counts.lock().contains_key(&ns_dead),
             "J2-1 LEAK REGRESSION: pruned dead-Weak entries must uncharge to zero"
@@ -2857,10 +2874,18 @@ impl SocketTable {
 
         // (4) Reserve->refund reconcile (the double-count fix): reserve a payload,
         //     buffer fewer bytes (OOM truncation), reconcile -> counter trues DOWN.
-        let mut tcb_r =
-            TcpControlBlock::new_client(Ipv4Addr([10, 0, 0, 9]), 9, Ipv4Addr([10, 0, 0, 10]), 10, 0);
+        let mut tcb_r = TcpControlBlock::new_client(
+            Ipv4Addr([10, 0, 0, 9]),
+            9,
+            Ipv4Addr([10, 0, 0, 10]),
+            10,
+            0,
+        );
         assert!(table.try_charge_ns_send(ns_u, &mut tcb_r, 8192).is_ok());
-        assert_eq!(table.per_ns_send_bytes.lock().get(&ns_u).copied(), Some(8192));
+        assert_eq!(
+            table.per_ns_send_bytes.lock().get(&ns_u).copied(),
+            Some(8192)
+        );
         tcb_r.send_buffer_bytes = 5000; // only 5000 of the 8192 reserved were buffered
         table.reconcile_ns_send(ns_u, &mut tcb_r);
         assert_eq!(
@@ -2874,7 +2899,10 @@ impl SocketTable {
         );
         tcb_r.send_buffer_bytes = 1000; // ACK drains 5000 -> 1000
         table.reconcile_ns_send(ns_u, &mut tcb_r);
-        assert_eq!(table.per_ns_send_bytes.lock().get(&ns_u).copied(), Some(1000));
+        assert_eq!(
+            table.per_ns_send_bytes.lock().get(&ns_u).copied(),
+            Some(1000)
+        );
         tcb_r.send_buffer_bytes = 0; // fully drained -> remove-at-0
         table.reconcile_ns_send(ns_u, &mut tcb_r);
         assert!(
@@ -2983,10 +3011,20 @@ impl SocketTable {
         //     mirror (not 0, not the sum). This is the only test that proves the
         //     cross-sibling accumulation the whole budget exists to enforce.
         let ns_agg = NamespaceId(13);
-        let mut tcb_x =
-            TcpControlBlock::new_client(Ipv4Addr([10, 0, 0, 15]), 15, Ipv4Addr([10, 0, 0, 16]), 16, 0);
-        let mut tcb_y =
-            TcpControlBlock::new_client(Ipv4Addr([10, 0, 0, 17]), 17, Ipv4Addr([10, 0, 0, 18]), 18, 0);
+        let mut tcb_x = TcpControlBlock::new_client(
+            Ipv4Addr([10, 0, 0, 15]),
+            15,
+            Ipv4Addr([10, 0, 0, 16]),
+            16,
+            0,
+        );
+        let mut tcb_y = TcpControlBlock::new_client(
+            Ipv4Addr([10, 0, 0, 17]),
+            17,
+            Ipv4Addr([10, 0, 0, 18]),
+            18,
+            0,
+        );
         assert!(table.try_charge_ns_send(ns_agg, &mut tcb_x, 3000).is_ok());
         assert!(table.try_charge_ns_send(ns_agg, &mut tcb_y, 5000).is_ok());
         assert_eq!(
@@ -3065,14 +3103,25 @@ impl SocketTable {
         );
 
         // (4) Reconcile down-true + remove-at-0.
-        let mut rtcb_u =
-            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 9]), 9, Ipv4Addr([10, 1, 0, 10]), 10, 0);
+        let mut rtcb_u = TcpControlBlock::new_client(
+            Ipv4Addr([10, 1, 0, 9]),
+            9,
+            Ipv4Addr([10, 1, 0, 10]),
+            10,
+            0,
+        );
         rtcb_u.ooo_bytes = 8192;
         table.reconcile_ns_recv(ns_ru, &mut rtcb_u);
-        assert_eq!(table.per_ns_recv_bytes.lock().get(&ns_ru).copied(), Some(8192));
+        assert_eq!(
+            table.per_ns_recv_bytes.lock().get(&ns_ru).copied(),
+            Some(8192)
+        );
         rtcb_u.ooo_bytes = 5000;
         table.reconcile_ns_recv(ns_ru, &mut rtcb_u);
-        assert_eq!(table.per_ns_recv_bytes.lock().get(&ns_ru).copied(), Some(5000));
+        assert_eq!(
+            table.per_ns_recv_bytes.lock().get(&ns_ru).copied(),
+            Some(5000)
+        );
         rtcb_u.ooo_bytes = 0;
         table.reconcile_ns_recv(ns_ru, &mut rtcb_u);
         assert!(
@@ -3086,14 +3135,22 @@ impl SocketTable {
 
         // (9) FIN-CLEAR-NO-OVERCOUNT (headline recv hazard): F = recv_buffer.len() +
         //     ooo_bytes; clearing OOO must drop the counter to recv_buffer.len() only.
-        let mut rtcb_fin =
-            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 11]), 11, Ipv4Addr([10, 1, 0, 12]), 12, 0);
+        let mut rtcb_fin = TcpControlBlock::new_client(
+            Ipv4Addr([10, 1, 0, 11]),
+            11,
+            Ipv4Addr([10, 1, 0, 12]),
+            12,
+            0,
+        );
         for _ in 0..1000 {
             rtcb_fin.recv_buffer.push_back(0u8);
         }
         rtcb_fin.ooo_bytes = 4000;
         table.reconcile_ns_recv(ns_ru, &mut rtcb_fin);
-        assert_eq!(table.per_ns_recv_bytes.lock().get(&ns_ru).copied(), Some(5000));
+        assert_eq!(
+            table.per_ns_recv_bytes.lock().get(&ns_ru).copied(),
+            Some(5000)
+        );
         rtcb_fin.ooo_bytes = 0; // simulate the FIN-clear OOO purge
         table.reconcile_ns_recv(ns_ru, &mut rtcb_fin);
         assert_eq!(
@@ -3106,10 +3163,20 @@ impl SocketTable {
         assert!(!table.per_ns_recv_bytes.lock().contains_key(&ns_ru));
 
         // (8) AGGREGATION across two live siblings in one namespace.
-        let mut rtcb_x =
-            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 13]), 13, Ipv4Addr([10, 1, 0, 14]), 14, 0);
-        let mut rtcb_y =
-            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 15]), 15, Ipv4Addr([10, 1, 0, 16]), 16, 0);
+        let mut rtcb_x = TcpControlBlock::new_client(
+            Ipv4Addr([10, 1, 0, 13]),
+            13,
+            Ipv4Addr([10, 1, 0, 14]),
+            14,
+            0,
+        );
+        let mut rtcb_y = TcpControlBlock::new_client(
+            Ipv4Addr([10, 1, 0, 15]),
+            15,
+            Ipv4Addr([10, 1, 0, 16]),
+            16,
+            0,
+        );
         rtcb_x.ooo_bytes = 3000;
         rtcb_y.ooo_bytes = 5000;
         table.reconcile_ns_recv(ns_ragg, &mut rtcb_x);
@@ -3133,26 +3200,47 @@ impl SocketTable {
         // (10) GATE-REARM + OOO-non-bypass: the post-mutation reconcile (not the
         //      gate) is what re-arms enforcement; the gate is grow_by-agnostic, so an
         //      OOO grow_by is admitted/rejected identically to an in-order one.
-        let mut rtcb_near =
-            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 17]), 17, Ipv4Addr([10, 1, 0, 18]), 18, 0);
+        let mut rtcb_near = TcpControlBlock::new_client(
+            Ipv4Addr([10, 1, 0, 17]),
+            17,
+            Ipv4Addr([10, 1, 0, 18]),
+            18,
+            0,
+        );
         rtcb_near.ooo_bytes = (SocketTable::MAX_RECV_BYTES_PER_NS - 1000) as u32;
         table.reconcile_ns_recv(ns_rx, &mut rtcb_near);
-        let rtcb_probe =
-            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 19]), 19, Ipv4Addr([10, 1, 0, 20]), 20, 0);
+        let rtcb_probe = TcpControlBlock::new_client(
+            Ipv4Addr([10, 1, 0, 19]),
+            19,
+            Ipv4Addr([10, 1, 0, 20]),
+            20,
+            0,
+        );
         assert!(
-            table.try_charge_ns_recv_gate(ns_rx, &rtcb_probe, 500).is_ok(),
+            table
+                .try_charge_ns_recv_gate(ns_rx, &rtcb_probe, 500)
+                .is_ok(),
             "J2-recv: gate admits below the cap"
         );
         assert!(
-            table.try_charge_ns_recv_gate(ns_rx, &rtcb_probe, 2000).is_err(),
+            table
+                .try_charge_ns_recv_gate(ns_rx, &rtcb_probe, 2000)
+                .is_err(),
             "J2-recv: gate rejects above the cap (same logic for OOO and in-order)"
         );
-        let mut rtcb_push =
-            TcpControlBlock::new_client(Ipv4Addr([10, 1, 0, 21]), 21, Ipv4Addr([10, 1, 0, 22]), 22, 0);
+        let mut rtcb_push = TcpControlBlock::new_client(
+            Ipv4Addr([10, 1, 0, 21]),
+            21,
+            Ipv4Addr([10, 1, 0, 22]),
+            22,
+            0,
+        );
         rtcb_push.ooo_bytes = 1500;
         table.reconcile_ns_recv(ns_rx, &mut rtcb_push);
         assert!(
-            table.try_charge_ns_recv_gate(ns_rx, &rtcb_probe, 1).is_err(),
+            table
+                .try_charge_ns_recv_gate(ns_rx, &rtcb_probe, 1)
+                .is_err(),
             "J2-recv: a reconcile that pushes the ns past the cap re-arms the gate"
         );
         rtcb_near.ooo_bytes = 0;
@@ -3275,9 +3363,17 @@ impl SocketTable {
         let s1 = mk(101, ns);
         {
             let mut b = table.udp_bindings.lock();
-            match SocketTable::insert_binding_charged(&mut b, (ns, 5000), &s1, 42, BindKind::Ephemeral) {
+            match SocketTable::insert_binding_charged(
+                &mut b,
+                (ns, 5000),
+                &s1,
+                42,
+                BindKind::Ephemeral,
+            ) {
                 InsertOutcome::FreshGrowth => {}
-                InsertOutcome::DisplacedCharge(_) => panic!("J2-8: fresh insert must be FreshGrowth"),
+                InsertOutcome::DisplacedCharge(_) => {
+                    panic!("J2-8: fresh insert must be FreshGrowth")
+                }
             }
             assert_eq!(b.get(&(ns, 5000)).map(|pb| pb.charged_cgroup), Some(42));
         }
@@ -3289,11 +3385,18 @@ impl SocketTable {
         {
             let mut b = table.udp_bindings.lock();
             assert!(
-                SocketTable::remove_binding_charged(&mut b, (ns, 5000), Some(Arc::as_ptr(&s_other)))
-                    .is_none(),
+                SocketTable::remove_binding_charged(
+                    &mut b,
+                    (ns, 5000),
+                    Some(Arc::as_ptr(&s_other))
+                )
+                .is_none(),
                 "J2-8: a foreign ptr must NOT remove/uncharge the binding"
             );
-            assert!(b.contains_key(&(ns, 5000)), "J2-8: foreign-rejected entry restored");
+            assert!(
+                b.contains_key(&(ns, 5000)),
+                "J2-8: foreign-rejected entry restored"
+            );
             assert_eq!(
                 SocketTable::remove_binding_charged(&mut b, (ns, 5000), Some(Arc::as_ptr(&s1))),
                 Some(42),
@@ -3318,11 +3421,19 @@ impl SocketTable {
         {
             let mut b = table.udp_bindings.lock();
             SocketTable::insert_binding_charged(&mut b, (ns, 5002), &s1, 7, BindKind::Ephemeral);
-            match SocketTable::insert_binding_charged(&mut b, (ns, 5002), &s1, 8, BindKind::Ephemeral) {
+            match SocketTable::insert_binding_charged(
+                &mut b,
+                (ns, 5002),
+                &s1,
+                8,
+                BindKind::Ephemeral,
+            ) {
                 InsertOutcome::DisplacedCharge(old) => {
                     assert_eq!(old, 7, "J2-8: must report the displaced charge for refund")
                 }
-                InsertOutcome::FreshGrowth => panic!("J2-8: replacing a charged entry must displace"),
+                InsertOutcome::FreshGrowth => {
+                    panic!("J2-8: replacing a charged entry must displace")
+                }
             }
             assert_eq!(
                 b.get(&(ns, 5002)).map(|pb| pb.charged_cgroup),
@@ -3337,9 +3448,16 @@ impl SocketTable {
         table.enqueue_port_uncharge(3, 2); // folds 3 -> 3
         table.enqueue_port_uncharge(4, 1);
         table.enqueue_port_uncharge(0, 5); // cgid 0 is a no-op
-        assert_eq!(table.port_uncharge_pending.lock().get(&3).copied(), Some(3), "J2-8: fold-by-cgid");
+        assert_eq!(
+            table.port_uncharge_pending.lock().get(&3).copied(),
+            Some(3),
+            "J2-8: fold-by-cgid"
+        );
         assert_eq!(table.port_uncharge_pending.lock().get(&4).copied(), Some(1));
-        assert!(table.port_uncharge_pending.lock().get(&0).is_none(), "J2-8: cgid 0 never enqueued");
+        assert!(
+            table.port_uncharge_pending.lock().get(&0).is_none(),
+            "J2-8: cgid 0 never enqueued"
+        );
         table.drain_deferred_port_uncharges();
         assert!(
             table.port_uncharge_pending.lock().is_empty(),
@@ -3356,9 +3474,27 @@ impl SocketTable {
             let dead2 = mk(202, ns);
             {
                 let mut b = table.udp_bindings.lock();
-                SocketTable::insert_binding_charged(&mut b, (ns, 6000), &live, 0, BindKind::Ephemeral);
-                SocketTable::insert_binding_charged(&mut b, (ns, 6001), &dead1, 55, BindKind::Ephemeral);
-                SocketTable::insert_binding_charged(&mut b, (ns, 6002), &dead2, 0, BindKind::Ephemeral);
+                SocketTable::insert_binding_charged(
+                    &mut b,
+                    (ns, 6000),
+                    &live,
+                    0,
+                    BindKind::Ephemeral,
+                );
+                SocketTable::insert_binding_charged(
+                    &mut b,
+                    (ns, 6001),
+                    &dead1,
+                    55,
+                    BindKind::Ephemeral,
+                );
+                SocketTable::insert_binding_charged(
+                    &mut b,
+                    (ns, 6002),
+                    &dead2,
+                    0,
+                    BindKind::Ephemeral,
+                );
             }
             // dead1 / dead2 dropped here -> their Weaks become un-upgradeable.
         }
@@ -3366,7 +3502,10 @@ impl SocketTable {
             let mut b = table.udp_bindings.lock();
             table.reap_dead_bindings(&mut b, ns);
             assert!(b.contains_key(&(ns, 6000)), "J2-8: live binding kept");
-            assert!(!b.contains_key(&(ns, 6001)), "J2-8: dead charged binding reaped");
+            assert!(
+                !b.contains_key(&(ns, 6001)),
+                "J2-8: dead charged binding reaped"
+            );
             assert!(
                 !b.contains_key(&(ns, 6002)),
                 "J2-8: dead UNcharged binding reaped too (port-availability fix)"
@@ -3389,12 +3528,21 @@ impl SocketTable {
             let mut b = table.tcp_bindings.lock();
             SocketTable::insert_binding_charged(&mut b, (ns, 7000), &s_a, 71, BindKind::Ephemeral);
             SocketTable::insert_binding_charged(&mut b, (ns, 7001), &s_b, 0, BindKind::Ephemeral);
-            SocketTable::insert_binding_charged(&mut b, (other_ns, 7000), &s_c, 99, BindKind::Ephemeral);
+            SocketTable::insert_binding_charged(
+                &mut b,
+                (other_ns, 7000),
+                &s_c,
+                99,
+                BindKind::Ephemeral,
+            );
         }
         table.drain_ns_port_bindings(ns);
         {
             let b = table.tcp_bindings.lock();
-            assert!(!b.contains_key(&(ns, 7000)), "J2-8: backstop removed the ns binding");
+            assert!(
+                !b.contains_key(&(ns, 7000)),
+                "J2-8: backstop removed the ns binding"
+            );
             assert!(!b.contains_key(&(ns, 7001)));
             assert!(
                 b.contains_key(&(other_ns, 7000)),
@@ -3422,12 +3570,30 @@ impl SocketTable {
             let dead_tcp = mk(401, other_ns);
             {
                 let mut b = table.udp_bindings.lock();
-                SocketTable::insert_binding_charged(&mut b, (ns, 7100), &dead_udp, 81, BindKind::Ephemeral);
+                SocketTable::insert_binding_charged(
+                    &mut b,
+                    (ns, 7100),
+                    &dead_udp,
+                    81,
+                    BindKind::Ephemeral,
+                );
             }
             {
                 let mut b = table.tcp_bindings.lock();
-                SocketTable::insert_binding_charged(&mut b, (other_ns, 7101), &dead_tcp, 91, BindKind::Ephemeral);
-                SocketTable::insert_binding_charged(&mut b, (other_ns, 7102), &live_keep, 17, BindKind::Ephemeral);
+                SocketTable::insert_binding_charged(
+                    &mut b,
+                    (other_ns, 7101),
+                    &dead_tcp,
+                    91,
+                    BindKind::Ephemeral,
+                );
+                SocketTable::insert_binding_charged(
+                    &mut b,
+                    (other_ns, 7102),
+                    &live_keep,
+                    17,
+                    BindKind::Ephemeral,
+                );
             }
             // dead_udp / dead_tcp dropped here -> their Weaks become dead.
         }
@@ -3479,7 +3645,13 @@ impl SocketTable {
         let child = mk(501, ns); // passive-open child: distinct Arc, same (ns,port)
         {
             let mut b = table.tcp_bindings.lock();
-            SocketTable::insert_binding_charged(&mut b, (ns, 7200), &listener, 123, BindKind::Ephemeral);
+            SocketTable::insert_binding_charged(
+                &mut b,
+                (ns, 7200),
+                &listener,
+                123,
+                BindKind::Ephemeral,
+            );
             // (a) child cannot uncharge the listener (ptr-eq miss); entry restored.
             assert!(
                 SocketTable::remove_binding_charged(&mut b, (ns, 7200), Some(Arc::as_ptr(&child)))
@@ -3493,7 +3665,11 @@ impl SocketTable {
             );
             // (b) the listener's own close refunds exactly once.
             assert_eq!(
-                SocketTable::remove_binding_charged(&mut b, (ns, 7200), Some(Arc::as_ptr(&listener))),
+                SocketTable::remove_binding_charged(
+                    &mut b,
+                    (ns, 7200),
+                    Some(Arc::as_ptr(&listener))
+                ),
                 Some(123),
                 "R169-6: the listener's own close refunds its stored charge once"
             );
@@ -3503,7 +3679,13 @@ impl SocketTable {
             let dropped_listener = mk(502, ns);
             {
                 let mut b = table.tcp_bindings.lock();
-                SocketTable::insert_binding_charged(&mut b, (ns, 7201), &dropped_listener, 124, BindKind::Ephemeral);
+                SocketTable::insert_binding_charged(
+                    &mut b,
+                    (ns, 7201),
+                    &dropped_listener,
+                    124,
+                    BindKind::Ephemeral,
+                );
             }
             // dropped_listener dropped here -> its Weak is dead.
         }
@@ -3604,18 +3786,32 @@ impl SocketTable {
             // (15) PRIVILEGED (port < 1024) Explicit: identical accounting —
             //      no port-magnitude branch exists in teardown (hoarding closed).
             let priv_sock = mk(602, ns);
-            SocketTable::insert_binding_charged(&mut b, (ns, 80), &priv_sock, 224, BindKind::Explicit);
+            SocketTable::insert_binding_charged(
+                &mut b,
+                (ns, 80),
+                &priv_sock,
+                224,
+                BindKind::Explicit,
+            );
             assert_eq!(
                 SocketTable::peek_binding_kind(&b, (ns, 80), Arc::as_ptr(&priv_sock)),
                 Some((BindKind::Explicit, 224))
             );
             assert_eq!(
-                SocketTable::resolve_while_alive_teardown(&mut b, (ns, 80), Arc::as_ptr(&priv_sock)),
+                SocketTable::resolve_while_alive_teardown(
+                    &mut b,
+                    (ns, 80),
+                    Arc::as_ptr(&priv_sock)
+                ),
                 TeardownAction::SkipExplicit,
                 "R169-6 s2: privileged Explicit is held identically"
             );
             assert_eq!(
-                SocketTable::remove_binding_charged(&mut b, (ns, 80), Some(Arc::as_ptr(&priv_sock))),
+                SocketTable::remove_binding_charged(
+                    &mut b,
+                    (ns, 80),
+                    Some(Arc::as_ptr(&priv_sock))
+                ),
                 Some(224)
             );
 
@@ -3652,8 +3848,13 @@ impl SocketTable {
         {
             let mut b = table.tcp_bindings.lock();
             let s_y = mk(604, ns);
-            match SocketTable::insert_binding_charged(&mut b, (ns, 5107), &s_y, 227, BindKind::Explicit)
-            {
+            match SocketTable::insert_binding_charged(
+                &mut b,
+                (ns, 5107),
+                &s_y,
+                227,
+                BindKind::Explicit,
+            ) {
                 InsertOutcome::DisplacedCharge(old) => assert_eq!(
                     old, 226,
                     "R169-6 s2: dead Explicit displaced by a live Explicit refunds once"
@@ -3673,7 +3874,13 @@ impl SocketTable {
         let s_udp = mk(605, ns);
         {
             let mut b = table.udp_bindings.lock();
-            SocketTable::insert_binding_charged(&mut b, (ns, 5108), &s_udp, 228, BindKind::Explicit);
+            SocketTable::insert_binding_charged(
+                &mut b,
+                (ns, 5108),
+                &s_udp,
+                228,
+                BindKind::Explicit,
+            );
             assert_eq!(
                 SocketTable::remove_binding_charged(&mut b, (ns, 5108), Some(Arc::as_ptr(&s_udp))),
                 Some(228),
@@ -3690,7 +3897,13 @@ impl SocketTable {
         let s_drain = mk(606, drain_ns2);
         {
             let mut b = table.tcp_bindings.lock();
-            SocketTable::insert_binding_charged(&mut b, (drain_ns2, 5109), &s_drain, 229, BindKind::Explicit);
+            SocketTable::insert_binding_charged(
+                &mut b,
+                (drain_ns2, 5109),
+                &s_drain,
+                229,
+                BindKind::Explicit,
+            );
         }
         table.drain_ns_port_bindings(drain_ns2);
         assert_eq!(
@@ -3701,8 +3914,13 @@ impl SocketTable {
         {
             let mut b = table.tcp_bindings.lock();
             // The connect-repair stamps speculative 0 / Ephemeral (see connect()).
-            match SocketTable::insert_binding_charged(&mut b, (drain_ns2, 5109), &s_drain, 0, BindKind::Ephemeral)
-            {
+            match SocketTable::insert_binding_charged(
+                &mut b,
+                (drain_ns2, 5109),
+                &s_drain,
+                0,
+                BindKind::Ephemeral,
+            ) {
                 InsertOutcome::FreshGrowth => {}
                 InsertOutcome::DisplacedCharge(_) => {
                     panic!("R169-6 s2: a post-drain repair must not displace a charge")
@@ -4358,7 +4576,15 @@ impl SocketTable {
                 // (ephemeral range is 49152-65535, well above privileged port limit)
                 // J2-8: ACTIVE-OPEN ephemeral auto-bind -> charge the per-cgroup
                 // ports.max budget (BindCharge::Ephemeral).
-                self.bind_udp(sock, current, cap_id, src_ip, None, false, BindCharge::Ephemeral)?
+                self.bind_udp(
+                    sock,
+                    current,
+                    cap_id,
+                    src_ip,
+                    None,
+                    false,
+                    BindCharge::Ephemeral,
+                )?
             }
         };
 
@@ -4481,7 +4707,8 @@ impl SocketTable {
         let local_ip = sock.local_ip().map(Ipv4Addr).unwrap_or(src_ip);
 
         // Build the connection key for uniqueness check
-        let conn_key = tcp_map_key_from_parts(sock.net_ns_id, local_ip, local_port, dst_ip, dst_port);
+        let conn_key =
+            tcp_map_key_from_parts(sock.net_ns_id, local_ip, local_port, dst_ip, dst_port);
 
         // Check for duplicate connection (but don't register yet - defer until after LSM)
         {
@@ -4646,7 +4873,11 @@ impl SocketTable {
                 // inserted -> spurious uncharge -> undercount.
                 let cgid = {
                     let mut bindings = self.tcp_bindings.lock();
-                    Self::remove_binding_charged(&mut bindings, binding_key, Some(Arc::as_ptr(sock)))
+                    Self::remove_binding_charged(
+                        &mut bindings,
+                        binding_key,
+                        Some(Arc::as_ptr(sock)),
+                    )
                 };
                 if let Some(c) = cgid {
                     uncharge_port_cgroup(c, 1);
@@ -5161,10 +5392,8 @@ impl SocketTable {
             return Err(SocketError::NoMemory);
         }
 
-        tcp_state.control.send_buffer_bytes = tcp_state
-            .control
-            .send_buffer_bytes
-            .saturating_add(offset);
+        tcp_state.control.send_buffer_bytes =
+            tcp_state.control.send_buffer_bytes.saturating_add(offset);
 
         // J2-6: true the per-ns counter to the bytes actually buffered, refunding
         // the (payload.len() - offset) over-reservation when OOM truncated the loop.
@@ -5178,8 +5407,7 @@ impl SocketTable {
         drop(guard);
 
         // Update statistics
-        sock.tx_bytes
-            .fetch_add(offset as u64, Ordering::Relaxed);
+        sock.tx_bytes.fetch_add(offset as u64, Ordering::Relaxed);
 
         Ok((offset, segments))
     }
@@ -5797,7 +6025,13 @@ impl SocketTable {
                     meta.remote_ip,
                     meta.remote_port,
                 ) {
-                    let key = tcp_map_key_from_parts(sock.net_ns_id, Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
+                    let key = tcp_map_key_from_parts(
+                        sock.net_ns_id,
+                        Ipv4Addr(lip),
+                        lport,
+                        Ipv4Addr(rip),
+                        rport,
+                    );
                     if self.tcp_conns.lock().remove(&key).is_some() {
                         // J2-1: uncharge the per-namespace connection (bound to
                         // tcp_conns membership, independent of counted_in_active).
@@ -6221,7 +6455,10 @@ impl SocketTable {
                             // Never send challenge ACK — RFC 5961 challenge ACKs are for
                             // synchronized states only. Bare RST (no ACK) is silently dropped.
                             let has_ack = header.flags & TCP_FLAG_ACK != 0;
-                            (has_ack && header.ack_num == tcp_state.control.snd_nxt, false)
+                            (
+                                has_ack && header.ack_num == tcp_state.control.snd_nxt,
+                                false,
+                            )
                         }
                         // R146-NET-3 FIX: Accept RST in SynReceived so
                         // half-open connections can be aborted and SYN queue
@@ -6239,7 +6476,8 @@ impl SocketTable {
                             let wnd = tcp_state.control.rcv_wnd.max(1);
                             if header.seq_num == tcp_state.control.rcv_nxt {
                                 (true, false)
-                            } else if seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, wnd) {
+                            } else if seq_in_window(header.seq_num, tcp_state.control.rcv_nxt, wnd)
+                            {
                                 (false, true)
                             } else {
                                 (false, false)
@@ -6308,12 +6546,17 @@ impl SocketTable {
                         // this, the slot leaks until SYN timeout (30s), allowing
                         // an attacker to exhaust the half-open limit.
                         if old_state == TcpState::SynReceived {
-                            if let Some(listener) = self.lookup_tcp_listener(net_ns_id, header.dst_port) {
+                            if let Some(listener) =
+                                self.lookup_tcp_listener(net_ns_id, header.dst_port)
+                            {
                                 let mut listen_guard = listener.listen.lock();
                                 if let Some(listen_state) = listen_guard.as_mut() {
                                     let syn_key = tcp_map_key_from_parts(
-                                        net_ns_id, dst_ip, header.dst_port,
-                                        src_ip, header.src_port,
+                                        net_ns_id,
+                                        dst_ip,
+                                        header.dst_port,
+                                        src_ip,
+                                        header.src_port,
                                     );
                                     listen_state.take_syn(&syn_key, self);
                                 }
@@ -6329,309 +6572,107 @@ impl SocketTable {
         }
 
         // Look up existing connection by namespace + 4-tuple
-        let sock = match self.lookup_tcp_conn(net_ns_id, dst_ip, header.dst_port, src_ip, header.src_port) {
-            Some(s) => s,
-            None => {
-                // R51-1: Passive open handling for inbound SYN
-                let is_syn = header.flags & TCP_FLAG_SYN != 0;
-                let is_ack = header.flags & TCP_FLAG_ACK != 0;
+        let sock =
+            match self.lookup_tcp_conn(net_ns_id, dst_ip, header.dst_port, src_ip, header.src_port)
+            {
+                Some(s) => s,
+                None => {
+                    // R51-1: Passive open handling for inbound SYN
+                    let is_syn = header.flags & TCP_FLAG_SYN != 0;
+                    let is_ack = header.flags & TCP_FLAG_ACK != 0;
 
-                // Pure SYN (without ACK) indicates new connection request
-                if is_syn && !is_ack {
-                    // R75-1 FIX: Look up listener within the specified namespace
-                    if let Some(listener) = self.lookup_tcp_listener(net_ns_id, header.dst_port) {
-                        let mut listen_guard = listener.listen.lock();
-                        if let Some(listen_state) = listen_guard.as_mut() {
-                            let syn_key = tcp_map_key_from_parts(
-                                listener.net_ns_id,
-                                dst_ip,
-                                header.dst_port,
-                                src_ip,
-                                header.src_port,
-                            );
-
-                            // Handle retransmitted SYN: resend cached SYN-ACK
-                            if let Some(existing) = listen_state.get_syn(&syn_key) {
-                                return Some(existing.syn_ack.clone());
-                            }
-
-                            // Get current timestamp for SYN cookie timing
-                            let now_ms = self.time_wait_now();
-
-                            // Select MSS for SYN cookie (used in both paths)
-                            let (mss_index, cookie_mss) = syn_cookie_select_mss(options.mss);
-
-                            // R106-2 FIX: Determine if we should fall back to SYN cookies.
-                            // When the global connection limit is reached, use stateless
-                            // SYN-ACK instead of silently dropping.  This ensures legitimate
-                            // clients can still complete handshakes once connection slots
-                            // free up, while attackers gain no DoS advantage.
-                            let mut force_syn_cookie = false;
-                            {
-                                let mut conns = self.tcp_conns.lock();
-                                self.conns_retain_accounted(&mut conns);
-                                if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
-                                    // R106-2 FIX: Global active connection limit reached —
-                                    // fall back to SYN cookies instead of dropping the SYN.
-                                    force_syn_cookie = true;
-                                }
-                                // Check if 4-tuple already exists (race condition guard)
-                                if conns.get(&syn_key).and_then(|w| w.upgrade()).is_some() {
-                                    return None;
-                                }
-                            }
-
-                            // R106-2 FIX: SYN Cookie Path — use stateless SYN-ACK when:
-                            // 1. Per-listener SYN backlog is full (original condition), OR
-                            // 2. Global active connection limit is reached (new condition)
-                            // SYN cookies require zero per-connection state, providing
-                            // graceful degradation instead of silent SYN drops.
-                            if force_syn_cookie
-                                || listen_state.syn_queue.len() >= listen_state.syn_backlog
-                            {
-                                // R137-2 FIX: Rate limit stateless SYN-cookie SYN-ACK
-                                // generation to reduce spoofed-source reflection.
-                                if !allow_syn_cookie_ack(now_ms) {
-                                    return None;
-                                }
-
-                                // Generate SYN cookie ISN (encodes 4-tuple, time, MSS)
-                                SYN_COOKIES_GENERATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
-                                let cookie_iss = generate_syn_cookie_isn(
-                                    now_ms,
+                    // Pure SYN (without ACK) indicates new connection request
+                    if is_syn && !is_ack {
+                        // R75-1 FIX: Look up listener within the specified namespace
+                        if let Some(listener) = self.lookup_tcp_listener(net_ns_id, header.dst_port)
+                        {
+                            let mut listen_guard = listener.listen.lock();
+                            if let Some(listen_state) = listen_guard.as_mut() {
+                                let syn_key = tcp_map_key_from_parts(
+                                    listener.net_ns_id,
                                     dst_ip,
                                     header.dst_port,
                                     src_ip,
                                     header.src_port,
-                                    mss_index,
                                 );
 
-                                // Build SYN-ACK with cookie ISN and MSS option
-                                // Note: Window scaling is NOT preserved in SYN cookies
-                                let syn_ack_options = [TcpOptionKind::Mss(cookie_mss)];
-                                let syn_ack = build_tcp_segment_with_options(
-                                    dst_ip,
-                                    src_ip,
-                                    header.dst_port,
-                                    header.src_port,
-                                    cookie_iss,
-                                    header.seq_num.wrapping_add(1), // ACK = IRS + 1
-                                    TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                    TCP_DEFAULT_WINDOW, // Unscaled window
-                                    &syn_ack_options,
-                                    &[],
-                                );
+                                // Handle retransmitted SYN: resend cached SYN-ACK
+                                if let Some(existing) = listen_state.get_syn(&syn_key) {
+                                    return Some(existing.syn_ack.clone());
+                                }
 
-                                // No state allocated - SYN cookie is stateless
-                                // R107-3 FIX: Seed synthetic conntrack state so the
-                                // returning ACK is not classified as invalid mid-stream.
-                                // Step 1: Register the incoming SYN (creates SynSent entry)
-                                // Step 2: Register the outgoing SYN-ACK (advances to SynRecv)
-                                #[cfg(feature = "conntrack")]
+                                // Get current timestamp for SYN cookie timing
+                                let now_ms = self.time_wait_now();
+
+                                // Select MSS for SYN cookie (used in both paths)
+                                let (mss_index, cookie_mss) = syn_cookie_select_mss(options.mss);
+
+                                // R106-2 FIX: Determine if we should fall back to SYN cookies.
+                                // When the global connection limit is reached, use stateless
+                                // SYN-ACK instead of silently dropping.  This ensures legitimate
+                                // clients can still complete handshakes once connection slots
+                                // free up, while attackers gain no DoS advantage.
+                                let mut force_syn_cookie = false;
                                 {
-                                    use crate::conntrack::ct_process_tcp;
-                                    let _ = ct_process_tcp(
-                                        listener.net_ns_id.0,
-                                        src_ip,
-                                        dst_ip,
-                                        header.src_port,
-                                        header.dst_port,
-                                        header.flags,
-                                        payload.len(),
-                                        now_ms,
-                                    );
-                                    let _ = ct_process_tcp(
-                                        listener.net_ns_id.0,
-                                        dst_ip,
-                                        src_ip,
-                                        header.dst_port,
-                                        header.src_port,
-                                        TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                        0,
-                                        now_ms,
-                                    );
-                                }
-                                return Some(syn_ack);
-                            }
-
-                            // R77-4 FIX: Enforce per-namespace socket quota before creating child socket.
-                            // Without this check, TCP listeners could create unlimited child sockets
-                            // bypassing the MAX_SOCKETS_PER_NS quota, leading to DoS via connection
-                            // floods and potential count underflow when sockets are later closed.
-                            if let Err(_) = self.try_inc_ns_count(listener.net_ns_id) {
-                                // Quota exceeded: silently drop SYN like backlog-full scenario.
-                                // This prevents attackers from exhausting socket resources via
-                                // connection floods while appearing as normal packet loss.
-                                return None;
-                            }
-
-                            // Create child socket inheriting listener properties
-                            // R75-1 FIX: Child socket inherits parent listener's network namespace
-                            // R107-5 FIX: Overflow-safe socket ID allocation
-                            let child_id = match self.next_socket_id.fetch_update(
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                                |current| current.checked_add(1),
-                            ) {
-                                Ok(prev) => prev,
-                                Err(_) => {
-                                    self.dec_ns_count(listener.net_ns_id); // Rollback quota
-                                    return None; // ID space exhausted, drop like backlog-full
-                                }
-                            };
-                            let child = Arc::new(SocketState::new(
-                                child_id,
-                                listener.domain,
-                                listener.ty,
-                                listener.proto,
-                                listener.label,
-                                listener.net_ns_id,
-                            ));
-
-                            // Register in socket table
-                            self.sockets.write().insert(child_id, child.clone());
-                            self.created.fetch_add(1, Ordering::Relaxed);
-
-                            // Set local and remote addresses
-                            child.bind_local(dst_ip, header.dst_port);
-                            child.set_remote(src_ip, header.src_port);
-
-                            // Generate server ISN using the secure ISN generator
-                            let iss =
-                                generate_isn(dst_ip, header.dst_port, src_ip, header.src_port);
-
-                            // Create server-side TCB in SynReceived state
-                            let mut tcb = TcpControlBlock::new_server(
-                                dst_ip,
-                                header.dst_port,
-                                src_ip,
-                                header.src_port,
-                                iss,
-                                header.seq_num,
-                            );
-
-                            // Set MSS from negotiated value
-                            tcb.snd_mss = cookie_mss;
-                            tcb.rcv_mss = cookie_mss;
-                            tcb.cwnd = initial_cwnd(cookie_mss);
-
-                            // R58: RFC 7323 Window Scaling - process WSopt from incoming SYN
-                            // If client sent WSopt, we should respond with our own WSopt
-                            if let Some(peer_scale) = options.window_scale {
-                                tcb.snd_wscale = peer_scale.min(TCP_MAX_WINDOW_SCALE);
-                                tcb.wscale_received = true;
-                                // Calculate our scale factor for outgoing window advertisements
-                                tcb.rcv_wscale = calc_wscale(tcb.rcv_wnd);
-                                tcb.wscale_requested = true;
-                            }
-
-                            // RFC 2018: SACK negotiation — record peer's SACK-Permitted
-                            // and advertise our own capability in the SYN-ACK.
-                            if options.sack_permitted {
-                                tcb.sack_received = true;
-                            }
-                            tcb.sack_requested = true;
-
-                            child.attach_tcp(tcb);
-
-                            // R58: Calculate window for SYN-ACK (unscaled per RFC 7323)
-                            // RFC 7323 Section 2.2: The window field in SYN and SYN-ACK
-                            // segments is never scaled; scaling takes effect only after
-                            // the SYN exchange is complete.
-                            let syn_ack_wnd = {
-                                let guard = child.tcp.lock();
-                                if let Some(ts) = guard.as_ref() {
-                                    encode_window(ts.control.rcv_wnd, 0, true)
-                                } else {
-                                    TCP_DEFAULT_WINDOW
-                                }
-                            };
-
-                            // Build SYN-ACK segment with MSS, SACK-Permitted, and optional WSopt
-                            // RFC 793: SYN consumes 1 sequence number
-                            let syn_ack = if options.window_scale.is_some() {
-                                // Include MSS, WSopt, and SACK-Permitted in response
-                                let our_scale = {
-                                    let guard = child.tcp.lock();
-                                    guard.as_ref().map(|ts| ts.control.rcv_wscale).unwrap_or(0)
-                                };
-                                let syn_ack_options = [
-                                    TcpOptionKind::Mss(cookie_mss),
-                                    TcpOptionKind::WindowScale(our_scale),
-                                    TcpOptionKind::SackPermitted,
-                                ];
-                                build_tcp_segment_with_options(
-                                    dst_ip,
-                                    src_ip,
-                                    header.dst_port,
-                                    header.src_port,
-                                    iss,
-                                    header.seq_num.wrapping_add(1), // ACK = IRS + 1
-                                    TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                    syn_ack_wnd,
-                                    &syn_ack_options,
-                                    &[],
-                                )
-                            } else {
-                                // Include MSS and SACK-Permitted
-                                let syn_ack_options = [
-                                    TcpOptionKind::Mss(cookie_mss),
-                                    TcpOptionKind::SackPermitted,
-                                ];
-                                build_tcp_segment_with_options(
-                                    dst_ip,
-                                    src_ip,
-                                    header.dst_port,
-                                    header.src_port,
-                                    iss,
-                                    header.seq_num.wrapping_add(1), // ACK = IRS + 1
-                                    TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                    syn_ack_wnd,
-                                    &syn_ack_options,
-                                    &[],
-                                )
-                            };
-
-                            // Register connection for demux.
-                            // J2-1: charge the per-namespace connection budget bound
-                            // to this tcp_conns insertion. If the tenant is already at
-                            // its connection cap, skip the insert + SYN queue and fall
-                            // back to stateless SYN cookies (handled below), exactly
-                            // like the global half-open / queue_syn failure path.
-                            let ns_conn_charged = {
-                                let mut conns = self.tcp_conns.lock();
-                                if self.try_inc_ns_conn(syn_key.0).is_ok() {
-                                    // Bind the charge to a genuine membership growth: the
-                                    // dup-check for this path ran under an earlier, separate
-                                    // tcp_conns lock (TOCTOU), so if the key raced in, insert
-                                    // would REPLACE without growing the map — undo the extra
-                                    // charge to keep count == live tcp_conns key count.
-                                    if conns.insert(syn_key, Arc::downgrade(&child)).is_some() {
-                                        self.dec_ns_conn(syn_key.0);
+                                    let mut conns = self.tcp_conns.lock();
+                                    self.conns_retain_accounted(&mut conns);
+                                    if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
+                                        // R106-2 FIX: Global active connection limit reached —
+                                        // fall back to SYN cookies instead of dropping the SYN.
+                                        force_syn_cookie = true;
                                     }
-                                    true
-                                } else {
-                                    false
+                                    // Check if 4-tuple already exists (race condition guard)
+                                    if conns.get(&syn_key).and_then(|w| w.upgrade()).is_some() {
+                                        return None;
+                                    }
                                 }
-                            };
 
-                            // Queue half-open connection in SYN queue (only if it was
-                            // charged + registered above).
-                            if ns_conn_charged {
-                                let pending = PendingSyn {
-                                    key: syn_key,
-                                    sock: child.clone(),
-                                    syn_ack: syn_ack.clone(),
-                                    syn_sent_at: now_ms,
-                                };
+                                // R106-2 FIX: SYN Cookie Path — use stateless SYN-ACK when:
+                                // 1. Per-listener SYN backlog is full (original condition), OR
+                                // 2. Global active connection limit is reached (new condition)
+                                // SYN cookies require zero per-connection state, providing
+                                // graceful degradation instead of silent SYN drops.
+                                if force_syn_cookie
+                                    || listen_state.syn_queue.len() >= listen_state.syn_backlog
+                                {
+                                    // R137-2 FIX: Rate limit stateless SYN-cookie SYN-ACK
+                                    // generation to reduce spoofed-source reflection.
+                                    if !allow_syn_cookie_ack(now_ms) {
+                                        return None;
+                                    }
 
-                                // SYN cookie path handles the backlog-full case above,
-                                // but queue_syn can still fail due to the global/per-ns
-                                // half-open limit.
-                                if listen_state.queue_syn(pending, self) {
-                                    // R155-9 FIX: Seed conntrack for the inbound SYN +
-                                    // outbound SYN-ACK so the final ACK transitions to
-                                    // Established. Same pattern as the SYN cookie path.
+                                    // Generate SYN cookie ISN (encodes 4-tuple, time, MSS)
+                                    SYN_COOKIES_GENERATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
+                                    let cookie_iss = generate_syn_cookie_isn(
+                                        now_ms,
+                                        dst_ip,
+                                        header.dst_port,
+                                        src_ip,
+                                        header.src_port,
+                                        mss_index,
+                                    );
+
+                                    // Build SYN-ACK with cookie ISN and MSS option
+                                    // Note: Window scaling is NOT preserved in SYN cookies
+                                    let syn_ack_options = [TcpOptionKind::Mss(cookie_mss)];
+                                    let syn_ack = build_tcp_segment_with_options(
+                                        dst_ip,
+                                        src_ip,
+                                        header.dst_port,
+                                        header.src_port,
+                                        cookie_iss,
+                                        header.seq_num.wrapping_add(1), // ACK = IRS + 1
+                                        TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                        TCP_DEFAULT_WINDOW, // Unscaled window
+                                        &syn_ack_options,
+                                        &[],
+                                    );
+
+                                    // No state allocated - SYN cookie is stateless
+                                    // R107-3 FIX: Seed synthetic conntrack state so the
+                                    // returning ACK is not classified as invalid mid-stream.
+                                    // Step 1: Register the incoming SYN (creates SynSent entry)
+                                    // Step 2: Register the outgoing SYN-ACK (advances to SynRecv)
                                     #[cfg(feature = "conntrack")]
                                     {
                                         use crate::conntrack::ct_process_tcp;
@@ -6659,304 +6700,513 @@ impl SocketTable {
                                     return Some(syn_ack);
                                 }
 
-                                // R106-2 FIX: queue_syn failed. J2-1: uncharge the
-                                // per-namespace connection charged above and remove the
-                                // tcp_conns entry before falling back to SYN cookies.
-                                if self.tcp_conns.lock().remove(&syn_key).is_some() {
-                                    self.dec_ns_conn(syn_key.0);
-                                }
-                            }
-
-                            // Clean up the child socket + fall back to SYN cookies.
-                            // Reached when queue_syn failed OR the per-namespace
-                            // connection budget was exceeded (ns_conn_charged == false,
-                            // in which case the child was never inserted into tcp_conns).
-                            self.sockets.write().remove(&child_id);
-                            // R77-4 FIX: Rollback quota on failure path
-                            self.dec_ns_count(listener.net_ns_id);
-
-                            // Fall back to stateless SYN cookie SYN-ACK
-                            // R137-2 FIX: Rate limit fallback SYN-cookie path as well.
-                            if !allow_syn_cookie_ack(now_ms) {
-                                return None;
-                            }
-                            SYN_COOKIES_GENERATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
-                            let cookie_iss = generate_syn_cookie_isn(
-                                now_ms,
-                                dst_ip,
-                                header.dst_port,
-                                src_ip,
-                                header.src_port,
-                                mss_index,
-                            );
-                            let syn_ack_options = [TcpOptionKind::Mss(cookie_mss)];
-                            let cookie_syn_ack = build_tcp_segment_with_options(
-                                dst_ip,
-                                src_ip,
-                                header.dst_port,
-                                header.src_port,
-                                cookie_iss,
-                                header.seq_num.wrapping_add(1),
-                                TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                TCP_DEFAULT_WINDOW,
-                                &syn_ack_options,
-                                &[],
-                            );
-                            // R107-3 FIX: Seed synthetic conntrack state for this
-                            // SYN-cookie handshake (SYN-ACK retry path).
-                            #[cfg(feature = "conntrack")]
-                            {
-                                use crate::conntrack::ct_process_tcp;
-                                let _ = ct_process_tcp(
-                                    listener.net_ns_id.0,
-                                    src_ip,
-                                    dst_ip,
-                                    header.src_port,
-                                    header.dst_port,
-                                    header.flags,
-                                    payload.len(),
-                                    now_ms,
-                                );
-                                let _ = ct_process_tcp(
-                                    listener.net_ns_id.0,
-                                    dst_ip,
-                                    src_ip,
-                                    header.dst_port,
-                                    header.src_port,
-                                    TCP_FLAG_SYN | TCP_FLAG_ACK,
-                                    0,
-                                    now_ms,
-                                );
-                            }
-                            return Some(cookie_syn_ack);
-                        }
-                    }
-                }
-
-                // SYN Cookie Validation Path: If this is an ACK with no half-open
-                // connection, it might be completing a SYN cookie handshake
-                let is_ack = header.flags & TCP_FLAG_ACK != 0;
-                let is_syn = header.flags & TCP_FLAG_SYN != 0;
-
-                if is_ack && !is_syn {
-                    // R75-1 FIX: Look up listener within the specified namespace
-                    if let Some(listener) = self.lookup_tcp_listener(net_ns_id, header.dst_port) {
-                        let now_ms = self.time_wait_now();
-
-                        // The cookie ISN is (ACK number - 1) since we sent SYN-ACK with ISN,
-                        // and client ACK should acknowledge ISN+1
-                        let cookie_isn = header.ack_num.wrapping_sub(1);
-
-                        if let Some(cookie_data) = validate_syn_cookie(
-                            now_ms,
-                            cookie_isn,
-                            dst_ip,
-                            header.dst_port,
-                            src_ip,
-                            header.src_port,
-                        ) {
-                            SYN_COOKIES_VALIDATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
-                            // Security: Final ACK must exactly acknowledge our SYN (ISS + 1)
-                            // This prevents attacks with forged ACK numbers that could
-                            // corrupt send-window accounting
-                            if header.ack_num != cookie_data.iss.wrapping_add(1) {
-                                return self.build_tcp_rst(dst_ip, src_ip, header, payload);
-                            }
-
-                            // Security: SYN-cookie completion must be a pure ACK (no data)
-                            // Accepting data here would silently drop or misorder it
-                            // and increase attack surface for injection attacks
-                            if !payload.is_empty() {
-                                return self.build_tcp_rst(dst_ip, src_ip, header, payload);
-                            }
-
-                            // Valid SYN cookie - create connection
-                            let syn_key = tcp_map_key_from_parts(
-                                listener.net_ns_id,
-                                dst_ip,
-                                header.dst_port,
-                                src_ip,
-                                header.src_port,
-                            );
-
-                            // P0-2 FIX: Check limits before creating connection.
-                            // When at capacity, attempt TIME_WAIT eviction so that
-                            // validated SYN cookie completions are not silently
-                            // dropped under sustained load.
-                            {
-                                let mut conns = self.tcp_conns.lock();
-                                self.conns_retain_accounted(&mut conns);
-                                // Check for duplicate first (race condition guard)
-                                if conns.get(&syn_key).and_then(|w| w.upgrade()).is_some() {
+                                // R77-4 FIX: Enforce per-namespace socket quota before creating child socket.
+                                // Without this check, TCP listeners could create unlimited child sockets
+                                // bypassing the MAX_SOCKETS_PER_NS quota, leading to DoS via connection
+                                // floods and potential count underflow when sockets are later closed.
+                                if let Err(_) = self.try_inc_ns_count(listener.net_ns_id) {
+                                    // Quota exceeded: silently drop SYN like backlog-full scenario.
+                                    // This prevents attackers from exhausting socket resources via
+                                    // connection floods while appearing as normal packet loss.
                                     return None;
                                 }
-                                if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
-                                    // Release lock — try_evict needs it internally.
-                                    drop(conns);
-                                    if !self.try_evict_time_wait_for_cookie(now_ms) {
-                                        // Genuinely no capacity even after eviction.
-                                        return None;
+
+                                // Create child socket inheriting listener properties
+                                // R75-1 FIX: Child socket inherits parent listener's network namespace
+                                // R107-5 FIX: Overflow-safe socket ID allocation
+                                let child_id = match self.next_socket_id.fetch_update(
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                    |current| current.checked_add(1),
+                                ) {
+                                    Ok(prev) => prev,
+                                    Err(_) => {
+                                        self.dec_ns_count(listener.net_ns_id); // Rollback quota
+                                        return None; // ID space exhausted, drop like backlog-full
                                     }
-                                    // Re-check under fresh lock: another core may have
-                                    // consumed the freed slot or inserted a duplicate.
+                                };
+                                let child = Arc::new(SocketState::new(
+                                    child_id,
+                                    listener.domain,
+                                    listener.ty,
+                                    listener.proto,
+                                    listener.label,
+                                    listener.net_ns_id,
+                                ));
+
+                                // Register in socket table
+                                self.sockets.write().insert(child_id, child.clone());
+                                self.created.fetch_add(1, Ordering::Relaxed);
+
+                                // Set local and remote addresses
+                                child.bind_local(dst_ip, header.dst_port);
+                                child.set_remote(src_ip, header.src_port);
+
+                                // Generate server ISN using the secure ISN generator
+                                let iss =
+                                    generate_isn(dst_ip, header.dst_port, src_ip, header.src_port);
+
+                                // Create server-side TCB in SynReceived state
+                                let mut tcb = TcpControlBlock::new_server(
+                                    dst_ip,
+                                    header.dst_port,
+                                    src_ip,
+                                    header.src_port,
+                                    iss,
+                                    header.seq_num,
+                                );
+
+                                // Set MSS from negotiated value
+                                tcb.snd_mss = cookie_mss;
+                                tcb.rcv_mss = cookie_mss;
+                                tcb.cwnd = initial_cwnd(cookie_mss);
+
+                                // R58: RFC 7323 Window Scaling - process WSopt from incoming SYN
+                                // If client sent WSopt, we should respond with our own WSopt
+                                if let Some(peer_scale) = options.window_scale {
+                                    tcb.snd_wscale = peer_scale.min(TCP_MAX_WINDOW_SCALE);
+                                    tcb.wscale_received = true;
+                                    // Calculate our scale factor for outgoing window advertisements
+                                    tcb.rcv_wscale = calc_wscale(tcb.rcv_wnd);
+                                    tcb.wscale_requested = true;
+                                }
+
+                                // RFC 2018: SACK negotiation — record peer's SACK-Permitted
+                                // and advertise our own capability in the SYN-ACK.
+                                if options.sack_permitted {
+                                    tcb.sack_received = true;
+                                }
+                                tcb.sack_requested = true;
+
+                                child.attach_tcp(tcb);
+
+                                // R58: Calculate window for SYN-ACK (unscaled per RFC 7323)
+                                // RFC 7323 Section 2.2: The window field in SYN and SYN-ACK
+                                // segments is never scaled; scaling takes effect only after
+                                // the SYN exchange is complete.
+                                let syn_ack_wnd = {
+                                    let guard = child.tcp.lock();
+                                    if let Some(ts) = guard.as_ref() {
+                                        encode_window(ts.control.rcv_wnd, 0, true)
+                                    } else {
+                                        TCP_DEFAULT_WINDOW
+                                    }
+                                };
+
+                                // Build SYN-ACK segment with MSS, SACK-Permitted, and optional WSopt
+                                // RFC 793: SYN consumes 1 sequence number
+                                let syn_ack = if options.window_scale.is_some() {
+                                    // Include MSS, WSopt, and SACK-Permitted in response
+                                    let our_scale = {
+                                        let guard = child.tcp.lock();
+                                        guard.as_ref().map(|ts| ts.control.rcv_wscale).unwrap_or(0)
+                                    };
+                                    let syn_ack_options = [
+                                        TcpOptionKind::Mss(cookie_mss),
+                                        TcpOptionKind::WindowScale(our_scale),
+                                        TcpOptionKind::SackPermitted,
+                                    ];
+                                    build_tcp_segment_with_options(
+                                        dst_ip,
+                                        src_ip,
+                                        header.dst_port,
+                                        header.src_port,
+                                        iss,
+                                        header.seq_num.wrapping_add(1), // ACK = IRS + 1
+                                        TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                        syn_ack_wnd,
+                                        &syn_ack_options,
+                                        &[],
+                                    )
+                                } else {
+                                    // Include MSS and SACK-Permitted
+                                    let syn_ack_options = [
+                                        TcpOptionKind::Mss(cookie_mss),
+                                        TcpOptionKind::SackPermitted,
+                                    ];
+                                    build_tcp_segment_with_options(
+                                        dst_ip,
+                                        src_ip,
+                                        header.dst_port,
+                                        header.src_port,
+                                        iss,
+                                        header.seq_num.wrapping_add(1), // ACK = IRS + 1
+                                        TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                        syn_ack_wnd,
+                                        &syn_ack_options,
+                                        &[],
+                                    )
+                                };
+
+                                // Register connection for demux.
+                                // J2-1: charge the per-namespace connection budget bound
+                                // to this tcp_conns insertion. If the tenant is already at
+                                // its connection cap, skip the insert + SYN queue and fall
+                                // back to stateless SYN cookies (handled below), exactly
+                                // like the global half-open / queue_syn failure path.
+                                let ns_conn_charged = {
+                                    let mut conns = self.tcp_conns.lock();
+                                    if self.try_inc_ns_conn(syn_key.0).is_ok() {
+                                        // Bind the charge to a genuine membership growth: the
+                                        // dup-check for this path ran under an earlier, separate
+                                        // tcp_conns lock (TOCTOU), so if the key raced in, insert
+                                        // would REPLACE without growing the map — undo the extra
+                                        // charge to keep count == live tcp_conns key count.
+                                        if conns.insert(syn_key, Arc::downgrade(&child)).is_some() {
+                                            self.dec_ns_conn(syn_key.0);
+                                        }
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                };
+
+                                // Queue half-open connection in SYN queue (only if it was
+                                // charged + registered above).
+                                if ns_conn_charged {
+                                    let pending = PendingSyn {
+                                        key: syn_key,
+                                        sock: child.clone(),
+                                        syn_ack: syn_ack.clone(),
+                                        syn_sent_at: now_ms,
+                                    };
+
+                                    // SYN cookie path handles the backlog-full case above,
+                                    // but queue_syn can still fail due to the global/per-ns
+                                    // half-open limit.
+                                    if listen_state.queue_syn(pending, self) {
+                                        // R155-9 FIX: Seed conntrack for the inbound SYN +
+                                        // outbound SYN-ACK so the final ACK transitions to
+                                        // Established. Same pattern as the SYN cookie path.
+                                        #[cfg(feature = "conntrack")]
+                                        {
+                                            use crate::conntrack::ct_process_tcp;
+                                            let _ = ct_process_tcp(
+                                                listener.net_ns_id.0,
+                                                src_ip,
+                                                dst_ip,
+                                                header.src_port,
+                                                header.dst_port,
+                                                header.flags,
+                                                payload.len(),
+                                                now_ms,
+                                            );
+                                            let _ = ct_process_tcp(
+                                                listener.net_ns_id.0,
+                                                dst_ip,
+                                                src_ip,
+                                                header.dst_port,
+                                                header.src_port,
+                                                TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                                0,
+                                                now_ms,
+                                            );
+                                        }
+                                        return Some(syn_ack);
+                                    }
+
+                                    // R106-2 FIX: queue_syn failed. J2-1: uncharge the
+                                    // per-namespace connection charged above and remove the
+                                    // tcp_conns entry before falling back to SYN cookies.
+                                    if self.tcp_conns.lock().remove(&syn_key).is_some() {
+                                        self.dec_ns_conn(syn_key.0);
+                                    }
+                                }
+
+                                // Clean up the child socket + fall back to SYN cookies.
+                                // Reached when queue_syn failed OR the per-namespace
+                                // connection budget was exceeded (ns_conn_charged == false,
+                                // in which case the child was never inserted into tcp_conns).
+                                self.sockets.write().remove(&child_id);
+                                // R77-4 FIX: Rollback quota on failure path
+                                self.dec_ns_count(listener.net_ns_id);
+
+                                // Fall back to stateless SYN cookie SYN-ACK
+                                // R137-2 FIX: Rate limit fallback SYN-cookie path as well.
+                                if !allow_syn_cookie_ack(now_ms) {
+                                    return None;
+                                }
+                                SYN_COOKIES_GENERATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
+                                let cookie_iss = generate_syn_cookie_isn(
+                                    now_ms,
+                                    dst_ip,
+                                    header.dst_port,
+                                    src_ip,
+                                    header.src_port,
+                                    mss_index,
+                                );
+                                let syn_ack_options = [TcpOptionKind::Mss(cookie_mss)];
+                                let cookie_syn_ack = build_tcp_segment_with_options(
+                                    dst_ip,
+                                    src_ip,
+                                    header.dst_port,
+                                    header.src_port,
+                                    cookie_iss,
+                                    header.seq_num.wrapping_add(1),
+                                    TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                    TCP_DEFAULT_WINDOW,
+                                    &syn_ack_options,
+                                    &[],
+                                );
+                                // R107-3 FIX: Seed synthetic conntrack state for this
+                                // SYN-cookie handshake (SYN-ACK retry path).
+                                #[cfg(feature = "conntrack")]
+                                {
+                                    use crate::conntrack::ct_process_tcp;
+                                    let _ = ct_process_tcp(
+                                        listener.net_ns_id.0,
+                                        src_ip,
+                                        dst_ip,
+                                        header.src_port,
+                                        header.dst_port,
+                                        header.flags,
+                                        payload.len(),
+                                        now_ms,
+                                    );
+                                    let _ = ct_process_tcp(
+                                        listener.net_ns_id.0,
+                                        dst_ip,
+                                        src_ip,
+                                        header.dst_port,
+                                        header.src_port,
+                                        TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                        0,
+                                        now_ms,
+                                    );
+                                }
+                                return Some(cookie_syn_ack);
+                            }
+                        }
+                    }
+
+                    // SYN Cookie Validation Path: If this is an ACK with no half-open
+                    // connection, it might be completing a SYN cookie handshake
+                    let is_ack = header.flags & TCP_FLAG_ACK != 0;
+                    let is_syn = header.flags & TCP_FLAG_SYN != 0;
+
+                    if is_ack && !is_syn {
+                        // R75-1 FIX: Look up listener within the specified namespace
+                        if let Some(listener) = self.lookup_tcp_listener(net_ns_id, header.dst_port)
+                        {
+                            let now_ms = self.time_wait_now();
+
+                            // The cookie ISN is (ACK number - 1) since we sent SYN-ACK with ISN,
+                            // and client ACK should acknowledge ISN+1
+                            let cookie_isn = header.ack_num.wrapping_sub(1);
+
+                            if let Some(cookie_data) = validate_syn_cookie(
+                                now_ms,
+                                cookie_isn,
+                                dst_ip,
+                                header.dst_port,
+                                src_ip,
+                                header.src_port,
+                            ) {
+                                SYN_COOKIES_VALIDATED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
+                                                                                       // Security: Final ACK must exactly acknowledge our SYN (ISS + 1)
+                                                                                       // This prevents attacks with forged ACK numbers that could
+                                                                                       // corrupt send-window accounting
+                                if header.ack_num != cookie_data.iss.wrapping_add(1) {
+                                    return self.build_tcp_rst(dst_ip, src_ip, header, payload);
+                                }
+
+                                // Security: SYN-cookie completion must be a pure ACK (no data)
+                                // Accepting data here would silently drop or misorder it
+                                // and increase attack surface for injection attacks
+                                if !payload.is_empty() {
+                                    return self.build_tcp_rst(dst_ip, src_ip, header, payload);
+                                }
+
+                                // Valid SYN cookie - create connection
+                                let syn_key = tcp_map_key_from_parts(
+                                    listener.net_ns_id,
+                                    dst_ip,
+                                    header.dst_port,
+                                    src_ip,
+                                    header.src_port,
+                                );
+
+                                // P0-2 FIX: Check limits before creating connection.
+                                // When at capacity, attempt TIME_WAIT eviction so that
+                                // validated SYN cookie completions are not silently
+                                // dropped under sustained load.
+                                {
                                     let mut conns = self.tcp_conns.lock();
                                     self.conns_retain_accounted(&mut conns);
-                                    if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
-                                        return None;
-                                    }
+                                    // Check for duplicate first (race condition guard)
                                     if conns.get(&syn_key).and_then(|w| w.upgrade()).is_some() {
                                         return None;
                                     }
-                                }
-                            }
-
-                            // Check accept queue capacity
-                            {
-                                let listen_guard = listener.listen.lock();
-                                if let Some(listen_state) = listen_guard.as_ref() {
-                                    if listen_state.accept_queue.len()
-                                        >= listen_state.accept_backlog
-                                    {
-                                        // Accept queue full - send RST
-                                        return self.build_tcp_rst(dst_ip, src_ip, header, payload);
+                                    if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
+                                        // Release lock — try_evict needs it internally.
+                                        drop(conns);
+                                        if !self.try_evict_time_wait_for_cookie(now_ms) {
+                                            // Genuinely no capacity even after eviction.
+                                            return None;
+                                        }
+                                        // Re-check under fresh lock: another core may have
+                                        // consumed the freed slot or inserted a duplicate.
+                                        let mut conns = self.tcp_conns.lock();
+                                        self.conns_retain_accounted(&mut conns);
+                                        if conns.len() >= TCP_MAX_ACTIVE_CONNECTIONS {
+                                            return None;
+                                        }
+                                        if conns.get(&syn_key).and_then(|w| w.upgrade()).is_some() {
+                                            return None;
+                                        }
                                     }
                                 }
-                            }
 
-                            // R77-4 FIX: Enforce per-namespace socket quota before creating child socket.
-                            // This is the SYN cookie completion path - without this check, validated
-                            // cookies could create unlimited sockets bypassing namespace quotas.
-                            if let Err(_) = self.try_inc_ns_count(listener.net_ns_id) {
-                                // Quota exceeded: behave like accept queue full and send RST
-                                return self.build_tcp_rst(dst_ip, src_ip, header, payload);
-                            }
-
-                            // Create child socket for the connection
-                            // R75-1 FIX: Child socket inherits parent listener's network namespace
-                            // R107-5 FIX: Overflow-safe socket ID allocation
-                            let child_id = match self.next_socket_id.fetch_update(
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                                |current| current.checked_add(1),
-                            ) {
-                                Ok(prev) => prev,
-                                Err(_) => {
-                                    self.dec_ns_count(listener.net_ns_id); // Rollback quota
-                                    return self.build_tcp_rst(dst_ip, src_ip, header, payload); // ID exhausted
+                                // Check accept queue capacity
+                                {
+                                    let listen_guard = listener.listen.lock();
+                                    if let Some(listen_state) = listen_guard.as_ref() {
+                                        if listen_state.accept_queue.len()
+                                            >= listen_state.accept_backlog
+                                        {
+                                            // Accept queue full - send RST
+                                            return self
+                                                .build_tcp_rst(dst_ip, src_ip, header, payload);
+                                        }
+                                    }
                                 }
-                            };
-                            let child = Arc::new(SocketState::new(
-                                child_id,
-                                listener.domain,
-                                listener.ty,
-                                listener.proto,
-                                listener.label,
-                                listener.net_ns_id,
-                            ));
 
-                            self.sockets.write().insert(child_id, child.clone());
-                            self.created.fetch_add(1, Ordering::Relaxed);
+                                // R77-4 FIX: Enforce per-namespace socket quota before creating child socket.
+                                // This is the SYN cookie completion path - without this check, validated
+                                // cookies could create unlimited sockets bypassing namespace quotas.
+                                if let Err(_) = self.try_inc_ns_count(listener.net_ns_id) {
+                                    // Quota exceeded: behave like accept queue full and send RST
+                                    return self.build_tcp_rst(dst_ip, src_ip, header, payload);
+                                }
 
-                            child.bind_local(dst_ip, header.dst_port);
-                            child.set_remote(src_ip, header.src_port);
+                                // Create child socket for the connection
+                                // R75-1 FIX: Child socket inherits parent listener's network namespace
+                                // R107-5 FIX: Overflow-safe socket ID allocation
+                                let child_id = match self.next_socket_id.fetch_update(
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                    |current| current.checked_add(1),
+                                ) {
+                                    Ok(prev) => prev,
+                                    Err(_) => {
+                                        self.dec_ns_count(listener.net_ns_id); // Rollback quota
+                                        return self.build_tcp_rst(dst_ip, src_ip, header, payload);
+                                        // ID exhausted
+                                    }
+                                };
+                                let child = Arc::new(SocketState::new(
+                                    child_id,
+                                    listener.domain,
+                                    listener.ty,
+                                    listener.proto,
+                                    listener.label,
+                                    listener.net_ns_id,
+                                ));
 
-                            // Create TCB in Established state (handshake completed via cookie)
-                            // The IRS (Initial Receive Sequence) was header.seq_num in the original SYN
-                            // which is now header.seq_num - 1 (they sent +1 in their ACK)
-                            let irs = header.seq_num.wrapping_sub(1);
-                            let mut tcb = TcpControlBlock::new_server(
-                                dst_ip,
-                                header.dst_port,
-                                src_ip,
-                                header.src_port,
-                                cookie_data.iss,
-                                irs,
-                            );
+                                self.sockets.write().insert(child_id, child.clone());
+                                self.created.fetch_add(1, Ordering::Relaxed);
 
-                            // R151-8 FIX: SYN cookie connections do not negotiate window
-                            // scaling. Cap rcv_wnd to what can be advertised in the 16-bit
-                            // TCP window field without WSopt. Without this cap, the stack
-                            // accepts up to 256 KiB per connection while only advertising
-                            // 64 KiB, enabling 4x memory amplification under SYN flood.
-                            if !tcb.wscale_enabled() {
-                                tcb.rcv_wnd = tcb.rcv_wnd.min(u16::MAX as u32);
-                            }
+                                child.bind_local(dst_ip, header.dst_port);
+                                child.set_remote(src_ip, header.src_port);
 
-                            // Set MSS from cookie
-                            tcb.snd_mss = cookie_data.mss;
-                            tcb.rcv_mss = cookie_data.mss;
-                            tcb.cwnd = initial_cwnd(cookie_data.mss);
+                                // Create TCB in Established state (handshake completed via cookie)
+                                // The IRS (Initial Receive Sequence) was header.seq_num in the original SYN
+                                // which is now header.seq_num - 1 (they sent +1 in their ACK)
+                                let irs = header.seq_num.wrapping_sub(1);
+                                let mut tcb = TcpControlBlock::new_server(
+                                    dst_ip,
+                                    header.dst_port,
+                                    src_ip,
+                                    header.src_port,
+                                    cookie_data.iss,
+                                    irs,
+                                );
 
-                            // Update sequence numbers: our SYN consumed 1 byte
-                            tcb.snd_nxt = cookie_data.iss.wrapping_add(1);
-                            tcb.snd_una = cookie_data.iss;
+                                // R151-8 FIX: SYN cookie connections do not negotiate window
+                                // scaling. Cap rcv_wnd to what can be advertised in the 16-bit
+                                // TCP window field without WSopt. Without this cap, the stack
+                                // accepts up to 256 KiB per connection while only advertising
+                                // 64 KiB, enabling 4x memory amplification under SYN flood.
+                                if !tcb.wscale_enabled() {
+                                    tcb.rcv_wnd = tcb.rcv_wnd.min(u16::MAX as u32);
+                                }
 
-                            // Initialize send window from their ACK
-                            // Note: No window scaling for SYN cookie connections
-                            tcb.snd_wnd = decode_window(header.window, 0);
-                            tcb.snd_wl1 = header.seq_num;
-                            tcb.snd_wl2 = header.ack_num;
+                                // Set MSS from cookie
+                                tcb.snd_mss = cookie_data.mss;
+                                tcb.rcv_mss = cookie_data.mss;
+                                tcb.cwnd = initial_cwnd(cookie_data.mss);
 
-                            // Transition directly to Established (cookie validated)
-                            tcb.state = TcpState::Established;
-                            tcb.established_at = now_ms;
-                            tcb.last_activity = now_ms;
+                                // Update sequence numbers: our SYN consumed 1 byte
+                                tcb.snd_nxt = cookie_data.iss.wrapping_add(1);
+                                tcb.snd_una = cookie_data.iss;
 
-                            // Process the ACK to update snd_una
-                            handle_ack(&mut tcb, header.ack_num, now_ms);
+                                // Initialize send window from their ACK
+                                // Note: No window scaling for SYN cookie connections
+                                tcb.snd_wnd = decode_window(header.window, 0);
+                                tcb.snd_wl1 = header.seq_num;
+                                tcb.snd_wl2 = header.ack_num;
 
-                            child.attach_tcp(tcb);
+                                // Transition directly to Established (cookie validated)
+                                tcb.state = TcpState::Established;
+                                tcb.established_at = now_ms;
+                                tcb.last_activity = now_ms;
 
-                            // Register connection.
-                            // J2-1: charge the per-namespace connection budget bound
-                            // to this insertion. On over-quota, tear down the child
-                            // (cleanup_tcp_connection removes it from the sockets map +
-                            // dec_ns_count) and send RST — mirrors accept-queue-full.
-                            // The conns guard is dropped before cleanup_tcp_connection,
-                            // which re-locks tcp_conns (non-reentrant).
-                            {
-                                let mut conns = self.tcp_conns.lock();
-                                if self.try_inc_ns_conn(syn_key.0).is_err() {
-                                    drop(conns);
+                                // Process the ACK to update snd_una
+                                handle_ack(&mut tcb, header.ack_num, now_ms);
+
+                                child.attach_tcp(tcb);
+
+                                // Register connection.
+                                // J2-1: charge the per-namespace connection budget bound
+                                // to this insertion. On over-quota, tear down the child
+                                // (cleanup_tcp_connection removes it from the sockets map +
+                                // dec_ns_count) and send RST — mirrors accept-queue-full.
+                                // The conns guard is dropped before cleanup_tcp_connection,
+                                // which re-locks tcp_conns (non-reentrant).
+                                {
+                                    let mut conns = self.tcp_conns.lock();
+                                    if self.try_inc_ns_conn(syn_key.0).is_err() {
+                                        drop(conns);
+                                        child.mark_closed();
+                                        self.cleanup_tcp_connection(&child);
+                                        return self.build_tcp_rst(dst_ip, src_ip, header, payload);
+                                    }
+                                    // Bind the charge to a genuine membership growth (TOCTOU:
+                                    // the dup-check ran under an earlier, separate tcp_conns
+                                    // lock; a raced-in key would make insert REPLACE).
+                                    if conns.insert(syn_key, Arc::downgrade(&child)).is_some() {
+                                        self.dec_ns_conn(syn_key.0);
+                                    }
+                                }
+
+                                // Add to accept queue
+                                if !listener.push_accept_ready(child.clone()) {
+                                    // Accept queue became full between check and push
                                     child.mark_closed();
+                                    // R129-2 FIX: cleanup_tcp_connection now handles dec_ns_count
+                                    // when removing from sockets map. The explicit dec_ns_count
+                                    // (R77-4) that was here is no longer needed and would cause
+                                    // a double-decrement.
                                     self.cleanup_tcp_connection(&child);
                                     return self.build_tcp_rst(dst_ip, src_ip, header, payload);
                                 }
-                                // Bind the charge to a genuine membership growth (TOCTOU:
-                                // the dup-check ran under an earlier, separate tcp_conns
-                                // lock; a raced-in key would make insert REPLACE).
-                                if conns.insert(syn_key, Arc::downgrade(&child)).is_some() {
-                                    self.dec_ns_conn(syn_key.0);
-                                }
+
+                                // Wake waiting accept()
+                                child.wake_tcp_waiters();
+
+                                // No response needed - connection is established
+                                return None;
+                            } else {
+                                SYN_COOKIES_REJECTED.fetch_add(1, Ordering::Relaxed);
+                                // R132-5 FIX
                             }
-
-                            // Add to accept queue
-                            if !listener.push_accept_ready(child.clone()) {
-                                // Accept queue became full between check and push
-                                child.mark_closed();
-                                // R129-2 FIX: cleanup_tcp_connection now handles dec_ns_count
-                                // when removing from sockets map. The explicit dec_ns_count
-                                // (R77-4) that was here is no longer needed and would cause
-                                // a double-decrement.
-                                self.cleanup_tcp_connection(&child);
-                                return self.build_tcp_rst(dst_ip, src_ip, header, payload);
-                            }
-
-                            // Wake waiting accept()
-                            child.wake_tcp_waiters();
-
-                            // No response needed - connection is established
-                            return None;
-                        } else {
-                            SYN_COOKIES_REJECTED.fetch_add(1, Ordering::Relaxed); // R132-5 FIX
                         }
                     }
-                }
 
-                // No connection found - send RST per RFC 793
-                return self.build_tcp_rst(dst_ip, src_ip, header, payload);
-            }
-        };
+                    // No connection found - send RST per RFC 793
+                    return self.build_tcp_rst(dst_ip, src_ip, header, payload);
+                }
+            };
 
         // Process based on current TCP state
         let mut guard = sock.tcp.lock();
@@ -6989,8 +7239,7 @@ impl SocketTable {
                         // Process peer's TCP options (MSS, window scale, SACK)
                         if tcp_state.control.wscale_requested {
                             if let Some(peer_scale) = options.window_scale {
-                                tcp_state.control.snd_wscale =
-                                    peer_scale.min(TCP_MAX_WINDOW_SCALE);
+                                tcp_state.control.snd_wscale = peer_scale.min(TCP_MAX_WINDOW_SCALE);
                                 tcp_state.control.wscale_received = true;
                             }
                         }
@@ -7003,8 +7252,7 @@ impl SocketTable {
                         if let Some(mss) = options.mss {
                             let clamped = mss.max(64).min(TCP_ETHERNET_MSS);
                             tcp_state.control.snd_mss = clamped;
-                            tcp_state.control.cwnd =
-                                initial_cwnd(tcp_state.control.snd_mss);
+                            tcp_state.control.cwnd = initial_cwnd(tcp_state.control.snd_mss);
                         }
 
                         // Initialize send window (unscaled per RFC 7323 §2.2)
@@ -7018,38 +7266,67 @@ impl SocketTable {
                         // construction with a bounded stack array. There are at most 3
                         // options (MSS, WindowScale, SackPermitted); we populate a
                         // fixed-size array and slice it to the actual count used.
-                        let wscale_opt = tcp_state.control.wscale_requested.then(||
-                            TcpOptionKind::WindowScale(tcp_state.control.rcv_wscale)
-                        );
-                        let sack_opt = tcp_state.control.sack_requested.then(||
-                            TcpOptionKind::SackPermitted
-                        );
+                        let wscale_opt = tcp_state
+                            .control
+                            .wscale_requested
+                            .then(|| TcpOptionKind::WindowScale(tcp_state.control.rcv_wscale));
+                        let sack_opt = tcp_state
+                            .control
+                            .sack_requested
+                            .then(|| TcpOptionKind::SackPermitted);
                         let syn_ack = match (wscale_opt, sack_opt) {
                             (Some(ws), Some(_sack)) => build_tcp_segment_with_options(
-                                dst_ip, src_ip, header.dst_port, header.src_port,
-                                tcp_state.control.snd_una, tcp_state.control.rcv_nxt,
-                                TCP_FLAG_SYN | TCP_FLAG_ACK, TCP_DEFAULT_WINDOW,
-                                &[TcpOptionKind::Mss(TCP_ETHERNET_MSS), ws, TcpOptionKind::SackPermitted],
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
+                                tcp_state.control.snd_una,
+                                tcp_state.control.rcv_nxt,
+                                TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                TCP_DEFAULT_WINDOW,
+                                &[
+                                    TcpOptionKind::Mss(TCP_ETHERNET_MSS),
+                                    ws,
+                                    TcpOptionKind::SackPermitted,
+                                ],
                                 &[],
                             ),
                             (Some(ws), None) => build_tcp_segment_with_options(
-                                dst_ip, src_ip, header.dst_port, header.src_port,
-                                tcp_state.control.snd_una, tcp_state.control.rcv_nxt,
-                                TCP_FLAG_SYN | TCP_FLAG_ACK, TCP_DEFAULT_WINDOW,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
+                                tcp_state.control.snd_una,
+                                tcp_state.control.rcv_nxt,
+                                TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                TCP_DEFAULT_WINDOW,
                                 &[TcpOptionKind::Mss(TCP_ETHERNET_MSS), ws],
                                 &[],
                             ),
                             (None, Some(_sack)) => build_tcp_segment_with_options(
-                                dst_ip, src_ip, header.dst_port, header.src_port,
-                                tcp_state.control.snd_una, tcp_state.control.rcv_nxt,
-                                TCP_FLAG_SYN | TCP_FLAG_ACK, TCP_DEFAULT_WINDOW,
-                                &[TcpOptionKind::Mss(TCP_ETHERNET_MSS), TcpOptionKind::SackPermitted],
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
+                                tcp_state.control.snd_una,
+                                tcp_state.control.rcv_nxt,
+                                TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                TCP_DEFAULT_WINDOW,
+                                &[
+                                    TcpOptionKind::Mss(TCP_ETHERNET_MSS),
+                                    TcpOptionKind::SackPermitted,
+                                ],
                                 &[],
                             ),
                             (None, None) => build_tcp_segment_with_options(
-                                dst_ip, src_ip, header.dst_port, header.src_port,
-                                tcp_state.control.snd_una, tcp_state.control.rcv_nxt,
-                                TCP_FLAG_SYN | TCP_FLAG_ACK, TCP_DEFAULT_WINDOW,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
+                                tcp_state.control.snd_una,
+                                tcp_state.control.rcv_nxt,
+                                TCP_FLAG_SYN | TCP_FLAG_ACK,
+                                TCP_DEFAULT_WINDOW,
                                 &[TcpOptionKind::Mss(TCP_ETHERNET_MSS)],
                                 &[],
                             ),
@@ -7092,7 +7369,12 @@ impl SocketTable {
                 let syn_len = 1u32;
                 tcp_state.control.rcv_nxt = header.seq_num.wrapping_add(syn_len);
                 // Update snd_una and refresh RTT estimates from ACK
-                self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
+                self.handle_ack_reconciled(
+                    &sock,
+                    &mut tcp_state.control,
+                    header.ack_num,
+                    self.time_wait_now(),
+                );
 
                 // R58: RFC 7323 Window Scaling - process WSopt from SYN-ACK
                 // Window scaling is ONLY negotiated if we sent WSopt in our SYN
@@ -7319,7 +7601,10 @@ impl SocketTable {
                             // Would overrun advertised window — send ACK with current window
                             let win_ack = Self::build_sack_ack(
                                 &tcp_state.control,
-                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
                                 window_after_ack,
                             );
                             return Some(win_ack);
@@ -7328,22 +7613,37 @@ impl SocketTable {
                         // J2-4: per-namespace recv-memory gate (decide-only, fail-closed;
                         // identical drop+window-ACK shape as the per-conn overrun above).
                         if self
-                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .try_charge_ns_recv_gate(
+                                sock.net_ns_id,
+                                &tcp_state.control,
+                                payload.len(),
+                            )
                             .is_err()
                         {
                             let win_ack = Self::build_sack_ack(
                                 &tcp_state.control,
-                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
                                 window_after_ack,
                             );
                             return Some(win_ack);
                         }
 
                         // R162-9 FIX: Fallible recv_buffer growth
-                        if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
+                        if tcp_state
+                            .control
+                            .recv_buffer
+                            .try_reserve(payload.len())
+                            .is_err()
+                        {
                             return None;
                         }
-                        tcp_state.control.recv_buffer.extend(payload.iter().copied());
+                        tcp_state
+                            .control
+                            .recv_buffer
+                            .extend(payload.iter().copied());
                         tcp_state.control.rcv_nxt =
                             tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
 
@@ -7381,7 +7681,10 @@ impl SocketTable {
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         response = Some(Self::build_sack_ack(
                             &tcp_state.control,
-                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
                             ack_wnd,
                         ));
                         data_received = true;
@@ -7391,24 +7694,36 @@ impl SocketTable {
                         // J2-4: gate before buffering OOO (so OOO is not a budget bypass);
                         // on reject drop the segment + SACK-ACK (peer/SACK retransmits).
                         if self
-                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .try_charge_ns_recv_gate(
+                                sock.net_ns_id,
+                                &tcp_state.control,
+                                payload.len(),
+                            )
                             .is_err()
                         {
                             let ack_wnd = Self::current_adv_window(&tcp_state.control);
                             let sack_ack = Self::build_sack_ack(
                                 &tcp_state.control,
-                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
                                 ack_wnd,
                             );
                             return Some(sack_ack);
                         }
-                        tcp_state.control.ooo_insert(header.seq_num, payload, is_fin);
+                        tcp_state
+                            .control
+                            .ooo_insert(header.seq_num, payload, is_fin);
                         self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
 
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let sack_ack = Self::build_sack_ack(
                             &tcp_state.control,
-                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
                             ack_wnd,
                         );
                         return Some(sack_ack);
@@ -7419,26 +7734,35 @@ impl SocketTable {
                         // and handle OOO-drain state transitions (wake waiters, set timers).
                         let seg_end = header.seq_num.wrapping_add(payload.len() as u32);
                         if seq_gt(seg_end, tcp_state.control.rcv_nxt) {
-                            let skip = tcp_state.control.rcv_nxt
-                                .wrapping_sub(header.seq_num) as usize;
+                            let skip =
+                                tcp_state.control.rcv_nxt.wrapping_sub(header.seq_num) as usize;
                             let useful = &payload[skip..];
                             let pass_fin = is_fin;
                             // J2-4: gate the in-window overlap tail before buffering; on
                             // reject drop it and dup-ACK (peer/SACK retransmits).
                             if self
-                                .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, useful.len())
+                                .try_charge_ns_recv_gate(
+                                    sock.net_ns_id,
+                                    &tcp_state.control,
+                                    useful.len(),
+                                )
                                 .is_err()
                             {
                                 let ack_wnd = Self::current_adv_window(&tcp_state.control);
                                 let dup_ack = Self::build_sack_ack(
                                     &tcp_state.control,
-                                    dst_ip, src_ip, header.dst_port, header.src_port,
+                                    dst_ip,
+                                    src_ip,
+                                    header.dst_port,
+                                    header.src_port,
                                     ack_wnd,
                                 );
                                 return Some(dup_ack);
                             }
                             tcp_state.control.ooo_insert(
-                                tcp_state.control.rcv_nxt, useful, pass_fin,
+                                tcp_state.control.rcv_nxt,
+                                useful,
+                                pass_fin,
                             );
                             tcp_state.control.ooo_drain_contiguous();
                             // J2-4: reconcile to true F after the drain — covers BOTH the
@@ -7454,7 +7778,10 @@ impl SocketTable {
                                 let ack_wnd = Self::current_adv_window(&tcp_state.control);
                                 let ack = Self::build_sack_ack(
                                     &tcp_state.control,
-                                    dst_ip, src_ip, header.dst_port, header.src_port,
+                                    dst_ip,
+                                    src_ip,
+                                    header.dst_port,
+                                    header.src_port,
                                     ack_wnd,
                                 );
                                 drop(guard);
@@ -7466,7 +7793,10 @@ impl SocketTable {
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let dup_ack = Self::build_sack_ack(
                             &tcp_state.control,
-                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
                             ack_wnd,
                         );
                         return Some(dup_ack);
@@ -7478,12 +7808,9 @@ impl SocketTable {
                     // R144-1 FIX: Use the pre-OOO-drain rcv_nxt (if available) so that
                     // contiguous OOO segments drained after the in-order data do not
                     // push rcv_nxt past the FIN position, silently losing FIN.
-                    let expected_fin_pos = fin_expected_seq
-                        .unwrap_or(tcp_state.control.rcv_nxt);
+                    let expected_fin_pos = fin_expected_seq.unwrap_or(tcp_state.control.rcv_nxt);
                     // FIN must be in-order (seq_num + payload_len == expected position)
-                    if header.seq_num.wrapping_add(payload.len() as u32)
-                        != expected_fin_pos
-                    {
+                    if header.seq_num.wrapping_add(payload.len() as u32) != expected_fin_pos {
                         let dup_ack = build_tcp_segment(
                             dst_ip,
                             src_ip,
@@ -7632,7 +7959,12 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
+                    self.handle_ack_reconciled(
+                        &sock,
+                        &mut tcp_state.control,
+                        header.ack_num,
+                        self.time_wait_now(),
+                    );
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -7704,7 +8036,10 @@ impl SocketTable {
                         if (payload.len() as u32) > available {
                             let win_ack = Self::build_sack_ack(
                                 &tcp_state.control,
-                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
                                 window_after_ack,
                             );
                             return Some(win_ack);
@@ -7713,22 +8048,37 @@ impl SocketTable {
                         // J2-4: per-namespace recv-memory gate (decide-only, fail-closed;
                         // identical drop+window-ACK shape as the per-conn overrun above).
                         if self
-                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .try_charge_ns_recv_gate(
+                                sock.net_ns_id,
+                                &tcp_state.control,
+                                payload.len(),
+                            )
                             .is_err()
                         {
                             let win_ack = Self::build_sack_ack(
                                 &tcp_state.control,
-                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
                                 window_after_ack,
                             );
                             return Some(win_ack);
                         }
 
                         // R162-9 FIX: Fallible recv_buffer growth
-                        if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
+                        if tcp_state
+                            .control
+                            .recv_buffer
+                            .try_reserve(payload.len())
+                            .is_err()
+                        {
                             return None;
                         }
-                        tcp_state.control.recv_buffer.extend(payload.iter().copied());
+                        tcp_state
+                            .control
+                            .recv_buffer
+                            .extend(payload.iter().copied());
                         tcp_state.control.rcv_nxt =
                             tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
                         // R144-1 FIX: Snapshot before OOO drain; skip drain if FIN.
@@ -7759,7 +8109,10 @@ impl SocketTable {
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         response = Some(Self::build_sack_ack(
                             &tcp_state.control,
-                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
                             ack_wnd,
                         ));
                         data_received = true;
@@ -7768,23 +8121,35 @@ impl SocketTable {
                         // J2-4: gate before buffering OOO (so OOO is not a budget bypass);
                         // on reject drop the segment + SACK-ACK (peer/SACK retransmits).
                         if self
-                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .try_charge_ns_recv_gate(
+                                sock.net_ns_id,
+                                &tcp_state.control,
+                                payload.len(),
+                            )
                             .is_err()
                         {
                             let ack_wnd = Self::current_adv_window(&tcp_state.control);
                             let sack_ack = Self::build_sack_ack(
                                 &tcp_state.control,
-                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
                                 ack_wnd,
                             );
                             return Some(sack_ack);
                         }
-                        tcp_state.control.ooo_insert(header.seq_num, payload, is_fin);
+                        tcp_state
+                            .control
+                            .ooo_insert(header.seq_num, payload, is_fin);
                         self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let sack_ack = Self::build_sack_ack(
                             &tcp_state.control,
-                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
                             ack_wnd,
                         );
                         return Some(sack_ack);
@@ -7793,26 +8158,35 @@ impl SocketTable {
                         // R162-6-1/6-2 FIX: Pass FIN and handle OOO-drain transitions.
                         let seg_end = header.seq_num.wrapping_add(payload.len() as u32);
                         if seq_gt(seg_end, tcp_state.control.rcv_nxt) {
-                            let skip = tcp_state.control.rcv_nxt
-                                .wrapping_sub(header.seq_num) as usize;
+                            let skip =
+                                tcp_state.control.rcv_nxt.wrapping_sub(header.seq_num) as usize;
                             let useful = &payload[skip..];
                             let pass_fin = is_fin;
                             // J2-4: gate the in-window overlap tail before buffering; on
                             // reject drop it and dup-ACK (peer/SACK retransmits).
                             if self
-                                .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, useful.len())
+                                .try_charge_ns_recv_gate(
+                                    sock.net_ns_id,
+                                    &tcp_state.control,
+                                    useful.len(),
+                                )
                                 .is_err()
                             {
                                 let ack_wnd = Self::current_adv_window(&tcp_state.control);
                                 let dup_ack = Self::build_sack_ack(
                                     &tcp_state.control,
-                                    dst_ip, src_ip, header.dst_port, header.src_port,
+                                    dst_ip,
+                                    src_ip,
+                                    header.dst_port,
+                                    header.src_port,
                                     ack_wnd,
                                 );
                                 return Some(dup_ack);
                             }
                             tcp_state.control.ooo_insert(
-                                tcp_state.control.rcv_nxt, useful, pass_fin,
+                                tcp_state.control.rcv_nxt,
+                                useful,
+                                pass_fin,
                             );
                             tcp_state.control.ooo_drain_contiguous();
                             // J2-4: reconcile to true F after the drain — covers BOTH the
@@ -7828,7 +8202,10 @@ impl SocketTable {
                                 let ack_wnd = Self::current_adv_window(&tcp_state.control);
                                 let ack = Self::build_sack_ack(
                                     &tcp_state.control,
-                                    dst_ip, src_ip, header.dst_port, header.src_port,
+                                    dst_ip,
+                                    src_ip,
+                                    header.dst_port,
+                                    header.src_port,
                                     ack_wnd,
                                 );
                                 drop(guard);
@@ -7840,7 +8217,10 @@ impl SocketTable {
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let dup_ack = Self::build_sack_ack(
                             &tcp_state.control,
-                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
                             ack_wnd,
                         );
                         return Some(dup_ack);
@@ -7850,8 +8230,7 @@ impl SocketTable {
                 // Handle peer's FIN
                 if is_fin {
                     // R144-1 FIX: Use pre-OOO-drain rcv_nxt.
-                    let expected_fin_seq = fin_expected_seq
-                        .unwrap_or(tcp_state.control.rcv_nxt);
+                    let expected_fin_seq = fin_expected_seq.unwrap_or(tcp_state.control.rcv_nxt);
                     if header.seq_num.wrapping_add(payload.len() as u32) != expected_fin_seq {
                         let dup_ack = build_tcp_segment(
                             dst_ip,
@@ -7987,7 +8366,12 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
+                    self.handle_ack_reconciled(
+                        &sock,
+                        &mut tcp_state.control,
+                        header.ack_num,
+                        self.time_wait_now(),
+                    );
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -8047,7 +8431,10 @@ impl SocketTable {
                         if (payload.len() as u32) > available {
                             let win_ack = Self::build_sack_ack(
                                 &tcp_state.control,
-                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
                                 window_after_ack,
                             );
                             return Some(win_ack);
@@ -8056,22 +8443,37 @@ impl SocketTable {
                         // J2-4: per-namespace recv-memory gate (decide-only, fail-closed;
                         // identical drop+window-ACK shape as the per-conn overrun above).
                         if self
-                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .try_charge_ns_recv_gate(
+                                sock.net_ns_id,
+                                &tcp_state.control,
+                                payload.len(),
+                            )
                             .is_err()
                         {
                             let win_ack = Self::build_sack_ack(
                                 &tcp_state.control,
-                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
                                 window_after_ack,
                             );
                             return Some(win_ack);
                         }
 
                         // R162-9 FIX: Fallible recv_buffer growth
-                        if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
+                        if tcp_state
+                            .control
+                            .recv_buffer
+                            .try_reserve(payload.len())
+                            .is_err()
+                        {
                             return None;
                         }
-                        tcp_state.control.recv_buffer.extend(payload.iter().copied());
+                        tcp_state
+                            .control
+                            .recv_buffer
+                            .extend(payload.iter().copied());
                         tcp_state.control.rcv_nxt =
                             tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
                         // R144-1 FIX: Snapshot before OOO drain; skip drain if FIN.
@@ -8102,7 +8504,10 @@ impl SocketTable {
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         response = Some(Self::build_sack_ack(
                             &tcp_state.control,
-                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
                             ack_wnd,
                         ));
                         data_received = true;
@@ -8111,23 +8516,35 @@ impl SocketTable {
                         // J2-4: gate before buffering OOO (so OOO is not a budget bypass);
                         // on reject drop the segment + SACK-ACK (peer/SACK retransmits).
                         if self
-                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .try_charge_ns_recv_gate(
+                                sock.net_ns_id,
+                                &tcp_state.control,
+                                payload.len(),
+                            )
                             .is_err()
                         {
                             let ack_wnd = Self::current_adv_window(&tcp_state.control);
                             let sack_ack = Self::build_sack_ack(
                                 &tcp_state.control,
-                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
                                 ack_wnd,
                             );
                             return Some(sack_ack);
                         }
-                        tcp_state.control.ooo_insert(header.seq_num, payload, is_fin);
+                        tcp_state
+                            .control
+                            .ooo_insert(header.seq_num, payload, is_fin);
                         self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let sack_ack = Self::build_sack_ack(
                             &tcp_state.control,
-                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
                             ack_wnd,
                         );
                         return Some(sack_ack);
@@ -8136,26 +8553,35 @@ impl SocketTable {
                         // R162-6-1/6-2 FIX: Pass FIN and handle OOO-drain transitions.
                         let seg_end = header.seq_num.wrapping_add(payload.len() as u32);
                         if seq_gt(seg_end, tcp_state.control.rcv_nxt) {
-                            let skip = tcp_state.control.rcv_nxt
-                                .wrapping_sub(header.seq_num) as usize;
+                            let skip =
+                                tcp_state.control.rcv_nxt.wrapping_sub(header.seq_num) as usize;
                             let useful = &payload[skip..];
                             let pass_fin = is_fin;
                             // J2-4: gate the in-window overlap tail before buffering; on
                             // reject drop it and dup-ACK (peer/SACK retransmits).
                             if self
-                                .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, useful.len())
+                                .try_charge_ns_recv_gate(
+                                    sock.net_ns_id,
+                                    &tcp_state.control,
+                                    useful.len(),
+                                )
                                 .is_err()
                             {
                                 let ack_wnd = Self::current_adv_window(&tcp_state.control);
                                 let dup_ack = Self::build_sack_ack(
                                     &tcp_state.control,
-                                    dst_ip, src_ip, header.dst_port, header.src_port,
+                                    dst_ip,
+                                    src_ip,
+                                    header.dst_port,
+                                    header.src_port,
                                     ack_wnd,
                                 );
                                 return Some(dup_ack);
                             }
                             tcp_state.control.ooo_insert(
-                                tcp_state.control.rcv_nxt, useful, pass_fin,
+                                tcp_state.control.rcv_nxt,
+                                useful,
+                                pass_fin,
                             );
                             tcp_state.control.ooo_drain_contiguous();
                             // J2-4: reconcile to true F after the drain — covers BOTH the
@@ -8171,7 +8597,10 @@ impl SocketTable {
                                 let ack_wnd = Self::current_adv_window(&tcp_state.control);
                                 let ack = Self::build_sack_ack(
                                     &tcp_state.control,
-                                    dst_ip, src_ip, header.dst_port, header.src_port,
+                                    dst_ip,
+                                    src_ip,
+                                    header.dst_port,
+                                    header.src_port,
                                     ack_wnd,
                                 );
                                 drop(guard);
@@ -8183,7 +8612,10 @@ impl SocketTable {
                         let ack_wnd = Self::current_adv_window(&tcp_state.control);
                         let dup_ack = Self::build_sack_ack(
                             &tcp_state.control,
-                            dst_ip, src_ip, header.dst_port, header.src_port,
+                            dst_ip,
+                            src_ip,
+                            header.dst_port,
+                            header.src_port,
                             ack_wnd,
                         );
                         return Some(dup_ack);
@@ -8193,8 +8625,7 @@ impl SocketTable {
                 // Handle peer's FIN
                 if is_fin {
                     // R144-1 FIX: Use pre-OOO-drain rcv_nxt.
-                    let expected_fin_seq = fin_expected_seq
-                        .unwrap_or(tcp_state.control.rcv_nxt);
+                    let expected_fin_seq = fin_expected_seq.unwrap_or(tcp_state.control.rcv_nxt);
                     if header.seq_num.wrapping_add(payload.len() as u32) != expected_fin_seq {
                         let dup_ack = build_tcp_segment(
                             dst_ip,
@@ -8310,7 +8741,12 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
+                    self.handle_ack_reconciled(
+                        &sock,
+                        &mut tcp_state.control,
+                        header.ack_num,
+                        self.time_wait_now(),
+                    );
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -8407,7 +8843,12 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
+                    self.handle_ack_reconciled(
+                        &sock,
+                        &mut tcp_state.control,
+                        header.ack_num,
+                        self.time_wait_now(),
+                    );
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -8516,7 +8957,12 @@ impl SocketTable {
                     && seq_ge(tcp_state.control.snd_nxt, header.ack_num);
 
                 if ack_in_range {
-                    self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
+                    self.handle_ack_reconciled(
+                        &sock,
+                        &mut tcp_state.control,
+                        header.ack_num,
+                        self.time_wait_now(),
+                    );
 
                     if seq_gt(header.seq_num, tcp_state.control.snd_wl1)
                         || (header.seq_num == tcp_state.control.snd_wl1
@@ -8647,8 +9093,13 @@ impl SocketTable {
                 // R51-1: Handle final ACK to complete passive open handshake
                 let is_syn = header.flags & TCP_FLAG_SYN != 0;
                 let is_ack = header.flags & TCP_FLAG_ACK != 0;
-                let syn_key =
-                    tcp_map_key_from_parts(net_ns_id, dst_ip, header.dst_port, src_ip, header.src_port);
+                let syn_key = tcp_map_key_from_parts(
+                    net_ns_id,
+                    dst_ip,
+                    header.dst_port,
+                    src_ip,
+                    header.src_port,
+                );
 
                 // Handle retransmitted SYN: resend cached SYN-ACK
                 if is_syn && !is_ack {
@@ -8708,7 +9159,12 @@ impl SocketTable {
                 }
 
                 // Handshake complete - transition to Established
-                self.handle_ack_reconciled(&sock, &mut tcp_state.control, header.ack_num, self.time_wait_now());
+                self.handle_ack_reconciled(
+                    &sock,
+                    &mut tcp_state.control,
+                    header.ack_num,
+                    self.time_wait_now(),
+                );
                 // R58: Apply window scaling when updating send window
                 tcp_state.control.snd_wnd =
                     decode_window(header.window, tcp_state.control.effective_snd_wscale());
@@ -8745,7 +9201,8 @@ impl SocketTable {
                     true
                 };
 
-                if payload_allowed && !payload.is_empty()
+                if payload_allowed
+                    && !payload.is_empty()
                     && header.seq_num == tcp_state.control.rcv_nxt
                 {
                     // R154-I2 FIX: Window calculation uses recv_buffer.len() without ooo_bytes.
@@ -8753,8 +9210,10 @@ impl SocketTable {
                     // buffering only occurs in Established/FinWait1/FinWait2 paths. This is
                     // the first data segment accepted after handshake completion, so ooo_bytes
                     // is guaranteed to be zero here.
-                    debug_assert_eq!(tcp_state.control.ooo_bytes, 0,
-                        "R154-I2: OOO bytes non-zero in SynReceived→Established transition");
+                    debug_assert_eq!(
+                        tcp_state.control.ooo_bytes, 0,
+                        "R154-I2: OOO bytes non-zero in SynReceived→Established transition"
+                    );
                     let consumed = tcp_state.control.recv_buffer.len() as u32;
                     let available = tcp_state.control.rcv_wnd.saturating_sub(consumed);
                     if (payload.len() as u32) <= available {
@@ -8764,32 +9223,48 @@ impl SocketTable {
                         // data+FIN segment whose data is budget-rejected also fails the
                         // FIN check at the piggyback block below -> no half-accept.
                         if self
-                            .try_charge_ns_recv_gate(sock.net_ns_id, &tcp_state.control, payload.len())
+                            .try_charge_ns_recv_gate(
+                                sock.net_ns_id,
+                                &tcp_state.control,
+                                payload.len(),
+                            )
                             .is_err()
                         {
                             let ack_wnd = Self::current_adv_window(&tcp_state.control);
                             ack_response = Some(Self::build_sack_ack(
                                 &tcp_state.control,
-                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
                                 ack_wnd,
                             ));
                         } else {
                             // R162-9 FIX: Fallible recv_buffer growth
-                            if tcp_state.control.recv_buffer.try_reserve(payload.len()).is_err() {
+                            if tcp_state
+                                .control
+                                .recv_buffer
+                                .try_reserve(payload.len())
+                                .is_err()
+                            {
                                 return None;
                             }
-                            tcp_state.control.recv_buffer.extend(payload.iter().copied());
-                            tcp_state.control.rcv_nxt = tcp_state
+                            tcp_state
                                 .control
-                                .rcv_nxt
-                                .wrapping_add(payload.len() as u32);
+                                .recv_buffer
+                                .extend(payload.iter().copied());
+                            tcp_state.control.rcv_nxt =
+                                tcp_state.control.rcv_nxt.wrapping_add(payload.len() as u32);
                             // J2-4: reconcile to true F (== recv_buffer.len(); ooo_bytes==0
                             // here per the debug_assert above). Runs before drop(guard).
                             self.reconcile_ns_recv(sock.net_ns_id, &mut tcp_state.control);
                             let ack_wnd = Self::current_adv_window(&tcp_state.control);
                             ack_response = Some(Self::build_sack_ack(
                                 &tcp_state.control,
-                                dst_ip, src_ip, header.dst_port, header.src_port,
+                                dst_ip,
+                                src_ip,
+                                header.dst_port,
+                                header.src_port,
                                 ack_wnd,
                             ));
                         }
@@ -8809,8 +9284,10 @@ impl SocketTable {
                         .rcv_wnd
                         .saturating_sub(tcp_state.control.recv_buffer.len() as u32);
                     ack_response = Some(build_tcp_segment(
-                        dst_ip, src_ip,
-                        header.dst_port, header.src_port,
+                        dst_ip,
+                        src_ip,
+                        header.dst_port,
+                        header.src_port,
                         tcp_state.control.snd_nxt,
                         tcp_state.control.rcv_nxt,
                         TCP_FLAG_ACK,
@@ -9656,8 +10133,7 @@ impl SocketTable {
                                 mark_timeout_close = true;
                             } else {
                                 // Send keepalive probe: seq = snd_una - 1 to elicit ACK
-                                let advertised_wnd =
-                                    Self::current_adv_window(&tcp_state.control);
+                                let advertised_wnd = Self::current_adv_window(&tcp_state.control);
                                 let probe = build_tcp_segment(
                                     local_ip,
                                     remote_ip,
@@ -9671,7 +10147,14 @@ impl SocketTable {
                                 );
                                 tcp_state.control.keepalive_probes_sent =
                                     tcp_state.control.keepalive_probes_sent.saturating_add(1);
-                                keepalive_probes.push((remote_ip, probe, sock.net_ns_id.0, local_ip, local_port, remote_port));
+                                keepalive_probes.push((
+                                    remote_ip,
+                                    probe,
+                                    sock.net_ns_id.0,
+                                    local_ip,
+                                    local_port,
+                                    remote_port,
+                                ));
                             }
                         }
                     }
@@ -9884,8 +10367,14 @@ impl SocketTable {
             {
                 use crate::conntrack::ct_process_tcp;
                 let _ = ct_process_tcp(
-                    ns_id, local_ip, dst_ip, local_port, remote_port,
-                    TCP_FLAG_ACK, 0, current_time_ms,
+                    ns_id,
+                    local_ip,
+                    dst_ip,
+                    local_port,
+                    remote_port,
+                    TCP_FLAG_ACK,
+                    0,
+                    current_time_ms,
                 );
             }
             let _ = transmit_tcp_segment(dst_ip, &seg, ns_id);
@@ -9978,7 +10467,8 @@ impl SocketTable {
             meta.remote_ip,
             meta.remote_port,
         ) {
-            let key = tcp_map_key_from_parts(sock.net_ns_id, Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
+            let key =
+                tcp_map_key_from_parts(sock.net_ns_id, Ipv4Addr(lip), lport, Ipv4Addr(rip), rport);
             if self.tcp_conns.lock().remove(&key).is_some() {
                 // J2-1: uncharge the per-namespace connection (bound to tcp_conns
                 // membership, independent of counted_in_active).

@@ -1425,7 +1425,10 @@ fn generate_status(pid: u32) -> String {
         pid_ns_chain: alloc::vec::Vec<kernel_core::PidNamespaceMembership>,
     }
 
-    let (snap, caller_chain): (Option<StatusSnap>, alloc::vec::Vec<kernel_core::PidNamespaceMembership>) = {
+    let (snap, caller_chain): (
+        Option<StatusSnap>,
+        alloc::vec::Vec<kernel_core::PidNamespaceMembership>,
+    ) = {
         let table = PROCESS_TABLE.lock();
         let caller_chain = process::current_pid()
             .and_then(|cur_pid| table.get(cur_pid))
@@ -1433,32 +1436,35 @@ fn generate_status(pid: u32) -> String {
             .map(|proc_arc| proc_arc.lock().pid_ns_chain.clone())
             .unwrap_or_default();
 
-        let s = table.get(pid as usize).and_then(|slot| slot.as_ref()).map(|proc_arc| {
-            let p = proc_arc.lock();
-            let (sc, sn) = match p.state {
-                ProcessState::Zombie => ('Z', "zombie"),
-                ProcessState::Terminated => ('X', "dead"),
-                ProcessState::Stopped => ('T', "stopped"),
-                _ if p.stopped => ('T', "stopped"),
-                ProcessState::Ready | ProcessState::Running => ('R', "running"),
-                ProcessState::Blocked | ProcessState::Sleeping => ('S', "sleeping"),
-            };
-            let creds = p.credentials.read();
-            StatusSnap {
-                name: p.name.clone(),
-                umask: p.umask,
-                state_char: sc,
-                state_name: sn,
-                tgid: p.tgid,
-                pid_val: p.pid,
-                ppid: p.ppid,
-                uid: creds.uid,
-                euid: creds.euid,
-                gid: creds.gid,
-                egid: creds.egid,
-                pid_ns_chain: p.pid_ns_chain.clone(),
-            }
-        });
+        let s = table
+            .get(pid as usize)
+            .and_then(|slot| slot.as_ref())
+            .map(|proc_arc| {
+                let p = proc_arc.lock();
+                let (sc, sn) = match p.state {
+                    ProcessState::Zombie => ('Z', "zombie"),
+                    ProcessState::Terminated => ('X', "dead"),
+                    ProcessState::Stopped => ('T', "stopped"),
+                    _ if p.stopped => ('T', "stopped"),
+                    ProcessState::Ready | ProcessState::Running => ('R', "running"),
+                    ProcessState::Blocked | ProcessState::Sleeping => ('S', "sleeping"),
+                };
+                let creds = p.credentials.read();
+                StatusSnap {
+                    name: p.name.clone(),
+                    umask: p.umask,
+                    state_char: sc,
+                    state_name: sn,
+                    tgid: p.tgid,
+                    pid_val: p.pid,
+                    ppid: p.ppid,
+                    uid: creds.uid,
+                    euid: creds.euid,
+                    gid: creds.gid,
+                    egid: creds.egid,
+                    pid_ns_chain: p.pid_ns_chain.clone(),
+                }
+            });
         (s, caller_chain)
     };
     // PROCESS_TABLE lock dropped here
@@ -1486,10 +1492,21 @@ fn generate_status(pid: u32) -> String {
                  Uid:\t{}\t{}\t{}\t{}\n\
                  Gid:\t{}\t{}\t{}\t{}\n\
                  Threads:\t1\n",
-                s.name, s.umask, s.state_char, s.state_name,
-                ns_tgid, ns_pid, ns_ppid,
-                s.uid, s.euid, s.uid, s.uid,
-                s.gid, s.egid, s.gid, s.gid,
+                s.name,
+                s.umask,
+                s.state_char,
+                s.state_name,
+                ns_tgid,
+                ns_pid,
+                ns_ppid,
+                s.uid,
+                s.euid,
+                s.uid,
+                s.uid,
+                s.gid,
+                s.egid,
+                s.gid,
+                s.gid,
             )
         }
         _ => String::new(),
@@ -1607,7 +1624,9 @@ fn generate_maps(pid: u32) -> String {
             // D2 Phase 2: mmap_regions values are MmapEntry; snapshot the raw
             // packed word so the downstream formatting (len/flags decode) is
             // unchanged.
-            let regions: Vec<(usize, usize)> = mm.mmap_regions.iter()
+            let regions: Vec<(usize, usize)> = mm
+                .mmap_regions
+                .iter()
                 .take(MAX_MAPS_ENTRIES)
                 .map(|(&start, &entry)| (start, entry.raw()))
                 .collect();

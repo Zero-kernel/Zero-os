@@ -557,7 +557,10 @@ pub fn create_pipe(flags: PipeFlags) -> Result<(PipeHandle, PipeHandle), PipeErr
 }
 
 /// 创建指定容量的管道
-pub fn create_pipe_with_capacity(capacity: usize, flags: PipeFlags) -> Result<(PipeHandle, PipeHandle), PipeError> {
+pub fn create_pipe_with_capacity(
+    capacity: usize,
+    flags: PipeFlags,
+) -> Result<(PipeHandle, PipeHandle), PipeError> {
     // R111-3 FIX: Use fetch_update + checked_add to prevent wrapping to 0
     // on usize overflow.  Follows the R105-5 pattern established for IPC
     // endpoint IDs and socket IDs.

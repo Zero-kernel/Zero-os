@@ -14,16 +14,16 @@ extern crate block;
 extern crate cap;
 extern crate ipc;
 extern crate kernel_core;
+extern crate livepatch;
 extern crate mm;
 extern crate net;
 extern crate sched;
 extern crate security;
-extern crate vfs;
-extern crate livepatch; // R101-4: Boot-time ECDSA key validation
+extern crate vfs; // R101-4: Boot-time ECDSA key validation
 #[macro_use]
 extern crate audit;
-extern crate trace;
 extern crate compliance;
+extern crate trace;
 #[macro_use]
 extern crate klog;
 
@@ -44,8 +44,7 @@ use trace::counters::{increment_counter, TraceCounter};
 /// This flag is set to `true` after the first successful counter increment
 /// (which happens during early boot via timer ISR). The alloc_error_handler
 /// only increments the counter when this flag is `true`.
-static COUNTERS_READY: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static COUNTERS_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// R109-4 FIX: Flag to distinguish early-boot context from post-boot kernel threads.
 ///
@@ -201,13 +200,19 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
     };
 
     // Write test pattern
-    klog!(Info, "        Writing test pattern to sector {}...", test_sector);
+    klog!(
+        Info,
+        "        Writing test pattern to sector {}...",
+        test_sector
+    );
     match device.write_sync(test_sector, &test_pattern) {
         Ok(n) if n == sector_size => {}
         Ok(n) => {
-            klog!(Error,
+            klog!(
+                Error,
                 "        [FAIL] Write returned {} bytes, expected {}",
-                n, sector_size
+                n,
+                sector_size
             );
             return false;
         }
@@ -222,9 +227,11 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
     match device.read_sync(test_sector, &mut read_buf) {
         Ok(n) if n == sector_size => {}
         Ok(n) => {
-            klog!(Error,
+            klog!(
+                Error,
                 "        [FAIL] Read returned {} bytes, expected {}",
-                n, sector_size
+                n,
+                sector_size
             );
             return false;
         }
@@ -240,7 +247,11 @@ fn test_block_write(device: &alloc::sync::Arc<dyn block::BlockDevice>) -> bool {
         true
     } else {
         klog!(Error, "        [FAIL] Data mismatch!");
-        klog!(Info, "        Expected first 8: {:02x?}", &test_pattern[..8]);
+        klog!(
+            Info,
+            "        Expected first 8: {:02x?}",
+            &test_pattern[..8]
+        );
         klog!(Info, "        Got first 8:      {:02x?}", &read_buf[..8]);
         false
     }
@@ -411,9 +422,14 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         match security::init(sec_config, &mut frame_allocator) {
             Ok(report) => {
                 klog_always!("      ✓ Security hardening applied");
-                klog!(Info, "        - Identity map: {:?}", report.identity_cleanup);
+                klog!(
+                    Info,
+                    "        - Identity map: {:?}",
+                    report.identity_cleanup
+                );
                 if let Some(nx) = &report.nx_summary {
-                    klog!(Info, 
+                    klog!(
+                        Info,
                         "        - NX enforced: {} pages protected",
                         nx.data_nx_pages
                     );
@@ -449,10 +465,16 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 // can verify which security features are active at boot.
                 let ps = compliance::policy();
                 klog_always!("      PolicySurface enforcement:");
-                klog_always!("        - panic_redact_details: {}", ps.panic_redact_details);
+                klog_always!(
+                    "        - panic_redact_details: {}",
+                    ps.panic_redact_details
+                );
                 klog_always!("        - kaslr_fail_closed:    {}", ps.kaslr_fail_closed);
                 klog_always!("        - kpti_fail_closed:     {}", ps.kpti_fail_closed);
-                klog_always!("        - debug_interfaces:     {}", ps.debug_interfaces_enabled);
+                klog_always!(
+                    "        - debug_interfaces:     {}",
+                    ps.debug_interfaces_enabled
+                );
                 klog_always!("        - spectre_mitigations:  {}", ps.spectre_mitigations);
                 klog_always!("        - kptr_guard:           {}", ps.kptr_guard);
                 klog_always!("        - strict_wxorx:         {}", ps.strict_wxorx);
@@ -660,11 +682,16 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             Ok(info) => {
                 klog_always!(
                     "      ✓ HPET initialized (freq={} Hz, timers={}, 64-bit={})",
-                    info.frequency_hz, info.comparator_count, info.counter_64bit
+                    info.frequency_hz,
+                    info.comparator_count,
+                    info.counter_64bit
                 );
             }
             Err(e) => {
-                klog_always!("      ! HPET unavailable: {:?} (using PIT for calibration)", e);
+                klog_always!(
+                    "      ! HPET unavailable: {:?} (using PIT for calibration)",
+                    e
+                );
             }
         }
 
@@ -786,7 +813,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
     let rsdp_phys = boot_info.map(|i| i.rsdp_address).unwrap_or(0);
     match iommu::init(rsdp_phys) {
         Ok(units) => {
-            klog_always!("      ✓ IOMMU active: {} unit(s), DMA translation enabled", units);
+            klog_always!(
+                "      ✓ IOMMU active: {} unit(s), DMA translation enabled",
+                units
+            );
         }
         Err(iommu::IommuError::NoDmarTable) => {
             klog_always!("      ! No ACPI DMAR table discovered — legacy (unisolated) DMA mode");
@@ -846,14 +876,18 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                 match vfs::Ext2Fs::mount(device) {
                     Ok(fs) => match vfs::mount("/mnt", fs) {
                         Ok(()) => klog_always!("      ✓ Mounted /dev/{} on /mnt as ext2", name),
-                        Err(e) => klog!(Warn,
+                        Err(e) => klog!(
+                            Warn,
                             "      ! Registered /dev/{} but failed to mount on /mnt: {:?}",
-                            name, e
+                            name,
+                            e
                         ),
                     },
-                    Err(e) => klog!(Warn,
+                    Err(e) => klog!(
+                        Warn,
                         "      ! Registered /dev/{} but failed to initialize ext2: {:?}",
-                        name, e
+                        name,
+                        e
                     ),
                 }
             }
@@ -971,7 +1005,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                     },
                     Err(e) => {
                         klog!(Error, "      ! Failed to generate audit HMAC key: {:?}", e);
-                        klog!(Warn, "        - Audit events using plain SHA-256 chain only");
+                        klog!(
+                            Warn,
+                            "        - Audit events using plain SHA-256 chain only"
+                        );
                     }
                 }
                 // R72-HMAC: Zero key material from stack to limit exposure window
@@ -989,7 +1026,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
                     audit::AuditKind::Internal,
                     audit::AuditOutcome::Info,
                     audit::AuditSubject::new(pid, uid, 0, None),
-                    audit::AuditObject::Process { pid, signal: Some(9) }, // SIGKILL
+                    audit::AuditObject::Process {
+                        pid,
+                        signal: Some(9),
+                    }, // SIGKILL
                     &[needed, rss, adj as u64],
                     0,
                     timestamp,
@@ -1000,17 +1040,19 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             // P1-4: Register livepatch audit callback for tamper-evident lifecycle recording.
             // Livepatch state transitions (load/enable/disable/unload) are now fed into
             // the hash-chained audit ring buffer alongside OOM events.
-            livepatch::register_audit_callback(|action, patch_id, target_addr, extra, timestamp| {
-                let _ = audit::emit(
-                    audit::AuditKind::Internal,
-                    audit::AuditOutcome::Info,
-                    audit::AuditSubject::new(0, 0, 0, None),
-                    audit::AuditObject::None,
-                    &[action, patch_id, target_addr, extra[0], extra[1], extra[2]],
-                    0,
-                    timestamp,
-                );
-            });
+            livepatch::register_audit_callback(
+                |action, patch_id, target_addr, extra, timestamp| {
+                    let _ = audit::emit(
+                        audit::AuditKind::Internal,
+                        audit::AuditOutcome::Info,
+                        audit::AuditSubject::new(0, 0, 0, None),
+                        audit::AuditObject::None,
+                        &[action, patch_id, target_addr, extra[0], extra[1], extra[2]],
+                        0,
+                        timestamp,
+                    );
+                },
+            );
             klog_always!("      ✓ Livepatch audit callback registered (P1-4)");
         }
         Err(e) => {
@@ -1064,7 +1106,11 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
         // 运行运行时功能测试
         let test_report = runtime_tests::run_all_runtime_tests();
         if test_report.failed > 0 {
-            klog!(Warn, "WARNING: {} runtime tests failed!", test_report.failed);
+            klog!(
+                Warn,
+                "WARNING: {} runtime tests failed!",
+                test_report.failed
+            );
         }
 
         // 运行 Ring 3 用户态测试
@@ -1075,8 +1121,10 @@ pub extern "C" fn _start(boot_info_ptr: u64) -> ! {
             klog!(Error, "      ! Ring 3 test setup failed");
         }
     } else {
-        klog_force!("[POLICY] {} profile: debug/test interfaces disabled",
-                     compliance::policy().profile.name());
+        klog_force!(
+            "[POLICY] {} profile: debug/test interfaces disabled",
+            compliance::policy().profile.name()
+        );
     }
 
     klog_always!("=== System Ready ===");

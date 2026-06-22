@@ -95,7 +95,7 @@ impl HardeningProfile {
                 enforce_nx: true,
                 validate_wxorx: true,
                 initialize_rng: true,
-                strict_wxorx: true,  // Panic on W^X violation
+                strict_wxorx: true, // Panic on W^X violation
                 enable_kptr_guard: true,
                 enable_spectre_mitigations: true,
                 run_security_tests: true,
@@ -114,7 +114,7 @@ impl HardeningProfile {
             Self::Performance => SecurityConfig {
                 phys_offset,
                 cleanup_strategy: security::IdentityCleanupStrategy::RemoveWritable,
-                enforce_nx: true,  // Always keep NX for basic safety
+                enforce_nx: true, // Always keep NX for basic safety
                 validate_wxorx: false,
                 initialize_rng: true,
                 strict_wxorx: false,
@@ -887,11 +887,7 @@ impl HardeningProfile {
         let lower: [u8; 16] = {
             let mut buf = [0u8; 16];
             for (i, &b) in s.iter().take(16).enumerate() {
-                buf[i] = if b >= b'A' && b <= b'Z' {
-                    b + 32
-                } else {
-                    b
-                };
+                buf[i] = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
             }
             buf
         };
@@ -900,9 +896,13 @@ impl HardeningProfile {
 
         if lower_slice == b"secure" || lower_slice == b"strict" || lower_slice == b"hardened" {
             Some(Self::Secure)
-        } else if lower_slice == b"balanced" || lower_slice == b"default" || lower_slice == b"normal" {
+        } else if lower_slice == b"balanced"
+            || lower_slice == b"default"
+            || lower_slice == b"normal"
+        {
             Some(Self::Balanced)
-        } else if lower_slice == b"performance" || lower_slice == b"perf" || lower_slice == b"fast" {
+        } else if lower_slice == b"performance" || lower_slice == b"perf" || lower_slice == b"fast"
+        {
             Some(Self::Performance)
         } else {
             None

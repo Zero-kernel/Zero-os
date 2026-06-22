@@ -12,7 +12,7 @@
 
 use userspace::libc::{print, print_hex, print_int, println};
 use userspace::syscall::{
-    is_error, sys_getpid, sys_gettid, sys_getrandom, sys_set_robust_list, sys_set_tid_address,
+    is_error, sys_getpid, sys_getrandom, sys_gettid, sys_set_robust_list, sys_set_tid_address,
 };
 
 /// Test result type

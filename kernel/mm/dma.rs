@@ -305,7 +305,8 @@ impl Drop for DmaBuffer {
                 scrub_range(self.phys, alloc_bytes);
                 kprintln!(
                     "[DMA] WARNING: IOMMU unmap failed for iova={:#x} size={}, leaking pages",
-                    self.iova, self.size
+                    self.iova,
+                    self.size
                 );
                 return;
             }
@@ -396,12 +397,10 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
             return Err(DmaError::InvalidSize);
         }
     };
-    let alloc_bytes = alloc_pages
-        .checked_mul(DMA_PAGE_SIZE)
-        .ok_or_else(|| {
-            buddy_allocator::free_physical_pages(frame, pages);
-            DmaError::InvalidSize
-        })?;
+    let alloc_bytes = alloc_pages.checked_mul(DMA_PAGE_SIZE).ok_or_else(|| {
+        buddy_allocator::free_physical_pages(frame, pages);
+        DmaError::InvalidSize
+    })?;
 
     // Verify the allocation is within the CPU direct-map range.
     let end = phys
@@ -419,10 +418,7 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
     // Identity IOVA strategy: keep driver-facing DMA addresses unchanged.
     // This simplifies driver code since iova == phys.
     let iova = phys;
-    let domain_id = IOMMU_OPS
-        .get()
-        .map(|ops| ops.kernel_domain_id)
-        .unwrap_or(0);
+    let domain_id = IOMMU_OPS.get().map(|ops| ops.kernel_domain_id).unwrap_or(0);
 
     // On-demand IOMMU mapping (only if IOMMU ops registered).
     if let Some(ops) = IOMMU_OPS.get() {
@@ -436,7 +432,8 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
                     // Safe error: no mapping was installed, we can free the pages
                     kprintln!(
                         "[DMA] INFO: IOMMU map rejected for phys={:#x} size={}, freeing pages",
-                        phys, size
+                        phys,
+                        size
                     );
                     buddy_allocator::free_physical_pages(frame, pages);
                 }
@@ -445,7 +442,8 @@ pub fn alloc_dma_buffer(size: usize) -> Result<DmaBuffer, DmaError> {
                     // to prevent device from accessing reused memory
                     kprintln!(
                         "[DMA] WARNING: IOMMU map failed for phys={:#x} size={}, leaking pages",
-                        phys, size
+                        phys,
+                        size
                     );
                 }
             }

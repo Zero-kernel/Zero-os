@@ -415,10 +415,7 @@ pub unsafe fn read_and_clear_fault_status(reg_base: u64) -> (bool, bool, u8) {
     // from retriggering interrupts or masking new faults
     let clear_mask = status & (FSTS_PFO | FSTS_PPF | FSTS_FRI_MASK);
     if clear_mask != 0 {
-        write_volatile(
-            (reg_base + VTD_REG_FSTS as u64) as *mut u32,
-            clear_mask,
-        );
+        write_volatile((reg_base + VTD_REG_FSTS as u64) as *mut u32, clear_mask);
     }
 
     (overflow, pending, fri)
@@ -502,11 +499,11 @@ mod tests {
             FaultReason::from_code(0x1),
             FaultReason::RootEntryNotPresent
         );
-        assert_eq!(
-            FaultReason::from_code(0x5),
-            FaultReason::WriteToReadOnly
-        );
-        assert!(matches!(FaultReason::from_code(0xFF), FaultReason::Unknown(0xFF)));
+        assert_eq!(FaultReason::from_code(0x5), FaultReason::WriteToReadOnly);
+        assert!(matches!(
+            FaultReason::from_code(0xFF),
+            FaultReason::Unknown(0xFF)
+        ));
     }
 
     #[test]

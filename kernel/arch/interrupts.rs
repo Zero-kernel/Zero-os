@@ -329,7 +329,11 @@ impl InterruptStatsSnapshot {
         klog!(Info, "  Breakpoint:       {}", self.breakpoint);
         klog!(Info, "  Page Fault:       {}", self.page_fault);
         klog!(Info, "  Double Fault:     {}", self.double_fault);
-        klog!(Info, "  GP Fault:         {}", self.general_protection_fault);
+        klog!(
+            Info,
+            "  GP Fault:         {}",
+            self.general_protection_fault
+        );
         klog!(Info, "  Invalid Opcode:   {}", self.invalid_opcode);
         klog!(Info, "  Divide Error:     {}", self.divide_error);
         klog!(Info, "Hardware Interrupts:");
@@ -1095,9 +1099,7 @@ extern "x86-interrupt" fn page_fault_handler(
             fault_addr, stack_frame
         );
         #[cfg(not(debug_assertions))]
-        panic!(
-            "Usercopy page fault (details redacted) - TOCTOU detected (no current PID)"
-        );
+        panic!("Usercopy page fault (details redacted) - TOCTOU detected (no current PID)");
     }
 
     // 【安全修复 S-3】检查是否为用户态触发的用户空间缺页
@@ -1271,7 +1273,11 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                 macro_rules! uart_wait_thr {
                     () => {
                         for _ in 0..MAX_WAIT {
-                            if (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5).read() & 0x20) != 0 {
+                            if (x86_64::instructions::port::PortReadOnly::<u8>::new(port + 5)
+                                .read()
+                                & 0x20)
+                                != 0
+                            {
                                 break;
                             }
                         }
@@ -1284,7 +1290,8 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                 uart_wait_thr!();
                 x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b':');
                 uart_wait_thr!();
-                x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b'0' + (cpu_id as u8));
+                x86_64::instructions::port::PortWriteOnly::<u8>::new(port)
+                    .write(b'0' + (cpu_id as u8));
                 uart_wait_thr!();
                 x86_64::instructions::port::PortWriteOnly::<u8>::new(port).write(b']');
                 uart_wait_thr!();

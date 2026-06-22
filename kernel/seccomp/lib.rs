@@ -105,7 +105,10 @@ pub fn register_current_hooks(evaluator: SeccompEvaluator, enabled_check: Seccom
     *CURRENT_ENABLED_CHECK.write() = Some(enabled_check);
     // R65-14 FIX: Mark seccomp as initialized - fail-closed after this point
     SECCOMP_INITIALIZED.store(true, Ordering::SeqCst);
-    klog!(Info, "  Seccomp hooks registered for current-process evaluation (fail-closed mode active)");
+    klog!(
+        Info,
+        "  Seccomp hooks registered for current-process evaluation (fail-closed mode active)"
+    );
 }
 
 // ============================================================================
@@ -254,9 +257,7 @@ pub fn pledge_syscall_list(promises: PledgePromises) -> Vec<u64> {
         allowed_syscalls.extend_from_slice(&[
             SYS_OPEN,   // R150-3 FIX: CPATH is a valid path capability for open (creation)
             SYS_OPENAT, // R150-3 FIX: match promise_allows_syscall() has_path gate
-            SYS_MKDIR,
-            SYS_RMDIR,
-            SYS_LINK,
+            SYS_MKDIR, SYS_RMDIR, SYS_LINK,
         ]);
     }
 
@@ -279,12 +280,7 @@ pub fn pledge_syscall_list(promises: PledgePromises) -> Vec<u64> {
 
     if promises.contains(PledgePromises::PROC) {
         allowed_syscalls.extend_from_slice(&[
-            SYS_CLONE,
-            SYS_FORK,
-            SYS_VFORK,
-            SYS_WAIT4,
-            SYS_KILL,
-            SYS_WAITID,
+            SYS_CLONE, SYS_FORK, SYS_VFORK, SYS_WAIT4, SYS_KILL, SYS_WAITID,
         ]);
     }
 
@@ -293,18 +289,11 @@ pub fn pledge_syscall_list(promises: PledgePromises) -> Vec<u64> {
     }
 
     if promises.contains(PledgePromises::THREAD) {
-        allowed_syscalls.extend_from_slice(&[
-            SYS_CLONE,
-            SYS_FUTEX,
-            SYS_SET_TID_ADDRESS,
-        ]);
+        allowed_syscalls.extend_from_slice(&[SYS_CLONE, SYS_FUTEX, SYS_SET_TID_ADDRESS]);
     }
 
     if promises.contains(PledgePromises::TIME) {
-        allowed_syscalls.extend_from_slice(&[
-            SYS_CLOCK_GETTIME,
-            SYS_GETRANDOM,
-        ]);
+        allowed_syscalls.extend_from_slice(&[SYS_CLOCK_GETTIME, SYS_GETRANDOM]);
     }
 
     if promises.contains(PledgePromises::SENDSIG) {
@@ -312,12 +301,7 @@ pub fn pledge_syscall_list(promises: PledgePromises) -> Vec<u64> {
     }
 
     if promises.contains(PledgePromises::FATTR) {
-        allowed_syscalls.extend_from_slice(&[
-            SYS_CHMOD,
-            SYS_CHOWN,
-            SYS_FCHMOD,
-            SYS_FCHOWN,
-        ]);
+        allowed_syscalls.extend_from_slice(&[SYS_CHMOD, SYS_CHOWN, SYS_FCHMOD, SYS_FCHOWN]);
     }
 
     if promises.contains(PledgePromises::RLIMIT) {
@@ -538,9 +522,15 @@ pub fn run_seccomp_cap_self_test() {
         installed += 1;
     }
 
-    assert!(rejected, "seccomp chain cap must reject before unbounded growth");
+    assert!(
+        rejected,
+        "seccomp chain cap must reject before unbounded growth"
+    );
     assert!(installed >= 1, "a below-cap install must succeed");
-    assert!(installed <= max_installs, "must not exceed the total-insn cap");
+    assert!(
+        installed <= max_installs,
+        "must not exceed the total-insn cap"
+    );
 
     let total: usize = state.filters().iter().map(|f| f.prog_len()).sum();
     assert!(

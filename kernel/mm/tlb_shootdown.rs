@@ -637,9 +637,7 @@ fn enqueue_mailbox(
 
                 // Also update request_gen for compatibility with ACK waiting.
                 // Use fetch_max to keep it monotonic under concurrent posters.
-                mailbox
-                    .request_gen
-                    .fetch_max(generation, Ordering::Release);
+                mailbox.request_gen.fetch_max(generation, Ordering::Release);
                 return true;
             }
             // CAS failed, retry
@@ -713,9 +711,7 @@ fn post_requests(targets: &[usize], cr3: u64, start: u64, len: u64, generation: 
         if !enqueue_mailbox(mailbox, cr3, start, len, generation) {
             // R106-5 FIX: Queue saturated for this CPU. Advance request_gen so
             // the IPI handler performs a full flush when it sees the generation gap.
-            mailbox
-                .request_gen
-                .fetch_max(generation, Ordering::Release);
+            mailbox.request_gen.fetch_max(generation, Ordering::Release);
             STATS_COALESCED_FALLBACKS.fetch_add(1, Ordering::Relaxed);
             fallback_cpus.push(cpu);
         }
@@ -796,11 +792,7 @@ fn get_unacked_cpus(targets: &[usize], generation: u64) -> Vec<usize> {
 ///
 /// Codex review fix: On timeout, resends IPIs and retries before failing.
 /// After ACK_TIMEOUT_RETRIES attempts, panics in debug builds or warns in release.
-fn wait_for_acks_with_retry(
-    targets: &[usize],
-    generation: u64,
-    sender: TlbIpiSender,
-) -> bool {
+fn wait_for_acks_with_retry(targets: &[usize], generation: u64, sender: TlbIpiSender) -> bool {
     for attempt in 0..=ACK_TIMEOUT_RETRIES {
         if wait_for_acks(targets, generation) {
             return true;
@@ -993,11 +985,9 @@ impl ShootdownCpuPin {
                 continue;
             }
 
-            let per_cpu = PER_CPU_DATA
-                .get_cpu(cpu_id)
-                .unwrap_or_else(|| {
-                    panic!("TLB shootdown: missing per-CPU slot for CPU {}", cpu_id)
-                });
+            let per_cpu = PER_CPU_DATA.get_cpu(cpu_id).unwrap_or_else(|| {
+                panic!("TLB shootdown: missing per-CPU slot for CPU {}", cpu_id)
+            });
 
             per_cpu.preempt_disable();
             core::sync::atomic::compiler_fence(Ordering::SeqCst);
@@ -1064,7 +1054,12 @@ pub fn flush_current_as_all() {
     flush_all_local();
 
     // Wait for remote ACKs with retry support
-    if let Some(ShootdownDispatch { targets, generation, .. }) = shoot {
+    if let Some(ShootdownDispatch {
+        targets,
+        generation,
+        ..
+    }) = shoot
+    {
         // P2-7 FIX: Use mailbox_for_cpu() with pinned CPU ID instead of
         // current_cpu().tlb_mailbox() to prevent stale reference on migration.
         let local_mailbox = mailbox_for_cpu(_pin.cpu_id()).unwrap_or_else(|| {
@@ -1153,7 +1148,12 @@ pub fn flush_current_as_range(start: VirtAddr, len: usize) {
             }
 
             // Wait for remote ACKs with retry support
-            if let Some(ShootdownDispatch { targets, generation, .. }) = shoot {
+            if let Some(ShootdownDispatch {
+                targets,
+                generation,
+                ..
+            }) = shoot
+            {
                 // R71-4 FIX: Same self-ACK protection as flush_current_as_all.
                 // Only ACK if the request_gen matches to avoid accidentally
                 // acknowledging a foreign request.

@@ -317,7 +317,10 @@ impl Tracepoint {
         // R89-3 FIX: Store function pointer as raw bits (usize), not data pointer
         let raw = cb as usize;
         // CAS: only install if currently zero (no existing callback)
-        match self.callback.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire) {
+        match self
+            .callback
+            .compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => Ok(()),
             Err(_) => Err(TraceError::CallbackAlreadySet),
         }
@@ -575,7 +578,8 @@ pub fn init() {
     let _ = register_tracepoint(&watchdog::TRACE_WATCHDOG_HANG);
 
     klog_always!("[trace] Observability subsystem initialized");
-    klog!(Info, 
+    klog!(
+        Info,
         "      Max tracepoints: {}, counters: {}, watchdog slots: {}",
         MAX_TRACEPOINTS,
         counters::TRACE_COUNTER_COUNT,

@@ -232,11 +232,13 @@ impl SecurityReport {
             klog!(Info, "  Violations: {}", wx.violations);
         }
 
-        klog!(Info, 
+        klog!(
+            Info,
             "CSPRNG: {}",
             if self.rng_ready { "Ready" } else { "Not Ready" }
         );
-        klog!(Info, 
+        klog!(
+            Info,
             "kptr Guard: {}",
             if self.kptr_guard_active {
                 "Active"
@@ -247,7 +249,8 @@ impl SecurityReport {
 
         if let Some(ref spectre) = self.spectre_status {
             klog!(Info, "Spectre/Meltdown Mitigations:");
-            klog!(Info, 
+            klog!(
+                Info,
                 "  IBRS: {} (supported: {})",
                 if spectre.ibrs_enabled {
                     "enabled"
@@ -256,7 +259,8 @@ impl SecurityReport {
                 },
                 spectre.ibrs_supported
             );
-            klog!(Info, 
+            klog!(
+                Info,
                 "  STIBP: {} (supported: {})",
                 if spectre.stibp_enabled {
                     "enabled"
@@ -271,14 +275,18 @@ impl SecurityReport {
 
         if let Some(ref tests) = self.test_report {
             klog!(Info, "Security Self-Tests:");
-            klog!(Info, 
+            klog!(
+                Info,
                 "  Passed: {}, Failed: {}, Warnings: {}",
-                tests.passed, tests.failed, tests.warnings
+                tests.passed,
+                tests.failed,
+                tests.warnings
             );
         }
 
         klog!(Info, "Total Violations: {}", self.total_violations);
-        klog!(Info, 
+        klog!(
+            Info,
             "Overall Status: {}",
             if self.is_secure() {
                 "SECURE"
@@ -368,13 +376,15 @@ pub fn init(
                 report.wxorx_summary = Some(summary);
                 report.total_violations += summary.violations;
                 if config.strict_wxorx {
-                    klog!(Error,
+                    klog!(
+                        Error,
                         "      {} W^X violation(s) detected (strict mode)",
                         summary.violations
                     );
                     return Err(SecurityError::Wxorx(WxorxError::PolicyViolation(summary)));
                 }
-                klog!(Warn,
+                klog!(
+                    Warn,
                     "      WARNING: {} W^X violation(s) detected",
                     summary.violations
                 );
@@ -387,7 +397,11 @@ pub fn init(
                 });
 
                 if config.strict_wxorx {
-                    klog!(Error, "      W^X violation at {:?} (strict mode)", v.virt_base);
+                    klog!(
+                        Error,
+                        "      W^X violation at {:?} (strict mode)",
+                        v.virt_base
+                    );
                     return Err(SecurityError::Wxorx(WxorxError::Violation(v)));
                 }
                 klog!(Warn, "      WARNING: W^X violation at {:?}", v.virt_base);
@@ -468,7 +482,8 @@ pub fn init(
         let test_report = tests::run_security_tests(&ctx);
 
         if test_report.failed > 0 {
-            klog!(Warn,
+            klog!(
+                Warn,
                 "      WARNING: {} security tests failed",
                 test_report.failed
             );

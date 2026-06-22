@@ -168,7 +168,9 @@ pub fn test_cgroup_vfs_dir_budget() {
     klog_always!("  [TEST] Per-Cgroup VFS Dir Budget (J.2-10)...");
     kernel_core::cgroup::run_cgroup_vfs_dir_budget_self_test();
     klog_always!("    ✓ vfs_dir.max clamp (short read) + ancestor propagation");
-    klog_always!("    ✓ Arc-pinned uncharge survives leaf deletion + root exempt + idempotent release");
+    klog_always!(
+        "    ✓ Arc-pinned uncharge survives leaf deletion + root exempt + idempotent release"
+    );
 }
 
 /// Test the Phase J.2 item 9 per-cgroup page-table-frame kmem accounting.
@@ -284,7 +286,9 @@ pub fn test_cgroup_port_budget() {
     klog_always!("    ✓ R170-2 origin-pinned gate: disabled-leaf charge pins leaf + delete EBUSY + unpin/rollback/saturate");
     net::socket::SocketTable::run_per_cgroup_port_budget_self_test();
     klog_always!("    ✓ hierarchical ports.max cap (fail-closed) + ancestor rollback + root exempt + saturating");
-    klog_always!("    ✓ PortBinding single-source + ptr-eq uncharge-once + displaced-charge refund");
+    klog_always!(
+        "    ✓ PortBinding single-source + ptr-eq uncharge-once + displaced-charge refund"
+    );
     klog_always!("    ✓ dead-Weak reaper (+ port-availability prune) + netns backstop + deferred-drain idempotency");
     klog_always!("    ✓ R169-6 s2 choke-point: charged Explicit pure-skip / charged Ephemeral remove+refund / uncharged-Explicit not held / privileged identical");
     klog_always!("    ✓ R169-6 s2 lifecycle: terminal remove (not hold-forever) + dead-Explicit displacement refund + netns-drain-then-repair net-once");
@@ -301,7 +305,9 @@ pub fn test_cgroup_port_budget() {
 pub fn test_cgroupfs_abi() {
     klog_always!("  [TEST] Cgroupfs ABI surface (J.2 files/ports/vfs_dir)...");
     vfs::cgroupfs::run_cgroupfs_j2_abi_self_test();
-    klog_always!("    ✓ filename round-trip + *.max writable / *.current read-only + inode non-aliasing");
+    klog_always!(
+        "    ✓ filename round-trip + *.max writable / *.current read-only + inode non-aliasing"
+    );
     klog_always!("    ✓ read/format path (numeric + unlimited=\"max\" + current) + controller-gated visibility");
 }
 
@@ -316,7 +322,9 @@ pub fn test_fragment_perns_budget() {
     klog_always!("  [TEST] Per-NS Fragment Triple-Budget (R169-10)...");
     net::fragment::run_fragment_perns_self_test();
     klog_always!("    ✓ sum(per_ns) == global across create/complete/timeout + prune-at-zero");
-    klog_always!("    ✓ cross-ns isolation: PerNsQueueLimit above the LRU branch, sibling ns unaffected");
+    klog_always!(
+        "    ✓ cross-ns isolation: PerNsQueueLimit above the LRU branch, sibling ns unaffected"
+    );
 }
 
 /// R171-CG2x1: per-process seccomp filter-chain total-instruction cap. Installing

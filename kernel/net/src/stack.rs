@@ -61,13 +61,13 @@ use crate::ipv4::{
     IPV4_HEADER_MIN_LEN,
 };
 use crate::socket::socket_table;
-use cap::NamespaceId;
 use crate::tcp::{
     build_tcp_segment, parse_tcp_header, parse_tcp_options, verify_tcp_checksum, TcpError,
     TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_HEADER_MIN_LEN,
 };
 use crate::udp::{parse_udp, UdpError, UdpResult, UdpStats};
 use crate::DEFAULT_MTU;
+use cap::NamespaceId;
 use mm::dma::{alloc_dma_buffer, DMA_PAGE_SIZE};
 
 // ============================================================================
@@ -301,7 +301,15 @@ pub fn process_frame(
     let result = match eth_hdr.ethertype {
         ETHERTYPE_IPV4 => {
             // R90-2 FIX: Pass network namespace to IPv4 handler
-            process_ipv4(eth_payload, &eth_hdr, our_mac, our_ip, stats, net_ns_id, now_ms)
+            process_ipv4(
+                eth_payload,
+                &eth_hdr,
+                our_mac,
+                our_ip,
+                stats,
+                net_ns_id,
+                now_ms,
+            )
         }
         ETHERTYPE_ARP => {
             // Process ARP packet
@@ -376,16 +384,15 @@ fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bo
     };
 
     // Extract transport-layer ports for TCP/UDP.
-    let (src_port, dst_port) = if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp)
-        && l4_bytes.len() >= 4
-    {
-        (
-            Some(u16::from_be_bytes([l4_bytes[0], l4_bytes[1]])),
-            Some(u16::from_be_bytes([l4_bytes[2], l4_bytes[3]])),
-        )
-    } else {
-        (None, None)
-    };
+    let (src_port, dst_port) =
+        if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp) && l4_bytes.len() >= 4 {
+            (
+                Some(u16::from_be_bytes([l4_bytes[0], l4_bytes[1]])),
+                Some(u16::from_be_bytes([l4_bytes[2], l4_bytes[3]])),
+            )
+        } else {
+            (None, None)
+        };
 
     // R165-7 FIX: This hook only evaluates kernel-generated reply frames
     // (ProcessResult::Reply — ICMP echo replies, TCP RSTs, REJECT responses),
@@ -402,14 +409,12 @@ fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bo
         let sp = src_port.unwrap_or(0);
         let dp = dst_port.unwrap_or(0);
         let proto_u8 = match proto {
-            Ipv4Proto::Tcp  => 6u8,
-            Ipv4Proto::Udp  => 17u8,
+            Ipv4Proto::Tcp => 6u8,
+            Ipv4Proto::Udp => 17u8,
             Ipv4Proto::Icmp => 1u8,
-            _               => 0u8,
+            _ => 0u8,
         };
-        let (key, _) = FlowKey::from_packet(
-            net_ns_id, proto_u8, ip_hdr.src, ip_hdr.dst, sp, dp,
-        );
+        let (key, _) = FlowKey::from_packet(net_ns_id, proto_u8, ip_hdr.src, ip_hdr.dst, sp, dp);
         Some(match conntrack_table().lookup(&key) {
             Some(_) => crate::conntrack::CtDecision::Established,
             None => crate::conntrack::CtDecision::Related,
@@ -466,16 +471,15 @@ fn egress_firewall_allows_reply(frame: &[u8], net_ns_id: u64, now_ms: u64) -> bo
     };
 
     // Extract transport-layer ports for TCP/UDP (same as the conntrack variant).
-    let (src_port, dst_port) = if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp)
-        && l4_bytes.len() >= 4
-    {
-        (
-            Some(u16::from_be_bytes([l4_bytes[0], l4_bytes[1]])),
-            Some(u16::from_be_bytes([l4_bytes[2], l4_bytes[3]])),
-        )
-    } else {
-        (None, None)
-    };
+    let (src_port, dst_port) =
+        if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp) && l4_bytes.len() >= 4 {
+            (
+                Some(u16::from_be_bytes([l4_bytes[0], l4_bytes[1]])),
+                Some(u16::from_be_bytes([l4_bytes[2], l4_bytes[3]])),
+            )
+        } else {
+            (None, None)
+        };
 
     // No conntrack: only stateless rules can match (ct_state = None).
     let fw_pkt = FirewallPacket {
@@ -696,7 +700,14 @@ fn process_udp(
 
     // Deliver to socket layer
     // R90-2 FIX: Use namespace ID from receiving device instead of hardcoded root
-    if socket_table().deliver_udp(net_ns_id, header.dst_port, ip_hdr.src, header.src_port, data, now_ms) {
+    if socket_table().deliver_udp(
+        net_ns_id,
+        header.dst_port,
+        ip_hdr.src,
+        header.src_port,
+        data,
+        now_ms,
+    ) {
         return ProcessResult::Handled;
     }
 
@@ -821,12 +832,7 @@ fn process_icmp(
             return ProcessResult::Dropped(DropReason::EthParseError);
         }
 
-        let frame = build_ethernet_frame(
-            eth_hdr.src,
-            our_mac,
-            ETHERTYPE_IPV4,
-            &ip_packet,
-        );
+        let frame = build_ethernet_frame(eth_hdr.src, our_mac, ETHERTYPE_IPV4, &ip_packet);
         if frame.is_empty() {
             return ProcessResult::Dropped(DropReason::EthParseError);
         }
@@ -960,9 +966,7 @@ fn process_tcp(
         {
             use crate::conntrack::ct_process_tcp;
             use crate::tcp::parse_tcp_header;
-            let resp_flags = parse_tcp_header(&resp_seg)
-                .map(|h| h.flags)
-                .unwrap_or(0);
+            let resp_flags = parse_tcp_header(&resp_seg).map(|h| h.flags).unwrap_or(0);
             let _ = ct_process_tcp(
                 net_ns_id.0,
                 ip_hdr.dst,
@@ -1141,16 +1145,15 @@ fn build_frame_and_transmit(
     // unconditionally. Conntrack-aware ct_state is only available when the
     // conntrack feature is enabled; without it, ct_state is None and
     // stateful rules won't match, but stateless DROP/REJECT rules still fire.
-    let (src_port, dst_port) = if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp)
-        && payload.len() >= 4
-    {
-        (
-            Some(u16::from_be_bytes([payload[0], payload[1]])),
-            Some(u16::from_be_bytes([payload[2], payload[3]])),
-        )
-    } else {
-        (None, None)
-    };
+    let (src_port, dst_port) =
+        if (proto == Ipv4Proto::Tcp || proto == Ipv4Proto::Udp) && payload.len() >= 4 {
+            (
+                Some(u16::from_be_bytes([payload[0], payload[1]])),
+                Some(u16::from_be_bytes([payload[2], payload[3]])),
+            )
+        } else {
+            (None, None)
+        };
     let cfg_pre = network_config();
 
     // Conntrack-aware ct_state lookup (only with conntrack feature).
@@ -1165,15 +1168,20 @@ fn build_frame_and_transmit(
             _ => 0u8,
         };
         let (key, _) = crate::conntrack::FlowKey::from_packet(
-            net_ns_id, proto_u8, cfg_pre.our_ip, dst_ip, sp, dp,
+            net_ns_id,
+            proto_u8,
+            cfg_pre.our_ip,
+            dst_ip,
+            sp,
+            dp,
         );
-        crate::conntrack::conntrack_table()
-            .lookup(&key)
-            .map(|e| if e.seen_reply {
+        crate::conntrack::conntrack_table().lookup(&key).map(|e| {
+            if e.seen_reply {
                 crate::conntrack::CtDecision::Established
             } else {
                 crate::conntrack::CtDecision::New
-            })
+            }
+        })
     };
     #[cfg(not(feature = "conntrack"))]
     let ct_decision: Option<crate::conntrack::CtDecision> = None;
@@ -1189,7 +1197,10 @@ fn build_frame_and_transmit(
     };
     let fw_table = firewall_table_for_ns(net_ns_id);
     let fw_verdict = fw_table.evaluate(&fw_pkt);
-    if matches!(fw_verdict.action, FirewallAction::Drop | FirewallAction::Reject { .. }) {
+    if matches!(
+        fw_verdict.action,
+        FirewallAction::Drop | FirewallAction::Reject { .. }
+    ) {
         return Err(TxError::InvalidBuffer);
     }
 
@@ -1298,7 +1309,11 @@ fn build_frame_and_transmit(
 /// # Returns
 /// * `Ok(())` on successful transmission
 /// * `Err(TxError)` on failure
-pub fn transmit_tcp_segment(dst_ip: Ipv4Addr, segment: &[u8], net_ns_id: u64) -> Result<(), TxError> {
+pub fn transmit_tcp_segment(
+    dst_ip: Ipv4Addr,
+    segment: &[u8],
+    net_ns_id: u64,
+) -> Result<(), TxError> {
     build_frame_and_transmit(Ipv4Proto::Tcp, dst_ip, segment, net_ns_id)
 }
 
@@ -1314,7 +1329,11 @@ pub fn transmit_tcp_segment(dst_ip: Ipv4Addr, segment: &[u8], net_ns_id: u64) ->
 /// # Returns
 /// * `Ok(())` on successful transmission
 /// * `Err(TxError)` on failure
-pub fn transmit_udp_datagram(dst_ip: Ipv4Addr, datagram: &[u8], net_ns_id: u64) -> Result<(), TxError> {
+pub fn transmit_udp_datagram(
+    dst_ip: Ipv4Addr,
+    datagram: &[u8],
+    net_ns_id: u64,
+) -> Result<(), TxError> {
     build_frame_and_transmit(Ipv4Proto::Udp, dst_ip, datagram, net_ns_id)
 }
 
@@ -1355,7 +1374,10 @@ fn build_original_ip_for_reject(ip_hdr: &Ipv4Header, l4_bytes: &[u8]) -> Vec<u8>
 
     // R164-6 FIX: Fallible allocation for reject quoted packet.
     let mut snapshot = Vec::new();
-    if snapshot.try_reserve_exact(IPV4_HEADER_MIN_LEN + quoted_len).is_err() {
+    if snapshot
+        .try_reserve_exact(IPV4_HEADER_MIN_LEN + quoted_len)
+        .is_err()
+    {
         return snapshot;
     }
     snapshot.extend_from_slice(&hdr);

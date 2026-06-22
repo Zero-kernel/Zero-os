@@ -845,9 +845,11 @@ impl Semaphore {
     /// R154-17 FIX: Use saturating increment to prevent u32 wrap-around
     /// that would clear all permits (count wraps from MAX to 0).
     pub fn signal(&self) {
-        let _ = self.count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-            Some(v.saturating_add(1))
-        });
+        let _ = self
+            .count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some(v.saturating_add(1))
+            });
         self.wait_queue.wake_one();
     }
 
@@ -1077,7 +1079,12 @@ fn drain_expired_timeouts(
     if woke_count > 0 {
         let done = &woke[..woke_count];
         let mut waits = waits.lock();
-        waits.retain(|tw| !done.iter().flatten().any(|d| d.pid == tw.pid && d.seq == tw.seq));
+        waits.retain(|tw| {
+            !done
+                .iter()
+                .flatten()
+                .any(|d| d.pid == tw.pid && d.seq == tw.seq)
+        });
     }
 }
 
@@ -1087,9 +1094,12 @@ fn process_waitqueue_timeouts(now_ticks: u64) {
     // touch a freed WaitQueue (the SMP use-after-free this fix closes). `seq` selects
     // THE exact pending wait; `generation` is carried into the per-PCB marker for the
     // epilogue's exact-gen consume.
-    drain_expired_timeouts(&TIMED_WAITERS, &WQ_TIMEOUT_SCAN_CURSOR, now_ticks, |waiter| {
-        process::wq_timeout_wake_by_seq(waiter.pid, waiter.seq, waiter.generation)
-    });
+    drain_expired_timeouts(
+        &TIMED_WAITERS,
+        &WQ_TIMEOUT_SCAN_CURSOR,
+        now_ticks,
+        |waiter| process::wq_timeout_wake_by_seq(waiter.pid, waiter.seq, waiter.generation),
+    );
 }
 
 /// M4-1c self-test: the WaitQueue timeout drain core (copy-don't-remove + rotating
@@ -1169,7 +1179,8 @@ pub fn run_wq_timeout_drain_self_test() {
         });
         let v = waits.lock();
         assert!(
-            v.iter().any(|t| t.pid == 7 && t.seq == 9999 && t.generation == 7),
+            v.iter()
+                .any(|t| t.pid == 7 && t.seq == 9999 && t.generation == 7),
             "M1-02: fresh re-registered (new seq) wait must survive the drain"
         );
         assert!(

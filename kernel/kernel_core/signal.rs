@@ -259,7 +259,12 @@ pub struct SigAction {
 
 impl SigAction {
     pub const fn default_action() -> Self {
-        Self { handler: SIG_DFL, flags: 0, restorer: 0, mask: 0 }
+        Self {
+            handler: SIG_DFL,
+            flags: 0,
+            restorer: 0,
+            mask: 0,
+        }
     }
     /// True when a real user handler is installed (not SIG_DFL / SIG_IGN).
     #[inline]
@@ -304,7 +309,11 @@ pub fn resolve_disposition(sigactions: &[SigAction; NSIG], signal: Signal) -> Di
     }
     let sa = sigactions[(signal.as_u8() - 1) as usize];
     if sa.is_handler() {
-        Disposition::Handler { handler: sa.handler, flags: sa.flags, mask: sa.mask }
+        Disposition::Handler {
+            handler: sa.handler,
+            flags: sa.flags,
+            mask: sa.mask,
+        }
     } else if sa.handler == SIG_IGN {
         Disposition::Ignored
     } else {
@@ -636,18 +645,34 @@ pub fn has_pending_signals(pid: ProcessId) -> bool {
 /// `kernel/src/integration_test.rs`.
 pub fn run_signal_self_test() {
     let kill_stop = uncatchable_mask();
-    assert_eq!(kill_stop, (1u64 << 8) | (1u64 << 18), "uncatchable == SIGKILL|SIGSTOP");
+    assert_eq!(
+        kill_stop,
+        (1u64 << 8) | (1u64 << 18),
+        "uncatchable == SIGKILL|SIGSTOP"
+    );
 
     // apply_sigprocmask: BLOCK adds, always strips SIGKILL/SIGSTOP.
     let m = apply_sigprocmask(0, SIG_BLOCK, Signal::SIGUSR1.bit() | kill_stop);
-    assert_eq!(m, Signal::SIGUSR1.bit(), "BLOCK adds; SIGKILL/SIGSTOP stripped");
+    assert_eq!(
+        m,
+        Signal::SIGUSR1.bit(),
+        "BLOCK adds; SIGKILL/SIGSTOP stripped"
+    );
     // SETMASK replaces, strips uncatchable.
     let m = apply_sigprocmask(0xFFFF_FFFF, SIG_SETMASK, kill_stop | Signal::SIGTERM.bit());
-    assert_eq!(m, Signal::SIGTERM.bit(), "SETMASK replaces; uncatchable stripped");
+    assert_eq!(
+        m,
+        Signal::SIGTERM.bit(),
+        "SETMASK replaces; uncatchable stripped"
+    );
     // UNBLOCK clears only the requested bit.
     let base = Signal::SIGUSR1.bit() | Signal::SIGUSR2.bit();
     let m = apply_sigprocmask(base, SIG_UNBLOCK, Signal::SIGUSR1.bit());
-    assert_eq!(m, Signal::SIGUSR2.bit(), "UNBLOCK clears the requested bit only");
+    assert_eq!(
+        m,
+        Signal::SIGUSR2.bit(),
+        "UNBLOCK clears the requested bit only"
+    );
 
     // resolve_disposition: default table => Default; handler => Handler; SIG_IGN =>
     // Ignored; SIGKILL/SIGSTOP => ALWAYS Default even with a (forbidden) handler.
@@ -658,19 +683,46 @@ pub fn run_signal_self_test() {
         resolve_disposition(&table, Signal::SIGUSR1),
         Disposition::Default(SignalAction::Terminate)
     ));
-    table[u1] = SigAction { handler: 0x40_0000, flags: SA_RESTORER, restorer: 0x40_1000, mask: 0 };
-    assert!(matches!(resolve_disposition(&table, Signal::SIGUSR1), Disposition::Handler { .. }));
-    table[u2] = SigAction { handler: SIG_IGN, flags: 0, restorer: 0, mask: 0 };
-    assert!(matches!(resolve_disposition(&table, Signal::SIGUSR2), Disposition::Ignored));
+    table[u1] = SigAction {
+        handler: 0x40_0000,
+        flags: SA_RESTORER,
+        restorer: 0x40_1000,
+        mask: 0,
+    };
+    assert!(matches!(
+        resolve_disposition(&table, Signal::SIGUSR1),
+        Disposition::Handler { .. }
+    ));
+    table[u2] = SigAction {
+        handler: SIG_IGN,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+    assert!(matches!(
+        resolve_disposition(&table, Signal::SIGUSR2),
+        Disposition::Ignored
+    ));
     // Defense-in-depth: even a handler-looking SIGKILL entry resolves to Default.
     let k = (Signal::SIGKILL.as_u8() - 1) as usize;
-    table[k] = SigAction { handler: 0x40_0000, flags: SA_RESTORER, restorer: 0x40_1000, mask: 0 };
+    table[k] = SigAction {
+        handler: 0x40_0000,
+        flags: SA_RESTORER,
+        restorer: 0x40_1000,
+        mask: 0,
+    };
     assert!(
-        matches!(resolve_disposition(&table, Signal::SIGKILL), Disposition::Default(_)),
+        matches!(
+            resolve_disposition(&table, Signal::SIGKILL),
+            Disposition::Default(_)
+        ),
         "SIGKILL is never handler-dispatched"
     );
     // default_sigactions is born clean.
-    assert!(default_sigactions().iter().all(|s| !s.is_handler()), "default table is all SIG_DFL");
+    assert!(
+        default_sigactions().iter().all(|s| !s.is_handler()),
+        "default table is all SIG_DFL"
+    );
 }
 
 /// Get signal name for debugging

@@ -217,9 +217,7 @@ pub fn reschedule_if_needed() {
     // The callback triggers context switches — holding a global spinlock
     // across switch_context corrupts the lock when the resumed task drops
     // its own stale MutexGuard. Same copy-then-call pattern as on_scheduler_tick().
-    let cb = x86_64::instructions::interrupts::without_interrupts(|| {
-        *RESCHED_CB.lock()
-    });
+    let cb = x86_64::instructions::interrupts::without_interrupts(|| *RESCHED_CB.lock());
     if let Some(cb) = cb {
         cb(irq_pending);
     }
@@ -231,9 +229,7 @@ pub fn reschedule_if_needed() {
 #[inline]
 pub fn force_reschedule() {
     // R160-3 FIX: Copy callback out of lock before invoking (same fix as reschedule_if_needed).
-    let cb = x86_64::instructions::interrupts::without_interrupts(|| {
-        *RESCHED_CB.lock()
-    });
+    let cb = x86_64::instructions::interrupts::without_interrupts(|| *RESCHED_CB.lock());
     if let Some(cb) = cb {
         cb(true);
     }

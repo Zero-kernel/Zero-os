@@ -211,7 +211,8 @@ fn compute_layout(
     // --- build the auxv (a_type, a_val) pairs, INCLUDING the trailing AT_NULL ---
     let mut auxv: Vec<(u64, u64)> = Vec::new();
     // Upper bound: PHDR triple (3) + 13 fixed + AT_NULL (1) = 17.
-    auxv.try_reserve_exact(17).map_err(|_| SyscallError::ENOMEM)?;
+    auxv.try_reserve_exact(17)
+        .map_err(|_| SyscallError::ENOMEM)?;
     // AT_PHDR/PHENT/PHNUM are conditional — omitted wholesale when phdr == 0.
     if phdr != 0 {
         auxv.push((AT_PHDR, phdr));
@@ -243,14 +244,13 @@ fn compute_layout(
         .and_then(|n| n.checked_add(1))
         .and_then(|n| n.checked_add(2u64.checked_mul(auxv.len() as u64)?))
         .ok_or(SyscallError::EFAULT)?;
-    let pointer_bytes = pointer_words.checked_mul(WORD).ok_or(SyscallError::EFAULT)?;
+    let pointer_bytes = pointer_words
+        .checked_mul(WORD)
+        .ok_or(SyscallError::EFAULT)?;
 
     // Unconditional 16-byte mask-down => RSP % 16 == 0 for EVERY parity. The discarded
     // 0..15 low bytes become a zero-filled gap between AT_NULL and the strings.
-    let buf_base = sp
-        .checked_sub(pointer_bytes)
-        .ok_or(SyscallError::E2BIG)?
-        & !0xF;
+    let buf_base = sp.checked_sub(pointer_bytes).ok_or(SyscallError::E2BIG)? & !0xF;
     if buf_base < stack_base {
         return Err(SyscallError::E2BIG);
     }
@@ -421,16 +421,21 @@ fn synth_args(n: usize) -> Vec<Vec<u8>> {
 fn selftest_alignment_sweep() {
     let entry = crate::elf_loader::USER_BASE as u64 + 0x1000;
     let ust = USER_STACK_TOP - 16;
-    let creds = StackCreds { uid: 0, euid: 0, gid: 0, egid: 0, at_secure: false };
+    let creds = StackCreds {
+        uid: 0,
+        euid: 0,
+        gid: 0,
+        egid: 0,
+        at_secure: false,
+    };
     for argc in 0..=3usize {
         for envc in 0..=2usize {
             for &phdr in &[0u64, entry + 0x2000] {
                 let argv = synth_args(argc);
                 let envp = synth_args(envc);
-                let plan = compute_layout(
-                    entry, ust, phdr, 56, 10, &argv, &envp, &creds, b"/selftest",
-                )
-                .expect("compute_layout must succeed for small inputs");
+                let plan =
+                    compute_layout(entry, ust, phdr, 56, 10, &argv, &envp, &creds, b"/selftest")
+                        .expect("compute_layout must succeed for small inputs");
                 assert_eq!(
                     plan.buf_base & 0xF,
                     0,
@@ -463,11 +468,25 @@ fn selftest_auxv_value_whitelist() {
     let entry = crate::elf_loader::USER_BASE as u64 + 0x1000;
     let ust = USER_STACK_TOP - 16;
     let stack_base = USER_STACK_TOP - USER_STACK_SIZE as u64;
-    let creds = StackCreds { uid: 7, euid: 7, gid: 9, egid: 9, at_secure: true };
+    let creds = StackCreds {
+        uid: 7,
+        euid: 7,
+        gid: 9,
+        egid: 9,
+        at_secure: true,
+    };
     let argv = synth_args(2);
     let envp = synth_args(1);
     let plan = compute_layout(
-        entry, ust, entry + 0x2000, 56, 10, &argv, &envp, &creds, b"/whoami",
+        entry,
+        ust,
+        entry + 0x2000,
+        56,
+        10,
+        &argv,
+        &envp,
+        &creds,
+        b"/whoami",
     )
     .expect("compute_layout");
     for &(t, v) in &plan.auxv {
@@ -495,11 +514,25 @@ fn selftest_auxv_value_whitelist() {
 fn selftest_layout_contiguity() {
     let entry = crate::elf_loader::USER_BASE as u64 + 0x1000;
     let ust = USER_STACK_TOP - 16;
-    let creds = StackCreds { uid: 0, euid: 0, gid: 0, egid: 0, at_secure: false };
+    let creds = StackCreds {
+        uid: 0,
+        euid: 0,
+        gid: 0,
+        egid: 0,
+        at_secure: false,
+    };
     let argv = synth_args(1); // ["a"]
     let envp = synth_args(1); // ["a"]
     let plan = compute_layout(
-        entry, ust, entry + 0x2000, 56, 10, &argv, &envp, &creds, b"/exe",
+        entry,
+        ust,
+        entry + 0x2000,
+        56,
+        10,
+        &argv,
+        &envp,
+        &creds,
+        b"/exe",
     )
     .expect("compute_layout");
     let rand = [0xABu8; AT_RANDOM_LEN];
@@ -516,11 +549,25 @@ fn selftest_layout_contiguity() {
     assert_eq!(read_word(plan.buf_base), 1, "argc must be at [RSP]");
     // argc | argv[0] | argv NULL | envp[0] | envp NULL | auxv...
     let argv0 = read_word(plan.buf_base + WORD);
-    assert_eq!(argv0, plan.argv_ptrs[0], "argv[0] slot must hold argv[0] VA");
-    assert_eq!(read_word(plan.buf_base + 2 * WORD), 0, "argv NULL terminator");
+    assert_eq!(
+        argv0, plan.argv_ptrs[0],
+        "argv[0] slot must hold argv[0] VA"
+    );
+    assert_eq!(
+        read_word(plan.buf_base + 2 * WORD),
+        0,
+        "argv NULL terminator"
+    );
     let envp0 = read_word(plan.buf_base + 3 * WORD);
-    assert_eq!(envp0, plan.envp_ptrs[0], "envp[0] slot must hold envp[0] VA");
-    assert_eq!(read_word(plan.buf_base + 4 * WORD), 0, "envp NULL terminator");
+    assert_eq!(
+        envp0, plan.envp_ptrs[0],
+        "envp[0] slot must hold envp[0] VA"
+    );
+    assert_eq!(
+        read_word(plan.buf_base + 4 * WORD),
+        0,
+        "envp NULL terminator"
+    );
 
     // auxv begins at buf_base + 5 words and ends with AT_NULL(0,0).
     let mut cur = plan.buf_base + 5 * WORD;
@@ -546,11 +593,17 @@ fn selftest_layout_contiguity() {
             break;
         }
     }
-    assert!(saw_random && saw_execfn && saw_null, "auxv must contain RANDOM/EXECFN/NULL");
+    assert!(
+        saw_random && saw_execfn && saw_null,
+        "auxv must contain RANDOM/EXECFN/NULL"
+    );
 
     // The 0..15-byte alignment gap (between AT_NULL and the string area) must be zero.
     let gap_start = (cur - plan.buf_base) as usize;
-    let gap_end = (plan.argv_ptrs[0].min(plan.envp_ptrs[0]).min(plan.rand_va).min(plan.execfn_va)
+    let gap_end = (plan.argv_ptrs[0]
+        .min(plan.envp_ptrs[0])
+        .min(plan.rand_va)
+        .min(plan.execfn_va)
         - plan.buf_base) as usize;
     for b in &buf[gap_start..gap_end] {
         assert_eq!(*b, 0, "alignment gap / slack must be zero-filled");

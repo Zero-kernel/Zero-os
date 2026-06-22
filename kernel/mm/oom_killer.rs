@@ -120,7 +120,8 @@ pub fn on_allocation_failure(nr_pages_needed: usize) {
     klog!(
         Error,
         "OOM: cache reclaim insufficient (reclaimed {} pages, needed {})",
-        reclaimed, nr_pages_needed
+        reclaimed,
+        nr_pages_needed
     );
 
     kill_best_candidate(nr_pages_needed);
@@ -142,7 +143,13 @@ fn still_under_pressure(nr_pages_needed: usize) -> bool {
 fn kill_best_candidate(nr_pages_needed: usize) {
     let (snapshot_cb, kill_cb, cleanup_cb, ts_cb, audit_cb) = {
         let cb = CALLBACKS.lock();
-        (cb.snapshot, cb.kill, cb.cleanup, cb.timestamp, cb.audit_emit)
+        (
+            cb.snapshot,
+            cb.kill,
+            cb.cleanup,
+            cb.timestamp,
+            cb.audit_emit,
+        )
     };
 
     let snapshot = match snapshot_cb {
@@ -162,7 +169,11 @@ fn kill_best_candidate(nr_pages_needed: usize) {
         klog!(
             Error,
             "OOM: killing pid={} tgid={} rss={} pages nice={} adj={}",
-            victim.pid, victim.tgid, victim.rss_pages, victim.nice, victim.oom_score_adj
+            victim.pid,
+            victim.tgid,
+            victim.rss_pages,
+            victim.nice,
+            victim.oom_score_adj
         );
 
         if let Some(kill) = kill_cb {
@@ -174,7 +185,10 @@ fn kill_best_candidate(nr_pages_needed: usize) {
 
         emit_audit(&victim, nr_pages_needed, ts_cb, audit_cb);
     } else {
-        klog!(Error, "OOM: no eligible processes to kill (protected or kernel threads)");
+        klog!(
+            Error,
+            "OOM: no eligible processes to kill (protected or kernel threads)"
+        );
     }
 }
 
@@ -245,7 +259,12 @@ fn emit_audit(
     klog!(
         Error,
         "OOM AUDIT: timestamp={} pid={} needed={} rss={} adj={} nice={}",
-        timestamp, victim.pid, needed, victim.rss_pages, victim.oom_score_adj, victim.nice
+        timestamp,
+        victim.pid,
+        needed,
+        victim.rss_pages,
+        victim.oom_score_adj,
+        victim.nice
     );
 
     // R106-8: Emit tamper-evident audit event via registered callback.

@@ -65,7 +65,9 @@ impl<K: Ord, V> FallibleOrderedMap<K, V> {
     /// Create an empty map. Const so it can initialize statics if ever needed.
     #[inline]
     pub const fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Number of entries.
@@ -286,6 +288,7 @@ impl<K: Ord, V> Default for FallibleOrderedMap<K, V> {
 /// In-kernel self-test (mirrors the `mm::buddy_allocator::run_self_test` style).
 /// Wired into the boot-time integration suite; any `assert!` failure panics the
 /// kernel, which `make test` / `make boot-check` detect via the serial log.
+#[allow(clippy::reversed_empty_ranges)] // self-test deliberately exercises reversed/empty ranges
 pub fn run_fallible_ordered_map_self_test() {
     let mut map: FallibleOrderedMap<usize, usize> = FallibleOrderedMap::new();
     assert!(map.is_empty(), "fresh map must be empty");
@@ -322,7 +325,7 @@ pub fn run_fallible_ordered_map_self_test() {
     );
     assert_eq!(map.range(10..30).count(), 2); // 10 and 20, not 30 (exclusive end)
     assert_eq!(map.range(..=30).count(), 3); // inclusive end covers 30
-    // Inverted range must be empty, never panic.
+                                             // Inverted range must be empty, never panic.
     assert_eq!(map.range(30..10).count(), 0);
 
     // range_mut mutates only in-range values.

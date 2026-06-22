@@ -149,10 +149,18 @@ impl fmt::Display for UserNsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             UserNsError::MaxDepthExceeded => {
-                write!(f, "user namespace depth exceeds MAX_USER_NS_LEVEL ({})", MAX_USER_NS_LEVEL)
+                write!(
+                    f,
+                    "user namespace depth exceeds MAX_USER_NS_LEVEL ({})",
+                    MAX_USER_NS_LEVEL
+                )
             }
             UserNsError::MaxNamespaces => {
-                write!(f, "user namespace count exceeds MAX_USER_NS_COUNT ({})", MAX_USER_NS_COUNT)
+                write!(
+                    f,
+                    "user namespace count exceeds MAX_USER_NS_COUNT ({})",
+                    MAX_USER_NS_COUNT
+                )
             }
             UserNsError::TooManyMappings => {
                 write!(f, "too many mapping extents (max {})", MAX_MAPPINGS)
@@ -846,7 +854,9 @@ impl Drop for UserNamespaceFd {
 impl FileOps for UserNamespaceFd {
     fn clone_box(&self) -> FileDescriptor {
         self.ns.inc_ref();
-        Box::new(Self { ns: self.ns.clone() })
+        Box::new(Self {
+            ns: self.ns.clone(),
+        })
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -899,15 +909,31 @@ mod tests {
     #[test]
     fn test_mapping_validation() {
         let mappings = vec![
-            UidGidMapping { ns_id: 0, host_id: 1000, count: 1 },
-            UidGidMapping { ns_id: 1, host_id: 1001, count: 1 },
+            UidGidMapping {
+                ns_id: 0,
+                host_id: 1000,
+                count: 1,
+            },
+            UidGidMapping {
+                ns_id: 1,
+                host_id: 1001,
+                count: 1,
+            },
         ];
         assert!(validate_mappings(&mappings).is_ok());
 
         // Overlapping ns_id
         let bad_mappings = vec![
-            UidGidMapping { ns_id: 0, host_id: 1000, count: 2 },
-            UidGidMapping { ns_id: 1, host_id: 2000, count: 1 },
+            UidGidMapping {
+                ns_id: 0,
+                host_id: 1000,
+                count: 2,
+            },
+            UidGidMapping {
+                ns_id: 1,
+                host_id: 2000,
+                count: 1,
+            },
         ];
         assert!(validate_mappings(&bad_mappings).is_err());
     }

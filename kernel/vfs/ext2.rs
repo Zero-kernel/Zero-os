@@ -63,8 +63,8 @@ pub const EXT2_FT_REG_FILE: u8 = 1;
 pub const EXT2_FT_DIR: u8 = 2;
 pub const EXT2_FT_CHRDEV: u8 = 3;
 pub const EXT2_FT_BLKDEV: u8 = 4;
-pub const EXT2_FT_FIFO: u8 = 5;   // R133-7 FIX
-pub const EXT2_FT_SOCK: u8 = 6;   // R133-7 FIX
+pub const EXT2_FT_FIFO: u8 = 5; // R133-7 FIX
+pub const EXT2_FT_SOCK: u8 = 6; // R133-7 FIX
 pub const EXT2_FT_SYMLINK: u8 = 7;
 
 /// Inode flags
@@ -718,9 +718,9 @@ impl Ext2Fs {
             return Err(FsError::Invalid);
         }
         let bgdt_block: u32 = if self.block_size == 1024 { 2 } else { 1 };
-        let group_block = u32::try_from(group / descs_per_block)
-            .map_err(|_| FsError::Invalid)?;
-        let block = bgdt_block.checked_add(group_block)
+        let group_block = u32::try_from(group / descs_per_block).map_err(|_| FsError::Invalid)?;
+        let block = bgdt_block
+            .checked_add(group_block)
             .ok_or(FsError::Invalid)?;
         let offset = (group % descs_per_block) * size_of::<Ext2GroupDesc>();
 
@@ -1043,8 +1043,7 @@ impl Ext2Inode {
             // Calculate which block to read
             let file_block_u64 = offset / fs.block_size as u64;
             // R97-3 FIX: Use try_from instead of truncating cast to prevent wraparound
-            let file_block =
-                u32::try_from(file_block_u64).map_err(|_| FsError::Invalid)?;
+            let file_block = u32::try_from(file_block_u64).map_err(|_| FsError::Invalid)?;
             let offset_in_block = offset % fs.block_size as u64;
 
             // Map to physical block
@@ -1166,8 +1165,8 @@ impl Ext2Inode {
 
                         // Calculate which file block and offset within block
                         // R97-3 FIX: Use try_from instead of truncating cast
-                        let file_block = u32::try_from(global_offset / block_size as u64)
-                            .map_err(|_| ())?;
+                        let file_block =
+                            u32::try_from(global_offset / block_size as u64).map_err(|_| ())?;
                         let offset_in_block = (global_offset % block_size as u64) as usize;
 
                         // Read the block from disk
@@ -1413,10 +1412,10 @@ impl Inode for Ext2Inode {
                                 EXT2_S_IFREG => FileType::Regular,
                                 EXT2_S_IFDIR => FileType::Directory,
                                 EXT2_S_IFLNK => FileType::Symlink,
-                                0x2000 => FileType::CharDevice,  // S_IFCHR
-                                0x6000 => FileType::BlockDevice,  // S_IFBLK
-                                0x1000 => FileType::Fifo,         // S_IFIFO
-                                0xC000 => FileType::Socket,       // S_IFSOCK
+                                0x2000 => FileType::CharDevice, // S_IFCHR
+                                0x6000 => FileType::BlockDevice, // S_IFBLK
+                                0x1000 => FileType::Fifo,       // S_IFIFO
+                                0xC000 => FileType::Socket,     // S_IFSOCK
                                 _ => FileType::Regular,
                             },
                             Err(_) => FileType::Regular,
@@ -1621,8 +1620,7 @@ impl FileOps for Ext2File {
         let inode_stat = self.inode.stat().map_err(SyscallError::from)?;
         let vfs_stat = VfsStat::from(inode_stat);
         if let Some(task) = lsm::ProcessCtx::from_current() {
-            lsm::hook_file_permission(&task, vfs_stat.ino, 0)
-                .map_err(|_| SyscallError::EACCES)?;
+            lsm::hook_file_permission(&task, vfs_stat.ino, 0).map_err(|_| SyscallError::EACCES)?;
         }
         Ok(vfs_stat)
     }

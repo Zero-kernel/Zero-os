@@ -47,9 +47,9 @@ pub const CT_TCP_TIMEOUT_SYN_RECV_MS: u64 = 60_000;
 // 5 minutes silently dropped SSH, DB, and long-poll connections.
 // 2 hours balances memory usage against real-world idle connection lifetimes.
 pub const CT_TCP_TIMEOUT_ESTABLISHED_MS: u64 = 7_200_000; // 2 hours
-// R155-10 FIX: Aligned with socket-layer FIN_WAIT_2 timeout (60s).
-// Previously 120s, causing conntrack to persist 60s after socket layer
-// killed the connection, classifying stale packets as Established.
+                                                          // R155-10 FIX: Aligned with socket-layer FIN_WAIT_2 timeout (60s).
+                                                          // Previously 120s, causing conntrack to persist 60s after socket layer
+                                                          // killed the connection, classifying stale packets as Established.
 pub const CT_TCP_TIMEOUT_FIN_WAIT_MS: u64 = 60_000; // 1 minute
 pub const CT_TCP_TIMEOUT_CLOSE_WAIT_MS: u64 = 60_000;
 pub const CT_TCP_TIMEOUT_LAST_ACK_MS: u64 = 30_000;
@@ -154,7 +154,14 @@ impl FlowKey {
     ) -> (Self, ConntrackDir) {
         // Pack type/code into port_lo, id into port_hi
         let pseudo_port = ((icmp_type as u16) << 8) | (icmp_code as u16);
-        Self::from_packet(net_ns_id, IPPROTO_ICMP, src_ip, dst_ip, pseudo_port, icmp_id)
+        Self::from_packet(
+            net_ns_id,
+            IPPROTO_ICMP,
+            src_ip,
+            dst_ip,
+            pseudo_port,
+            icmp_id,
+        )
     }
 }
 
@@ -732,46 +739,45 @@ impl ConntrackTable {
                 }
                 // Fall through to create new entry below
             } else {
+                // Calculate state direction relative to initiator
+                let state_dir = if dir == entry.initiator_dir {
+                    ConntrackDir::Original
+                } else {
+                    ConntrackDir::Reply
+                };
 
-            // Calculate state direction relative to initiator
-            let state_dir = if dir == entry.initiator_dir {
-                ConntrackDir::Original
-            } else {
-                ConntrackDir::Reply
-            };
+                let (new_state, decision) = self.transition_state(&entry, state_dir, proto, l4);
 
-            let (new_state, decision) = self.transition_state(&entry, state_dir, proto, l4);
+                if decision == CtDecision::Invalid {
+                    self.stats
+                        .invalid_transitions
+                        .fetch_add(1, Ordering::Relaxed);
+                    return CtUpdateResult {
+                        decision,
+                        state: entry.state,
+                        dir,
+                    };
+                }
 
-            if decision == CtDecision::Invalid {
-                self.stats
-                    .invalid_transitions
-                    .fetch_add(1, Ordering::Relaxed);
+                entry.state = new_state;
+                entry.update_stats(state_dir, l4.payload_len, now_ms);
+
+                // R65-3 FIX: Record LRU access
+                let lru_gen = self.next_lru_generation();
+                entry.lru_gen = lru_gen;
+                let last_seen_ms = entry.last_seen_ms;
+                drop(entry);
+
+                // R96-3 FIX: Pass entries reference for heap compaction
+                self.record_lru(&*entries, key, last_seen_ms, lru_gen);
+
+                // R95-2 FIX: Propagate actual decision from state machine
+                // (double-check path after write-lock acquisition).
                 return CtUpdateResult {
                     decision,
-                    state: entry.state,
+                    state: new_state,
                     dir,
                 };
-            }
-
-            entry.state = new_state;
-            entry.update_stats(state_dir, l4.payload_len, now_ms);
-
-            // R65-3 FIX: Record LRU access
-            let lru_gen = self.next_lru_generation();
-            entry.lru_gen = lru_gen;
-            let last_seen_ms = entry.last_seen_ms;
-            drop(entry);
-
-            // R96-3 FIX: Pass entries reference for heap compaction
-            self.record_lru(&*entries, key, last_seen_ms, lru_gen);
-
-            // R95-2 FIX: Propagate actual decision from state machine
-            // (double-check path after write-lock acquisition).
-            return CtUpdateResult {
-                decision,
-                state: new_state,
-                dir,
-            };
             } // else (non-expired)
         }
 
@@ -896,9 +902,7 @@ impl ConntrackTable {
             }
             // R150-I1 FIX: Simultaneous open — the reply side's ACK (or SYN+ACK)
             // also completes the handshake.
-            (TcpCtState::SynRecv, ConntrackDir::Reply) if l4.is_ack() => {
-                TcpCtState::Established
-            }
+            (TcpCtState::SynRecv, ConntrackDir::Reply) if l4.is_ack() => TcpCtState::Established,
             // Established - handle FIN
             (TcpCtState::Established, _) if l4.is_fin() => match dir {
                 ConntrackDir::Original => TcpCtState::FinWait,
@@ -910,7 +914,9 @@ impl ConntrackTable {
             // R156-8 FIX: FIN+ACK (common piggybacked close) skips directly
             // to TimeWait. Without this, the LastAck 30s timeout expires
             // prematurely vs TimeWait 120s if the initiator's ACK is lost.
-            (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_fin() && l4.is_ack() => TcpCtState::TimeWait,
+            (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_fin() && l4.is_ack() => {
+                TcpCtState::TimeWait
+            }
             (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_fin() => TcpCtState::LastAck,
             (TcpCtState::FinWait, ConntrackDir::Reply) if l4.is_ack() => TcpCtState::FinWait2,
             // FinWait2 → TimeWait when peer sends FIN (normal half-close close)
@@ -1347,14 +1353,20 @@ pub fn run_conntrack_reclaim_self_test() {
     );
     let far_future = t0 + 24 * 3600 * 1000; // +24h: past any conntrack timeout
     let swept = ct_sweep(far_future);
-    assert!(swept >= 1, "conntrack: ct_sweep must reclaim the expired flow");
+    assert!(
+        swept >= 1,
+        "conntrack: ct_sweep must reclaim the expired flow"
+    );
 
     // (2) namespace-teardown drain removes all of a ns's flows + drops its row.
     for p in 0..4u16 {
         let _ = ct_process_tcp(ns_drain, ip_a, ip_b, 20000 + p, 80, SYN, 0, far_future);
     }
     let drained = ct_drain_ns(ns_drain);
-    assert!(drained >= 1, "conntrack: ct_drain_ns must remove the ns's flows");
+    assert!(
+        drained >= 1,
+        "conntrack: ct_drain_ns must remove the ns's flows"
+    );
     // Idempotent: nothing left, the counter row is already gone.
     assert_eq!(
         ct_drain_ns(ns_drain),

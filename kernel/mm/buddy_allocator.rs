@@ -92,7 +92,7 @@ impl BuddyAllocator {
         let mut allocator = BuddyAllocator {
             free_lists: Default::default(),
             bitmap: BitVec::from_elem(bitmap_size, false),
-            alloc_order: vec![0u8; total_pages],  // R74-4: Initialize all as free (0)
+            alloc_order: vec![0u8; total_pages], // R74-4: Initialize all as free (0)
             base_addr,
             total_pages,
             // Set to the true free count after reservations are marked below.
@@ -695,8 +695,7 @@ pub fn run_reservation_self_test() {
     let resv_phys = base_u64 + (64 * PAGE_SIZE) as u64;
     let resv_len = (resv_pages * PAGE_SIZE) as u64;
 
-    let mut allocator =
-        BuddyAllocator::new_with_reservations(base, size, &[(resv_phys, resv_len)]);
+    let mut allocator = BuddyAllocator::new_with_reservations(base, size, &[(resv_phys, resv_len)]);
 
     assert!(
         allocator.reserved_pages == resv_pages,

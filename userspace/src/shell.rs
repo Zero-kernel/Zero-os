@@ -291,11 +291,7 @@ fn copy_arg(args: &[u8], out: &mut [u8]) -> usize {
     }
     let mut j = 0;
     // Copy until space, null, or buffer full
-    while i < args.len()
-        && args[i] != 0
-        && args[i] != b' '
-        && args[i] != b'\t'
-        && j + 1 < out.len()
+    while i < args.len() && args[i] != 0 && args[i] != b' ' && args[i] != b'\t' && j + 1 < out.len()
     {
         out[j] = args[i];
         i += 1;
@@ -759,7 +755,14 @@ fn do_tcp(args: &[u8]) {
     print(" bytes... ");
 
     let sent = unsafe {
-        sys_sendto(sock as i32, msg_slice.as_ptr(), msg_slice.len(), 0, ptr::null(), 0)
+        sys_sendto(
+            sock as i32,
+            msg_slice.as_ptr(),
+            msg_slice.len(),
+            0,
+            ptr::null(),
+            0,
+        )
     };
     if is_error(sent) {
         println("FAILED");
@@ -773,7 +776,14 @@ fn do_tcp(args: &[u8]) {
     print("Waiting for response... ");
     let mut buf = [0u8; READ_BUF_SIZE];
     let recv = unsafe {
-        sys_recvfrom(sock as i32, buf.as_mut_ptr(), buf.len(), 0, ptr::null_mut(), ptr::null_mut())
+        sys_recvfrom(
+            sock as i32,
+            buf.as_mut_ptr(),
+            buf.len(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
     };
     if is_error(recv) {
         println("FAILED");

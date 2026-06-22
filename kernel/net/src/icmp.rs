@@ -387,7 +387,10 @@ pub fn build_time_exceeded(code: u8, original_ip_header: &[u8]) -> Vec<u8> {
 fn build_error_message(icmp_type: u8, code: u8, original_data: &[u8]) -> Vec<u8> {
     let data_len = cmp::min(original_data.len(), 28);
     let mut packet = Vec::new();
-    if packet.try_reserve_exact(ICMP_HEADER_LEN + data_len).is_err() {
+    if packet
+        .try_reserve_exact(ICMP_HEADER_LEN + data_len)
+        .is_err()
+    {
         return packet;
     }
 

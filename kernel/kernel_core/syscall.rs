@@ -14,13 +14,13 @@ use crate::process::{
     current_net_ns_id, current_pid, get_process, terminate_process, terminate_self_and_halt,
     try_get_process, wait_should_abort, with_current_cap_table, ProcessId, ProcessState,
 };
-use cpu_local::{current_cpu, current_cpu_id, max_cpus};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem;
+use cpu_local::{current_cpu, current_cpu_id, max_cpus};
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
@@ -919,7 +919,9 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                 // enqueue+block runs under SOCKET_WAITERS + IRQs-off, so no marker can
                 // be set between enqueue above and this clear.
                 debug_assert!(
-                    proc.socket_timeout_marker.load(core::sync::atomic::Ordering::Relaxed) == 0,
+                    proc.socket_timeout_marker
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                        == 0,
                     "M4-1b: socket_timeout_marker not born-clean at wait entry"
                 );
                 proc.socket_timeout_marker
@@ -948,7 +950,9 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                 // "Woken" and the caller (sys_accept / recv) would re-park forever.
                 // Dequeue our exact (pid, generation), mark Ready, flag aborted.
                 if wait_should_abort(pid) {
-                    SOCKET_WAITERS.lock().remove_waiter(queue_addr, pid, Some(my_gen));
+                    SOCKET_WAITERS
+                        .lock()
+                        .remove_waiter(queue_addr, pid, Some(my_gen));
                     if let Some(proc_arc) = get_process(pid) {
                         proc_arc.lock().state = ProcessState::Ready;
                     }
@@ -967,7 +971,9 @@ impl net::SocketWaitHooks for KernelSocketWaitHooks {
                 // Check if closed
                 if queue.is_closed() {
                     // Remove from wait queue (R165-9: our exact generation)
-                    SOCKET_WAITERS.lock().remove_waiter(queue_addr, pid, Some(my_gen));
+                    SOCKET_WAITERS
+                        .lock()
+                        .remove_waiter(queue_addr, pid, Some(my_gen));
                     // Mark ready so we can return
                     if let Some(proc_arc) = get_process(pid) {
                         proc_arc.lock().state = ProcessState::Ready;
@@ -1342,9 +1348,9 @@ pub enum SyscallError {
     EOPNOTSUPP = -95,      // 操作不支持
     ECONNABORTED = -103,   // R51-1: 连接被中止 (accept on closed listener)
     // E.4 PI: Robust futex error
-    EOWNERDEAD = -130,     // E.4 PI: Robust futex - 锁持有者已退出
+    EOWNERDEAD = -130, // E.4 PI: Robust futex - 锁持有者已退出
     // R104-4: Arithmetic overflow (POSIX value 75)
-    EOVERFLOW = -75,       // 值溢出 (value too large for data type)
+    EOVERFLOW = -75, // 值溢出 (value too large for data type)
 }
 
 impl SyscallError {
@@ -1804,7 +1810,7 @@ fn materialize_namespace(ns: &Arc<crate::mount_namespace::MountNamespace>) {
         "CRITICAL: Mount namespace materialization callback not registered! \
          VFS must call register_mount_ns_materialize_callback() before any \
          namespace operations (clone/unshare with CLONE_NEWNS). This is a \
-         kernel initialization bug."
+         kernel initialization bug.",
     );
     cb(ns);
 }
@@ -2044,7 +2050,9 @@ pub(crate) fn copy_to_user(user_dst: *mut u8, src: &[u8]) -> Result<(), SyscallE
 #[inline]
 fn try_str_to_string(s: &str) -> Result<String, SyscallError> {
     let mut owned = String::new();
-    owned.try_reserve_exact(s.len()).map_err(|_| SyscallError::ENOMEM)?;
+    owned
+        .try_reserve_exact(s.len())
+        .map_err(|_| SyscallError::ENOMEM)?;
     owned.push_str(s);
     Ok(owned)
 }
@@ -2111,9 +2119,7 @@ fn copy_user_str_array(list_ptr: *const *const u8) -> Result<Vec<Vec<u8>>, Sysca
         }
 
         let s = copy_user_cstring(entry)?;
-        total = total
-            .checked_add(s.len() + 1)
-            .ok_or(SyscallError::E2BIG)?;
+        total = total.checked_add(s.len() + 1).ok_or(SyscallError::E2BIG)?;
         if total > MAX_ARG_TOTAL {
             return Err(SyscallError::E2BIG);
         }
@@ -2921,7 +2927,8 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
             // R153-3 FIX: Publish thread-group "exiting" flag before marking
             // siblings. This prevents concurrent sys_clone(CLONE_THREAD) from
             // slipping in between this point and the atomic marking scan below.
-            proc.thread_group_exiting.store(true, core::sync::atomic::Ordering::Release);
+            proc.thread_group_exiting
+                .store(true, core::sync::atomic::Ordering::Release);
             proc.tgid
         };
 
@@ -2937,7 +2944,10 @@ fn sys_exit_group(exit_code: i32) -> SyscallResult {
         // Now terminate ourselves directly (same CPU, always safe).
         kprintln!(
             "Process {} (tgid={}) exit_group with code {} ({} sibling task(s) marked for exit)",
-            pid, tgid, exit_code, marked
+            pid,
+            tgid,
+            exit_code,
+            marked
         );
 
         // R117-1 FIX: Use centralized terminate_self_and_halt().
@@ -3161,7 +3171,9 @@ fn sys_clone(
     // leaking user stack/instruction pointers and TLS base addresses.
     kprintln!(
         "[sys_clone] entry: flags=0x{:x}, stack=0x{:x}, tls=0x{:x}",
-        flags, stack as u64, tls
+        flags,
+        stack as u64,
+        tls
     );
 
     let parent_pid = current_pid().ok_or(SyscallError::ESRCH)?;
@@ -3215,8 +3227,12 @@ fn sys_clone(
         // fallback for single-thread exit paths.
         {
             let parent = parent_arc.lock();
-            if parent.thread_group_exiting.load(core::sync::atomic::Ordering::Acquire)
-                || parent.pending_kill.load(core::sync::atomic::Ordering::Acquire)
+            if parent
+                .thread_group_exiting
+                .load(core::sync::atomic::Ordering::Acquire)
+                || parent
+                    .pending_kill
+                    .load(core::sync::atomic::Ordering::Acquire)
             {
                 return Err(SyscallError::EINVAL);
             }
@@ -3360,36 +3376,36 @@ fn sys_clone(
         parent_user_memory_space, // H.3 KPTI: user CR3 root for CLONE_VM sharing
         parent_tgid,
         parent_thread_group_exiting, // R153-3 FIX: shared exiting flag
-        parent_mm_arc,  // D3-ARC-MM-SHARED: shared mm Arc for CLONE_VM
+        parent_mm_arc,               // D3-ARC-MM-SHARED: shared mm Arc for CLONE_VM
         parent_name,
         parent_priority,
-        parent_cgroup_id,     // R123-2 FIX: for cgroup attachment after create_process
-        parent_cpuset_id,     // R123-2 FIX: for cpuset inheritance
-        parent_allowed_cpus,  // R123-2 FIX: for cpuset CPU mask inheritance
+        parent_cgroup_id, // R123-2 FIX: for cgroup attachment after create_process
+        parent_cpuset_id, // R123-2 FIX: for cpuset inheritance
+        parent_allowed_cpus, // R123-2 FIX: for cpuset CPU mask inheritance
         _parent_context,
         parent_user_stack,
         parent_fs_base,
         parent_gs_base,
         parent_credentials_arc, // R39-3 FIX: 共享凭证 Arc
         parent_umask,
-        parent_rlimits, // M0-6: inherit rlimits on the CLONE_VM/THREAD manual path
+        parent_rlimits,    // M0-6: inherit rlimits on the CLONE_VM/THREAD manual path
         parent_sigactions, // M0 item 5: inherit signal dispositions (per-task copy)
         parent_blocked,    // M0 item 5: inherit blocked mask
         parent_seccomp_state,
         parent_pledge_state,
         parent_seccomp_installing,
-        parent_pid_ns_for_children, // F.1: PID namespace for children
-        parent_mount_ns,             // F.1: Mount namespace
+        parent_pid_ns_for_children,   // F.1: PID namespace for children
+        parent_mount_ns,              // F.1: Mount namespace
         parent_mount_ns_for_children, // F.1: Mount namespace for children
-        parent_ipc_ns,               // F.1: IPC namespace
-        parent_ipc_ns_for_children,  // F.1: IPC namespace for children
-        parent_net_ns,               // F.1: Network namespace
-        parent_net_ns_for_children,  // F.1: Network namespace for children
-        parent_user_ns,              // F.1: User namespace
-        parent_user_ns_for_children, // F.1: User namespace for children
-        parent_fd_table_snapshot,    // R133-5 FIX: fd_table snapshot under parent lock
-        parent_cloexec_snapshot,     // R169-L1 FIX: cloexec_fds snapshot under parent lock
-        parent_cap_table_clone,      // R133-5 FIX: cap_table clone under parent lock
+        parent_ipc_ns,                // F.1: IPC namespace
+        parent_ipc_ns_for_children,   // F.1: IPC namespace for children
+        parent_net_ns,                // F.1: Network namespace
+        parent_net_ns_for_children,   // F.1: Network namespace for children
+        parent_user_ns,               // F.1: User namespace
+        parent_user_ns_for_children,  // F.1: User namespace for children
+        parent_fd_table_snapshot,     // R133-5 FIX: fd_table snapshot under parent lock
+        parent_cloexec_snapshot,      // R169-L1 FIX: cloexec_fds snapshot under parent lock
+        parent_cap_table_clone,       // R133-5 FIX: cap_table clone under parent lock
     ) = {
         let mut parent = parent_arc.lock();
         // 始终从 MSR 同步 fs_base 到 PCB
@@ -3405,19 +3421,18 @@ fn sys_clone(
         // and cap_table cloning, violating the parent→child lock order
         // used in enforce_lsm_task_fork().
         // R158-7 FIX (LOW): Fallible fd_table snapshot (bounded by MAX_FD).
-        let fd_snapshot: Vec<(i32, crate::process::FileDescriptor)> =
-            if flags & CLONE_FILES != 0 {
-                let mut snap = Vec::new();
-                if snap.try_reserve_exact(parent.fd_table.len()).is_err() {
-                    return Err(SyscallError::ENOMEM);
-                }
-                for (&fd, desc) in parent.fd_table.iter() {
-                    snap.push((fd, desc.clone_box()));
-                }
-                snap
-            } else {
-                Vec::new()
-            };
+        let fd_snapshot: Vec<(i32, crate::process::FileDescriptor)> = if flags & CLONE_FILES != 0 {
+            let mut snap = Vec::new();
+            if snap.try_reserve_exact(parent.fd_table.len()).is_err() {
+                return Err(SyscallError::ENOMEM);
+            }
+            for (&fd, desc) in parent.fd_table.iter() {
+                snap.push((fd, desc.clone_box()));
+            }
+            snap
+        } else {
+            Vec::new()
+        };
 
         // R169-L1 FIX: Snapshot cloexec_fds under the parent lock too (fallibly,
         // matching fd_snapshot), so a CLONE_FILES child inherits the parent's
@@ -3442,7 +3457,12 @@ fn sys_clone(
         } else {
             // R25-8 FIX: Non-thread cases must inherit and filter CLOFORK entries
             // R161-4 FIX: Fallible clone + Arc wrapping
-            Arc::new(parent.cap_table.try_clone_for_fork().map_err(|_| SyscallError::ENOMEM)?)
+            Arc::new(
+                parent
+                    .cap_table
+                    .try_clone_for_fork()
+                    .map_err(|_| SyscallError::ENOMEM)?,
+            )
         };
 
         // D3-ARC-MM-SHARED: Clone mm Arc for CLONE_VM sharing.
@@ -3457,12 +3477,12 @@ fn sys_clone(
             parent.user_memory_space, // H.3 KPTI
             parent.tgid,
             parent.thread_group_exiting.clone(), // R153-3 FIX
-            parent_mm_arc_clone, // D3-ARC-MM-SHARED
+            parent_mm_arc_clone,                 // D3-ARC-MM-SHARED
             parent.name.clone(),
             parent.priority,
-            parent.cgroup_id,     // R123-2 FIX
-            parent.cpuset_id,     // R123-2 FIX
-            parent.allowed_cpus,  // R123-2 FIX
+            parent.cgroup_id,    // R123-2 FIX
+            parent.cpuset_id,    // R123-2 FIX
+            parent.allowed_cpus, // R123-2 FIX
             parent.context,
             parent.user_stack,
             parent.fs_base,
@@ -3471,22 +3491,25 @@ fn sys_clone(
             parent.umask,
             parent.rlimits, // M0-6: [RLimit; N] is Copy — snapshot under parent lock
             parent.sigactions, // M0 item 5: [SigAction; NSIG] is Copy
-            parent.blocked,    // M0 item 5: u64 mask
-            parent.seccomp_state.try_clone().map_err(|_| SyscallError::ENOMEM)?,
+            parent.blocked, // M0 item 5: u64 mask
+            parent
+                .seccomp_state
+                .try_clone()
+                .map_err(|_| SyscallError::ENOMEM)?,
             parent.pledge_state.clone(),
             parent.seccomp_installing,
             parent.pid_ns_for_children.clone(), // F.1: PID namespace
-            parent.mount_ns.clone(),             // F.1: Mount namespace
+            parent.mount_ns.clone(),            // F.1: Mount namespace
             parent.mount_ns_for_children.clone(), // F.1: Mount namespace for children
-            parent.ipc_ns.clone(),               // F.1: IPC namespace
-            parent.ipc_ns_for_children.clone(),  // F.1: IPC namespace for children
-            parent.net_ns.clone(),               // F.1: Network namespace
-            parent.net_ns_for_children.clone(),  // F.1: Network namespace for children
-            parent.user_ns.clone(),              // F.1: User namespace
+            parent.ipc_ns.clone(),              // F.1: IPC namespace
+            parent.ipc_ns_for_children.clone(), // F.1: IPC namespace for children
+            parent.net_ns.clone(),              // F.1: Network namespace
+            parent.net_ns_for_children.clone(), // F.1: Network namespace for children
+            parent.user_ns.clone(),             // F.1: User namespace
             parent.user_ns_for_children.clone(), // F.1: User namespace for children
-            fd_snapshot,                         // R133-5 FIX: fd_table snapshot
-            cloexec_snapshot,                    // R169-L1 FIX: cloexec_fds snapshot
-            cap_clone,                           // R133-5 FIX: cap_table clone
+            fd_snapshot,                        // R133-5 FIX: fd_table snapshot
+            cloexec_snapshot,                   // R169-L1 FIX: cloexec_fds snapshot
+            cap_clone,                          // R133-5 FIX: cap_table clone
         )
     };
 
@@ -3580,7 +3603,11 @@ fn sys_clone(
     // R160-14 FIX: Truncate child name to prevent unbounded growth from
     // deeply nested clone chains. The old infallible format!() could
     // accumulate ~230KB names and panic under OOM.
-    let suffix = if flags & CLONE_THREAD != 0 { "-thread" } else { "-clone" };
+    let suffix = if flags & CLONE_THREAD != 0 {
+        "-thread"
+    } else {
+        "-clone"
+    };
     let max_name = 256;
     let child_name = if parent_name.len() + suffix.len() > max_name {
         let mut name = String::new();
@@ -3642,11 +3669,18 @@ fn sys_clone(
                 Some(ns)
             }
             Err(crate::mount_namespace::MountNsError::MaxDepthExceeded) => {
-                klog!(Error, "[sys_clone] Failed to create mount namespace: max depth exceeded");
+                klog!(
+                    Error,
+                    "[sys_clone] Failed to create mount namespace: max depth exceeded"
+                );
                 return Err(SyscallError::EAGAIN);
             }
             Err(e) => {
-                klog!(Error, "[sys_clone] Failed to create mount namespace: {:?}", e);
+                klog!(
+                    Error,
+                    "[sys_clone] Failed to create mount namespace: {:?}",
+                    e
+                );
                 return Err(SyscallError::ENOMEM);
             }
         }
@@ -3658,7 +3692,8 @@ fn sys_clone(
     let new_ipc_ns = if flags & CLONE_NEWIPC != 0 {
         match crate::ipc_namespace::clone_ipc_namespace(parent_ipc_ns_for_children.clone()) {
             Ok(ns) => {
-                klog!(Info,
+                klog!(
+                    Info,
                     "[sys_clone] Created new IPC namespace: id={}, level={}",
                     ns.id().raw(),
                     ns.level()
@@ -3683,12 +3718,18 @@ fn sys_clone(
                 Some(ns)
             }
             Err(crate::ipc_namespace::IpcNsError::MaxDepthExceeded) => {
-                klog!(Error, "[sys_clone] Failed to create IPC namespace: max depth exceeded");
+                klog!(
+                    Error,
+                    "[sys_clone] Failed to create IPC namespace: max depth exceeded"
+                );
                 return Err(SyscallError::EAGAIN);
             }
             // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
             Err(crate::ipc_namespace::IpcNsError::MaxNamespaces) => {
-                klog!(Error, "[sys_clone] Failed to create IPC namespace: max namespaces exceeded");
+                klog!(
+                    Error,
+                    "[sys_clone] Failed to create IPC namespace: max namespaces exceeded"
+                );
                 return Err(SyscallError::EAGAIN);
             }
             Err(e) => {
@@ -3704,7 +3745,8 @@ fn sys_clone(
     let new_net_ns = if flags & CLONE_NEWNET != 0 {
         match crate::net_namespace::clone_net_namespace(parent_net_ns_for_children.clone()) {
             Ok(ns) => {
-                klog!(Info,
+                klog!(
+                    Info,
                     "[sys_clone] Created new network namespace: id={}, level={}, has_loopback={}",
                     ns.id().raw(),
                     ns.level(),
@@ -3730,16 +3772,26 @@ fn sys_clone(
                 Some(ns)
             }
             Err(crate::net_namespace::NetNsError::MaxDepthExceeded) => {
-                klog!(Error, "[sys_clone] Failed to create network namespace: max depth exceeded");
+                klog!(
+                    Error,
+                    "[sys_clone] Failed to create network namespace: max depth exceeded"
+                );
                 return Err(SyscallError::EAGAIN);
             }
             // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
             Err(crate::net_namespace::NetNsError::MaxNamespaces) => {
-                klog!(Error, "[sys_clone] Failed to create network namespace: max namespaces exceeded");
+                klog!(
+                    Error,
+                    "[sys_clone] Failed to create network namespace: max namespaces exceeded"
+                );
                 return Err(SyscallError::EAGAIN);
             }
             Err(e) => {
-                klog!(Error, "[sys_clone] Failed to create network namespace: {:?}", e);
+                klog!(
+                    Error,
+                    "[sys_clone] Failed to create network namespace: {:?}",
+                    e
+                );
                 return Err(SyscallError::ENOMEM);
             }
         }
@@ -3751,7 +3803,8 @@ fn sys_clone(
     let new_user_ns = if flags & CLONE_NEWUSER != 0 {
         match crate::user_namespace::clone_user_namespace(parent_user_ns_for_children.clone()) {
             Ok(ns) => {
-                klog!(Info,
+                klog!(
+                    Info,
                     "[sys_clone] Created new user namespace: id={}, level={}",
                     ns.id().raw(),
                     ns.level()
@@ -3776,15 +3829,25 @@ fn sys_clone(
                 Some(ns)
             }
             Err(crate::user_namespace::UserNsError::MaxDepthExceeded) => {
-                klog!(Error, "[sys_clone] Failed to create user namespace: max depth exceeded");
+                klog!(
+                    Error,
+                    "[sys_clone] Failed to create user namespace: max depth exceeded"
+                );
                 return Err(SyscallError::EAGAIN);
             }
             Err(crate::user_namespace::UserNsError::MaxNamespaces) => {
-                klog!(Error, "[sys_clone] Failed to create user namespace: max namespaces exceeded");
+                klog!(
+                    Error,
+                    "[sys_clone] Failed to create user namespace: max namespaces exceeded"
+                );
                 return Err(SyscallError::EAGAIN);
             }
             Err(e) => {
-                klog!(Error, "[sys_clone] Failed to create user namespace: {:?}", e);
+                klog!(
+                    Error,
+                    "[sys_clone] Failed to create user namespace: {:?}",
+                    e
+                );
                 return Err(SyscallError::ENOMEM);
             }
         }
@@ -3800,7 +3863,9 @@ fn sys_clone(
                 // R104-2 FIX: Gate diagnostic println behind debug_assertions.
                 kprintln!("[sys_clone] Failed to create PID namespace: {:?}", e);
                 match e {
-                    crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => SyscallError::EAGAIN,
+                    crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => {
+                        SyscallError::EAGAIN
+                    }
                     // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
                     crate::pid_namespace::PidNamespaceError::MaxNamespaces => SyscallError::EAGAIN,
                     _ => SyscallError::ENOMEM,
@@ -3817,8 +3882,7 @@ fn sys_clone(
             .map_err(|_| SyscallError::ENOMEM)?
     } else {
         // Regular process creation - inherits parent's pid_ns_for_children
-        create_process(child_name, parent_pid, parent_priority)
-            .map_err(|_| SyscallError::ENOMEM)?
+        create_process(child_name, parent_pid, parent_priority).map_err(|_| SyscallError::ENOMEM)?
     };
 
     let child_arc = get_process(child_pid).ok_or(SyscallError::ESRCH)?;
@@ -3927,7 +3991,9 @@ fn sys_clone(
             // R101-2 FIX: Gate SyscallFrame debug print behind debug_assertions
             kprintln!(
                 "[sys_clone] SyscallFrame: rcx(rip)=0x{:x}, rsp=0x{:x}, r9=0x{:x}",
-                frame.rcx, frame.rsp, frame.r9
+                frame.rcx,
+                frame.rsp,
+                frame.r9
             );
 
             // 从 syscall 帧复制寄存器状态
@@ -4029,7 +4095,9 @@ fn sys_clone(
         // R101-2 FIX: Gate TLS debug print behind debug_assertions
         kprintln!(
             "[sys_clone] TLS: msr_fs=0x{:x}, parent_fs=0x{:x}, child_fs=0x{:x}",
-            current_fs_base, parent_fs_base, child.fs_base
+            current_fs_base,
+            parent_fs_base,
+            child.fs_base
         );
 
         // 设置 tid 指针
@@ -4696,9 +4764,8 @@ fn exec_from_bytes(
     // mappings are established, because create_kpti_user_pml4() copies PML4[0..255]
     // entries by value — any entries created later would be invisible under user CR3.
     let new_user_memory_space = if security::is_kpti_enabled() {
-        let (_user_frame, user_phys) =
-            crate::fork::create_kpti_user_pml4(new_memory_space)
-                .map_err(|_| SyscallError::ENOMEM)?;
+        let (_user_frame, user_phys) = crate::fork::create_kpti_user_pml4(new_memory_space)
+            .map_err(|_| SyscallError::ENOMEM)?;
         user_phys
     } else {
         0
@@ -4851,18 +4918,18 @@ fn exec_from_bytes(
             // were fully uncharged above; new ELF image starts with a clean slate.
             mm.vm_charged_bytes = 0;
             mm.brk_pending_growth = 0; // R144-1 FIX: Clear pending brk growth on exec
-            // R165-1 FIX: clear any brk reservation on exec image replacement.
-            // exec already rejects multithreaded/shared-VM callers, so no sibling
-            // brk can be in flight here; reset defensively for a clean slate.
+                                       // R165-1 FIX: clear any brk reservation on exec image replacement.
+                                       // exec already rejects multithreaded/shared-VM callers, so no sibling
+                                       // brk can be in flight here; reset defensively for a clean slate.
             mm.brk_in_progress = false;
             mm.mprotect_pending_bytes = 0; // R147-1 FIX: Clear pending mprotect charges on exec
             mm.exec_pending_bytes = 0; // R149-3 FIX: Charge now reflected in elf_charged_bytes
-            // R137-1 FIX: Record the new ELF image's cgroup charges (segments + stack)
-            // so that process exit and subsequent exec can uncharge them. The old
-            // image's elf_charged_bytes were already uncharged above alongside
-            // mmap_regions and brk. Safe to set before space_guard.commit() because
-            // no fallible operations remain between lock release and commit(); if the
-            // guard were to roll back, it uncharges via its own charged_bytes field.
+                                       // R137-1 FIX: Record the new ELF image's cgroup charges (segments + stack)
+                                       // so that process exit and subsequent exec can uncharge them. The old
+                                       // image's elf_charged_bytes were already uncharged above alongside
+                                       // mmap_regions and brk. Safe to set before space_guard.commit() because
+                                       // no fallible operations remain between lock release and commit(); if the
+                                       // guard were to roll back, it uncharges via its own charged_bytes field.
             mm.elf_charged_bytes = load_result.charged_bytes;
             mm.mmap_regions.clear();
             // H.2 Partial KASLR: Re-randomize mmap base on exec for ASLR
@@ -4994,7 +5061,9 @@ fn exec_from_bytes(
     // These leak user entry point and stack pointer addresses.
     kprintln!(
         "exec_from_bytes: entry=0x{:x}, rsp=0x{:x}, argc={}",
-        load_result.entry, final_rsp, stack_layout.argc
+        load_result.entry,
+        final_rsp,
+        stack_layout.argc
     );
 
     Ok(0)
@@ -5029,7 +5098,11 @@ fn exec_comm_name(execfn: &[u8]) -> Result<alloc::string::String, SyscallError> 
     s.try_reserve(cap).map_err(|_| SyscallError::ENOMEM)?;
     for &b in &base[..cap] {
         // Reserved `cap` 1-byte chars => push never reallocs (no infallible alloc).
-        s.push(if (0x20..0x7f).contains(&b) { b as char } else { '?' });
+        s.push(if (0x20..0x7f).contains(&b) {
+            b as char
+        } else {
+            '?'
+        });
     }
     Ok(s)
 }
@@ -5115,12 +5188,14 @@ fn parse_shebang_line(bytes: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), Syscal
         None
     } else {
         let mut v = Vec::new();
-        v.try_reserve(rest.len()).map_err(|_| SyscallError::ENOMEM)?;
+        v.try_reserve(rest.len())
+            .map_err(|_| SyscallError::ENOMEM)?;
         v.extend_from_slice(rest);
         Some(v)
     };
     let mut iv = Vec::new();
-    iv.try_reserve(interp.len()).map_err(|_| SyscallError::ENOMEM)?;
+    iv.try_reserve(interp.len())
+        .map_err(|_| SyscallError::ENOMEM)?;
     iv.extend_from_slice(interp);
     Ok((iv, optarg))
 }
@@ -5137,11 +5212,7 @@ fn reconstruct_argv(
     script_path: &[u8],
     orig: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>, SyscallError> {
-    fn push_entry(
-        out: &mut Vec<Vec<u8>>,
-        total: &mut usize,
-        e: &[u8],
-    ) -> Result<(), SyscallError> {
+    fn push_entry(out: &mut Vec<Vec<u8>>, total: &mut usize, e: &[u8]) -> Result<(), SyscallError> {
         if e.len() > MAX_ARG_STRLEN {
             return Err(SyscallError::E2BIG); // Codex Fix B: per-string cap
         }
@@ -5197,7 +5268,8 @@ fn sys_spawn_image(
     if image_len > MAX_EXEC_IMAGE_SIZE {
         kprintln!(
             "sys_spawn_image: ELF size {} exceeds limit {}",
-            image_len, MAX_EXEC_IMAGE_SIZE
+            image_len,
+            MAX_EXEC_IMAGE_SIZE
         );
         return Err(SyscallError::E2BIG);
     }
@@ -5288,7 +5360,7 @@ fn sys_execve(
         // argv = [interp, optarg?, cur_path] ++ cur_argv[1..]; drop cur_argv[0].
         cur_argv = reconstruct_argv(&interp, optarg.as_deref(), cur_path.as_bytes(), &cur_argv)?;
         cur_path = interp_path; // next hop reads the interpreter file
-        // `bytes` drops here => at most one MAX_EXEC_IMAGE_SIZE buffer is live.
+                                // `bytes` drops here => at most one MAX_EXEC_IMAGE_SIZE buffer is live.
     };
 
     exec_from_bytes(process, elf_bytes, cur_argv, envp_vec, execfn)
@@ -5337,7 +5409,8 @@ pub fn run_exec_disambiguation_self_test() {
         ]
     );
 
-    let out = reconstruct_argv(b"/bin/sh", Some(b"-x"), b"/script", &orig).expect("rebuild: optarg");
+    let out =
+        reconstruct_argv(b"/bin/sh", Some(b"-x"), b"/script", &orig).expect("rebuild: optarg");
     assert_eq!(
         out,
         alloc::vec![
@@ -5364,7 +5437,10 @@ pub fn run_exec_disambiguation_self_test() {
     assert!(utf8_path(&[0xff, 0xfe]).is_err());
 
     // --- exec_comm_name (basename, <=15 bytes, ASCII-sanitized) ---
-    assert_eq!(exec_comm_name(b"/usr/bin/python3").expect("comm"), "python3");
+    assert_eq!(
+        exec_comm_name(b"/usr/bin/python3").expect("comm"),
+        "python3"
+    );
     assert_eq!(exec_comm_name(b"noslash").expect("comm"), "noslash");
     assert_eq!(
         exec_comm_name(b"/a/abcdefghijklmnopqrstuvwxyz")
@@ -5456,7 +5532,11 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
 
         // 查找已终止的僵尸子进程
         // F.1 PID Namespace: Also capture the child's namespace chain to derive ns-local PID
-        let mut zombie_child: Option<(ProcessId, i32, Vec<crate::pid_namespace::PidNamespaceMembership>)> = None;
+        let mut zombie_child: Option<(
+            ProcessId,
+            i32,
+            Vec<crate::pid_namespace::PidNamespaceMembership>,
+        )> = None;
         let mut stale_pids: vec::Vec<ProcessId> = vec::Vec::new();
 
         for child_pid in child_list.iter() {
@@ -5536,7 +5616,9 @@ fn sys_wait(status: *mut i32) -> SyscallResult {
 
             kprintln!(
                 "sys_wait: reaped child {} (ns_pid={}) with exit code {}",
-                child_pid, parent_view_pid, exit_code
+                child_pid,
+                parent_view_pid,
+                exit_code
             );
             // F.1: Return namespace-local PID to parent (Linux semantics)
             return Ok(parent_view_pid);
@@ -5634,9 +5716,8 @@ fn sys_gettid() -> SyscallResult {
 
     // F.1: Return the TID from the owning namespace (TID == namespace-local PID)
     // R94-6 FIX: Translation failure returns EFAULT instead of leaking global TID.
-    let ns_tid =
-        crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain)
-            .ok_or(SyscallError::EFAULT)?;
+    let ns_tid = crate::pid_namespace::pid_in_owning_namespace(&proc.pid_ns_chain)
+        .ok_or(SyscallError::EFAULT)?;
     Ok(ns_tid)
 }
 
@@ -5815,12 +5896,15 @@ fn sys_kill(pid: ProcessId, sig: i32) -> SyscallResult {
 
         // Map sender's UIDs to host-level equivalents
         const OVERFLOW_UID: u32 = 65534;
-        let sender_host_euid = sender_ns.map_uid_from_ns(sender_creds.euid)
+        let sender_host_euid = sender_ns
+            .map_uid_from_ns(sender_creds.euid)
             .unwrap_or(OVERFLOW_UID);
-        let sender_host_uid = sender_ns.map_uid_from_ns(sender_creds.uid)
+        let sender_host_uid = sender_ns
+            .map_uid_from_ns(sender_creds.uid)
             .unwrap_or(OVERFLOW_UID);
         // Map target's UID to host-level equivalent
-        let target_host_uid = target_ns.map_uid_from_ns(target_uid)
+        let target_host_uid = target_ns
+            .map_uid_from_ns(target_uid)
             .unwrap_or(OVERFLOW_UID);
 
         // POSIX 权限检查 (namespace-aware):
@@ -6023,7 +6107,12 @@ fn sys_rt_sigaction(
         }
         // SIGKILL/SIGSTOP can never be auto-blocked via sa_mask.
         let mask = mask & !crate::signal::uncatchable_mask();
-        Some(SigAction { handler, flags, restorer, mask })
+        Some(SigAction {
+            handler,
+            flags,
+            restorer,
+            mask,
+        })
     } else {
         None
     };
@@ -6213,7 +6302,11 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
             None => return,
         };
         match crate::signal::resolve_disposition(&proc.sigactions, sig) {
-            crate::signal::Disposition::Handler { handler, flags, mask } => {
+            crate::signal::Disposition::Handler {
+                handler,
+                flags,
+                mask,
+            } => {
                 let restorer = proc.sigactions[bit as usize].restorer;
                 (sig, handler, restorer, mask, flags, proc.blocked)
             }
@@ -6305,8 +6398,8 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
         frame.rdi = sig.as_u8() as u64; // arg0 = signum
         frame.rsi = layout.siginfo_va; // arg1 = &siginfo
         frame.rdx = layout.uc_va; // arg2 = &ucontext
-        // Handler-entry RFLAGS: sanitize the interrupted flags (clear DF/TF/IOPL,
-        // force IF). The ORIGINAL flags are saved into the sigframe's mcontext.EFLAGS.
+                                  // Handler-entry RFLAGS: sanitize the interrupted flags (clear DF/TF/IOPL,
+                                  // force IF). The ORIGINAL flags are saved into the sigframe's mcontext.EFLAGS.
         frame.r11 = crate::signal_frame::sanitize_user_rflags(ctx.rflags);
     });
     if committed.is_none() {
@@ -6329,7 +6422,8 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
         // SA_RESETHAND (Codex review): a one-shot handler resets to SIG_DFL after
         // this single delivery; the next occurrence takes the default action.
         if sa_flags & crate::signal::SA_RESETHAND != 0 {
-            proc.sigactions[(sig.as_u8() - 1) as usize] = crate::signal::SigAction::default_action();
+            proc.sigactions[(sig.as_u8() - 1) as usize] =
+                crate::signal::SigAction::default_action();
         }
     }
 
@@ -6414,22 +6508,22 @@ fn sys_unshare(flags: u64) -> SyscallResult {
             proc.pid_ns_for_children.clone()
         };
 
-        let new_ns =
-            crate::pid_namespace::PidNamespace::new_child(current_ns_for_children).map_err(
-                |e| {
-                    klog!(Error, "[sys_unshare] Failed to create PID namespace: {:?}", e);
-                    match e {
-                        crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => {
-                            SyscallError::EAGAIN
-                        }
-                        // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
-                        crate::pid_namespace::PidNamespaceError::MaxNamespaces => {
-                            SyscallError::EAGAIN
-                        }
-                        _ => SyscallError::ENOMEM,
+        let new_ns = crate::pid_namespace::PidNamespace::new_child(current_ns_for_children)
+            .map_err(|e| {
+                klog!(
+                    Error,
+                    "[sys_unshare] Failed to create PID namespace: {:?}",
+                    e
+                );
+                match e {
+                    crate::pid_namespace::PidNamespaceError::MaxDepthExceeded => {
+                        SyscallError::EAGAIN
                     }
-                },
-            )?;
+                    // R76-2 FIX: Map MaxNamespaces to EAGAIN (retriable resource limit)
+                    crate::pid_namespace::PidNamespaceError::MaxNamespaces => SyscallError::EAGAIN,
+                    _ => SyscallError::ENOMEM,
+                }
+            })?;
 
         // Update the process's pid_ns_for_children
         {
@@ -6437,7 +6531,8 @@ fn sys_unshare(flags: u64) -> SyscallResult {
             proc.pid_ns_for_children = new_ns.clone();
         }
 
-        klog!(Info,
+        klog!(
+            Info,
             "[sys_unshare] Process {} unshared PID namespace, children will use ns_id={}, level={}",
             pid,
             new_ns.id().raw(),
@@ -6489,7 +6584,11 @@ fn sys_unshare(flags: u64) -> SyscallResult {
         };
 
         let new_ns = crate::mount_namespace::clone_namespace(current_ns.clone()).map_err(|e| {
-            klog!(Error, "[sys_unshare] Failed to create mount namespace: {:?}", e);
+            klog!(
+                Error,
+                "[sys_unshare] Failed to create mount namespace: {:?}",
+                e
+            );
             match e {
                 crate::mount_namespace::MountNsError::MaxDepthExceeded => SyscallError::EAGAIN,
                 _ => SyscallError::ENOMEM,
@@ -6629,7 +6728,8 @@ fn sys_setns(fd: i32, nstype: i32) -> SyscallResult {
         }
     }
 
-    klog!(Info,
+    klog!(
+        Info,
         "[sys_setns] Process {} switching to mount namespace id={}, level={}",
         pid,
         target_ns.id().raw(),
@@ -6833,15 +6933,30 @@ const DISPATCHED_PROMISED: &[u64] = &[
 /// reason. Bounded by MAX_EXEMPT, which every future M0-6 slice MUST lower — so
 /// this list can never permanently hide divergence.
 const INTENTIONAL_UNDISPATCHED: &[(u64, &str)] = &[
-    (25, "mremap: VM promise, dispatch deferred (M0-6 later slice)"),
-    (58, "vfork: deliberate ENOSYS-by-invariant (sys_clone documents the fallback)"),
+    (
+        25,
+        "mremap: VM promise, dispatch deferred (M0-6 later slice)",
+    ),
+    (
+        58,
+        "vfork: deliberate ENOSYS-by-invariant (sys_clone documents the fallback)",
+    ),
     (82, "rename: WPATH, deferred to the VFS-META slice"),
     (86, "link: CPATH, deferred (needs FileSystem::link)"),
     (88, "symlink: WPATH, deferred (needs FileSystem::symlink)"),
-    (89, "readlink: RPATH, deferred to VFS-META (lookup-resolver fix needed)"),
+    (
+        89,
+        "readlink: RPATH, deferred to VFS-META (lookup-resolver fix needed)",
+    ),
     (92, "chown: FATTR, dispatch deferred (M0-6 later slice)"),
-    (93, "fchown: FATTR (post-const-fix), dispatch deferred (M0-6 later slice)"),
-    (247, "waitid: PROC promise, dispatch deferred (M0-6 later slice)"),
+    (
+        93,
+        "fchown: FATTR (post-const-fix), dispatch deferred (M0-6 later slice)",
+    ),
+    (
+        247,
+        "waitid: PROC promise, dispatch deferred (M0-6 later slice)",
+    ),
 ];
 const MAX_EXEMPT: usize = 9;
 
@@ -6860,7 +6975,11 @@ pub fn run_pledge_dispatch_parity_self_test() {
     );
     let union = seccomp::pledge_full_syscall_union();
     for &nr in &union {
-        assert!(nr < 512, "M0-6: pledge union member {} >= 512 (FastAllowSet boundary)", nr);
+        assert!(
+            nr < 512,
+            "M0-6: pledge union member {} >= 512 (FastAllowSet boundary)",
+            nr
+        );
         let disp = DISPATCHED_PROMISED.contains(&nr);
         let ex = rlimit_is_exempt(nr);
         assert!(
@@ -6870,12 +6989,23 @@ pub fn run_pledge_dispatch_parity_self_test() {
         );
     }
     for &nr in DISPATCHED_PROMISED {
-        assert!(union.contains(&nr), "M0-6: DISPATCHED_PROMISED {} is not pledge-promised (stale)", nr);
+        assert!(
+            union.contains(&nr),
+            "M0-6: DISPATCHED_PROMISED {} is not pledge-promised (stale)",
+            nr
+        );
     }
     for &(nr, _) in INTENTIONAL_UNDISPATCHED {
-        assert!(union.contains(&nr), "M0-6: exemption {} is not pledge-promised (stale)", nr);
+        assert!(
+            union.contains(&nr),
+            "M0-6: exemption {} is not pledge-promised (stale)",
+            nr
+        );
     }
-    assert!(!union.contains(&517), "M0-6: spawn_image(517) must not be pledge-able");
+    assert!(
+        !union.contains(&517),
+        "M0-6: spawn_image(517) must not be pledge-able"
+    );
 }
 
 /// M0-6: machine-check BPF<->semantic agreement (R150-3) + promise non-vacuity.
@@ -6893,10 +7023,18 @@ pub fn run_pledge_semantic_parity_self_test() {
         );
     }
     const LIST_BEARING: &[PledgePromises] = &[
-        PledgePromises::STDIO, PledgePromises::RPATH, PledgePromises::WPATH,
-        PledgePromises::CPATH, PledgePromises::TMPPATH, PledgePromises::PROC,
-        PledgePromises::EXEC, PledgePromises::THREAD, PledgePromises::TIME,
-        PledgePromises::SENDSIG, PledgePromises::FATTR, PledgePromises::RLIMIT,
+        PledgePromises::STDIO,
+        PledgePromises::RPATH,
+        PledgePromises::WPATH,
+        PledgePromises::CPATH,
+        PledgePromises::TMPPATH,
+        PledgePromises::PROC,
+        PledgePromises::EXEC,
+        PledgePromises::THREAD,
+        PledgePromises::TIME,
+        PledgePromises::SENDSIG,
+        PledgePromises::FATTR,
+        PledgePromises::RLIMIT,
         PledgePromises::VM,
     ];
     let base = seccomp::pledge_syscall_list(PledgePromises::empty()).len();
@@ -6914,11 +7052,46 @@ pub fn run_rlimit_self_test() {
     let d = default_rlimits();
     assert_eq!(d[RLIMIT_NOFILE].rlim_cur, crate::process::MAX_FD as u64);
     assert_eq!(d[0].rlim_cur, RLIM_INFINITY); // CPU index = infinity
-    let old = RLimit { rlim_cur: 100, rlim_max: 200 };
-    assert!(validate_rlimit_change(old, RLimit { rlim_cur: 10, rlim_max: 5 }, false).is_err()); // cur>max
-    assert!(validate_rlimit_change(old, RLimit { rlim_cur: 100, rlim_max: 300 }, false).is_err()); // raise w/o root
-    assert!(validate_rlimit_change(old, RLimit { rlim_cur: 100, rlim_max: 300 }, true).is_ok()); // raise w/ root
-    assert!(validate_rlimit_change(old, RLimit { rlim_cur: 50, rlim_max: 150 }, false).is_ok()); // lower
+    let old = RLimit {
+        rlim_cur: 100,
+        rlim_max: 200,
+    };
+    assert!(validate_rlimit_change(
+        old,
+        RLimit {
+            rlim_cur: 10,
+            rlim_max: 5
+        },
+        false
+    )
+    .is_err()); // cur>max
+    assert!(validate_rlimit_change(
+        old,
+        RLimit {
+            rlim_cur: 100,
+            rlim_max: 300
+        },
+        false
+    )
+    .is_err()); // raise w/o root
+    assert!(validate_rlimit_change(
+        old,
+        RLimit {
+            rlim_cur: 100,
+            rlim_max: 300
+        },
+        true
+    )
+    .is_ok()); // raise w/ root
+    assert!(validate_rlimit_change(
+        old,
+        RLimit {
+            rlim_cur: 50,
+            rlim_max: 150
+        },
+        false
+    )
+    .is_ok()); // lower
 }
 
 fn sys_pipe(fds: *mut i32) -> SyscallResult {
@@ -6998,7 +7171,8 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
 
         // R156-3 FIX: Fallible allocation — infallible vec! panics on OOM.
         let mut tmp = Vec::new();
-        tmp.try_reserve_exact(count).map_err(|_| SyscallError::ENOMEM)?;
+        tmp.try_reserve_exact(count)
+            .map_err(|_| SyscallError::ENOMEM)?;
         tmp.resize(count, 0);
         loop {
             // 先尝试读取
@@ -7046,7 +7220,8 @@ fn sys_read(fd: i32, buf: *mut u8, count: usize) -> SyscallResult {
 
     // R156-3 FIX: Fallible allocation for read buffer.
     let mut tmp = Vec::new();
-    tmp.try_reserve_exact(count).map_err(|_| SyscallError::ENOMEM)?;
+    tmp.try_reserve_exact(count)
+        .map_err(|_| SyscallError::ENOMEM)?;
     tmp.resize(count, 0);
     let bytes_read = read_fn(fd, &mut tmp)?;
 
@@ -7083,7 +7258,8 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
 
     // R156-3 FIX: Fallible allocation for write buffer.
     let mut tmp = Vec::new();
-    tmp.try_reserve_exact(count).map_err(|_| SyscallError::ENOMEM)?;
+    tmp.try_reserve_exact(count)
+        .map_err(|_| SyscallError::ENOMEM)?;
     tmp.resize(count, 0);
     copy_from_user(&mut tmp, buf)?;
 
@@ -7100,7 +7276,10 @@ fn sys_write(fd: i32, buf: *const u8, count: usize) -> SyscallResult {
                 let mut i = 0;
                 while i < tmp.len() {
                     match core::str::from_utf8(&tmp[i..]) {
-                        Ok(s) => { print!("{}", s); break; }
+                        Ok(s) => {
+                            print!("{}", s);
+                            break;
+                        }
                         Err(e) => {
                             let valid_end = e.valid_up_to();
                             if valid_end > 0 {
@@ -7325,10 +7504,7 @@ fn sys_open(path: *const u8, flags: i32, mode: u32) -> SyscallResult {
         if path_bytes.is_empty() {
             return Err(SyscallError::EINVAL);
         }
-        try_str_to_string(
-            core::str::from_utf8(&path_bytes)
-                .map_err(|_| SyscallError::EINVAL)?
-        )?
+        try_str_to_string(core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?)?
     };
 
     // R96-5 FIX: Delegate to internal helper to avoid TOCTOU in openat
@@ -7371,12 +7547,10 @@ fn sys_open_internal(path_str: &str, flags: i32, mode: u32) -> SyscallResult {
         // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the rejected
         // object on the EMFILE arm (byte-equivalent to the old
         // allocate_fd-internal drop); conversion to drop-outside tracked.
-        let fd = proc
-            .allocate_fd(file_ops)
-            .map_err(|rejected| {
-                drop(rejected);
-                SyscallError::EMFILE
-            })?;
+        let fd = proc.allocate_fd(file_ops).map_err(|rejected| {
+            drop(rejected);
+            SyscallError::EMFILE
+        })?;
 
         // R39-4 FIX: 如果 flags 包含 O_CLOEXEC，标记 fd 为 close-on-exec
         //
@@ -7421,10 +7595,7 @@ fn sys_stat(path: *const u8, statbuf: *mut VfsStat) -> SyscallResult {
         if path_bytes.is_empty() {
             return Err(SyscallError::EINVAL);
         }
-        try_str_to_string(
-            core::str::from_utf8(&path_bytes)
-                .map_err(|_| SyscallError::EINVAL)?
-        )?
+        try_str_to_string(core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?)?
     };
 
     // R96-5 FIX: Delegate to internal helper to avoid TOCTOU in fstatat
@@ -7723,8 +7894,9 @@ const MMAP_REGION_FLAG_PENDING_MPROTECT: usize = 1 << 6;
 
 /// Mask of transient in-flight flags. Only these are stripped on fork/clone;
 /// persistent committed flags (e.g. PROT_NONE) are preserved.
-pub(crate) const MMAP_REGION_FLAG_TRANSIENT_MASK: usize =
-    MMAP_REGION_FLAG_PENDING_MAP | MMAP_REGION_FLAG_PENDING_UNMAP | MMAP_REGION_FLAG_PENDING_MPROTECT;
+pub(crate) const MMAP_REGION_FLAG_TRANSIENT_MASK: usize = MMAP_REGION_FLAG_PENDING_MAP
+    | MMAP_REGION_FLAG_PENDING_UNMAP
+    | MMAP_REGION_FLAG_PENDING_MPROTECT;
 
 /// D2-MMAP-LIFECYCLE Phase 2: typed newtype for `mmap_regions` VALUES.
 ///
@@ -7875,9 +8047,8 @@ impl MmapEntry {
     /// OR the new prot bits, leaving length + PROT_NONE + transient bits untouched.
     #[inline]
     pub fn rewrite_prot_bits(&mut self, new_prot_flags: usize) {
-        let prot_mask = MMAP_REGION_FLAG_PROT_READ
-            | MMAP_REGION_FLAG_PROT_WRITE
-            | MMAP_REGION_FLAG_PROT_EXEC;
+        let prot_mask =
+            MMAP_REGION_FLAG_PROT_READ | MMAP_REGION_FLAG_PROT_WRITE | MMAP_REGION_FLAG_PROT_EXEC;
         self.0 = (self.0 & !prot_mask) | new_prot_flags;
     }
 
@@ -7949,9 +8120,21 @@ fn mmap_prot_to_flags(prot: i32) -> usize {
 /// mappings), so the 4th character is always 'p'.
 pub fn mmap_flags_to_perms(flags: usize) -> [u8; 4] {
     [
-        if flags & MMAP_REGION_FLAG_PROT_READ != 0 { b'r' } else { b'-' },
-        if flags & MMAP_REGION_FLAG_PROT_WRITE != 0 { b'w' } else { b'-' },
-        if flags & MMAP_REGION_FLAG_PROT_EXEC != 0 { b'x' } else { b'-' },
+        if flags & MMAP_REGION_FLAG_PROT_READ != 0 {
+            b'r'
+        } else {
+            b'-'
+        },
+        if flags & MMAP_REGION_FLAG_PROT_WRITE != 0 {
+            b'w'
+        } else {
+            b'-'
+        },
+        if flags & MMAP_REGION_FLAG_PROT_EXEC != 0 {
+            b'x'
+        } else {
+            b'-'
+        },
         b'p', // always private
     ]
 }
@@ -8122,41 +8305,95 @@ fn sys_brk(addr: usize) -> SyscallResult {
         // If allocation fails partway, we must unmap+free pages already mapped in this call.
         let map_result: Result<vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> = unsafe {
             use x86_64::structures::paging::PhysFrame;
-            with_current_manager(VirtAddr::new(0), |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
-                // M2-1 SLICE-4b: record the intermediate PT/PD/PDPT frames map_page
-                // builds for this heap growth so they are charged + ledgered at the
-                // commit fold (mirrors sys_mmap Phase-2/3). The per-page DATA frame
-                // below goes through the inherent allocate_data_frame (UNrecorded);
-                // only map_page's trait allocate_frame records page-table frames.
-                let mut frame_alloc = RecordingFrameAllocator::new();
-                let flags = PageTableFlags::PRESENT
-                    | PageTableFlags::WRITABLE
-                    | PageTableFlags::USER_ACCESSIBLE
-                    | PageTableFlags::NO_EXECUTE;
-                let mut mapped_pages: Vec<Page<x86_64::structures::paging::Size4KiB>> = Vec::new();
+            with_current_manager(
+                VirtAddr::new(0),
+                |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
+                    // M2-1 SLICE-4b: record the intermediate PT/PD/PDPT frames map_page
+                    // builds for this heap growth so they are charged + ledgered at the
+                    // commit fold (mirrors sys_mmap Phase-2/3). The per-page DATA frame
+                    // below goes through the inherent allocate_data_frame (UNrecorded);
+                    // only map_page's trait allocate_frame records page-table frames.
+                    let mut frame_alloc = RecordingFrameAllocator::new();
+                    let flags = PageTableFlags::PRESENT
+                        | PageTableFlags::WRITABLE
+                        | PageTableFlags::USER_ACCESSIBLE
+                        | PageTableFlags::NO_EXECUTE;
+                    let mut mapped_pages: Vec<Page<x86_64::structures::paging::Size4KiB>> =
+                        Vec::new();
 
-                for offset in (0..grow_size).step_by(PAGE_SIZE) {
-                    let vaddr = VirtAddr::new((old_top + offset) as u64);
-                    let page = Page::containing_address(vaddr);
+                    for offset in (0..grow_size).step_by(PAGE_SIZE) {
+                        let vaddr = VirtAddr::new((old_top + offset) as u64);
+                        let page = Page::containing_address(vaddr);
 
-                    // 检查页面是否已映射
-                    if manager.translate_addr(vaddr).is_some() {
-                        continue;
-                    }
+                        // 检查页面是否已映射
+                        if manager.translate_addr(vaddr).is_some() {
+                            continue;
+                        }
 
-                    // 分配物理帧 - with rollback on failure
-                    // M2-1 SLICE-4b: DATA frame via the inherent allocate_data_frame
-                    // (NOT recorded into the PT ledger). LOAD-BEARING split — the
-                    // map_page call below KEEPS `&mut frame_alloc`, so only the
-                    // intermediate tables it pulls are recorded.
-                    let frame = match frame_alloc.allocate_data_frame() {
-                        Some(f) => f,
-                        None => {
-                            // R127-2 FIX: 3-phase rollback pattern —
-                            // 1) unmap pages and collect frames
-                            // 2) cross-CPU TLB shootdown
-                            // 3) deallocate frames after TLB is flushed
-                            // R158-12 + R158-6 FIX: Fallible rollback Vec; immediate free on OOM.
+                        // 分配物理帧 - with rollback on failure
+                        // M2-1 SLICE-4b: DATA frame via the inherent allocate_data_frame
+                        // (NOT recorded into the PT ledger). LOAD-BEARING split — the
+                        // map_page call below KEEPS `&mut frame_alloc`, so only the
+                        // intermediate tables it pulls are recorded.
+                        let frame = match frame_alloc.allocate_data_frame() {
+                            Some(f) => f,
+                            None => {
+                                // R127-2 FIX: 3-phase rollback pattern —
+                                // 1) unmap pages and collect frames
+                                // 2) cross-CPU TLB shootdown
+                                // 3) deallocate frames after TLB is flushed
+                                // R158-12 + R158-6 FIX: Fallible rollback Vec; immediate free on OOM.
+                                let mut frames_to_free = Vec::new();
+                                let _ = frames_to_free.try_reserve(mapped_pages.len());
+                                for &rollback_page in mapped_pages.iter().rev() {
+                                    if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
+                                        if frames_to_free.try_reserve(1).is_ok() {
+                                            frames_to_free.push(freed_frame);
+                                        } else {
+                                            mm::flush_current_as_page(
+                                                rollback_page.start_address(),
+                                            );
+                                            frame_alloc.deallocate_frame(freed_frame);
+                                        }
+                                    }
+                                }
+                                // M2-1 SLICE-4b: reclaim the now-empty intermediate PT/PD
+                                // tables this rolled-back growth left behind (mirrors
+                                // sys_mmap R169-L2; also fixes the pre-existing brk-grow
+                                // rollback table leak). old_top/grow_size spans the whole
+                                // request — mapped_pages is SPARSE (translate_addr skip at
+                                // the top of the loop), and table_empty() leaves a table
+                                // still pinned by a skipped sibling leaf untouched.
+                                manager.prune_empty_tables_in_range(
+                                    VirtAddr::new(old_top as u64),
+                                    grow_size,
+                                    &mut frames_to_free,
+                                );
+                                if !frames_to_free.is_empty() {
+                                    mm::flush_current_as_range(
+                                        VirtAddr::new(old_top as u64),
+                                        grow_size,
+                                    );
+                                    for frame in frames_to_free {
+                                        frame_alloc.deallocate_frame(frame);
+                                    }
+                                }
+                                return Err(SyscallError::ENOMEM);
+                            }
+                        };
+
+                        // 清零新分配的帧
+                        let virt = mm::phys_to_virt(frame.start_address());
+                        core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
+
+                        // 映射页 - with rollback on failure
+                        if manager
+                            .map_page(page, frame, flags, &mut frame_alloc)
+                            .is_err()
+                        {
+                            // Free the frame we just allocated
+                            frame_alloc.deallocate_frame(frame);
+                            // R127-2 + R158-6 FIX: 3-phase rollback; immediate free on OOM.
                             let mut frames_to_free = Vec::new();
                             let _ = frames_to_free.try_reserve(mapped_pages.len());
                             for &rollback_page in mapped_pages.iter().rev() {
@@ -8169,13 +8406,10 @@ fn sys_brk(addr: usize) -> SyscallResult {
                                     }
                                 }
                             }
-                            // M2-1 SLICE-4b: reclaim the now-empty intermediate PT/PD
-                            // tables this rolled-back growth left behind (mirrors
-                            // sys_mmap R169-L2; also fixes the pre-existing brk-grow
-                            // rollback table leak). old_top/grow_size spans the whole
-                            // request — mapped_pages is SPARSE (translate_addr skip at
-                            // the top of the loop), and table_empty() leaves a table
-                            // still pinned by a skipped sibling leaf untouched.
+                            // M2-1 SLICE-4b: reclaim now-empty intermediate PT/PD tables
+                            // (mirrors sys_mmap R169-L2; fixes the pre-existing brk-grow
+                            // rollback table leak). old_top/grow_size spans the sparse
+                            // request; table_empty() guards still-pinned tables.
                             manager.prune_empty_tables_in_range(
                                 VirtAddr::new(old_top as u64),
                                 grow_size,
@@ -8192,99 +8426,54 @@ fn sys_brk(addr: usize) -> SyscallResult {
                             }
                             return Err(SyscallError::ENOMEM);
                         }
-                    };
 
-                    // 清零新分配的帧
-                    let virt = mm::phys_to_virt(frame.start_address());
-                    core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
-
-                    // 映射页 - with rollback on failure
-                    if manager
-                        .map_page(page, frame, flags, &mut frame_alloc)
-                        .is_err()
-                    {
-                        // Free the frame we just allocated
-                        frame_alloc.deallocate_frame(frame);
-                        // R127-2 + R158-6 FIX: 3-phase rollback; immediate free on OOM.
-                        let mut frames_to_free = Vec::new();
-                        let _ = frames_to_free.try_reserve(mapped_pages.len());
-                        for &rollback_page in mapped_pages.iter().rev() {
-                            if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
-                                if frames_to_free.try_reserve(1).is_ok() {
-                                    frames_to_free.push(freed_frame);
-                                } else {
-                                    mm::flush_current_as_page(rollback_page.start_address());
-                                    frame_alloc.deallocate_frame(freed_frame);
+                        // R158-6 FIX: fallible push — unmap+free on OOM.
+                        if mapped_pages.try_reserve(1).is_err() {
+                            if let Ok(freed) = manager.unmap_page(page) {
+                                mm::flush_current_as_page(page.start_address());
+                                frame_alloc.deallocate_frame(freed);
+                            }
+                            let mut frames_to_free = Vec::new();
+                            let _ = frames_to_free.try_reserve(mapped_pages.len());
+                            for &rollback_page in mapped_pages.iter().rev() {
+                                if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
+                                    if frames_to_free.try_reserve(1).is_ok() {
+                                        frames_to_free.push(freed_frame);
+                                    } else {
+                                        mm::flush_current_as_page(rollback_page.start_address());
+                                        frame_alloc.deallocate_frame(freed_frame);
+                                    }
                                 }
                             }
-                        }
-                        // M2-1 SLICE-4b: reclaim now-empty intermediate PT/PD tables
-                        // (mirrors sys_mmap R169-L2; fixes the pre-existing brk-grow
-                        // rollback table leak). old_top/grow_size spans the sparse
-                        // request; table_empty() guards still-pinned tables.
-                        manager.prune_empty_tables_in_range(
-                            VirtAddr::new(old_top as u64),
-                            grow_size,
-                            &mut frames_to_free,
-                        );
-                        if !frames_to_free.is_empty() {
-                            mm::flush_current_as_range(
+                            // M2-1 SLICE-4b: reclaim now-empty intermediate PT/PD tables
+                            // (mirrors sys_mmap R169-L2; fixes the pre-existing brk-grow
+                            // rollback table leak). old_top/grow_size spans the sparse
+                            // request; table_empty() guards still-pinned tables.
+                            manager.prune_empty_tables_in_range(
                                 VirtAddr::new(old_top as u64),
                                 grow_size,
+                                &mut frames_to_free,
                             );
-                            for frame in frames_to_free {
-                                frame_alloc.deallocate_frame(frame);
-                            }
-                        }
-                        return Err(SyscallError::ENOMEM);
-                    }
-
-                    // R158-6 FIX: fallible push — unmap+free on OOM.
-                    if mapped_pages.try_reserve(1).is_err() {
-                        if let Ok(freed) = manager.unmap_page(page) {
-                            mm::flush_current_as_page(page.start_address());
-                            frame_alloc.deallocate_frame(freed);
-                        }
-                        let mut frames_to_free = Vec::new();
-                        let _ = frames_to_free.try_reserve(mapped_pages.len());
-                        for &rollback_page in mapped_pages.iter().rev() {
-                            if let Ok(freed_frame) = manager.unmap_page(rollback_page) {
-                                if frames_to_free.try_reserve(1).is_ok() {
-                                    frames_to_free.push(freed_frame);
-                                } else {
-                                    mm::flush_current_as_page(rollback_page.start_address());
-                                    frame_alloc.deallocate_frame(freed_frame);
+                            if !frames_to_free.is_empty() {
+                                mm::flush_current_as_range(
+                                    VirtAddr::new(old_top as u64),
+                                    grow_size,
+                                );
+                                for f in frames_to_free {
+                                    frame_alloc.deallocate_frame(f);
                                 }
                             }
+                            return Err(SyscallError::ENOMEM);
                         }
-                        // M2-1 SLICE-4b: reclaim now-empty intermediate PT/PD tables
-                        // (mirrors sys_mmap R169-L2; fixes the pre-existing brk-grow
-                        // rollback table leak). old_top/grow_size spans the sparse
-                        // request; table_empty() guards still-pinned tables.
-                        manager.prune_empty_tables_in_range(
-                            VirtAddr::new(old_top as u64),
-                            grow_size,
-                            &mut frames_to_free,
-                        );
-                        if !frames_to_free.is_empty() {
-                            mm::flush_current_as_range(
-                                VirtAddr::new(old_top as u64),
-                                grow_size,
-                            );
-                            for f in frames_to_free {
-                                frame_alloc.deallocate_frame(f);
-                            }
-                        }
-                        return Err(SyscallError::ENOMEM);
+                        mapped_pages.push(page);
                     }
-                    mapped_pages.push(page);
-                }
-                // M2-1 SLICE-4b: yield the recorded PT-frame identities (NOT a count)
-                // for the Step-3 charge + ledger fold. Every Err path above freed its
-                // own DATA leaves AND pruned+freed its own intermediate tables, so this
-                // Vec is meaningful only on this Ok path.
-                Ok(frame_alloc.pt_frames)
-            })
+                    // M2-1 SLICE-4b: yield the recorded PT-frame identities (NOT a count)
+                    // for the Step-3 charge + ledger fold. Every Err path above freed its
+                    // own DATA leaves AND pruned+freed its own intermediate tables, so this
+                    // Vec is meaningful only on this Ok path.
+                    Ok(frame_alloc.pt_frames)
+                },
+            )
         };
 
         // M2-1 SLICE-4b: bind the recorded PT-frame identities on success. The Err arm
@@ -8351,9 +8540,7 @@ fn sys_brk(addr: usize) -> SyscallResult {
             mm.brk = addr;
             // R163-9 FIX: saturating_sub to preserve concurrent brk pending.
             mm.brk_pending_growth = mm.brk_pending_growth.saturating_sub(grow_size as u64);
-            mm.vm_charged_bytes = mm
-                .vm_charged_bytes
-                .saturating_add(grow_size as u64);
+            mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_add(grow_size as u64);
             // M2-1 SLICE-4b: SOFT/forced PT-frame kmem charge, after-the-fact (the PT
             // count is knowable only after map_page ran — IM-15), migration-atomic under
             // this Process+MmState hold. record_pt_charge does the per-AS frame-identity
@@ -8515,9 +8702,7 @@ fn sys_brk(addr: usize) -> SyscallResult {
                 // growth. The DATA charge for these freed pages must still be released (the
                 // frames were already deallocated). reclaim stays armed; its Drop publishes
                 // the table frames to the buddy AFTER this ledger removal (free-after-remove).
-                mm.vm_charged_bytes = mm
-                    .vm_charged_bytes
-                    .saturating_sub(shrink_size as u64);
+                mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_sub(shrink_size as u64);
                 let current_brk = mm.brk;
                 cgroup::uncharge_memory(cgroup_id, shrink_size as u64);
                 if pt_freed > 0 {
@@ -8526,9 +8711,7 @@ fn sys_brk(addr: usize) -> SyscallResult {
                 return Ok(current_brk);
             }
             mm.brk = addr;
-            mm.vm_charged_bytes = mm
-                .vm_charged_bytes
-                .saturating_sub(shrink_size as u64);
+            mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_sub(shrink_size as u64);
             cgroup::uncharge_memory(cgroup_id, shrink_size as u64);
             if pt_freed > 0 {
                 cgroup::uncharge_memory(cgroup_id, pt_freed);
@@ -8627,8 +8810,7 @@ unsafe impl x86_64::structures::paging::FrameAllocator<x86_64::structures::pagin
 {
     fn allocate_frame(
         &mut self,
-    ) -> Option<x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>>
-    {
+    ) -> Option<x86_64::structures::paging::PhysFrame<x86_64::structures::paging::Size4KiB>> {
         // Reserve the ledger slot BEFORE pulling a frame from the buddy. On OOM
         // return None without allocating: `map_to` then fails and the caller's
         // existing rollback runs — no unrecorded live PT frame can exist (fail-closed).
@@ -8658,13 +8840,21 @@ pub fn run_recording_frame_allocator_split_self_test() {
     let d = fa
         .allocate_data_frame()
         .expect("buddy frame for DATA self-test");
-    assert_eq!(fa.pt_frames.len(), 0, "DATA frame must NOT enter the PT ledger");
+    assert_eq!(
+        fa.pt_frames.len(),
+        0,
+        "DATA frame must NOT enter the PT ledger"
+    );
     // PT frame via the trait method `map_page` uses: must be recorded by identity.
     let p = <RecordingFrameAllocator as x86_64::structures::paging::FrameAllocator<
         x86_64::structures::paging::Size4KiB,
     >>::allocate_frame(&mut fa)
     .expect("buddy frame for PT self-test");
-    assert_eq!(fa.pt_frames.len(), 1, "trait allocate_frame MUST record the PT frame");
+    assert_eq!(
+        fa.pt_frames.len(),
+        1,
+        "trait allocate_frame MUST record the PT frame"
+    );
     assert_eq!(
         fa.pt_frames[0], p,
         "recorded PT frame identity must match the allocation"
@@ -8827,14 +9017,21 @@ fn sys_mmap(
 
         // Reserve the region with PENDING_MAP flag before dropping locks.
         let phase1_flags = MMAP_REGION_FLAG_PENDING_MAP
-            | if is_prot_none { MMAP_REGION_FLAG_PROT_NONE } else { 0 };
+            | if is_prot_none {
+                MMAP_REGION_FLAG_PROT_NONE
+            } else {
+                0
+            };
         // next-phase #11: fallible insert. `base` is a new key (overlap-checked
         // above), so this allocates a slot. On OOM, roll back the cgroup charge
         // made for the non-PROT_NONE case before returning ENOMEM — otherwise the
         // charge would leak with no region to account for it.
         if mm
             .mmap_regions
-            .try_insert(base, MmapEntry::from_len_flags(length_aligned, phase1_flags))
+            .try_insert(
+                base,
+                MmapEntry::from_len_flags(length_aligned, phase1_flags),
+            )
             .is_err()
         {
             if !is_prot_none {
@@ -8883,7 +9080,9 @@ fn sys_mmap(
         #[cfg(debug_assertions)]
         kprintln!(
             "sys_mmap: pid={}, reserved {} bytes at 0x{:x} (PROT_NONE, no frames)",
-            pid, length_aligned, base
+            pid,
+            length_aligned,
+            base
         );
 
         return Ok(base);
@@ -8906,26 +9105,70 @@ fn sys_mmap(
     let map_result: Result<vec::Vec<x86_64::structures::paging::PhysFrame>, SyscallError> = unsafe {
         use x86_64::structures::paging::PhysFrame;
 
-        with_current_manager(VirtAddr::new(0), |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
-            let mut frame_alloc = RecordingFrameAllocator {
-                inner: FrameAllocator::new(),
-                pt_frames: vec::Vec::new(),
-            };
-            // 跟踪已成功映射的 (page, frame) 对，用于失败时回滚
-            let mut mapped: vec::Vec<(Page, PhysFrame)> = vec::Vec::new();
+        with_current_manager(
+            VirtAddr::new(0),
+            |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
+                let mut frame_alloc = RecordingFrameAllocator {
+                    inner: FrameAllocator::new(),
+                    pt_frames: vec::Vec::new(),
+                };
+                // 跟踪已成功映射的 (page, frame) 对，用于失败时回滚
+                let mut mapped: vec::Vec<(Page, PhysFrame)> = vec::Vec::new();
 
-            for offset in (0..length_aligned).step_by(0x1000) {
-                let page = Page::containing_address(VirtAddr::new((base + offset) as u64));
+                for offset in (0..length_aligned).step_by(0x1000) {
+                    let page = Page::containing_address(VirtAddr::new((base + offset) as u64));
 
-                // 分配物理帧，失败时回滚所有已映射的页
-                // R171-CG1x0 FIX (M2-1 SLICE-0): the DATA frame uses the inherent
-                // `allocate_data_frame` (NOT recorded into the PT ledger); only the
-                // intermediate tables `map_page`/`map_to` pull below are recorded.
-                let frame = match frame_alloc.allocate_data_frame() {
-                    Some(f) => f,
-                    None => {
-                        // R127-2 + R158-12 FIX: 3-phase rollback; immediate free on OOM.
-                        let flush_len = mapped.len() * 0x1000;
+                    // 分配物理帧，失败时回滚所有已映射的页
+                    // R171-CG1x0 FIX (M2-1 SLICE-0): the DATA frame uses the inherent
+                    // `allocate_data_frame` (NOT recorded into the PT ledger); only the
+                    // intermediate tables `map_page`/`map_to` pull below are recorded.
+                    let frame = match frame_alloc.allocate_data_frame() {
+                        Some(f) => f,
+                        None => {
+                            // R127-2 + R158-12 FIX: 3-phase rollback; immediate free on OOM.
+                            let flush_len = mapped.len() * 0x1000;
+                            let mut frames_to_free = vec::Vec::new();
+                            let _ = frames_to_free.try_reserve(mapped.len());
+                            for (cleanup_page, cleanup_frame) in mapped.drain(..) {
+                                if manager.unmap_page(cleanup_page).is_ok() {
+                                    if frames_to_free.try_reserve(1).is_ok() {
+                                        frames_to_free.push(cleanup_frame);
+                                    } else {
+                                        mm::flush_current_as_page(cleanup_page.start_address());
+                                        frame_alloc.deallocate_frame(cleanup_frame);
+                                    }
+                                }
+                            }
+                            // R169-L2 FIX: reclaim the intermediate PT/PD tables the
+                            // rolled-back leaves left empty; the frames ride the same
+                            // flush+free below (3-phase: clear entry, flush, free).
+                            manager.prune_empty_tables_in_range(
+                                VirtAddr::new(base as u64),
+                                flush_len,
+                                &mut frames_to_free,
+                            );
+                            if !frames_to_free.is_empty() {
+                                mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
+                                for frame in frames_to_free {
+                                    frame_alloc.deallocate_frame(frame);
+                                }
+                            }
+                            return Err(SyscallError::ENOMEM);
+                        }
+                    };
+
+                    // 安全：清零新分配的帧，防止泄漏其他进程的数据
+                    // 使用高半区直映访问物理内存
+                    let virt = mm::phys_to_virt(frame.start_address());
+                    core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
+
+                    // 映射页，失败时回滚
+                    if let Err(_) = manager.map_page(page, frame, page_flags, &mut frame_alloc) {
+                        frame_alloc.deallocate_frame(frame);
+                        // R127-2 + R158-12 FIX: 3-phase rollback with fallible Vec.
+                        // R169-L2: +1 page so the prune covers the CURRENT page, whose
+                        // intermediate tables map_to may have created before failing.
+                        let flush_len = (mapped.len() + 1) * 0x1000;
                         let mut frames_to_free = vec::Vec::new();
                         let _ = frames_to_free.try_reserve(mapped.len());
                         for (cleanup_page, cleanup_frame) in mapped.drain(..) {
@@ -8938,9 +9181,7 @@ fn sys_mmap(
                                 }
                             }
                         }
-                        // R169-L2 FIX: reclaim the intermediate PT/PD tables the
-                        // rolled-back leaves left empty; the frames ride the same
-                        // flush+free below (3-phase: clear entry, flush, free).
+                        // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
                         manager.prune_empty_tables_in_range(
                             VirtAddr::new(base as u64),
                             flush_len,
@@ -8954,90 +9195,51 @@ fn sys_mmap(
                         }
                         return Err(SyscallError::ENOMEM);
                     }
-                };
 
-                // 安全：清零新分配的帧，防止泄漏其他进程的数据
-                // 使用高半区直映访问物理内存
-                let virt = mm::phys_to_virt(frame.start_address());
-                core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
-
-                // 映射页，失败时回滚
-                if let Err(_) = manager.map_page(page, frame, page_flags, &mut frame_alloc) {
-                    frame_alloc.deallocate_frame(frame);
-                    // R127-2 + R158-12 FIX: 3-phase rollback with fallible Vec.
-                    // R169-L2: +1 page so the prune covers the CURRENT page, whose
-                    // intermediate tables map_to may have created before failing.
-                    let flush_len = (mapped.len() + 1) * 0x1000;
-                    let mut frames_to_free = vec::Vec::new();
-                    let _ = frames_to_free.try_reserve(mapped.len());
-                    for (cleanup_page, cleanup_frame) in mapped.drain(..) {
-                        if manager.unmap_page(cleanup_page).is_ok() {
-                            if frames_to_free.try_reserve(1).is_ok() {
-                                frames_to_free.push(cleanup_frame);
-                            } else {
-                                mm::flush_current_as_page(cleanup_page.start_address());
-                                frame_alloc.deallocate_frame(cleanup_frame);
-                            }
-                        }
-                    }
-                    // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
-                    manager.prune_empty_tables_in_range(
-                        VirtAddr::new(base as u64),
-                        flush_len,
-                        &mut frames_to_free,
-                    );
-                    if !frames_to_free.is_empty() {
-                        mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
-                        for frame in frames_to_free {
+                    // R156-3 + R158-12 FIX: Fallible push for mmap page tracking.
+                    if mapped.try_reserve(1).is_err() {
+                        if manager.unmap_page(page).is_ok() {
+                            mm::flush_current_as_page(page.start_address());
                             frame_alloc.deallocate_frame(frame);
                         }
-                    }
-                    return Err(SyscallError::ENOMEM);
-                }
-
-                // R156-3 + R158-12 FIX: Fallible push for mmap page tracking.
-                if mapped.try_reserve(1).is_err() {
-                    if manager.unmap_page(page).is_ok() {
-                        mm::flush_current_as_page(page.start_address());
-                        frame_alloc.deallocate_frame(frame);
-                    }
-                    // R169-L2: +1 page — the current page was mapped then locally
-                    // unmapped above, so its intermediate tables may now be prunable.
-                    let flush_len = (mapped.len() + 1) * 0x1000;
-                    let mut frames_to_free = vec::Vec::new();
-                    let _ = frames_to_free.try_reserve(mapped.len());
-                    for (cleanup_page, cleanup_frame) in mapped.drain(..) {
-                        if manager.unmap_page(cleanup_page).is_ok() {
-                            if frames_to_free.try_reserve(1).is_ok() {
-                                frames_to_free.push(cleanup_frame);
-                            } else {
-                                mm::flush_current_as_page(cleanup_page.start_address());
-                                frame_alloc.deallocate_frame(cleanup_frame);
+                        // R169-L2: +1 page — the current page was mapped then locally
+                        // unmapped above, so its intermediate tables may now be prunable.
+                        let flush_len = (mapped.len() + 1) * 0x1000;
+                        let mut frames_to_free = vec::Vec::new();
+                        let _ = frames_to_free.try_reserve(mapped.len());
+                        for (cleanup_page, cleanup_frame) in mapped.drain(..) {
+                            if manager.unmap_page(cleanup_page).is_ok() {
+                                if frames_to_free.try_reserve(1).is_ok() {
+                                    frames_to_free.push(cleanup_frame);
+                                } else {
+                                    mm::flush_current_as_page(cleanup_page.start_address());
+                                    frame_alloc.deallocate_frame(cleanup_frame);
+                                }
                             }
                         }
-                    }
-                    // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
-                    manager.prune_empty_tables_in_range(
-                        VirtAddr::new(base as u64),
-                        flush_len,
-                        &mut frames_to_free,
-                    );
-                    if !frames_to_free.is_empty() {
-                        mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
-                        for frame in frames_to_free {
-                            frame_alloc.deallocate_frame(frame);
+                        // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
+                        manager.prune_empty_tables_in_range(
+                            VirtAddr::new(base as u64),
+                            flush_len,
+                            &mut frames_to_free,
+                        );
+                        if !frames_to_free.is_empty() {
+                            mm::flush_current_as_range(VirtAddr::new(base as u64), flush_len);
+                            for frame in frames_to_free {
+                                frame_alloc.deallocate_frame(frame);
+                            }
                         }
+                        return Err(SyscallError::ENOMEM);
                     }
-                    return Err(SyscallError::ENOMEM);
+                    mapped.push((page, frame));
                 }
-                mapped.push((page, frame));
-            }
 
-            // R171-CG1x0 FIX (M2-1 SLICE-0): yield the recorded PT-frame identities
-            // (NOT a count). On every Err path above the closure freed its own
-            // frames, so this Vec is meaningful only on the Ok path.
-            Ok(frame_alloc.pt_frames)
-        })
+                // R171-CG1x0 FIX (M2-1 SLICE-0): yield the recorded PT-frame identities
+                // (NOT a count). On every Err path above the closure freed its own
+                // frames, so this Vec is meaningful only on the Ok path.
+                Ok(frame_alloc.pt_frames)
+            },
+        )
     };
 
     // F.2 Cgroup: If mapping fails, rollback the memory charge and Phase 1
@@ -9126,7 +9328,10 @@ fn sys_mmap(
             let ledgered = if mm.pt_charged_frames.try_reserve(pt_frames.len()).is_ok() {
                 let mut all_fresh = true;
                 for f in &pt_frames {
-                    match mm.pt_charged_frames.try_insert(f.start_address().as_u64(), ()) {
+                    match mm
+                        .pt_charged_frames
+                        .try_insert(f.start_address().as_u64(), ())
+                    {
                         Ok(None) => {}
                         Ok(Some(_)) => {
                             // A frame the allocator just handed out as is_unused()
@@ -9179,7 +9384,9 @@ fn sys_mmap(
     #[cfg(debug_assertions)]
     kprintln!(
         "sys_mmap: pid={}, mapped {} bytes at 0x{:x}",
-        pid, length_aligned, base
+        pid,
+        length_aligned,
+        base
     );
 
     Ok(base)
@@ -9353,10 +9560,10 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
             // next-phase #11: `addr` still carries its PENDING_UNMAP marker here, so
             // this is an in-place replace that cannot allocate; ignore the result so
             // the original unmap error `e` is the one returned.
-            let _ = mm_arc
-                .lock()
-                .mmap_regions
-                .try_insert(addr, MmapEntry::from_len_flags(recorded_length, committed_flags));
+            let _ = mm_arc.lock().mmap_regions.try_insert(
+                addr,
+                MmapEntry::from_len_flags(recorded_length, committed_flags),
+            );
             return Err(e);
         }
     };
@@ -9447,7 +9654,9 @@ fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     #[cfg(debug_assertions)]
     kprintln!(
         "sys_munmap: pid={}, unmapped {} bytes at 0x{:x}",
-        pid, length_aligned, addr
+        pid,
+        length_aligned,
+        addr
     );
 
     Ok(0)
@@ -9594,7 +9803,10 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 let in_range_len = end - last_base;
                 let right_len = last_end - end;
                 mm.mmap_regions
-                    .try_insert(last_base, MmapEntry::from_len_flags(in_range_len, last_flags))
+                    .try_insert(
+                        last_base,
+                        MmapEntry::from_len_flags(in_range_len, last_flags),
+                    )
                     .map_err(|_| SyscallError::ENOMEM)?;
                 mm.mmap_regions
                     .try_insert(end, MmapEntry::from_len_flags(right_len, last_flags))
@@ -9700,8 +9912,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 let mut mm = mm_arc.lock();
                 // R162-3 FIX: Accumulate instead of overwrite to prevent concurrent
                 // mprotect operations from clobbering each other's pending charge.
-                mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
-                    .saturating_add(region_len as u64);
+                mm.mprotect_pending_bytes =
+                    mm.mprotect_pending_bytes.saturating_add(region_len as u64);
                 // R149-6 FIX: Set transient flag so concurrent munmap sees
                 // the in-flight mprotect and returns EBUSY.
                 // R164-2 FIX: Check if PENDING_MPROTECT is already set by a
@@ -9711,8 +9923,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 // other's commit check to fail — leaking frames.
                 if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
                     if entry.is_pending_mprotect() {
-                        mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
-                            .saturating_sub(region_len as u64);
+                        mm.mprotect_pending_bytes =
+                            mm.mprotect_pending_bytes.saturating_sub(region_len as u64);
                         drop(mm);
                         let cgroup_id = proc.cgroup_id;
                         drop(proc);
@@ -9735,12 +9947,9 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                     // bail on has_transient() for the entire Step 2 window, so
                     // `region_len` is guaranteed to remain the live length through
                     // the Step 3 commit below.
-                    if !entry.is_prot_none()
-                        || entry.has_transient()
-                        || entry.len() != region_len
-                    {
-                        mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
-                            .saturating_sub(region_len as u64);
+                    if !entry.is_prot_none() || entry.has_transient() || entry.len() != region_len {
+                        mm.mprotect_pending_bytes =
+                            mm.mprotect_pending_bytes.saturating_sub(region_len as u64);
                         drop(mm);
                         drop(proc);
                         cgroup::uncharge_memory(cgroup_id, region_len as u64);
@@ -9752,8 +9961,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                     // roll back the charge and fail.
                     // R162-3 FIX: Decrement instead of zeroing to preserve
                     // other concurrent mprotect operations' pending charges.
-                    mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
-                        .saturating_sub(region_len as u64);
+                    mm.mprotect_pending_bytes =
+                        mm.mprotect_pending_bytes.saturating_sub(region_len as u64);
                     drop(mm);
                     drop(proc);
                     cgroup::uncharge_memory(cgroup_id, region_len as u64);
@@ -9772,20 +9981,63 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                 // Step-3 commit, mirroring sys_mmap. The DATA frame uses the inherent
                 // allocate_data_frame (NOT recorded); only map_page's trait
                 // allocate_frame records PT/PD frames.
-                with_current_manager(VirtAddr::new(0), |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
-                    let mut frame_alloc = RecordingFrameAllocator::new();
-                    let mut mapped: vec::Vec<(Page, PhysFrame)> = vec::Vec::new();
+                with_current_manager(
+                    VirtAddr::new(0),
+                    |manager| -> Result<vec::Vec<PhysFrame>, SyscallError> {
+                        let mut frame_alloc = RecordingFrameAllocator::new();
+                        let mut mapped: vec::Vec<(Page, PhysFrame)> = vec::Vec::new();
 
-                    for offset in (0..region_len).step_by(0x1000) {
-                        let page = Page::containing_address(
-                            VirtAddr::new((region_base + offset) as u64),
-                        );
+                        for offset in (0..region_len).step_by(0x1000) {
+                            let page = Page::containing_address(VirtAddr::new(
+                                (region_base + offset) as u64,
+                            ));
 
-                        let frame = match frame_alloc.allocate_data_frame() {
-                            Some(f) => f,
-                            None => {
-                                // R159-4 FIX: Fallible rollback (same pattern as R158-7).
-                                let flush_len = mapped.len() * 0x1000;
+                            let frame = match frame_alloc.allocate_data_frame() {
+                                Some(f) => f,
+                                None => {
+                                    // R159-4 FIX: Fallible rollback (same pattern as R158-7).
+                                    let flush_len = mapped.len() * 0x1000;
+                                    let mut frames_to_free = vec::Vec::new();
+                                    let _ = frames_to_free.try_reserve(mapped.len());
+                                    for (cp, cf) in mapped.drain(..) {
+                                        if manager.unmap_page(cp).is_ok() {
+                                            if frames_to_free.try_reserve(1).is_ok() {
+                                                frames_to_free.push(cf);
+                                            } else {
+                                                mm::flush_current_as_page(cp.start_address());
+                                                frame_alloc.deallocate_frame(cf);
+                                            }
+                                        }
+                                    }
+                                    // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
+                                    manager.prune_empty_tables_in_range(
+                                        VirtAddr::new(region_base as u64),
+                                        flush_len,
+                                        &mut frames_to_free,
+                                    );
+                                    if !frames_to_free.is_empty() {
+                                        mm::flush_current_as_range(
+                                            VirtAddr::new(region_base as u64),
+                                            flush_len,
+                                        );
+                                        for f in frames_to_free {
+                                            frame_alloc.deallocate_frame(f);
+                                        }
+                                    }
+                                    return Err(SyscallError::ENOMEM);
+                                }
+                            };
+
+                            // Security: zero new frame to prevent data leakage.
+                            let virt = mm::phys_to_virt(frame.start_address());
+                            core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
+
+                            if let Err(_) = manager.map_page(page, frame, flags, &mut frame_alloc) {
+                                frame_alloc.deallocate_frame(frame);
+                                // R159-4 FIX: Fallible rollback.
+                                // R169-L2: +1 page so the prune covers the CURRENT page,
+                                // whose tables map_to may have created before failing.
+                                let flush_len = (mapped.len() + 1) * 0x1000;
                                 let mut frames_to_free = vec::Vec::new();
                                 let _ = frames_to_free.try_reserve(mapped.len());
                                 for (cp, cf) in mapped.drain(..) {
@@ -9815,96 +10067,56 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                                 }
                                 return Err(SyscallError::ENOMEM);
                             }
-                        };
 
-                        // Security: zero new frame to prevent data leakage.
-                        let virt = mm::phys_to_virt(frame.start_address());
-                        core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 0x1000);
-
-                        if let Err(_) = manager.map_page(page, frame, flags, &mut frame_alloc) {
-                            frame_alloc.deallocate_frame(frame);
-                            // R159-4 FIX: Fallible rollback.
-                            // R169-L2: +1 page so the prune covers the CURRENT page,
-                            // whose tables map_to may have created before failing.
-                            let flush_len = (mapped.len() + 1) * 0x1000;
-                            let mut frames_to_free = vec::Vec::new();
-                            let _ = frames_to_free.try_reserve(mapped.len());
-                            for (cp, cf) in mapped.drain(..) {
-                                if manager.unmap_page(cp).is_ok() {
-                                    if frames_to_free.try_reserve(1).is_ok() {
-                                        frames_to_free.push(cf);
-                                    } else {
-                                        mm::flush_current_as_page(cp.start_address());
-                                        frame_alloc.deallocate_frame(cf);
+                            // R157-5 FIX: Fallible push (same pattern as R157-1/R156-3).
+                            if mapped.try_reserve(1).is_err() {
+                                if manager.unmap_page(page).is_ok() {
+                                    mm::flush_current_as_page(page.start_address());
+                                    frame_alloc.deallocate_frame(frame);
+                                }
+                                // R159-4 FIX: Fallible rollback.
+                                // R169-L2: +1 page — the current page was mapped then
+                                // locally unmapped; its tables may now be prunable.
+                                let flush_len = (mapped.len() + 1) * 0x1000;
+                                let mut frames_to_free = vec::Vec::new();
+                                let _ = frames_to_free.try_reserve(mapped.len());
+                                for (cp, cf) in mapped.drain(..) {
+                                    if manager.unmap_page(cp).is_ok() {
+                                        if frames_to_free.try_reserve(1).is_ok() {
+                                            frames_to_free.push(cf);
+                                        } else {
+                                            mm::flush_current_as_page(cp.start_address());
+                                            frame_alloc.deallocate_frame(cf);
+                                        }
                                     }
                                 }
-                            }
-                            // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
-                            manager.prune_empty_tables_in_range(
-                                VirtAddr::new(region_base as u64),
-                                flush_len,
-                                &mut frames_to_free,
-                            );
-                            if !frames_to_free.is_empty() {
-                                mm::flush_current_as_range(
+                                // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
+                                manager.prune_empty_tables_in_range(
                                     VirtAddr::new(region_base as u64),
                                     flush_len,
+                                    &mut frames_to_free,
                                 );
-                                for f in frames_to_free {
-                                    frame_alloc.deallocate_frame(f);
-                                }
-                            }
-                            return Err(SyscallError::ENOMEM);
-                        }
-
-                        // R157-5 FIX: Fallible push (same pattern as R157-1/R156-3).
-                        if mapped.try_reserve(1).is_err() {
-                            if manager.unmap_page(page).is_ok() {
-                                mm::flush_current_as_page(page.start_address());
-                                frame_alloc.deallocate_frame(frame);
-                            }
-                            // R159-4 FIX: Fallible rollback.
-                            // R169-L2: +1 page — the current page was mapped then
-                            // locally unmapped; its tables may now be prunable.
-                            let flush_len = (mapped.len() + 1) * 0x1000;
-                            let mut frames_to_free = vec::Vec::new();
-                            let _ = frames_to_free.try_reserve(mapped.len());
-                            for (cp, cf) in mapped.drain(..) {
-                                if manager.unmap_page(cp).is_ok() {
-                                    if frames_to_free.try_reserve(1).is_ok() {
-                                        frames_to_free.push(cf);
-                                    } else {
-                                        mm::flush_current_as_page(cp.start_address());
-                                        frame_alloc.deallocate_frame(cf);
+                                if !frames_to_free.is_empty() {
+                                    mm::flush_current_as_range(
+                                        VirtAddr::new(region_base as u64),
+                                        flush_len,
+                                    );
+                                    for f in frames_to_free {
+                                        frame_alloc.deallocate_frame(f);
                                     }
                                 }
+                                return Err(SyscallError::ENOMEM);
                             }
-                            // R169-L2 FIX: reclaim now-empty intermediate PT/PD tables.
-                            manager.prune_empty_tables_in_range(
-                                VirtAddr::new(region_base as u64),
-                                flush_len,
-                                &mut frames_to_free,
-                            );
-                            if !frames_to_free.is_empty() {
-                                mm::flush_current_as_range(
-                                    VirtAddr::new(region_base as u64),
-                                    flush_len,
-                                );
-                                for f in frames_to_free {
-                                    frame_alloc.deallocate_frame(f);
-                                }
-                            }
-                            return Err(SyscallError::ENOMEM);
+                            mapped.push((page, frame));
                         }
-                        mapped.push((page, frame));
-                    }
 
-                    // M2-1 SLICE-4a: yield the recorded PT-frame identities (NOT a
-                    // count) for the Step-3 charge + ledger fold. On every Err path
-                    // above the closure freed its own frames, so this Vec is
-                    // meaningful only on the Ok path.
-                    Ok(frame_alloc.pt_frames)
-                })
+                        // M2-1 SLICE-4a: yield the recorded PT-frame identities (NOT a
+                        // count) for the Step-3 charge + ledger fold. On every Err path
+                        // above the closure freed its own frames, so this Vec is
+                        // meaningful only on the Ok path.
+                        Ok(frame_alloc.pt_frames)
+                    },
+                )
             };
 
             // M2-1 SLICE-4a: capture the recorded PT-frame identities on success
@@ -9918,8 +10130,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                     let rollback_cgroup_id = {
                         let proc = process.lock();
                         let mut mm = mm_arc.lock();
-                        mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
-                            .saturating_sub(region_len as u64);
+                        mm.mprotect_pending_bytes =
+                            mm.mprotect_pending_bytes.saturating_sub(region_len as u64);
                         // R149-6 FIX: Clear the transient mprotect flag on rollback.
                         if let Some(entry) = mm.mmap_regions.get_mut(&region_base) {
                             entry.clear_pending_mprotect();
@@ -9959,19 +10171,18 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         // Entry present with our transient flag — commit.
                         // Clear PROT_NONE + old prot bits + transient mprotect flag.
                         let preserved = old.committed_flags_excluding_prot();
-                        let new_entry = MmapEntry::from_len_flags(region_len, preserved | new_prot_flags);
+                        let new_entry =
+                            MmapEntry::from_len_flags(region_len, preserved | new_prot_flags);
                         // next-phase #11: `region_base` is present (matched just
                         // above under this same lock hold), so replace in place —
                         // get_mut cannot allocate, keeping this commit infallible.
                         if let Some(slot) = mm.mmap_regions.get_mut(&region_base) {
                             *slot = new_entry;
                         }
-                        mm.vm_charged_bytes = mm
-                            .vm_charged_bytes
-                            .saturating_add(region_len as u64);
+                        mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_add(region_len as u64);
                         // R147-1 FIX: Charge is now reflected in mmap_regions.
-                        mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
-                            .saturating_sub(region_len as u64);
+                        mm.mprotect_pending_bytes =
+                            mm.mprotect_pending_bytes.saturating_sub(region_len as u64);
                         // M2-1 SLICE-4a: charge + ledger the PT-frame kmem this
                         // PROT_NONE -> real materialization built, under the SAME
                         // Process + MmState hold (migration-atomic). charge_memory_forced
@@ -9995,8 +10206,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         // here — the map_to-built frames were never ledgered, so a
                         // concurrent munmap's reconcile debits 0 (no bypass) and they
                         // ride to teardown (over-count-safe). `pt_frames` is dropped.
-                        mm.mprotect_pending_bytes = mm.mprotect_pending_bytes
-                            .saturating_sub(region_len as u64);
+                        mm.mprotect_pending_bytes =
+                            mm.mprotect_pending_bytes.saturating_sub(region_len as u64);
                         Err(())
                     }
                 }
@@ -10110,9 +10321,8 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                     let _ = frames_to_free.try_reserve(region_len / 0x1000);
 
                     for offset in (0..region_len).step_by(0x1000) {
-                        let page = Page::containing_address(
-                            VirtAddr::new((region_base + offset) as u64),
-                        );
+                        let page =
+                            Page::containing_address(VirtAddr::new((region_base + offset) as u64));
 
                         let frame_opt = match manager.unmap_page(page) {
                             Ok(frame) => Some(frame),
@@ -10142,10 +10352,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
 
                     // Batch TLB shootdown then deallocate deferred frames
                     if !frames_to_free.is_empty() {
-                        mm::flush_current_as_range(
-                            VirtAddr::new(region_base as u64),
-                            region_len,
-                        );
+                        mm::flush_current_as_range(VirtAddr::new(region_base as u64), region_len);
                         for frame in frames_to_free {
                             frame_alloc.deallocate_frame(frame);
                         }
@@ -10174,8 +10381,7 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
                         if let Some(slot) = mm.mmap_regions.get_mut(&region_base) {
                             *slot = MmapEntry::prot_none(live_len);
                         }
-                        mm.vm_charged_bytes =
-                            mm.vm_charged_bytes.saturating_sub(live_len as u64);
+                        mm.vm_charged_bytes = mm.vm_charged_bytes.saturating_sub(live_len as u64);
                         Some((proc.cgroup_id, live_len))
                     }
                     _ => {
@@ -10414,7 +10620,9 @@ fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFil
 
     // R158-3 FIX: Fallible allocation — user-controlled len can exhaust kernel heap.
     let mut raw_insns = Vec::new();
-    raw_insns.try_reserve_exact(len).map_err(|_| SyscallError::ENOMEM)?;
+    raw_insns
+        .try_reserve_exact(len)
+        .map_err(|_| SyscallError::ENOMEM)?;
     raw_insns.resize(len, UserSeccompInsn::default());
     let raw_bytes =
         unsafe { core::slice::from_raw_parts_mut(raw_insns.as_mut_ptr() as *mut u8, total) };
@@ -10425,7 +10633,9 @@ fn load_user_seccomp_filter(flags: u32, args: u64) -> Result<seccomp::SeccompFil
 
     // R158-3 FIX: Fallible allocation for translated program.
     let mut program = Vec::new();
-    program.try_reserve_exact(len).map_err(|_| SyscallError::ENOMEM)?;
+    program
+        .try_reserve_exact(len)
+        .map_err(|_| SyscallError::ENOMEM)?;
     for insn in raw_insns.iter() {
         program.push(translate_user_insn(insn)?);
     }
@@ -10498,9 +10708,11 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
 
             let thread_count = crate::process::thread_group_size(tgid);
             if thread_count > 1 {
-                klog!(Warn,
+                klog!(
+                    Warn,
                     "[sys_seccomp] PID={} STRICT mode REJECTED: threads={} (multi-threaded)",
-                    pid, thread_count
+                    pid,
+                    thread_count
                 );
                 return Err(SyscallError::EPERM);
             }
@@ -10508,9 +10720,11 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             let pure_vm_siblings =
                 crate::process::non_thread_group_vm_share_count(memory_space, tgid);
             if pure_vm_siblings > 0 {
-                klog!(Warn,
+                klog!(
+                    Warn,
                     "[sys_seccomp] PID={} STRICT mode REJECTED: {} CLONE_VM siblings",
-                    pid, pure_vm_siblings
+                    pid,
+                    pure_vm_siblings
                 );
                 return Err(SyscallError::EPERM);
             }
@@ -10578,9 +10792,11 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
 
             // Reject if multi-threaded without TSYNC (partial sandboxing)
             if thread_count > 1 && !tsync_requested {
-                klog!(Warn,
+                klog!(
+                    Warn,
                     "[sys_seccomp] PID={} REJECTED: threads={} without TSYNC",
-                    pid, thread_count
+                    pid,
+                    thread_count
                 );
                 return Err(SyscallError::EPERM);
             }
@@ -10628,7 +10844,8 @@ fn sys_seccomp(op: u32, flags: u32, args: u64) -> SyscallResult {
             // R26-3 FIX: Mark installation complete
             proc.seccomp_installing = false;
 
-            klog!(Info,
+            klog!(
+                Info,
                 "[sys_seccomp] PID={} installed FILTER mode (total filters: {})",
                 pid,
                 proc.seccomp_state.filters().len()
@@ -11029,7 +11246,8 @@ fn can_set_affinity(target_pid: ProcessId) -> Result<bool, SyscallError> {
     }
 
     // Check for CAP_SYS_NICE (using ADMIN capability as closest match)
-    let has_cap = with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
+    let has_cap =
+        with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
     if has_cap {
         return Ok(true);
     }
@@ -11160,7 +11378,8 @@ fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> Syscal
     // P1-6 FIX: Removed redundant outer UserAccessGuard — copy_from_user_safe
     // creates its own guard internally.
     let mut mask_bytes = [0u8; 8];
-    crate::usercopy::copy_from_user_safe(&mut mask_bytes, mask).map_err(|_| SyscallError::EFAULT)?;
+    crate::usercopy::copy_from_user_safe(&mut mask_bytes, mask)
+        .map_err(|_| SyscallError::EFAULT)?;
     let new_mask = normalize_affinity_mask(u64::from_ne_bytes(mask_bytes))?;
 
     // Update PCB and get info needed for reschedule decision
@@ -11189,7 +11408,9 @@ fn sys_sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> Syscal
     if old_mask != new_mask {
         sched_affinity_debug!(
             "[AFFINITY] pid={} mask changed: 0x{:016x} -> 0x{:016x}",
-            target_pid, old_mask, new_mask
+            target_pid,
+            old_mask,
+            new_mask
         );
     }
 
@@ -11317,7 +11538,8 @@ fn sys_getrandom(buf: *mut u8, len: usize, flags: u32) -> SyscallResult {
     // - 提供密码学安全的随机数
     // R156-3 FIX: Fallible allocation for getrandom buffer.
     let mut tmp = Vec::new();
-    tmp.try_reserve_exact(count).map_err(|_| SyscallError::ENOMEM)?;
+    tmp.try_reserve_exact(count)
+        .map_err(|_| SyscallError::ENOMEM)?;
     tmp.resize(count, 0);
     match rng::fill_random(&mut tmp) {
         Ok(()) => {}
@@ -11630,10 +11852,7 @@ fn sys_fstatat(dirfd: i32, path: *const u8, statbuf: *mut VfsStat, _flags: i32) 
         if path_bytes.is_empty() {
             return Err(SyscallError::EINVAL);
         }
-        try_str_to_string(
-            core::str::from_utf8(&path_bytes)
-                .map_err(|_| SyscallError::EINVAL)?
-        )?
+        try_str_to_string(core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?)?
     };
 
     // Check from kernel copy - no TOCTOU possible
@@ -11671,10 +11890,7 @@ fn sys_openat(dirfd: i32, path: *const u8, flags: i32, mode: u32) -> SyscallResu
         if path_bytes.is_empty() {
             return Err(SyscallError::EINVAL);
         }
-        try_str_to_string(
-            core::str::from_utf8(&path_bytes)
-                .map_err(|_| SyscallError::EINVAL)?
-        )?
+        try_str_to_string(core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?)?
     };
 
     // Check from kernel copy - no TOCTOU possible
@@ -11727,10 +11943,8 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
     if path_bytes.is_empty() {
         return Err(SyscallError::EINVAL);
     }
-    let path_str = try_str_to_string(
-        core::str::from_utf8(&path_bytes)
-            .map_err(|_| SyscallError::EINVAL)?
-    )?;
+    let path_str =
+        try_str_to_string(core::str::from_utf8(&path_bytes).map_err(|_| SyscallError::EINVAL)?)?;
 
     // Get current process
     let pid = current_pid().ok_or(SyscallError::ESRCH)?;
@@ -11750,7 +11964,8 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
             try_str_to_string("/")?
         } else {
             let mut s = String::new();
-            s.try_reserve_exact(1 + path_str.len()).map_err(|_| SyscallError::ENOMEM)?;
+            s.try_reserve_exact(1 + path_str.len())
+                .map_err(|_| SyscallError::ENOMEM)?;
             s.push('/');
             s.push_str(&path_str);
             s
@@ -11836,12 +12051,10 @@ fn sys_openat2(dirfd: i32, path: *const u8, how: *const OpenHow, size: usize) ->
         // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the rejected
         // object on the EMFILE arm (byte-equivalent to the old
         // allocate_fd-internal drop); conversion to drop-outside tracked.
-        let fd = proc
-            .allocate_fd(file_ops)
-            .map_err(|rejected| {
-                drop(rejected);
-                SyscallError::EMFILE
-            })?;
+        let fd = proc.allocate_fd(file_ops).map_err(|rejected| {
+            drop(rejected);
+            SyscallError::EMFILE
+        })?;
 
         if open_flags & O_CLOEXEC != 0 {
             proc.set_fd_cloexec(fd, true);
@@ -11873,12 +12086,10 @@ fn sys_dup(oldfd: i32) -> SyscallResult {
     // D2-FD-DROP-UNDER-LOCK: pre-existing inline drop of the rejected clone on
     // the EMFILE arm (byte-equivalent to the old allocate_fd-internal drop);
     // conversion to drop-outside tracked.
-    let newfd = proc
-        .allocate_fd(cloned)
-        .map_err(|rejected| {
-            drop(rejected);
-            SyscallError::EMFILE
-        })?;
+    let newfd = proc.allocate_fd(cloned).map_err(|rejected| {
+        drop(rejected);
+        SyscallError::EMFILE
+    })?;
     Ok(newfd as usize)
 }
 
@@ -12056,7 +12267,10 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
     let header_size = core::mem::size_of::<LinuxDirent64>();
     // R114-2 FIX: Validate ABI assumption — vfs_readdir_callback uses DIRENT64_HEADER_SIZE=24
     // for budget estimation. If repr(C) padding changes, this catches the mismatch.
-    debug_assert_eq!(header_size, 24, "LinuxDirent64 size mismatch: budget estimation assumes 24");
+    debug_assert_eq!(
+        header_size, 24,
+        "LinuxDirent64 size mismatch: budget estimation assumes 24"
+    );
 
     for entry in entries {
         let name_bytes = entry.name.as_bytes();
@@ -12094,7 +12308,8 @@ fn sys_getdents64(fd: i32, dirp: *mut u8, count: usize) -> SyscallResult {
 
         // R156-3 FIX: Fallible allocation for dirent buffer.
         let mut buf = Vec::new();
-        buf.try_reserve_exact(reclen).map_err(|_| SyscallError::ENOMEM)?;
+        buf.try_reserve_exact(reclen)
+            .map_err(|_| SyscallError::ENOMEM)?;
         buf.resize(reclen, 0);
 
         // R113-1 FIX: Write header fields individually into the zeroed buffer
@@ -12357,34 +12572,64 @@ pub fn run_startup_abi_self_test() {
     // All-empty (incl. the iovcnt==0 case) selects nothing => readv returns 0.
     assert_eq!(first_nonempty_iovec(&[]), None);
     assert_eq!(
-        first_nonempty_iovec(&[Iovec { iov_base: z, iov_len: 0 }]),
+        first_nonempty_iovec(&[Iovec {
+            iov_base: z,
+            iov_len: 0
+        }]),
         None
     );
     assert_eq!(
         first_nonempty_iovec(&[
-            Iovec { iov_base: z, iov_len: 0 },
-            Iovec { iov_base: z, iov_len: 0 },
+            Iovec {
+                iov_base: z,
+                iov_len: 0
+            },
+            Iovec {
+                iov_base: z,
+                iov_len: 0
+            },
         ]),
         None
     );
     // First non-empty wins; leading zero-length segments are skipped.
     assert_eq!(
-        first_nonempty_iovec(&[Iovec { iov_base: z, iov_len: 5 }]),
+        first_nonempty_iovec(&[Iovec {
+            iov_base: z,
+            iov_len: 5
+        }]),
         Some(0)
     );
     assert_eq!(
         first_nonempty_iovec(&[
-            Iovec { iov_base: z, iov_len: 0 },
-            Iovec { iov_base: z, iov_len: 3 },
+            Iovec {
+                iov_base: z,
+                iov_len: 0
+            },
+            Iovec {
+                iov_base: z,
+                iov_len: 3
+            },
         ]),
         Some(1)
     );
     assert_eq!(
         first_nonempty_iovec(&[
-            Iovec { iov_base: z, iov_len: 0 },
-            Iovec { iov_base: z, iov_len: 0 },
-            Iovec { iov_base: z, iov_len: 7 },
-            Iovec { iov_base: z, iov_len: 1 },
+            Iovec {
+                iov_base: z,
+                iov_len: 0
+            },
+            Iovec {
+                iov_base: z,
+                iov_len: 0
+            },
+            Iovec {
+                iov_base: z,
+                iov_len: 7
+            },
+            Iovec {
+                iov_base: z,
+                iov_len: 1
+            },
         ]),
         Some(2)
     );
@@ -12665,7 +12910,10 @@ fn sys_socket(domain: i32, type_: i32, protocol: i32) -> SyscallResult {
     }
     let cap_entry = cap::CapEntry::with_flags(
         // R75-1 FIX: Pass network namespace ID to Socket capability for isolation tracking
-        cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(socket.id, socket.net_ns_id.raw()))),
+        cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(
+            socket.id,
+            socket.net_ns_id.raw(),
+        ))),
         rights,
         cap_flags,
     );
@@ -12834,11 +13082,27 @@ fn sys_bind(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult {
     };
     if socket.ty == net::SocketType::Dgram && socket.proto == net::SocketProtocol::Udp {
         net::socket_table()
-            .bind_udp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged, policy)
+            .bind_udp(
+                &socket,
+                &ctx,
+                cap_id,
+                ip,
+                port_opt,
+                can_bind_privileged,
+                policy,
+            )
             .map_err(socket_error_to_syscall)?;
     } else if socket.ty == net::SocketType::Stream && socket.proto == net::SocketProtocol::Tcp {
         net::socket_table()
-            .bind_tcp(&socket, &ctx, cap_id, ip, port_opt, can_bind_privileged, policy)
+            .bind_tcp(
+                &socket,
+                &ctx,
+                cap_id,
+                ip,
+                port_opt,
+                can_bind_privileged,
+                policy,
+            )
             .map_err(socket_error_to_syscall)?;
     } else {
         return Err(SyscallError::EOPNOTSUPP);
@@ -12988,24 +13252,24 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
             out.sin_port = rport.to_be();
             out.sin_addr = u32::from_be_bytes(rip);
 
-            let addr_valid = validate_user_ptr(addr as *const u8, core::mem::size_of::<SockAddrIn>()).is_ok()
-                && validate_user_ptr(addrlen as *const u8, core::mem::size_of::<u32>()).is_ok();
+            let addr_valid =
+                validate_user_ptr(addr as *const u8, core::mem::size_of::<SockAddrIn>()).is_ok()
+                    && validate_user_ptr(addrlen as *const u8, core::mem::size_of::<u32>()).is_ok();
             if !addr_valid {
                 // Skip addr copy but don't destroy the child — proceed to return fd.
             } else {
-
-            // Convert struct to bytes for copy_to_user
-            // lint-repr-c-copy: allow (no-padding: SockAddrIn {u16,u16,u32,[u8;8]} = 16 bytes)
-            let out_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    &out as *const SockAddrIn as *const u8,
-                    core::mem::size_of::<SockAddrIn>(),
-                )
-            };
-            // R162-11 FIX: copy_to_user failure is also non-fatal for addr fill.
-            let _ = copy_to_user(addr as *mut u8, out_bytes);
-            let len_val = core::mem::size_of::<SockAddrIn>() as u32;
-            let _ = copy_to_user(addrlen as *mut u8, &len_val.to_ne_bytes());
+                // Convert struct to bytes for copy_to_user
+                // lint-repr-c-copy: allow (no-padding: SockAddrIn {u16,u16,u32,[u8;8]} = 16 bytes)
+                let out_bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        &out as *const SockAddrIn as *const u8,
+                        core::mem::size_of::<SockAddrIn>(),
+                    )
+                };
+                // R162-11 FIX: copy_to_user failure is also non-fatal for addr fill.
+                let _ = copy_to_user(addr as *mut u8, out_bytes);
+                let len_val = core::mem::size_of::<SockAddrIn>() as u32;
+                let _ = copy_to_user(addrlen as *mut u8, &len_val.to_ne_bytes());
             }
         }
     }
@@ -13017,7 +13281,10 @@ fn sys_accept(fd: i32, addr: *mut SockAddrIn, addrlen: *mut u32) -> SyscallResul
     // broader child capabilities via accept().
     let child_rights = (cap::CapRights::READ | cap::CapRights::WRITE) & entry.rights;
     let cap_entry = cap::CapEntry::with_flags(
-        cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(child.id, child.net_ns_id.raw()))),
+        cap::CapObject::Socket(alloc::sync::Arc::new(cap::Socket::new(
+            child.id,
+            child.net_ns_id.raw(),
+        ))),
         child_rights,
         cap::CapFlags::empty(),
     );
@@ -13214,7 +13481,9 @@ fn sys_connect(fd: i32, addr: *const SockAddrIn, addrlen: u32) -> SyscallResult 
 
     // Phase 2: Transmit the SYN segment via network device
     // R51-5 FIX: Abort connection if TX fails to prevent TCB/binding leak
-    if let Err(e) = net::transmit_tcp_segment(syn_result.dst_ip, &syn_result.segment, socket.net_ns_id.0) {
+    if let Err(e) =
+        net::transmit_tcp_segment(syn_result.dst_ip, &syn_result.segment, socket.net_ns_id.0)
+    {
         net::socket_table().abort_tcp_connect(&socket);
         return Err(tx_error_to_syscall(e));
     }
@@ -13326,7 +13595,8 @@ fn sys_sendto(
         validate_user_ptr(buf, len)?;
         // R156-3 FIX: Fallible allocation for TCP send buffer.
         let mut data = Vec::new();
-        data.try_reserve_exact(len).map_err(|_| SyscallError::ENOMEM)?;
+        data.try_reserve_exact(len)
+            .map_err(|_| SyscallError::ENOMEM)?;
         data.resize(len, 0);
         copy_from_user(&mut data, buf)?;
 
@@ -13386,7 +13656,8 @@ fn sys_sendto(
     validate_user_ptr(buf, len)?;
     // R156-3 FIX: Fallible allocation for UDP send buffer.
     let mut data = Vec::new();
-    data.try_reserve_exact(len).map_err(|_| SyscallError::ENOMEM)?;
+    data.try_reserve_exact(len)
+        .map_err(|_| SyscallError::ENOMEM)?;
     data.resize(len, 0);
     copy_from_user(&mut data, buf)?;
 
@@ -13405,7 +13676,8 @@ fn sys_sendto(
 
     // Transmit the UDP datagram via network device
     // R162-7-2 FIX: Pass socket's namespace for per-NS egress firewall evaluation.
-    net::transmit_udp_datagram(dst_ip, &datagram, socket.net_ns_id.0).map_err(tx_error_to_syscall)?;
+    net::transmit_udp_datagram(dst_ip, &datagram, socket.net_ns_id.0)
+        .map_err(tx_error_to_syscall)?;
 
     Ok(len)
 }
@@ -13568,7 +13840,11 @@ fn sys_shutdown(fd: i32, how: i32) -> SyscallResult {
         Ok(Some(fin_segment)) => {
             // Transmit the FIN segment
             if let Some(dst_ip) = socket.remote_ip() {
-                let _ = net::transmit_tcp_segment(net::Ipv4Addr(dst_ip), &fin_segment, socket.net_ns_id.0);
+                let _ = net::transmit_tcp_segment(
+                    net::Ipv4Addr(dst_ip),
+                    &fin_segment,
+                    socket.net_ns_id.0,
+                );
             }
             Ok(0)
         }
@@ -13748,7 +14024,8 @@ fn sys_cgroup_create(parent_id: u64, controllers: u32) -> Result<usize, SyscallE
     let has_cap_admin =
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
 
-    if !has_cap_admin && !crate::current_is_host_root() && !is_cgroup_delegated_to_caller(parent_id) {
+    if !has_cap_admin && !crate::current_is_host_root() && !is_cgroup_delegated_to_caller(parent_id)
+    {
         return Err(SyscallError::EPERM);
     }
 
@@ -13791,7 +14068,8 @@ fn sys_cgroup_destroy(cgroup_id: u64) -> Result<usize, SyscallError> {
     let has_cap_admin =
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
 
-    if !has_cap_admin && !crate::current_is_host_root() && !is_cgroup_delegated_to_caller(cgroup_id) {
+    if !has_cap_admin && !crate::current_is_host_root() && !is_cgroup_delegated_to_caller(cgroup_id)
+    {
         return Err(SyscallError::EPERM);
     }
 
@@ -13827,9 +14105,8 @@ fn sys_cgroup_delegate(cgroup_id: u64, uid: u64) -> Result<usize, SyscallError> 
 
     // P1-3: Allow host root, CAP_SYS_ADMIN, or delegated subtree managers.
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
-    let authorized = crate::current_is_host_root()
-        || has_cap_admin
-        || is_cgroup_delegated_to_caller(cgroup_id);
+    let authorized =
+        crate::current_is_host_root() || has_cap_admin || is_cgroup_delegated_to_caller(cgroup_id);
 
     let delegate_uid = if uid == u64::MAX {
         None
@@ -13939,9 +14216,8 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
             // is delegated to us, attaching is safe.
         } else {
             // Non-delegated, non-root: need CAP_SYS_ADMIN + descendant check
-            let has_cap_admin =
-                with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN))
-                    .unwrap_or(false);
+            let has_cap_admin = with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN))
+                .unwrap_or(false);
             if !has_cap_admin {
                 return Err(SyscallError::EPERM);
             }
@@ -13960,9 +14236,7 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     // iterates locking Process::inner — holding our Process::inner first
     // inverts the documented Level 5 ordering with create_process().
     let memory_space = { process.lock().memory_space };
-    if memory_space != 0
-        && crate::process::address_space_share_count(memory_space) > 1
-    {
+    if memory_space != 0 && crate::process::address_space_share_count(memory_space) > 1 {
         return Err(SyscallError::EBUSY);
     }
 
@@ -13990,8 +14264,7 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
 
     match cgroup::migrate_task(pid as u64, old_cgroup_id, cgroup_id) {
         Ok(()) => {
-            let total_charged_bytes =
-                crate::process::compute_cgroup_charged_bytes(&proc);
+            let total_charged_bytes = crate::process::compute_cgroup_charged_bytes(&proc);
 
             // J2-7: combined cgroup migration with a HOLE-FREE rollback. The two
             // MOVABLE controllers (memory + FDs) are migrated so that EVERY rollback
@@ -14025,11 +14298,9 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
                 let _ = cgroup::migrate_task(pid as u64, cgroup_id, old_cgroup_id);
                 return Err(SyscallError::EAGAIN);
             }
-            if let Err(_e) = cgroup::migrate_memory_charges(
-                total_charged_bytes,
-                old_cgroup_id,
-                cgroup_id,
-            ) {
+            if let Err(_e) =
+                cgroup::migrate_memory_charges(total_charged_bytes, old_cgroup_id, cgroup_id)
+            {
                 // Memory dest-charge failed → source memory untouched (R148-1).
                 // Undo the FD dest-charge (saturating, never fails) and revert.
                 // R156-5 FIX: keep the Process lock held throughout the rollback.
@@ -14117,7 +14388,11 @@ const CGROUP_LIMIT_VFS_DIR_MAX: u32 = 10;
 /// R93-17 FIX: Proper capability-based access control.
 ///
 /// Requires CAP_SYS_ADMIN capability to set limits.
-fn sys_cgroup_set_limit(cgroup_id: u64, limit_type: u32, value: u64) -> Result<usize, SyscallError> {
+fn sys_cgroup_set_limit(
+    cgroup_id: u64,
+    limit_type: u32,
+    value: u64,
+) -> Result<usize, SyscallError> {
     // R93-17 FIX: Capability-based access control for setting limits
     // P1-3: Delegated owners may set limits bounded by parent ceilings
     // R133-1 FIX: Use host-mapped root check for cgroup governance gate.
@@ -14276,7 +14551,8 @@ fn cgroup_stats_collect_and_copy(
     let _creds = crate::process::current_credentials().ok_or(SyscallError::ESRCH)?;
     let has_cap_admin =
         with_current_cap_table(|tbl| tbl.has_rights(cap::CapRights::ADMIN)).unwrap_or(false);
-    if !crate::current_is_host_root() && !has_cap_admin && !is_cgroup_delegated_to_caller(cgroup_id) {
+    if !crate::current_is_host_root() && !has_cap_admin && !is_cgroup_delegated_to_caller(cgroup_id)
+    {
         return Err(SyscallError::EPERM);
     }
 

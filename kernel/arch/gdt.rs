@@ -136,7 +136,12 @@ static SELECTORS_CACHE: Once<Selectors> = Once::new();
 ///
 /// Must be called exactly once per CPU during initialization.
 /// The `kernel_stack_top` must be a valid stack address.
-unsafe fn init_per_cpu_gdt(cpu_id: usize, kernel_stack_top: u64, df_stack_top: u64, nmi_stack_top: u64) {
+unsafe fn init_per_cpu_gdt(
+    cpu_id: usize,
+    kernel_stack_top: u64,
+    df_stack_top: u64,
+    nmi_stack_top: u64,
+) {
     if cpu_id >= MAX_CPUS {
         panic!("CPU ID {} exceeds MAX_CPUS {}", cpu_id, MAX_CPUS);
     }
@@ -358,9 +363,8 @@ pub unsafe fn init_for_ap(cpu_id: usize, kernel_stack_top: u64) {
     // R145-6 FIX: APs use a dedicated per-CPU IST stack for double-fault
     // handling so that a kernel stack overflow does not corrupt the #DF
     // handler's stack (which would escalate to a triple fault).
-    let df_stack_start = x86_64::VirtAddr::from_ptr(unsafe {
-        &raw const AP_DOUBLE_FAULT_STACKS[cpu_id].0
-    });
+    let df_stack_start =
+        x86_64::VirtAddr::from_ptr(unsafe { &raw const AP_DOUBLE_FAULT_STACKS[cpu_id].0 });
     let df_stack_top = (df_stack_start + DOUBLE_FAULT_STACK_SIZE as u64).as_u64();
 
     // R148-4 FIX: Unmap the bottom page of the AP IST stack as a guard page.
@@ -378,9 +382,7 @@ pub unsafe fn init_for_ap(cpu_id: usize, kernel_stack_top: u64) {
     }
 
     // R148-I5 FIX: Per-AP dedicated NMI IST stack + guard page
-    let nmi_stack_start = x86_64::VirtAddr::from_ptr(unsafe {
-        &raw const AP_NMI_STACKS[cpu_id].0
-    });
+    let nmi_stack_start = x86_64::VirtAddr::from_ptr(unsafe { &raw const AP_NMI_STACKS[cpu_id].0 });
     let nmi_stack_top = (nmi_stack_start + NMI_STACK_SIZE as u64).as_u64();
     {
         use x86_64::structures::paging::{Page, Size4KiB};

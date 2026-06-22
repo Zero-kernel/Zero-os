@@ -25,7 +25,6 @@ use xmas_elf::{
 // R93-6 FIX: Import cgroup module for memory accounting
 use crate::cgroup;
 
-
 /// 用户地址空间起始（4MB）
 ///
 /// 用户程序加载在 4MB 处，这是经典的 Linux 用户空间起始地址。
@@ -193,9 +192,11 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
         if ph.get_type() == Ok(PhType::Load) {
             load_segment_count += 1;
             if load_segment_count > MAX_ELF_LOAD_SEGMENTS {
-                klog!(Error,
+                klog!(
+                    Error,
                     "ELF loader: too many PT_LOAD segments ({} > {})",
-                    load_segment_count, MAX_ELF_LOAD_SEGMENTS
+                    load_segment_count,
+                    MAX_ELF_LOAD_SEGMENTS
                 );
                 rollback_all_mappings(&mut all_mappings, cgroup_id);
                 return Err(ElfLoadError::TooManySegments);
@@ -217,9 +218,11 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
                         // at Error level leaks address-layout info (and lets an
                         // unprivileged user flood the log) in Balanced/Performance
                         // profiles. The syscall still returns the error to userspace.
-                        klog!(Debug,
+                        klog!(
+                            Debug,
                             "ELF loader: PT_LOAD segment vaddr {:#x} + memsz {:#x} overflows",
-                            vaddr, memsz
+                            vaddr,
+                            memsz
                         );
                         rollback_all_mappings(&mut all_mappings, cgroup_id);
                         return Err(ElfLoadError::InvalidSegment);
@@ -262,13 +265,14 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
                 }
             }
 
-            let (seg_charged, seg_pt) = match load_segment_tracked(&elf, &ph, &mut all_mappings, cgroup_id) {
-                Ok(v) => v,
-                Err(e) => {
-                    rollback_all_mappings(&mut all_mappings, cgroup_id);
-                    return Err(e);
-                }
-            };
+            let (seg_charged, seg_pt) =
+                match load_segment_tracked(&elf, &ph, &mut all_mappings, cgroup_id) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        rollback_all_mappings(&mut all_mappings, cgroup_id);
+                        return Err(e);
+                    }
+                };
             charged_bytes = charged_bytes.saturating_add(seg_charged);
             // M2-1 SLICE-4d: fold this segment's recorded PT frames into the accumulator
             // (fallible — on OOM tear down the partial AS and fail, mirroring load_elf's
@@ -282,7 +286,8 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
     }
 
     // 分配用户栈
-    let (stack_charged, stack_pt) = match allocate_user_stack_tracked(&mut all_mappings, cgroup_id) {
+    let (stack_charged, stack_pt) = match allocate_user_stack_tracked(&mut all_mappings, cgroup_id)
+    {
         Ok(v) => v,
         Err(e) => {
             rollback_all_mappings(&mut all_mappings, cgroup_id);
@@ -306,9 +311,11 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
     if brk_start >= stack_base {
         // R165-12 FIX: Debug, not Error — `stack_base` is a KASLR-randomized VA;
         // leaking it at production log level weakens user-space ASLR.
-        klog!(Debug,
+        klog!(
+            Debug,
             "ELF loader: brk_start 0x{:x} overlaps with stack at 0x{:x}",
-            brk_start, stack_base
+            brk_start,
+            stack_base
         );
         rollback_all_mappings(&mut all_mappings, cgroup_id);
         return Err(ElfLoadError::OverlapWithStack);
@@ -328,9 +335,12 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
     let entry = elf.header.pt2.entry_point();
     if entry < USER_BASE as u64 || entry >= USER_STACK_TOP {
         // R165-12 FIX: Debug, not Error — echoes an attacker-controlled VA.
-        klog!(Debug,
+        klog!(
+            Debug,
             "ELF loader: invalid entry point 0x{:x} (valid range: 0x{:x}-0x{:x})",
-            entry, USER_BASE, USER_STACK_TOP
+            entry,
+            USER_BASE,
+            USER_STACK_TOP
         );
         rollback_all_mappings(&mut all_mappings, cgroup_id);
         return Err(ElfLoadError::SegmentOutOfRange);
@@ -348,12 +358,13 @@ pub fn load_elf(image: &[u8], cgroup_id: cgroup::CgroupId) -> Result<ElfLoadResu
     // R162-23 FIX: Verify entry point falls within a loaded PT_LOAD segment.
     // A crafted ELF could set e_entry to an unmapped gap between segments,
     // causing the process to fault immediately on execution.
-    let entry_in_segment = loaded_ranges.iter().any(|&(start, end)| {
-        (entry as usize) >= start && (entry as usize) < end
-    });
+    let entry_in_segment = loaded_ranges
+        .iter()
+        .any(|&(start, end)| (entry as usize) >= start && (entry as usize) < end);
     if !entry_in_segment {
         // R165-12 FIX: Debug, not Error — echoes an attacker-controlled VA.
-        klog!(Debug,
+        klog!(
+            Debug,
             "ELF loader: entry point 0x{:x} not within any loaded segment",
             entry
         );
@@ -447,7 +458,10 @@ fn compute_phdr_va(elf: &ElfFile) -> u64 {
                 };
                 // [e_phoff, table_end) ⊆ [seg_off, seg_file_end).
                 if seg_off <= e_phoff && table_end <= seg_file_end {
-                    candidate = ph.virtual_addr().checked_add(e_phoff - seg_off).unwrap_or(0);
+                    candidate = ph
+                        .virtual_addr()
+                        .checked_add(e_phoff - seg_off)
+                        .unwrap_or(0);
                     break;
                 }
             }
@@ -603,7 +617,8 @@ fn load_segment_tracked(
     // by loading large binaries that exceed memory.max.
     let charge_bytes = (page_count * PAGE_SIZE) as u64;
     if cgroup::try_charge_memory(cgroup_id, charge_bytes).is_err() {
-        klog!(Error,
+        klog!(
+            Error,
             "ELF loader: cgroup memory limit exceeded for segment (need {} bytes)",
             charge_bytes
         );
@@ -642,7 +657,10 @@ fn load_segment_tracked(
     // R105-2 FIX: Segment layout diagnostics moved to debug-gated kprintln!.
     kprintln!(
         "  load_segment: vaddr=0x{:x}, memsz={}, filesz={}, pages={}",
-        vaddr, memsz, filesz, page_count
+        vaddr,
+        memsz,
+        filesz,
+        page_count
     );
     kprintln!(
         "    flags: R={} W={} X={} => PTFlags: 0x{:x}",
@@ -669,7 +687,8 @@ fn load_segment_tracked(
 
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
                     // R165-12 FIX: Debug, not Error — leaks the loaded segment VA.
-                    klog!(Debug,
+                    klog!(
+                        Debug,
                         "ELF loader: map_page FAILED for va=0x{:x}: {:?}",
                         va.as_u64(),
                         e
@@ -682,7 +701,9 @@ fn load_segment_tracked(
 
                 // Z-10 fix: 追加到本段和全局追踪向量
                 // R155-4 FIX: Fallible push to avoid kernel panic on OOM
-                tracked.try_reserve(1).map_err(|_| ElfLoadError::OutOfMemory)?;
+                tracked
+                    .try_reserve(1)
+                    .map_err(|_| ElfLoadError::OutOfMemory)?;
                 segment_mapped.push((page, frame));
                 tracked.push((page, frame));
             }
@@ -759,7 +780,8 @@ fn allocate_user_stack_tracked(
     // This enforces cgroup memory limits for stack allocation.
     let charge_bytes = (page_count * PAGE_SIZE) as u64;
     if cgroup::try_charge_memory(cgroup_id, charge_bytes).is_err() {
-        klog!(Error,
+        klog!(
+            Error,
             "ELF loader: cgroup memory limit exceeded for stack (need {} bytes)",
             charge_bytes
         );
@@ -802,7 +824,8 @@ fn allocate_user_stack_tracked(
 
                 if let Err(e) = mgr.map_page(page, frame, flags, &mut frame_alloc) {
                     // R165-12 FIX: Debug, not Error — leaks the KASLR stack VA.
-                    klog!(Debug,
+                    klog!(
+                        Debug,
                         "ELF loader: map_page FAILED for stack va=0x{:x}: {:?}",
                         va.as_u64(),
                         e
@@ -886,7 +909,8 @@ fn rollback_all_mappings(tracked: &mut Vec<MappedEntry>, cgroup_id: cgroup::Cgro
                         frame_alloc.deallocate_frame(unmapped_frame);
                     }
                     Err(e) => {
-                        klog!(Warn,
+                        klog!(
+                            Warn,
                             "ELF rollback: unmap_page failed for va=0x{:x}: {:?}",
                             page.start_address().as_u64(),
                             e
@@ -910,7 +934,8 @@ pub fn print_elf_info(image: &[u8]) {
 
         for (i, ph) in elf.program_iter().enumerate() {
             if ph.get_type() == Ok(PhType::Load) {
-                klog!(Debug,
+                klog!(
+                    Debug,
                     "  Segment {}: vaddr=0x{:x}, memsz=0x{:x}, filesz=0x{:x}",
                     i,
                     ph.virtual_addr(),

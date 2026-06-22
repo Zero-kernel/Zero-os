@@ -830,11 +830,15 @@ impl FragmentCache {
                     return Err(FragmentDropReason::PerNsQueueLimit);
                 }
                 if (nb.frags as usize) >= MAX_FRAGS_PER_NS {
-                    self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .global_limit_drops
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(FragmentDropReason::PerNsFragLimit);
                 }
                 if nb.bytes.saturating_add(payload.len() as u64) > MAX_BYTES_PER_NS {
-                    self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .global_limit_drops
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(FragmentDropReason::PerNsByteLimit);
                 }
             }
@@ -985,7 +989,9 @@ impl FragmentCache {
                 self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
                 per_ns_release_queue(&mut per_ns, key.net_ns_id);
             }
-            self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .global_limit_drops
+                .fetch_add(1, Ordering::Relaxed);
             return Err(FragmentDropReason::PerNsFragLimit);
         }
         // R66-11 FIX: Atomically reserve fragment slot
@@ -1035,7 +1041,9 @@ impl FragmentCache {
                 self.stats.active_queues.fetch_sub(1, Ordering::Relaxed);
                 per_ns_release_queue(&mut per_ns, key.net_ns_id);
             }
-            self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .global_limit_drops
+                .fetch_add(1, Ordering::Relaxed);
             return Err(FragmentDropReason::PerNsByteLimit);
         }
         // R66-11 FIX: Atomically reserve bytes
@@ -1120,7 +1128,9 @@ impl FragmentCache {
                             Ok(Some(buf))
                         }
                         None => {
-                            self.stats.global_limit_drops.fetch_add(1, Ordering::Relaxed);
+                            self.stats
+                                .global_limit_drops
+                                .fetch_add(1, Ordering::Relaxed);
                             Ok(None)
                         }
                     }
@@ -1392,7 +1402,13 @@ pub fn run_fragment_perns_self_test() {
         assert!(
             q == gq && f == gf && b == gb,
             "R169-10 balance [{}]: per_ns(q={},f={},b={}) != global(q={},f={},b={})",
-            ctx, q, f, b, gq, gf, gb
+            ctx,
+            q,
+            f,
+            b,
+            gq,
+            gf,
+            gb
         );
     }
 

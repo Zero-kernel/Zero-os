@@ -595,7 +595,10 @@ fn make_trampoline_executable() {
         let pd_entry = &mut pd[0];
 
         if pd_entry.is_unused() {
-            klog!(Warn, "[SMP] WARNING: missing identity mapping for trampoline region");
+            klog!(
+                Warn,
+                "[SMP] WARNING: missing identity mapping for trampoline region"
+            );
             return;
         }
 
@@ -603,7 +606,8 @@ fn make_trampoline_executable() {
         let pd_addr = pd_entry.addr();
         let is_huge = pd_flags.contains(PageTableFlags::HUGE_PAGE);
 
-        klog!(Info,
+        klog!(
+            Info,
             "[SMP] PD[0] addr=0x{:x} flags={:?} (huge={})",
             pd_addr.as_u64(),
             pd_flags,
@@ -645,7 +649,10 @@ fn make_trampoline_executable() {
                     pt_entry.set_addr(pt_entry.addr(), new_flags);
                     klog_always!("[SMP] Trampoline PTE[{}] NX cleared", trampoline_pt_idx);
                 } else {
-                    klog_always!("[SMP] Trampoline PTE[{}] already executable", trampoline_pt_idx);
+                    klog_always!(
+                        "[SMP] Trampoline PTE[{}] already executable",
+                        trampoline_pt_idx
+                    );
                 }
             }
 
@@ -823,8 +830,7 @@ pub fn start_aps() -> usize {
             (*data_ptr).cr4 = cr4;
             // R67-2 FIX: Provide address where AP signals it has read all data.
             // We use the virtual address since the AP runs with paging enabled.
-            (*data_ptr).claim_flag_addr =
-                &AP_DATA_CLAIMED as *const AtomicU64 as u64;
+            (*data_ptr).claim_flag_addr = &AP_DATA_CLAIMED as *const AtomicU64 as u64;
         }
 
         // Send INIT-SIPI-SIPI sequence
@@ -855,7 +861,8 @@ pub fn start_aps() -> usize {
                 // mode before reaching the claim code. We cannot safely continue
                 // to the next AP as this AP might still be running and could
                 // read corrupted data later.
-                klog!(Error,
+                klog!(
+                    Error,
                     "[SMP] CRITICAL: CPU {} did not claim trampoline data - halting SMP init",
                     cpu_index
                 );
@@ -875,7 +882,11 @@ pub fn start_aps() -> usize {
             core::hint::spin_loop();
             timeout -= 1;
             if timeout == 0 {
-                klog!(Warn, "[SMP] WARNING: CPU {} failed to complete init!", cpu_index);
+                klog!(
+                    Warn,
+                    "[SMP] WARNING: CPU {} failed to complete init!",
+                    cpu_index
+                );
                 break;
             }
         }
@@ -959,14 +970,17 @@ pub extern "C" fn ap_rust_entry(
     let lapic_expected = lapic_id as u32;
     let lapic_actual = unsafe { apic::lapic_id() };
     if lapic_actual != lapic_expected {
-        klog!(Error,
+        klog!(
+            Error,
             "[SMP] SECURITY: LAPIC ID mismatch (expected {}, found {}) - halting AP",
             lapic_expected,
             lapic_actual
         );
         // Critical security violation - halt this AP permanently
         loop {
-            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); }
+            unsafe {
+                core::arch::asm!("cli; hlt", options(nomem, nostack));
+            }
         }
     }
     let lapic = lapic_actual;
@@ -1117,8 +1131,8 @@ fn ap_idle_loop() -> ! {
         // so if an IPI is pending, the CPU will wake from HLT immediately.
         unsafe {
             core::arch::asm!(
-                "sti",   // Enable interrupts (takes effect starting with HLT)
-                "hlt",   // Halt until interrupt - wakes immediately if interrupt pending
+                "sti", // Enable interrupts (takes effect starting with HLT)
+                "hlt", // Halt until interrupt - wakes immediately if interrupt pending
                 options(nomem, nostack, preserves_flags)
             );
         }
@@ -1170,15 +1184,20 @@ fn alloc_ap_stack() -> u64 {
             // R130-5 FIX: Gate physical address behind kprintln! (debug-only)
             // to comply with kptr-safety policy. The raw physical frame address
             // leaks physical memory layout in release builds.
-            kprintln!("[SMP] AP stack allocation attempt {} got high frame, retrying...",
-                     attempt + 1);
+            kprintln!(
+                "[SMP] AP stack allocation attempt {} got high frame, retrying...",
+                attempt + 1
+            );
         }
     }
 
     // All attempts returned high memory - this is a configuration issue
     // (system has very little RAM below 4GB)
-    panic!("[SMP] Cannot allocate AP stack in low memory (<4GB) after {} attempts. \
-            System may have insufficient low memory.", MAX_ALLOC_ATTEMPTS);
+    panic!(
+        "[SMP] Cannot allocate AP stack in low memory (<4GB) after {} attempts. \
+            System may have insufficient low memory.",
+        MAX_ALLOC_ATTEMPTS
+    );
 }
 
 // ============================================================================

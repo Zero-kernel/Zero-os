@@ -96,11 +96,7 @@ impl Endpoint {
     ///
     /// R106-1 FIX: 接受预解析的 (pid, generation) 对，避免在持有 ENDPOINTS 锁时
     /// 访问 PROCESS_TABLE（防止锁序反转死锁）。
-    fn new(
-        owner: ProcessId,
-        owner_generation: u64,
-        resolved_senders: &[(ProcessId, u64)],
-    ) -> Self {
+    fn new(owner: ProcessId, owner_generation: u64, resolved_senders: &[(ProcessId, u64)]) -> Self {
         let mut allowed = BTreeMap::new();
         // 所有者总是可以发送（给自己）
         allowed.insert(owner, owner_generation);
@@ -247,7 +243,11 @@ impl EndpointRegistry {
                 return false;
             }
             self.owner_index.remove(&endpoint_id);
-            if let Some(table) = self.per_ns.get_mut(&ns_id).and_then(|ns| ns.get_mut(&owner)) {
+            if let Some(table) = self
+                .per_ns
+                .get_mut(&ns_id)
+                .and_then(|ns| ns.get_mut(&owner))
+            {
                 table.remove(&endpoint_id);
                 return true;
             }

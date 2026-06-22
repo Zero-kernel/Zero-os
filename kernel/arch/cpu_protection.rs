@@ -50,15 +50,18 @@ impl CpuProtectionStatus {
         kprintln!("CPU Protection Status:");
         kprintln!(
             "  SMEP: supported={}, enabled={}",
-            self.smep_supported, self.smep_enabled
+            self.smep_supported,
+            self.smep_enabled
         );
         kprintln!(
             "  SMAP: supported={}, enabled={}",
-            self.smap_supported, self.smap_enabled
+            self.smap_supported,
+            self.smap_enabled
         );
         kprintln!(
             "  UMIP: supported={}, enabled={}",
-            self.umip_supported, self.umip_enabled
+            self.umip_supported,
+            self.umip_enabled
         );
     }
 }

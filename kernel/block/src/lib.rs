@@ -724,7 +724,8 @@ impl BlockDeviceRegistry {
 
         // P2-8 FIX: Use fetch_update + checked_add to prevent minor number
         // wrapping on overflow, following the R105-5 pattern.
-        let minor = self.next_minor
+        let minor = self
+            .next_minor
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
             .map_err(|_| BlockError::NoMem)? as u32;
 
@@ -791,7 +792,8 @@ lazy_static::lazy_static! {
 /// Register a block device.
 pub fn register_device(device: Arc<dyn BlockDevice>) -> Result<u32, BlockError> {
     let minor = BLOCK_REGISTRY.register(device.clone())?;
-    klog!(Info, 
+    klog!(
+        Info,
         "  Block device registered: {} (minor={}, capacity={}MB)",
         device.name(),
         minor,
@@ -886,9 +888,12 @@ unsafe fn map_high_mmio(phys_base: u64, size: usize) -> Result<i64, BlockError> 
     let virt_addr = HIGH_MMIO_VIRT_BASE + offset;
     let virt_offset = virt_addr as i64 - phys_base as i64;
 
-    klog!(Info, 
+    klog!(
+        Info,
         "      [MMIO] Mapping phys {:#x} -> virt {:#x} (size {:#x})",
-        phys_base, virt_addr, aligned_size
+        phys_base,
+        virt_addr,
+        aligned_size
     );
 
     // Create the mapping using the mm crate's map_mmio function
@@ -950,9 +955,13 @@ pub fn probe_devices(iommu_required: bool) -> Option<(Arc<dyn BlockDevice>, &'st
                     let capacity = device.capacity_sectors();
                     let sector_size = device.sector_size();
                     let size_mb = (capacity * sector_size as u64) / (1024 * 1024);
-                    klog!(Info,
+                    klog!(
+                        Info,
                         "    virtio-blk (mmio) /dev/{}: {} MB ({} sectors x {} bytes)",
-                        name, size_mb, capacity, sector_size
+                        name,
+                        size_mb,
+                        capacity,
+                        sector_size
                     );
                     return Some((device, name));
                 }
@@ -1006,8 +1015,15 @@ pub fn probe_devices(iommu_required: bool) -> Option<(Arc<dyn BlockDevice>, &'st
                 // R82-3 FIX: Disable bus mastering on MMIO mapping failure
                 // R162-10-1 FIX: Acquire PCI_CONFIG_LOCK for RMW serialization
                 let _pci_lock = iommu::PCI_CONFIG_LOCK.lock();
-                let cmd = pci::pci_config_read32(pci_id.bus, pci_id.device, pci_id.function, 0x04) as u16;
-                pci::pci_config_write16(pci_id.bus, pci_id.device, pci_id.function, 0x04, cmd & !0x04);
+                let cmd =
+                    pci::pci_config_read32(pci_id.bus, pci_id.device, pci_id.function, 0x04) as u16;
+                pci::pci_config_write16(
+                    pci_id.bus,
+                    pci_id.device,
+                    pci_id.function,
+                    0x04,
+                    cmd & !0x04,
+                );
                 drop(_pci_lock);
                 klog!(Error,
                     "    Failed to map virtio-blk MMIO region {:#x}-{:#x}: {:?} (bus master disabled)",
@@ -1022,7 +1038,7 @@ pub fn probe_devices(iommu_required: bool) -> Option<(Arc<dyn BlockDevice>, &'st
                 let capacity = device.capacity_sectors();
                 let sector_size = device.sector_size();
                 let size_mb = (capacity * sector_size as u64) / (1024 * 1024);
-                klog!(Info, 
+                klog!(Info,
                     "    virtio-blk (pci) /dev/{} @ {:02x}:{:02x}.{}: {} MB ({} sectors x {} bytes)",
                     name,
                     pci_id.bus,
@@ -1038,8 +1054,15 @@ pub fn probe_devices(iommu_required: bool) -> Option<(Arc<dyn BlockDevice>, &'st
                 // R82-3 FIX: Disable bus mastering on driver probe failure
                 // R162-10-1 FIX: Acquire PCI_CONFIG_LOCK for RMW serialization
                 let _pci_lock = iommu::PCI_CONFIG_LOCK.lock();
-                let cmd = pci::pci_config_read32(pci_id.bus, pci_id.device, pci_id.function, 0x04) as u16;
-                pci::pci_config_write16(pci_id.bus, pci_id.device, pci_id.function, 0x04, cmd & !0x04);
+                let cmd =
+                    pci::pci_config_read32(pci_id.bus, pci_id.device, pci_id.function, 0x04) as u16;
+                pci::pci_config_write16(
+                    pci_id.bus,
+                    pci_id.device,
+                    pci_id.function,
+                    0x04,
+                    cmd & !0x04,
+                );
                 drop(_pci_lock);
                 klog!(Warn,
                     "    Failed to probe virtio-blk /dev/{} @ {:02x}:{:02x}.{} (pci caps @ {:#x}): {:?} (bus master disabled)",

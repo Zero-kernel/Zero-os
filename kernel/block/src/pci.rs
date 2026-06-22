@@ -257,7 +257,9 @@ fn read_virtio_pci_caps(bus: u8, dev: u8, func: u8) -> Option<VirtioPciAddrs> {
 /// # Returns
 /// * `Some((pci_id, pci_addrs, device_name))` - Found device with modern virtio-pci capabilities
 /// * `None` - No compatible virtio-blk device found
-pub fn probe_virtio_blk(iommu_required: bool) -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)> {
+pub fn probe_virtio_blk(
+    iommu_required: bool,
+) -> Option<(PciDeviceId, VirtioPciAddrs, &'static str)> {
     // R161-15 FIX: Acquire shared PCI config lock to prevent concurrent
     // access with IOMMU's PCI operations on SMP.
     let _pci_lock = iommu::PCI_CONFIG_LOCK.lock();
@@ -309,16 +311,23 @@ pub fn probe_virtio_blk(iommu_required: bool) -> Option<(PciDeviceId, VirtioPciA
                         }
                         // IOMMU not present - proceed without DMA isolation (legacy mode)
                         // This is an explicit acknowledgment of the security tradeoff.
-                        klog!(Warn,
+                        klog!(
+                            Warn,
                             "    ! WARNING: No IOMMU - {:02x}:{:02x}.{} has unprotected DMA access",
-                            bus, dev, func
+                            bus,
+                            dev,
+                            func
                         );
                     }
                     Err(err) => {
                         // Other IOMMU errors - fail closed (skip device)
-                        klog!(Warn,
+                        klog!(
+                            Warn,
                             "    ! IOMMU attach failed for {:02x}:{:02x}.{}: {:?}",
-                            bus, dev, func, err
+                            bus,
+                            dev,
+                            func,
+                            err
                         );
                         continue;
                     }
@@ -341,7 +350,7 @@ pub fn probe_virtio_blk(iommu_required: bool) -> Option<(PciDeviceId, VirtioPciA
                     } else {
                         "transitional"
                     };
-                    klog!(Info, 
+                    klog!(Info,
                         "    Found virtio-blk ({}) at PCI {:02x}:{:02x}.{}, type={}, common_cfg={:#x}",
                         dev_type, bus, dev, func, subsystem_id, caps.common_cfg
                     );

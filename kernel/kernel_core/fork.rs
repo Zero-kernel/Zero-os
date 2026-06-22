@@ -148,7 +148,6 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
         drop(parent);
         cleanup_partial_child(child_pid);
     } else {
-
         // J2-7: per-cgroup FD budget — batch-charge the child's inherited fds.
         // fork_inner deep-copied the parent's fd_table into the child, so the
         // child's count == parent.fd_table.len() (read here under the held parent
@@ -210,8 +209,7 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
             let heap_bytes = {
                 const PAGE_SIZE: usize = 0x1000;
                 let brk_aligned = (parent_mm.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-                let brk_start_aligned =
-                    (parent_mm.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                let brk_start_aligned = (parent_mm.brk_start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
                 brk_aligned.saturating_sub(brk_start_aligned) as u64
             };
             bytes = bytes.saturating_add(heap_bytes);
@@ -455,8 +453,12 @@ fn fork_inner(
         // clone_for_fork() 会过滤掉带有 CLOFORK 标志的能力条目，
         // 并保持生成计数器的单调性以防止 wrap 攻击。
         // R161-4 FIX: Use fallible try_clone_for_fork to avoid OOM panic
-        child.cap_table = Arc::new(parent.cap_table.try_clone_for_fork()
-            .map_err(|_| ForkError::MemoryAllocationFailed)?);
+        child.cap_table = Arc::new(
+            parent
+                .cap_table
+                .try_clone_for_fork()
+                .map_err(|_| ForkError::MemoryAllocationFailed)?,
+        );
 
         child.time_slice = parent.time_slice;
         child.cpu_time = 0;
@@ -514,9 +516,12 @@ fn fork_inner(
             // D2 Phase 2: strip transient flags via the typed accessor (clears
             // PENDING_*, preserves PROT_NONE + prot bits — load-bearing for the
             // child's cgroup-charge skip).
-            snap.extend(parent_mm.mmap_regions.iter().map(|(&base, &len_with_flags)| {
-                (base, len_with_flags.fork_stripped())
-            }));
+            snap.extend(
+                parent_mm
+                    .mmap_regions
+                    .iter()
+                    .map(|(&base, &len_with_flags)| (base, len_with_flags.fork_stripped())),
+            );
 
             let child_mm = crate::process::MmState {
                 // next-phase #11 / R165-14 (CLOSED, was AD-02 tech-debt): the
@@ -589,7 +594,9 @@ fn fork_inner(
         // - no_new_privs: 粘滞标志，一旦设置不可清除，必须继承
         // - pledge_state: 包含 promises 和 exec_promises（exec 后生效）
         // R162-6 FIX: Use fallible try_clone to avoid OOM panic (R161-3 regression)
-        child.seccomp_state = parent.seccomp_state.try_clone()
+        child.seccomp_state = parent
+            .seccomp_state
+            .try_clone()
             .map_err(|_| ForkError::MemoryAllocationFailed)?;
         child.pledge_state = parent.pledge_state.clone();
 
@@ -625,7 +632,8 @@ fn fork_inner(
 
         kprintln!(
             "Fork: parent={}, child={}, COW enabled",
-            parent.pid, child.pid
+            parent.pid,
+            child.pid
         );
         Ok(child_pid)
     } else {
@@ -944,7 +952,8 @@ pub unsafe fn handle_cow_page_fault(pid: ProcessId, fault_addr: usize) -> Result
 
         kprintln!(
             "COW page fault: pid={}, addr=0x{:x} resolved",
-            pid, fault_addr
+            pid,
+            fault_addr
         );
         Ok(())
     })

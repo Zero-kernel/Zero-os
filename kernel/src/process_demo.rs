@@ -1,8 +1,6 @@
 //! 进程管理和调度器演示模块
 
-use kernel_core::process::{
-    create_process, get_process, get_process_stats, request_process_exit,
-};
+use kernel_core::process::{create_process, get_process, get_process_stats, request_process_exit};
 use sched::scheduler::{add_process, get_scheduler_stats, ready_count, schedule, tick};
 
 /// 演示进程管理功能
@@ -29,23 +27,35 @@ pub fn demo_process_management() {
     klog!(Info, "\n3. Process information:");
     if let Some(process) = get_process(proc1) {
         let proc = process.lock();
-        klog!(Info,
+        klog!(
+            Info,
             "   Process {}: Name={}, Priority={}, State={:?}",
-            proc.pid, proc.name, proc.priority, proc.state
+            proc.pid,
+            proc.name,
+            proc.priority,
+            proc.state
         );
     }
     if let Some(process) = get_process(proc2) {
         let proc = process.lock();
-        klog!(Info,
+        klog!(
+            Info,
             "   Process {}: Name={}, Priority={}, State={:?}",
-            proc.pid, proc.name, proc.priority, proc.state
+            proc.pid,
+            proc.name,
+            proc.priority,
+            proc.state
         );
     }
     if let Some(process) = get_process(proc3) {
         let proc = process.lock();
-        klog!(Info,
+        klog!(
+            Info,
             "   Process {}: Name={}, Priority={}, State={:?}",
-            proc.pid, proc.name, proc.priority, proc.state
+            proc.pid,
+            proc.name,
+            proc.priority,
+            proc.state
         );
     }
 
@@ -55,7 +65,8 @@ pub fn demo_process_management() {
         if let Some(pid) = schedule() {
             if let Some(process) = get_process(pid) {
                 let proc = process.lock();
-                klog!(Info,
+                klog!(
+                    Info,
                     "   Round {}: Running PID={} ({}), Priority={}, TimeSlice={}ms",
                     i + 1,
                     pid,
@@ -119,13 +130,17 @@ pub fn demo_priority_scheduling() {
 
     klog!(Info, "   ✓ Created processes with priorities: 0, 70, 139");
 
-    klog!(Info, "\n2. Observing scheduling order (should be by priority):");
+    klog!(
+        Info,
+        "\n2. Observing scheduling order (should be by priority):"
+    );
 
     for round in 0..3 {
         if let Some(pid) = schedule() {
             if let Some(process) = get_process(pid) {
                 let proc = process.lock();
-                klog!(Info,
+                klog!(
+                    Info,
                     "   Round {}: Selected PID={} ({}), Priority={}",
                     round + 1,
                     pid,
@@ -167,7 +182,8 @@ pub fn demo_time_slice() {
             if let Some(process) = get_process(pid) {
                 let mut proc = process.lock();
                 let initial_slice = proc.time_slice;
-                klog!(Info,
+                klog!(
+                    Info,
                     "   Round {}: PID={} ({}), Initial TimeSlice={}ms",
                     round + 1,
                     pid,

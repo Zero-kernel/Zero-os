@@ -327,7 +327,12 @@ impl MountNamespace {
         #[cfg(feature = "audit")]
         {
             use audit::{emit, AuditKind};
-            emit(AuditKind::Internal, child.id.raw(), parent.id.raw(), child.level as u64);
+            emit(
+                AuditKind::Internal,
+                child.id.raw(),
+                parent.id.raw(),
+                child.level as u64,
+            );
         }
 
         Ok(child)
@@ -451,7 +456,9 @@ impl MountNamespace {
             format!("{}/", path)
         };
 
-        mounts.keys().any(|k| k != path && k.starts_with(&path_with_slash))
+        mounts
+            .keys()
+            .any(|k| k != path && k.starts_with(&path_with_slash))
     }
 }
 
@@ -698,7 +705,10 @@ pub fn remove_mount(ns: &Arc<MountNamespace>, path: &str) -> Result<(), MountNsE
         }
     } else {
         let prefix = format!("{}/", normalized_path);
-        if table.keys().any(|k| k != &normalized_path && k.starts_with(&prefix)) {
+        if table
+            .keys()
+            .any(|k| k != &normalized_path && k.starts_with(&prefix))
+        {
             return Err(MountNsError::MountBusy);
         }
     }
@@ -709,7 +719,7 @@ pub fn remove_mount(ns: &Arc<MountNamespace>, path: &str) -> Result<(), MountNsE
         {
             use audit::{emit, AuditKind};
             let path_hash = hash_path(&normalized_path);
-            emit(AuditKind::Fs, ns.id.raw(), path_hash, 1);  // 1 = umount operation
+            emit(AuditKind::Fs, ns.id.raw(), path_hash, 1); // 1 = umount operation
         }
 
         Ok(())
@@ -752,10 +762,7 @@ pub fn print_namespace_info(ns: &Arc<MountNamespace>) {
 
     let mounts = ns.mounts.read();
     for (path, mount) in mounts.iter() {
-        kprintln!(
-            "  {} -> {} ({:?})",
-            path, mount.fstype, mount.flags
-        );
+        kprintln!("  {} -> {} ({:?})", path, mount.fstype, mount.flags);
     }
 }
 

@@ -336,7 +336,8 @@ impl Drop for UserAccessGuard {
             kprintln!(
                 "[usercopy] R106-7 WARNING: UserAccessGuard created on CPU {} dropped on CPU {}; \
                  corrective CLAC issued",
-                self.cpu_id, current_cpu
+                self.cpu_id,
+                current_cpu
             );
             return;
         }
@@ -769,8 +770,7 @@ pub fn copy_from_user_safe(dst: &mut [u8], src: *const u8) -> Result<(), ()> {
         // table fixup would fail and the page-fault handler would panic instead of
         // returning EFAULT.  By scoping per-CPU state to each chunk, migration
         // between chunks is harmless — state is always on the executing CPU.
-        let _guard =
-            UserCopyGuard::new((src as usize).wrapping_add(offset), chunk_end - offset);
+        let _guard = UserCopyGuard::new((src as usize).wrapping_add(offset), chunk_end - offset);
         USER_COPY_STATE.with(|s| s.remaining.store(len - offset, Ordering::SeqCst));
 
         // H-26 FIX: Copy using exception-safe helpers
@@ -832,8 +832,7 @@ pub fn copy_to_user_safe(dst: *mut u8, src: &[u8]) -> Result<(), ()> {
         let _smap_guard = UserAccessGuard::new();
 
         // R109-1 FIX: Scope UserCopyGuard to each chunk (see copy_from_user_safe).
-        let _guard =
-            UserCopyGuard::new((dst as usize).wrapping_add(offset), chunk_end - offset);
+        let _guard = UserCopyGuard::new((dst as usize).wrapping_add(offset), chunk_end - offset);
         USER_COPY_STATE.with(|s| s.remaining.store(len - offset, Ordering::SeqCst));
 
         // H-26 FIX: Copy using exception-safe helpers

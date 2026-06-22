@@ -166,14 +166,19 @@ pub fn register_context_provider(
     get_ticks: GetTicksCallback,
 ) {
     CTX_GET_PID.store(get_pid as u64, core::sync::atomic::Ordering::Release);
-    CTX_GET_CREDENTIALS.store(get_credentials as u64, core::sync::atomic::Ordering::Release);
+    CTX_GET_CREDENTIALS.store(
+        get_credentials as u64,
+        core::sync::atomic::Ordering::Release,
+    );
     CTX_GET_TICKS.store(get_ticks as u64, core::sync::atomic::Ordering::Release);
 }
 
 #[inline]
 fn current_pid() -> Option<ProcessId> {
     let ptr = CTX_GET_PID.load(core::sync::atomic::Ordering::Acquire);
-    if ptr == 0 { return None; }
+    if ptr == 0 {
+        return None;
+    }
     let f: GetPidCallback = unsafe { core::mem::transmute(ptr) };
     f()
 }
@@ -181,7 +186,9 @@ fn current_pid() -> Option<ProcessId> {
 #[inline]
 fn current_credentials() -> Option<Credentials> {
     let ptr = CTX_GET_CREDENTIALS.load(core::sync::atomic::Ordering::Acquire);
-    if ptr == 0 { return None; }
+    if ptr == 0 {
+        return None;
+    }
     let f: GetCredentialsCallback = unsafe { core::mem::transmute(ptr) };
     f()
 }
@@ -190,7 +197,9 @@ fn current_credentials() -> Option<Credentials> {
 #[inline]
 fn get_ticks() -> u64 {
     let ptr = CTX_GET_TICKS.load(core::sync::atomic::Ordering::Acquire);
-    if ptr == 0 { return 0; }
+    if ptr == 0 {
+        return 0;
+    }
     let f: GetTicksCallback = unsafe { core::mem::transmute(ptr) };
     f()
 }
@@ -526,7 +535,8 @@ static USER_POLICY_SLOT: Mutex<Option<&'static PolicySlot>> = Mutex::new(None);
 pub fn set_policy(policy: &'static dyn LsmPolicy) {
     // R103-4 FIX: Allocate the PolicySlot on the heap and leak it for a stable
     // 'static address. No `static mut`, no UB.
-    let slot: &'static PolicySlot = alloc::boxed::Box::leak(alloc::boxed::Box::new(PolicySlot { policy }));
+    let slot: &'static PolicySlot =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(PolicySlot { policy }));
     let slot_ptr = slot as *const PolicySlot as *mut PolicySlot;
 
     // Store reference for bookkeeping (previous slot is intentionally leaked)

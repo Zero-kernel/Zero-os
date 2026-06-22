@@ -108,11 +108,25 @@ impl CpuRegs {
     /// Create a zeroed register set.
     pub const fn zeroed() -> Self {
         Self {
-            rax: 0, rbx: 0, rcx: 0, rdx: 0,
-            rsi: 0, rdi: 0, rbp: 0,
-            r8: 0, r9: 0, r10: 0, r11: 0,
-            r12: 0, r13: 0, r14: 0, r15: 0,
-            rip: 0, rsp: 0, rflags: 0, cr3: 0,
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip: 0,
+            rsp: 0,
+            rflags: 0,
+            cr3: 0,
         }
     }
 }
@@ -475,7 +489,9 @@ pub fn emit_encrypted_dump(dump: &CrashDump) {
         secure_bzero(&mut key);
         secure_bzero(&mut out[..len]);
         scrub_kdump_storage_if_captured();
-        serial_write_str("\n[kdump] Encryption unavailable (FIPS) - dump suppressed for security\n");
+        serial_write_str(
+            "\n[kdump] Encryption unavailable (FIPS) - dump suppressed for security\n",
+        );
         return;
     }
     // R92-4 FIX: Zero key material after use to minimize exposure.
@@ -515,7 +531,11 @@ struct FixedBuf<'a> {
 
 impl<'a> FixedBuf<'a> {
     fn new(buf: &'a mut [u8]) -> Self {
-        Self { buf, len: 0, truncated: false }
+        Self {
+            buf,
+            len: 0,
+            truncated: false,
+        }
     }
 }
 
@@ -627,7 +647,9 @@ fn read_tsc() -> u64 {
     }
 
     #[cfg(not(target_arch = "x86_64"))]
-    { 0 }
+    {
+        0
+    }
 }
 
 // ============================================================================
@@ -762,7 +784,11 @@ fn is_kernel_address(addr: u64) -> bool {
 fn is_canonical_address(addr: u64) -> bool {
     let sign = (addr >> 47) & 1;
     let top = addr >> 48;
-    if sign == 0 { top == 0 } else { top == 0xFFFF }
+    if sign == 0 {
+        top == 0
+    } else {
+        top == 0xFFFF
+    }
 }
 
 #[inline]
@@ -882,7 +908,9 @@ fn serial_write_byte(byte: u8) {
         }
         core::hint::spin_loop();
     }
-    unsafe { outb(SERIAL_PORT, byte); }
+    unsafe {
+        outb(SERIAL_PORT, byte);
+    }
 }
 
 fn serial_write_str(s: &str) {
@@ -923,7 +951,9 @@ fn serial_write_hex_bytes(bytes: &[u8]) {
 /// Securely zero a buffer (prevents compiler from optimizing away).
 fn secure_bzero(buf: &mut [u8]) {
     for b in buf.iter_mut() {
-        unsafe { core::ptr::write_volatile(b, 0); }
+        unsafe {
+            core::ptr::write_volatile(b, 0);
+        }
     }
     core::sync::atomic::compiler_fence(Ordering::SeqCst);
 }

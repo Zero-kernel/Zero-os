@@ -90,9 +90,7 @@ fn apply_rela_dyn_relocations(
         .expect("Failed to parse .rela.dyn section data")
     {
         SectionData::Rela64(relas) => relas,
-        _ => panic!(
-            "Unexpected .rela.dyn format (expected Rela64 for x86_64 kernel)"
-        ),
+        _ => panic!("Unexpected .rela.dyn format (expected Rela64 for x86_64 kernel)"),
     };
 
     if relas.is_empty() {
@@ -373,310 +371,328 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     // R39-7 FIX: Get entry point, KASLR slide, and kernel size from loading block
     // Codex Review Fix: kernel_size needed for accurate page table setup
-    let (entry_point, kaslr_slide, kernel_size) =
-        {
-            let boot_services = system_table.boot_services();
+    let (entry_point, kaslr_slide, kernel_size) = {
+        let boot_services = system_table.boot_services();
 
-            let fs_handle = boot_services
-                .locate_handle_buffer(uefi::table::boot::SearchType::ByProtocol(
-                    &SimpleFileSystem::GUID,
-                ))
-                .expect("Failed to locate file system handles");
+        let fs_handle = boot_services
+            .locate_handle_buffer(uefi::table::boot::SearchType::ByProtocol(
+                &SimpleFileSystem::GUID,
+            ))
+            .expect("Failed to locate file system handles");
 
-            let fs_handle = fs_handle[0];
+        let fs_handle = fs_handle[0];
 
-            let mut fs = boot_services
-                .open_protocol_exclusive::<SimpleFileSystem>(fs_handle)
-                .expect("Failed to open file system protocol");
+        let mut fs = boot_services
+            .open_protocol_exclusive::<SimpleFileSystem>(fs_handle)
+            .expect("Failed to open file system protocol");
 
-            let mut root_dir = fs.open_volume().expect("Failed to open root directory");
+        let mut root_dir = fs.open_volume().expect("Failed to open root directory");
 
-            info!("Loading kernel...");
-            let kernel_path = CStr16::from_u16_with_nul(&[
-                b'k' as u16,
-                b'e' as u16,
-                b'r' as u16,
-                b'n' as u16,
-                b'e' as u16,
-                b'l' as u16,
-                b'.' as u16,
-                b'e' as u16,
-                b'l' as u16,
-                b'f' as u16,
-                0,
-            ])
-            .unwrap();
+        info!("Loading kernel...");
+        let kernel_path = CStr16::from_u16_with_nul(&[
+            b'k' as u16,
+            b'e' as u16,
+            b'r' as u16,
+            b'n' as u16,
+            b'e' as u16,
+            b'l' as u16,
+            b'.' as u16,
+            b'e' as u16,
+            b'l' as u16,
+            b'f' as u16,
+            0,
+        ])
+        .unwrap();
 
-            let mut kernel_file = root_dir
-                .open(kernel_path, FileMode::Read, FileAttribute::empty())
-                .expect("Failed to open kernel.elf")
-                .into_regular_file()
-                .expect("kernel.elf is not a regular file");
+        let mut kernel_file = root_dir
+            .open(kernel_path, FileMode::Read, FileAttribute::empty())
+            .expect("Failed to open kernel.elf")
+            .into_regular_file()
+            .expect("kernel.elf is not a regular file");
 
-            let mut info_buffer = [0u8; 512];
-            let info = kernel_file
-                .get_info::<FileInfo>(&mut info_buffer)
-                .expect("Failed to get file info");
+        let mut info_buffer = [0u8; 512];
+        let info = kernel_file
+            .get_info::<FileInfo>(&mut info_buffer)
+            .expect("Failed to get file info");
 
-            let file_size = info.file_size() as usize;
+        let file_size = info.file_size() as usize;
 
-            let mut kernel_data = Vec::with_capacity(file_size);
-            kernel_data.resize(file_size, 0);
+        let mut kernel_data = Vec::with_capacity(file_size);
+        kernel_data.resize(file_size, 0);
 
-            // 循环读取直到完整读取整个文件
-            let mut total_read = 0usize;
-            while total_read < file_size {
-                let read_size = kernel_file
-                    .read(&mut kernel_data[total_read..])
-                    .expect("Failed to read kernel file");
+        // 循环读取直到完整读取整个文件
+        let mut total_read = 0usize;
+        while total_read < file_size {
+            let read_size = kernel_file
+                .read(&mut kernel_data[total_read..])
+                .expect("Failed to read kernel file");
 
-                if read_size == 0 {
-                    // 读取返回0但文件未读完，说明发生了截断
-                    panic!(
-                        "Kernel file read truncated: expected {} bytes, got {} bytes",
-                        file_size, total_read
-                    );
-                }
-                total_read += read_size;
+            if read_size == 0 {
+                // 读取返回0但文件未读完，说明发生了截断
+                panic!(
+                    "Kernel file read truncated: expected {} bytes, got {} bytes",
+                    file_size, total_read
+                );
             }
+            total_read += read_size;
+        }
 
-            info!("Kernel loaded: {} bytes", total_read);
+        info!("Kernel loaded: {} bytes", total_read);
 
-            info!("Parsing ELF...");
-            let elf = ElfFile::new(&kernel_data).expect("Failed to parse ELF file");
+        info!("Parsing ELF...");
+        let elf = ElfFile::new(&kernel_data).expect("Failed to parse ELF file");
 
-            let entry_point = elf.header.pt2.entry_point();
-            info!("Entry point: 0x{:x}", entry_point);
+        let entry_point = elf.header.pt2.entry_point();
+        info!("Entry point: 0x{:x}", entry_point);
 
-            assert_eq!(
-                elf.header.pt1.magic,
-                [0x7f, 0x45, 0x4c, 0x46],
-                "Invalid ELF magic"
-            );
+        assert_eq!(
+            elf.header.pt1.magic,
+            [0x7f, 0x45, 0x4c, 0x46],
+            "Invalid ELF magic"
+        );
 
-            // 首先，计算内核需要的总内存大小
-            let mut min_addr = u64::MAX;
-            let mut max_addr = 0u64;
+        // 首先，计算内核需要的总内存大小
+        let mut min_addr = u64::MAX;
+        let mut max_addr = 0u64;
 
-            for program_header in elf.program_iter() {
-                if program_header.get_type() != Ok(Type::Load) {
-                    continue;
-                }
-                let virt_addr = program_header.virtual_addr();
-                // Skip non-kernel LOAD segments (e.g., .rela.dyn metadata at VA 0
-                // emitted by PIE linking). Only kernel segments reside in the
-                // high-half virtual range.
-                if virt_addr < KERNEL_VIRT_BASE {
-                    continue;
-                }
-                let mem_size = program_header.mem_size();
-
-                if virt_addr < min_addr {
-                    min_addr = virt_addr;
-                }
-                // R120-1 FIX: Use checked arithmetic to detect crafted ELF
-                // headers with wrapping virt_addr + mem_size values.
-                let end_addr = virt_addr
-                    .checked_add(mem_size)
-                    .expect("ELF LOAD segment virt_addr + mem_size overflow");
-                if end_addr > max_addr {
-                    max_addr = end_addr;
-                }
+        for program_header in elf.program_iter() {
+            if program_header.get_type() != Ok(Type::Load) {
+                continue;
             }
+            let virt_addr = program_header.virtual_addr();
+            // Skip non-kernel LOAD segments (e.g., .rela.dyn metadata at VA 0
+            // emitted by PIE linking). Only kernel segments reside in the
+            // high-half virtual range.
+            if virt_addr < KERNEL_VIRT_BASE {
+                continue;
+            }
+            let mem_size = program_header.mem_size();
 
-            // 分配一块连续的内存来容纳整个内核
-            //
-            // Text KASLR: The kernel is compiled as a static PIE with
-            // `-C relocation-model=pie`. The bootloader:
-            //   1. Generates a 2 MiB-aligned random slide (0 when feature disabled)
-            //   2. Attempts to allocate at KERNEL_PHYS_BASE + slide
-            //   3. Falls back to KERNEL_PHYS_BASE (slide=0) on allocation failure
-            //   4. Loads LOAD segments into the allocated region
-            //   5. Applies .rela.dyn R_X86_64_RELATIVE relocations with slide as load_bias
-            //   6. Jumps to entry_point + slide
-            // R120-1 FIX: Use checked subtraction to detect empty LOAD segment set
-            // (where no valid high-half segments were found).
-            let kernel_size = max_addr
-                .checked_sub(min_addr)
-                .expect("ELF LOAD: max_addr < min_addr (no valid kernel segments)") as usize;
-            // R120-1 FIX: Use checked arithmetic for page computation to prevent
-            // wrapping on crafted ELF headers with absurd segment sizes.
-            let pages = kernel_size
-                .checked_add(0xFFF)
-                .expect("ELF kernel size + page alignment overflow")
-                / 0x1000;
-            let alloc_bytes = pages
-                .checked_mul(0x1000)
-                .expect("Kernel allocation pages * 0x1000 overflow");
+            if virt_addr < min_addr {
+                min_addr = virt_addr;
+            }
+            // R120-1 FIX: Use checked arithmetic to detect crafted ELF
+            // headers with wrapping virt_addr + mem_size values.
+            let end_addr = virt_addr
+                .checked_add(mem_size)
+                .expect("ELF LOAD segment virt_addr + mem_size overflow");
+            if end_addr > max_addr {
+                max_addr = end_addr;
+            }
+        }
 
-            let mut kaslr_slide = generate_kaslr_slide();
-            let mut kernel_phys_base = KERNEL_PHYS_BASE + kaslr_slide;
+        // 分配一块连续的内存来容纳整个内核
+        //
+        // Text KASLR: The kernel is compiled as a static PIE with
+        // `-C relocation-model=pie`. The bootloader:
+        //   1. Generates a 2 MiB-aligned random slide (0 when feature disabled)
+        //   2. Attempts to allocate at KERNEL_PHYS_BASE + slide
+        //   3. Falls back to KERNEL_PHYS_BASE (slide=0) on allocation failure
+        //   4. Loads LOAD segments into the allocated region
+        //   5. Applies .rela.dyn R_X86_64_RELATIVE relocations with slide as load_bias
+        //   6. Jumps to entry_point + slide
+        // R120-1 FIX: Use checked subtraction to detect empty LOAD segment set
+        // (where no valid high-half segments were found).
+        let kernel_size = max_addr
+            .checked_sub(min_addr)
+            .expect("ELF LOAD: max_addr < min_addr (no valid kernel segments)")
+            as usize;
+        // R120-1 FIX: Use checked arithmetic for page computation to prevent
+        // wrapping on crafted ELF headers with absurd segment sizes.
+        let pages = kernel_size
+            .checked_add(0xFFF)
+            .expect("ELF kernel size + page alignment overflow")
+            / 0x1000;
+        let alloc_bytes = pages
+            .checked_mul(0x1000)
+            .expect("Kernel allocation pages * 0x1000 overflow");
 
-            // R119-1 FIX: Gate physical addresses and KASLR slide behind debug_assertions
-            #[cfg(debug_assertions)]
-            info!(
-                "Allocating {} pages ({} bytes) for kernel at 0x{:x} (KASLR slide=0x{:x})",
-                pages, kernel_size, kernel_phys_base, kaslr_slide
-            );
-            #[cfg(not(debug_assertions))]
-            info!(
-                "Allocating {} pages ({} bytes) for kernel",
-                pages, kernel_size
-            );
+        let mut kaslr_slide = generate_kaslr_slide();
+        let mut kernel_phys_base = KERNEL_PHYS_BASE + kaslr_slide;
 
-            // Try to allocate at the slid address; fall back to fixed base on failure.
-            // UEFI firmware or reserved regions may overlap the slid range.
-            let actual_phys_base = loop {
-                match boot_services.allocate_pages(
-                    AllocateType::Address(kernel_phys_base),
-                    MemoryType::LOADER_DATA,
-                    pages,
-                ) {
-                    Ok(_) => break kernel_phys_base,
-                    Err(status) => {
-                        if kaslr_slide == 0 {
-                            panic!(
+        // R119-1 FIX: Gate physical addresses and KASLR slide behind debug_assertions
+        #[cfg(debug_assertions)]
+        info!(
+            "Allocating {} pages ({} bytes) for kernel at 0x{:x} (KASLR slide=0x{:x})",
+            pages, kernel_size, kernel_phys_base, kaslr_slide
+        );
+        #[cfg(not(debug_assertions))]
+        info!(
+            "Allocating {} pages ({} bytes) for kernel",
+            pages, kernel_size
+        );
+
+        // Try to allocate at the slid address; fall back to fixed base on failure.
+        // UEFI firmware or reserved regions may overlap the slid range.
+        let actual_phys_base = loop {
+            match boot_services.allocate_pages(
+                AllocateType::Address(kernel_phys_base),
+                MemoryType::LOADER_DATA,
+                pages,
+            ) {
+                Ok(_) => break kernel_phys_base,
+                Err(status) => {
+                    if kaslr_slide == 0 {
+                        panic!(
                                 "FATAL: Cannot allocate kernel memory at 0x{:x}: {:?}. \
                                  Page table mappings require kernel within the 1 GiB high-half \
                                  identity region. Ensure no UEFI runtime or reserved regions overlap.",
                                 kernel_phys_base, status
                             );
-                        }
-                        // Slid allocation failed — fall back to deterministic base
-                        // R119-1 FIX: Gate addresses behind debug_assertions
-                        #[cfg(debug_assertions)]
-                        info!(
+                    }
+                    // Slid allocation failed — fall back to deterministic base
+                    // R119-1 FIX: Gate addresses behind debug_assertions
+                    #[cfg(debug_assertions)]
+                    info!(
                             "KASLR allocation at 0x{:x} failed ({:?}) — falling back to fixed base 0x{:x}",
                             kernel_phys_base, status, KERNEL_PHYS_BASE
                         );
-                        #[cfg(not(debug_assertions))]
-                        info!(
-                            "KASLR allocation failed ({:?}) — falling back to fixed base",
-                            status
-                        );
-                        kaslr_slide = 0;
-                        kernel_phys_base = KERNEL_PHYS_BASE;
-                    }
+                    #[cfg(not(debug_assertions))]
+                    info!(
+                        "KASLR allocation failed ({:?}) — falling back to fixed base",
+                        status
+                    );
+                    kaslr_slide = 0;
+                    kernel_phys_base = KERNEL_PHYS_BASE;
                 }
-            };
+            }
+        };
 
-            // R119-1 FIX: Gate allocated address and slide behind debug_assertions
-            #[cfg(debug_assertions)]
-            info!(
-                "Kernel memory allocated at 0x{:x} (final slide=0x{:x})",
-                actual_phys_base, kaslr_slide
-            );
-            #[cfg(not(debug_assertions))]
-            info!("Kernel memory allocated (KASLR {})",
-                if kaslr_slide != 0 { "active" } else { "inactive" }
-            );
+        // R119-1 FIX: Gate allocated address and slide behind debug_assertions
+        #[cfg(debug_assertions)]
+        info!(
+            "Kernel memory allocated at 0x{:x} (final slide=0x{:x})",
+            actual_phys_base, kaslr_slide
+        );
+        #[cfg(not(debug_assertions))]
+        info!(
+            "Kernel memory allocated (KASLR {})",
+            if kaslr_slide != 0 {
+                "active"
+            } else {
+                "inactive"
+            }
+        );
 
-            // R120-1 FIX: Zero the entire page-aligned allocation (alloc_bytes),
-            // not just kernel_size. This ensures the tail bytes (up to 4095) in
-            // the last page are zeroed, preventing stale UEFI memory from being
-            // mapped into the kernel's high-half virtual address range.
-            unsafe {
-                core::ptr::write_bytes(actual_phys_base as *mut u8, 0, alloc_bytes);
+        // R120-1 FIX: Zero the entire page-aligned allocation (alloc_bytes),
+        // not just kernel_size. This ensures the tail bytes (up to 4095) in
+        // the last page are zeroed, preventing stale UEFI memory from being
+        // mapped into the kernel's high-half virtual address range.
+        unsafe {
+            core::ptr::write_bytes(actual_phys_base as *mut u8, 0, alloc_bytes);
+        }
+
+        // 加载所有程序段到物理地址 0x100000
+        for program_header in elf.program_iter() {
+            if program_header.get_type() != Ok(Type::Load) {
+                continue;
             }
 
-            // 加载所有程序段到物理地址 0x100000
-            for program_header in elf.program_iter() {
-                if program_header.get_type() != Ok(Type::Load) {
-                    continue;
-                }
+            let virt_addr = program_header.virtual_addr();
+            // Skip non-kernel LOAD segments (e.g., .rela.dyn metadata at VA 0)
+            if virt_addr < KERNEL_VIRT_BASE {
+                continue;
+            }
+            let mem_size = program_header.mem_size();
+            let file_size = program_header.file_size();
+            let file_offset = program_header.offset();
 
-                let virt_addr = program_header.virtual_addr();
-                // Skip non-kernel LOAD segments (e.g., .rela.dyn metadata at VA 0)
-                if virt_addr < KERNEL_VIRT_BASE {
-                    continue;
-                }
-                let mem_size = program_header.mem_size();
-                let file_size = program_header.file_size();
-                let file_offset = program_header.offset();
-
-                // R24-10 fix: Validate that file_offset + file_size doesn't exceed kernel_data bounds
-                // A malformed ELF could have segments pointing beyond the file, causing OOB read
-                let file_end = file_offset
-                    .checked_add(file_size)
-                    .expect("ELF segment offset+size overflow");
-                if file_end as usize > kernel_data.len() {
-                    panic!(
+            // R24-10 fix: Validate that file_offset + file_size doesn't exceed kernel_data bounds
+            // A malformed ELF could have segments pointing beyond the file, causing OOB read
+            let file_end = file_offset
+                .checked_add(file_size)
+                .expect("ELF segment offset+size overflow");
+            if file_end as usize > kernel_data.len() {
+                panic!(
                     "ELF segment out of bounds: offset=0x{:x}, file_size=0x{:x}, file_len=0x{:x}",
-                    file_offset, file_size, kernel_data.len()
+                    file_offset,
+                    file_size,
+                    kernel_data.len()
                 );
-                }
+            }
 
-                // 计算物理地址：虚拟地址 - 虚拟基址 + 物理基址
-                // 虚拟基址是 min_addr (0xffffffff80000000)，物理基址是 actual_phys_base (0x100000)
-                let phys_addr = actual_phys_base + (virt_addr - min_addr);
+            // 计算物理地址：虚拟地址 - 虚拟基址 + 物理基址
+            // 虚拟基址是 min_addr (0xffffffff80000000)，物理基址是 actual_phys_base (0x100000)
+            let phys_addr = actual_phys_base + (virt_addr - min_addr);
 
-                // 清零整个段内存区域（包括.bss）
+            // 清零整个段内存区域（包括.bss）
+            unsafe {
+                let dest = phys_addr as *mut u8;
+                core::ptr::write_bytes(dest, 0, mem_size as usize);
+            }
+
+            // 复制段数据（file_size可能小于mem_size，剩余部分已清零）
+            if file_size > 0 {
                 unsafe {
                     let dest = phys_addr as *mut u8;
-                    core::ptr::write_bytes(dest, 0, mem_size as usize);
+                    let src = kernel_data.as_ptr().add(file_offset as usize);
+                    core::ptr::copy_nonoverlapping(src, dest, file_size as usize);
                 }
-
-                // 复制段数据（file_size可能小于mem_size，剩余部分已清零）
-                if file_size > 0 {
-                    unsafe {
-                        let dest = phys_addr as *mut u8;
-                        let src = kernel_data.as_ptr().add(file_offset as usize);
-                        core::ptr::copy_nonoverlapping(src, dest, file_size as usize);
-                    }
-                }
-
-                // R119-1 FIX: Physical addresses reveal KASLR slide; gate behind debug_assertions.
-                // Virtual addresses are link-time public and safe to log.
-                #[cfg(debug_assertions)]
-                info!(
-                    "Loaded segment: virt=0x{:x}, phys=0x{:x}, filesz=0x{:x}, memsz=0x{:x}",
-                    virt_addr, phys_addr, file_size, mem_size
-                );
-                #[cfg(not(debug_assertions))]
-                info!(
-                    "Loaded segment: virt=0x{:x}, filesz=0x{:x}, memsz=0x{:x}",
-                    virt_addr, file_size, mem_size
-                );
             }
 
-            // R119-1 FIX: Verification dump reveals physical load address; gate behind
-            // debug_assertions. In release, just do a volatile read to confirm accessibility.
-            #[cfg(debug_assertions)]
-            unsafe {
-                let kernel_start = actual_phys_base as *const u8;
-                let first_bytes = core::slice::from_raw_parts(kernel_start, 16);
-                info!(
-                    "First 16 bytes at phys 0x{:x}: {:x?}",
-                    actual_phys_base, first_bytes
-                );
-            }
-            #[cfg(not(debug_assertions))]
-            {
-                let kernel_start = actual_phys_base as *const u8;
-                let _ = unsafe { core::ptr::read_volatile(kernel_start) };
-                info!("Kernel image load verified");
-            }
-
-            // Text KASLR: Apply PIE relocations so absolute addresses in the
-            // kernel image point to the correct (slid) virtual addresses.
-            // This is a no-op when kaslr_slide == 0 and no .rela.dyn section exists.
-            apply_rela_dyn_relocations(&elf, min_addr, kernel_size as u64, actual_phys_base, kaslr_slide);
-
-            // R39-7 FIX: Apply KASLR slide to entry point
-            let adjusted_entry = entry_point + kaslr_slide;
-            // R119-1 FIX: Entry point and slide values reveal the kernel memory layout;
-            // gate behind debug_assertions to match kernel-side redaction pattern.
+            // R119-1 FIX: Physical addresses reveal KASLR slide; gate behind debug_assertions.
+            // Virtual addresses are link-time public and safe to log.
             #[cfg(debug_assertions)]
             info!(
-                "Using ELF entry point: 0x{:x} (slide applied: 0x{:x}, final: 0x{:x})",
-                entry_point, kaslr_slide, adjusted_entry
+                "Loaded segment: virt=0x{:x}, phys=0x{:x}, filesz=0x{:x}, memsz=0x{:x}",
+                virt_addr, phys_addr, file_size, mem_size
             );
             #[cfg(not(debug_assertions))]
-            info!("ELF entry point resolved (KASLR {})",
-                if kaslr_slide != 0 { "applied" } else { "inactive" }
+            info!(
+                "Loaded segment: virt=0x{:x}, filesz=0x{:x}, memsz=0x{:x}",
+                virt_addr, file_size, mem_size
             );
-            (adjusted_entry, kaslr_slide, kernel_size) // R39-7: Return entry, slide, and size
-        };
+        }
+
+        // R119-1 FIX: Verification dump reveals physical load address; gate behind
+        // debug_assertions. In release, just do a volatile read to confirm accessibility.
+        #[cfg(debug_assertions)]
+        unsafe {
+            let kernel_start = actual_phys_base as *const u8;
+            let first_bytes = core::slice::from_raw_parts(kernel_start, 16);
+            info!(
+                "First 16 bytes at phys 0x{:x}: {:x?}",
+                actual_phys_base, first_bytes
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let kernel_start = actual_phys_base as *const u8;
+            let _ = unsafe { core::ptr::read_volatile(kernel_start) };
+            info!("Kernel image load verified");
+        }
+
+        // Text KASLR: Apply PIE relocations so absolute addresses in the
+        // kernel image point to the correct (slid) virtual addresses.
+        // This is a no-op when kaslr_slide == 0 and no .rela.dyn section exists.
+        apply_rela_dyn_relocations(
+            &elf,
+            min_addr,
+            kernel_size as u64,
+            actual_phys_base,
+            kaslr_slide,
+        );
+
+        // R39-7 FIX: Apply KASLR slide to entry point
+        let adjusted_entry = entry_point + kaslr_slide;
+        // R119-1 FIX: Entry point and slide values reveal the kernel memory layout;
+        // gate behind debug_assertions to match kernel-side redaction pattern.
+        #[cfg(debug_assertions)]
+        info!(
+            "Using ELF entry point: 0x{:x} (slide applied: 0x{:x}, final: 0x{:x})",
+            entry_point, kaslr_slide, adjusted_entry
+        );
+        #[cfg(not(debug_assertions))]
+        info!(
+            "ELF entry point resolved (KASLR {})",
+            if kaslr_slide != 0 {
+                "applied"
+            } else {
+                "inactive"
+            }
+        );
+        (adjusted_entry, kaslr_slide, kernel_size) // R39-7: Return entry, slide, and size
+    };
 
     // 测试 VGA 缓冲区是否可访问 - 在 info! 之前
     unsafe {
@@ -697,9 +713,11 @@ fn efi_main(handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     // The LoadedImage protocol is inaccessible after exit_boot_services().
     let (cmdline_len, cmdline) = read_uefi_cmdline(handle, &system_table);
     if cmdline_len > 0 {
-        info!("Boot cmdline ({} bytes): {:?}",
-              cmdline_len,
-              core::str::from_utf8(&cmdline[..cmdline_len]).unwrap_or("<invalid>"));
+        info!(
+            "Boot cmdline ({} bytes): {:?}",
+            cmdline_len,
+            core::str::from_utf8(&cmdline[..cmdline_len]).unwrap_or("<invalid>")
+        );
     }
 
     // 分配 BootInfo 结构的内存（在低于 4GiB 的位置，便于恒等映射访问）

@@ -243,7 +243,13 @@ impl Domain {
     ///
     /// * `Ok(())` - Mapping successful
     /// * `Err(IommuError)` - Mapping failed
-    pub fn map_range(&self, iova: u64, phys: u64, size: usize, write: bool) -> Result<(), IommuError> {
+    pub fn map_range(
+        &self,
+        iova: u64,
+        phys: u64,
+        size: usize,
+        write: bool,
+    ) -> Result<(), IommuError> {
         // Validate alignment
         if (iova as usize) & (IOMMU_PAGE_SIZE - 1) != 0 {
             return Err(IommuError::InvalidRange);
@@ -322,7 +328,8 @@ impl Domain {
 
         // Track any replaced mapping for accurate accounting
         if let Some(replaced) = mappings.insert(iova, entry) {
-            self.mapped_bytes.fetch_sub(replaced.size as u64, Ordering::Relaxed);
+            self.mapped_bytes
+                .fetch_sub(replaced.size as u64, Ordering::Relaxed);
         }
         self.mapped_bytes.fetch_add(size as u64, Ordering::Relaxed);
 
@@ -348,7 +355,9 @@ impl Domain {
         if (iova as usize) & (IOMMU_PAGE_SIZE - 1) != 0 {
             return Err(IommuError::InvalidRange);
         }
-        let end_iova = iova.checked_add(size as u64).ok_or(IommuError::InvalidRange)?;
+        let end_iova = iova
+            .checked_add(size as u64)
+            .ok_or(IommuError::InvalidRange)?;
         let max_addr = if self.address_width >= 64 {
             u64::MAX
         } else {
@@ -369,7 +378,8 @@ impl Domain {
                 return Err(IommuError::InvalidRange);
             }
 
-            self.mapped_bytes.fetch_sub(entry.size as u64, Ordering::Relaxed);
+            self.mapped_bytes
+                .fetch_sub(entry.size as u64, Ordering::Relaxed);
 
             // For page-table domains, clear the page table entries
             if self.domain_type == DomainType::PageTable {
@@ -403,12 +413,10 @@ impl Domain {
         let phys = frame.start_address().as_u64();
 
         // Atomically install the root, only if still zero
-        match self.page_table_root.compare_exchange(
-            0,
-            phys,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match self
+            .page_table_root
+            .compare_exchange(0, phys, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => Ok(()),
             Err(_) => {
                 // Another CPU won the race; free our redundant allocation
@@ -429,8 +437,8 @@ impl Domain {
     /// Returns the allocated PhysFrame. The caller is responsible for freeing
     /// it if not used.
     fn alloc_zeroed_page_table() -> Result<PhysFrame<Size4KiB>, IommuError> {
-        let frame = buddy_allocator::alloc_physical_pages(1)
-            .ok_or(IommuError::PageTableAllocFailed)?;
+        let frame =
+            buddy_allocator::alloc_physical_pages(1).ok_or(IommuError::PageTableAllocFailed)?;
 
         // R80-1 FIX: Verify frame is within direct map range
         // The direct map only covers physical addresses 0-1GB
@@ -461,7 +469,10 @@ impl Domain {
     /// - The page_table_lock is held to prevent concurrent access
     unsafe fn table_from_phys(phys: u64) -> &'static mut SlPageTable {
         // Note: Caller must have validated phys < MAX_DIRECT_MAP_PHYS
-        debug_assert!(phys < MAX_DIRECT_MAP_PHYS, "physical address out of direct map range");
+        debug_assert!(
+            phys < MAX_DIRECT_MAP_PHYS,
+            "physical address out of direct map range"
+        );
         let virt = phys_to_virt(PhysAddr::new(phys));
         &mut *virt.as_mut_ptr::<SlPageTable>()
     }
@@ -514,7 +525,13 @@ impl Domain {
     /// - Rejects superpage entries to prevent unexpected large mappings
     /// - Rejects if leaf entry already present (no silent overwrites)
     /// - R80-4 FIX: Does not set ACCESSED/DIRTY bits (reserved on some hardware)
-    fn install_mapping(&self, iova: u64, phys: u64, size: usize, write: bool) -> Result<(), IommuError> {
+    fn install_mapping(
+        &self,
+        iova: u64,
+        phys: u64,
+        size: usize,
+        write: bool,
+    ) -> Result<(), IommuError> {
         // Ensure the root page table exists
         self.ensure_page_table_root()?;
 
@@ -595,7 +612,11 @@ impl Domain {
             }
 
             // Stage the leaf entry for commit after all pages are validated
-            staged.push((pt as *mut SlPageTable, l1_idx, SlPte::new_leaf(cur_phys, pte_flags)));
+            staged.push((
+                pt as *mut SlPageTable,
+                l1_idx,
+                SlPte::new_leaf(cur_phys, pte_flags),
+            ));
         }
 
         // Phase 2: Commit all staged entries (only reached if all validations passed)

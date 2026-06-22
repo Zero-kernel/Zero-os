@@ -187,7 +187,10 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
         if let Some((base, rand)) = select_heap_base_from_bootinfo(boot_info) {
             (base, rand, true)
         } else {
-            klog!(Warn, "  Warning: BootInfo memory map unavailable for heap validation, using default window");
+            klog!(
+            Warn,
+            "  Warning: BootInfo memory map unavailable for heap validation, using default window"
+        );
             let (base, rand) = select_heap_base();
             (base, rand, false)
         };
@@ -223,7 +226,10 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
 
     // 从 BootInfo 解析内存映射
     let (pmm_base, pmm_size) = select_region_from_bootinfo(boot_info).unwrap_or_else(|| {
-        klog!(Warn, "  Warning: BootInfo memory map unavailable, using fallback region");
+        klog!(
+            Warn,
+            "  Warning: BootInfo memory map unavailable, using fallback region"
+        );
         (FALLBACK_PHYS_MEM_START, FALLBACK_PHYS_MEM_SIZE)
     });
 
@@ -236,8 +242,13 @@ pub fn init_with_bootinfo(boot_info: &BootInfo) {
     // whose DMA/page-zeroing consumer corrupted the TIMER_CBS buffer → RIP=0).
     let heap_phys = (heap_base as u64).wrapping_sub(PHYSICAL_MEMORY_OFFSET);
     let mut reserved_ranges = [(0u64, 0u64); MAX_RESERVED_RANGES];
-    let reserved_count =
-        build_buddy_reservations(boot_info, pmm_base, pmm_size, heap_phys, &mut reserved_ranges);
+    let reserved_count = build_buddy_reservations(
+        boot_info,
+        pmm_base,
+        pmm_size,
+        heap_phys,
+        &mut reserved_ranges,
+    );
     let reserved_ranges = &reserved_ranges[..reserved_count];
 
     // R148-8 FIX: Physical memory region bounds also leak information.
@@ -297,7 +308,10 @@ pub fn init() {
     );
 
     // 使用硬编码区域
-    klog!(Warn, "  Warning: No BootInfo, using hardcoded memory region");
+    klog!(
+        Warn,
+        "  Warning: No BootInfo, using hardcoded memory region"
+    );
     // R167-B: reserve the heap out of the buddy region (same physical-overlap
     // exclusion as the BootInfo path, but via reservation so the full fallback
     // region minus the heap hole is managed). No UEFI map here, so the heap is
@@ -694,7 +708,10 @@ fn build_buddy_reservations(
         // (1) Heap — always valid (kernel-computed); the core R166 guarantee.
         builder.push(heap_phys, HEAP_SIZE as u64);
         // (2) Framebuffer — pre-existing field, valid even with a stale bootloader.
-        builder.push(boot_info.framebuffer.base, boot_info.framebuffer.size as u64);
+        builder.push(
+            boot_info.framebuffer.base,
+            boot_info.framebuffer.size as u64,
+        );
         // (3) Kernel image — only trust the new fields when the ABI version matches.
         if version_ok {
             builder.push(boot_info.kernel_phys_base, boot_info.kernel_phys_size);

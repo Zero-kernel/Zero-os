@@ -522,11 +522,9 @@ impl VtdUnit {
             return true;
         }
 
-        self.device_scopes
-            .iter()
-            .any(|&(bus, dev, func)| {
-                bus == device.bus && dev == device.device && func == device.function
-            })
+        self.device_scopes.iter().any(|&(bus, dev, func)| {
+            bus == device.bus && dev == device.device && func == device.function
+        })
     }
 
     /// Check if a domain is attached to this unit.
@@ -696,8 +694,8 @@ impl VtdUnit {
         }
 
         // Allocate a physical frame for the root table
-        let frame = buddy_allocator::alloc_physical_pages(1)
-            .ok_or(VtdError::RootTableAllocFailed)?;
+        let frame =
+            buddy_allocator::alloc_physical_pages(1).ok_or(VtdError::RootTableAllocFailed)?;
         let phys = frame.start_address().as_u64();
 
         // Validate frame is within direct map range
@@ -713,12 +711,10 @@ impl VtdUnit {
         }
 
         // Atomically install the root table (only if still zero)
-        match self.root_table_phys.compare_exchange(
-            0,
-            phys,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match self
+            .root_table_phys
+            .compare_exchange(0, phys, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => Ok(()),
             Err(existing) => {
                 // Another CPU installed a table; free our redundant allocation
@@ -781,8 +777,8 @@ impl VtdUnit {
         }
 
         // Allocate a new context table
-        let frame = buddy_allocator::alloc_physical_pages(1)
-            .ok_or(IommuError::PageTableAllocFailed)?;
+        let frame =
+            buddy_allocator::alloc_physical_pages(1).ok_or(IommuError::PageTableAllocFailed)?;
         let ctx_phys = frame.start_address().as_u64();
 
         // Validate frame is within direct map range
@@ -799,12 +795,7 @@ impl VtdUnit {
 
         // Atomically install the root entry (only if still zero)
         let new_entry = RootEntry::new(ctx_phys);
-        match entry_atomic.compare_exchange(
-            0,
-            new_entry.lo,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match entry_atomic.compare_exchange(0, new_entry.lo, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => Ok(unsafe { &mut *ctx_virt.as_mut_ptr::<ContextTable>() }),
             Err(existing) => {
                 // Another CPU installed an entry; free our allocation
@@ -1200,7 +1191,12 @@ impl VtdUnit {
     }
 
     /// Invalidate IOTLB entries for a specific range.
-    pub fn invalidate_iotlb_range(&self, domain_id: DomainId, iova: u64, size: usize) -> IommuResult<()> {
+    pub fn invalidate_iotlb_range(
+        &self,
+        domain_id: DomainId,
+        iova: u64,
+        size: usize,
+    ) -> IommuResult<()> {
         // Check if page-selective invalidation is supported
         if self.cap & CAP_PSI == 0 {
             // Fall back to domain invalidation
@@ -1445,8 +1441,7 @@ impl VtdUnit {
         use crate::fault;
 
         // Check and clear fault status first
-        let (overflow, pending, fri) =
-            unsafe { fault::read_and_clear_fault_status(self.reg_base) };
+        let (overflow, pending, fri) = unsafe { fault::read_and_clear_fault_status(self.reg_base) };
 
         if overflow {
             // Log that faults may have been lost due to overflow

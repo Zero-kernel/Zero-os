@@ -87,7 +87,11 @@ pub fn demo_error_handling() {
         0,
     );
     if result < 0 {
-        klog!(Info, "   ✓ Correctly returned error code: {} (EBADF)", result);
+        klog!(
+            Info,
+            "   ✓ Correctly returned error code: {} (EBADF)",
+            result
+        );
     } else {
         klog!(Error, "   ✗ Should have failed but returned: {}", result);
     }
@@ -104,7 +108,11 @@ pub fn demo_error_handling() {
         0,
     );
     if result < 0 {
-        klog!(Info, "   ✓ Correctly returned error code: {} (EFAULT)", result);
+        klog!(
+            Info,
+            "   ✓ Correctly returned error code: {} (EFAULT)",
+            result
+        );
     } else {
         klog!(Error, "   ✗ Should have failed but returned: {}", result);
     }
@@ -113,7 +121,11 @@ pub fn demo_error_handling() {
     klog!(Info, "\n3. Testing unimplemented syscall...");
     let result = syscall_dispatcher(SyscallNumber::Exec as u64, 0, 0, 0, 0, 0, 0);
     if result < 0 {
-        klog!(Info, "   ✓ Correctly returned error code: {} (ENOSYS)", result);
+        klog!(
+            Info,
+            "   ✓ Correctly returned error code: {} (ENOSYS)",
+            result
+        );
     } else {
         klog!(Error, "   ✗ Should have failed but returned: {}", result);
     }

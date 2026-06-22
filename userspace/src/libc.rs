@@ -303,7 +303,9 @@ pub unsafe fn gets_s(buf: *mut u8, size: usize) -> *mut u8 {
                 break ch as u8;
             }
             // Yield to other processes while waiting
-            unsafe { let _ = crate::syscall::sys_yield(); }
+            unsafe {
+                let _ = crate::syscall::sys_yield();
+            }
         };
 
         // Handle special characters

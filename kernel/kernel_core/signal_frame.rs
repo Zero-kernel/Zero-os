@@ -172,7 +172,11 @@ pub fn compute_sigframe_layout(
     }
     // Structural invariants (defense-in-depth; a corrupt layout must NEVER reach Ring 3).
     debug_assert_eq!(frame_base & 0xF, 8, "handler-entry RSP must be %16==8");
-    debug_assert_eq!((frame_base + OFF_FPSTATE) & 0xF, 0, "fpstate must be 16-aligned");
+    debug_assert_eq!(
+        (frame_base + OFF_FPSTATE) & 0xF,
+        0,
+        "fpstate must be 16-aligned"
+    );
     if frame_base & 0xF != 8 {
         return Err(SyscallError::EFAULT);
     }
@@ -281,7 +285,11 @@ pub fn sanitize_fxsave_for_export(fx: &mut [u8; FXSAVE_SIZE]) {
 /// kernel exit path cannot #GP on reserved MXCSR bits. `cpu_mask` is the live
 /// `MXCSR_MASK` (falls back to `MXCSR_DEFAULT_MASK` when reported as 0).
 pub fn sanitize_inbound_fxsave(fx: &mut [u8; FXSAVE_SIZE], cpu_mask: u32) {
-    let mask = if cpu_mask == 0 { MXCSR_DEFAULT_MASK } else { cpu_mask };
+    let mask = if cpu_mask == 0 {
+        MXCSR_DEFAULT_MASK
+    } else {
+        cpu_mask
+    };
     let mut mxcsr = u32::from_ne_bytes([
         fx[FXSAVE_MXCSR_OFF],
         fx[FXSAVE_MXCSR_OFF + 1],
@@ -392,13 +400,24 @@ fn selftest_layout_alignment() {
     for delta in 0..32u64 {
         let rsp = 0x40_0000u64 + delta;
         let layout = compute_sigframe_layout(rsp, floor).expect("layout");
-        assert_eq!(layout.frame_base & 0xF, 8, "frame_base must be %16==8 (rsp+{delta})");
-        assert_eq!(layout.fpstate_va & 0xF, 0, "fpstate must be 16-aligned (rsp+{delta})");
+        assert_eq!(
+            layout.frame_base & 0xF,
+            8,
+            "frame_base must be %16==8 (rsp+{delta})"
+        );
+        assert_eq!(
+            layout.fpstate_va & 0xF,
+            0,
+            "fpstate must be 16-aligned (rsp+{delta})"
+        );
         // Contiguous-offset contract the rt_sigreturn re-derivation depends on.
         assert_eq!(layout.uc_va, layout.frame_base + OFF_UC);
         assert_eq!(layout.siginfo_va, layout.frame_base + OFF_SIGINFO);
         assert_eq!(layout.fpstate_va, layout.uc_va + SIGRETURN_FPSTATE_FROM_UC);
-        assert_eq!(layout.frame_base + OFF_MCONTEXT, layout.uc_va + SIGRETURN_MCONTEXT_FROM_UC);
+        assert_eq!(
+            layout.frame_base + OFF_MCONTEXT,
+            layout.uc_va + SIGRETURN_MCONTEXT_FROM_UC
+        );
         assert_eq!(layout.len, FRAME_SIZE as usize);
     }
     // Underflow → E2BIG (never a wild write).
@@ -419,15 +438,21 @@ fn selftest_assemble_roundtrip() {
     ctx.rflags = 0x202;
     let mut fx = [0u8; FXSAVE_SIZE];
     fx[FXSAVE_MXCSR_OFF] = 0x80; // a benign MXCSR low byte (architectural, preserved)
-    // Plant kernel-stack residue ACROSS the whole non-architectural tail (416..512),
-    // including the early reserved region 416..463 that the old 464-cutoff missed.
+                                 // Plant kernel-stack residue ACROSS the whole non-architectural tail (416..512),
+                                 // including the early reserved region 416..463 that the old 464-cutoff missed.
     fx[416] = 0xAA;
     fx[448] = 0xBB;
     fx[FXSAVE_SIZE - 1] = 0xCC;
     sanitize_fxsave_for_export(&mut fx);
-    assert_eq!(fx[FXSAVE_MXCSR_OFF], 0x80, "architectural MXCSR byte must survive");
+    assert_eq!(
+        fx[FXSAVE_MXCSR_OFF], 0x80,
+        "architectural MXCSR byte must survive"
+    );
     for (i, b) in fx.iter().enumerate().skip(FXSAVE_RESERVED_TAIL) {
-        assert_eq!(*b, 0, "FXSAVE reserved tail byte {i} must be zeroed (info-leak gate)");
+        assert_eq!(
+            *b, 0,
+            "FXSAVE reserved tail byte {i} must be zeroed (info-leak gate)"
+        );
     }
     let buf = assemble_sigframe(&layout, &ctx, &fx, 10, 0xCAFE, 0xBEEF).expect("assemble");
     assert_eq!(buf.len(), FRAME_SIZE as usize);
@@ -452,7 +477,10 @@ fn selftest_mxcsr_and_rflags() {
     fx[FXSAVE_MXCSR_OFF..FXSAVE_MXCSR_OFF + 4].copy_from_slice(&0xFFFF_FFFFu32.to_ne_bytes());
     sanitize_inbound_fxsave(&mut fx, 0); // zero -> default 0xFFBF
     let m = read_u32_at(&fx, FXSAVE_MXCSR_OFF);
-    assert_eq!(m, MXCSR_DEFAULT_MASK, "MXCSR must be masked to the default usable bits");
+    assert_eq!(
+        m, MXCSR_DEFAULT_MASK,
+        "MXCSR must be masked to the default usable bits"
+    );
     // RFLAGS sanitize: IF forced on, TF/DF/IOPL cleared.
     let dirty = 0x3000 /*IOPL*/ | 0x100 /*TF*/ | 0x400 /*DF*/ | 0x1 /*CF*/;
     let clean = sanitize_user_rflags(dirty);
@@ -470,7 +498,9 @@ fn selftest_srop_canonical() {
     // High-half (kernel) rejected.
     assert!(!is_canonical_user_addr(0xFFFF_FFFF_8010_0000));
     // Non-canonical rejected.
-    assert!(!is_canonical_user_addr(0x0001_0000_0000_0000 | (1u64 << 47)));
+    assert!(!is_canonical_user_addr(
+        0x0001_0000_0000_0000 | (1u64 << 47)
+    ));
     assert!(!is_canonical_user_addr(0x8000_0000_0000_0000));
     // The boundary bit-47-set value is high-half → rejected.
     assert!(!is_canonical_user_addr(1u64 << 47));
@@ -516,7 +546,10 @@ fn selftest_mcontext_roundtrip() {
     let restored = parse_and_validate_mcontext(&mc).expect("valid mcontext");
     assert_eq!(restored.rip, 0x12_3456, "RIP round-trip");
     assert_eq!(restored.rsp, 0x3F_F000, "RSP round-trip");
-    assert_eq!(restored.rax, 0xFFFF_FFFF_FFFF_FFFC, "RAX (EINTR) round-trip");
+    assert_eq!(
+        restored.rax, 0xFFFF_FFFF_FFFF_FFFC,
+        "RAX (EINTR) round-trip"
+    );
     assert_eq!(restored.rdi, 0xAABB, "RDI round-trip");
     assert_eq!(restored.r15, 0xDEAD_BEEF, "R15 round-trip");
     // RFLAGS must be sanitized on the way back (IF forced, IOPL/TF cleared).
@@ -527,11 +560,17 @@ fn selftest_mcontext_roundtrip() {
     // Forged high-half (kernel) RIP must be rejected (SROP gate).
     let mut bad = mc;
     bad[MCI_RIP..MCI_RIP + 8].copy_from_slice(&0xFFFF_FFFF_8010_0000u64.to_ne_bytes());
-    assert!(parse_and_validate_mcontext(&bad).is_err(), "forged kernel RIP must be rejected");
+    assert!(
+        parse_and_validate_mcontext(&bad).is_err(),
+        "forged kernel RIP must be rejected"
+    );
     // Forged high-half RSP must be rejected too.
     let mut bad2 = mc;
     bad2[MCI_RSP..MCI_RSP + 8].copy_from_slice(&0xFFFF_8000_0000_0000u64.to_ne_bytes());
-    assert!(parse_and_validate_mcontext(&bad2).is_err(), "forged kernel RSP must be rejected");
+    assert!(
+        parse_and_validate_mcontext(&bad2).is_err(),
+        "forged kernel RSP must be rejected"
+    );
 }
 
 /// Run all rt_sigframe builder/validator self-tests. Any failure panics (surfaced by

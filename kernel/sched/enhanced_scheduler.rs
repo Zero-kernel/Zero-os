@@ -573,9 +573,13 @@ impl Scheduler {
     /// corruption class `drain_starve_rebucket` guards against with its `old_key` remove.
     /// Returns the removed PCB (the queue's own `Arc`), or `None` if `pid` was not present.
     fn remove_pid_from_queue(queue: &mut ReadyQueues, pid: Pid) -> Option<ProcessControlBlock> {
-        let key = queue
-            .iter()
-            .find_map(|(&k, bucket)| if bucket.contains_key(&pid) { Some(k) } else { None })?;
+        let key = queue.iter().find_map(|(&k, bucket)| {
+            if bucket.contains_key(&pid) {
+                Some(k)
+            } else {
+                None
+            }
+        })?;
         let bucket = queue.get_mut(&key)?;
         let pcb = bucket.remove(&pid);
         if bucket.is_empty() {
@@ -628,9 +632,7 @@ impl Scheduler {
     }
 
     /// Try to steal a ready process from another CPU
-    fn steal_one(
-        current_pid: Option<Pid>,
-    ) -> Option<(Pid, ProcessControlBlock, usize, Priority)> {
+    fn steal_one(current_pid: Option<Pid>) -> Option<(Pid, ProcessControlBlock, usize, Priority)> {
         let local_cpu = current_cpu_id();
         let cpu_count = Self::cpu_pool_size();
         if cpu_count < 2 {
@@ -669,7 +671,8 @@ impl Scheduler {
                 let mut pcb = proc_arc.lock();
                 if pcb.state != ProcessState::Ready
                     || pcb.stopped // R98-1 FIX: Also skip job-control stopped processes
-                    || process::is_pending_irq_kill(pid) // R169-9 FIX: don't steal IRQ-killed tasks
+                    || process::is_pending_irq_kill(pid)
+                // R169-9 FIX: don't steal IRQ-killed tasks
                 {
                     drop(pcb);
                     candidate = Self::select_next_locked(&guard, Some(pid));
@@ -838,7 +841,10 @@ impl Scheduler {
             if let Some((pid, proc_arc, mem_space, priority)) = Self::steal_one(current_pid) {
                 // Add stolen process to local queue
                 let mut queue = queue_ref.lock();
-                queue.entry(priority).or_default().insert(pid, proc_arc.clone());
+                queue
+                    .entry(priority)
+                    .or_default()
+                    .insert(pid, proc_arc.clone());
                 return (Some(pid), current_proc, Some(proc_arc), mem_space);
             }
         }
@@ -958,8 +964,8 @@ impl Scheduler {
                     } else {
                         // R98-1 FIX (race fix): Determine if we should add BEFORE clearing stopped.
                         // Only Ready or Stopped tasks should be re-enqueued.
-                        let should_add =
-                            proc.state == ProcessState::Ready || proc.state == ProcessState::Stopped;
+                        let should_add = proc.state == ProcessState::Ready
+                            || proc.state == ProcessState::Stopped;
 
                         // Clear the stopped flag.
                         proc.stopped = false;
@@ -1141,8 +1147,7 @@ impl Scheduler {
                             proc.reset_time_slice();
                             current_cpu().set_need_resched();
                         }
-                        cgroup::CpuQuotaStatus::Allowed
-                        | cgroup::CpuQuotaStatus::Unlimited => {
+                        cgroup::CpuQuotaStatus::Allowed | cgroup::CpuQuotaStatus::Unlimited => {
                             // Accumulation ran (or no quota exists anywhere
                             // in the chain) — the debt is consumed/moot.
                             proc.cpu_quota_debt_ns = 0;
@@ -1591,7 +1596,15 @@ impl Scheduler {
             // buffer's stable pointer for enter_usermode/switch_context.
             // R118-6 FIX: Also extract user_memory_space to pass directly to
             // activate_memory_space(), avoiding PROCESS_TABLE scan in the hot path.
-            let (new_ctx_ptr, next_kstack_top, next_cs, next_user_space, next_fs_base, next_gs_base, next_wd_handle): (
+            let (
+                new_ctx_ptr,
+                next_kstack_top,
+                next_cs,
+                next_user_space,
+                next_fs_base,
+                next_gs_base,
+                next_wd_handle,
+            ): (
                 *const ArchContext,
                 u64,
                 u64,
@@ -1609,7 +1622,9 @@ impl Scheduler {
                 let fs_base = guard.fs_base;
                 let gs_base = guard.gs_base;
                 let wd_handle = guard.watchdog_handle;
-                (ctx_ptr, kstack_top, cs, user_space, fs_base, gs_base, wd_handle)
+                (
+                    ctx_ptr, kstack_top, cs, user_space, fs_base, gs_base, wd_handle,
+                )
             });
 
             // 判断下一个进程是否为用户态进程（Ring 3）

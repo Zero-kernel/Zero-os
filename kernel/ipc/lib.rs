@@ -52,8 +52,8 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
     let process = get_process(pid).ok_or(SyscallError::ESRCH)?;
 
     // 创建管道
-    let (read_handle, write_handle) = create_pipe(PipeFlags::default())
-        .map_err(pipe_error_to_syscall)?;
+    let (read_handle, write_handle) =
+        create_pipe(PipeFlags::default()).map_err(pipe_error_to_syscall)?;
 
     // 分配文件描述符
     //
@@ -91,7 +91,8 @@ fn pipe_create_callback() -> Result<(i32, i32), SyscallError> {
 
     kprintln!(
         "sys_pipe: created pipe (read_fd={}, write_fd={})",
-        read_fd, write_fd
+        read_fd,
+        write_fd
     );
     Ok((read_fd, write_fd))
 }

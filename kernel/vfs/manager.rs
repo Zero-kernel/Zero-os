@@ -22,9 +22,9 @@ use alloc::vec::Vec;
 use block::BlockDevice;
 use cap::NamespaceId;
 use kernel_core::{
-    current_host_egid, current_host_euid, current_host_supplementary_groups,
-    current_is_host_root, current_mount_ns, current_umask, FileDescriptor, FileOps,
-    MountNamespace, SyscallError, VfsStat, ROOT_MNT_NAMESPACE,
+    current_host_egid, current_host_euid, current_host_supplementary_groups, current_is_host_root,
+    current_mount_ns, current_umask, FileDescriptor, FileOps, MountNamespace, SyscallError,
+    VfsStat, ROOT_MNT_NAMESPACE,
 };
 use spin::RwLock;
 
@@ -392,7 +392,11 @@ impl Vfs {
         // Get /sys/fs and create cgroup directory
         if let Ok(fs_inode) = sysfs.lookup(&sys_root, "fs") {
             if let Err(e) = sysfs.create(&fs_inode, "cgroup", dir_mode) {
-                klog!(Warn, "Warning: failed to create /sys/fs/cgroup directory: {:?}", e);
+                klog!(
+                    Warn,
+                    "Warning: failed to create /sys/fs/cgroup directory: {:?}",
+                    e
+                );
             }
         }
 
@@ -467,7 +471,13 @@ impl Vfs {
             return Err(FsError::NoMem);
         }
 
-        mounts.insert(path.clone(), Mount { path: path.clone(), fs: fs.clone() });
+        mounts.insert(
+            path.clone(),
+            Mount {
+                path: path.clone(),
+                fs: fs.clone(),
+            },
+        );
 
         // R152-9 FIX: Update root_fs while still holding mounts lock
         // to prevent a concurrent find_mount from observing an inconsistent
@@ -516,11 +526,7 @@ impl Vfs {
     /// # Arguments
     /// * `ns` - The mount namespace to unmount from
     /// * `path` - Normalized path to unmount
-    pub fn umount_in_namespace(
-        &self,
-        ns: &Arc<MountNamespace>,
-        path: &str,
-    ) -> Result<(), FsError> {
+    pub fn umount_in_namespace(&self, ns: &Arc<MountNamespace>, path: &str) -> Result<(), FsError> {
         let path = normalize_path(path)?;
         let table = self.ensure_namespace_table(ns);
         let mut mounts = table.mounts.write();
@@ -970,8 +976,7 @@ impl Vfs {
 
         // R153-2 FIX: MAC gate for stat — access_mask 0 = existence/metadata check.
         if let Some(task) = LsmProcessCtx::from_current() {
-            lsm::hook_file_permission(&task, stat.ino, 0)
-                .map_err(|_| FsError::PermDenied)?;
+            lsm::hook_file_permission(&task, stat.ino, 0).map_err(|_| FsError::PermDenied)?;
         }
 
         Ok(stat)
@@ -1025,7 +1030,9 @@ impl Vfs {
         let mut off: u64 = 0;
         let mut chunk = [0u8; 4096];
         loop {
-            let n = inode.read_at(off, &mut chunk).map_err(fs_error_to_syscall)?;
+            let n = inode
+                .read_at(off, &mut chunk)
+                .map_err(fs_error_to_syscall)?;
             if n == 0 {
                 break; // EOF / short-read terminator
             }
@@ -1692,7 +1699,10 @@ fn vfs_unlink_callback(path: &str) -> Result<(), SyscallError> {
 ///
 /// If the first entry alone exceeds the budget, returns `EINVAL` (Linux-compatible behavior
 /// for buffer-too-small).
-fn vfs_readdir_callback(fd: i32, max_bytes: usize) -> Result<alloc::vec::Vec<kernel_core::DirEntry>, SyscallError> {
+fn vfs_readdir_callback(
+    fd: i32,
+    max_bytes: usize,
+) -> Result<alloc::vec::Vec<kernel_core::DirEntry>, SyscallError> {
     use kernel_core::current_pid;
     use kernel_core::get_process;
 
@@ -1857,7 +1867,9 @@ fn vfs_truncate_callback(fd: i32, length: u64) -> Result<(), SyscallError> {
         // re-acquires the same Process mutex → deterministic self-deadlock.
         let task = {
             let creds = proc.credentials.read();
-            LsmProcessCtx::new(proc.pid, proc.tgid, creds.uid, creds.gid, creds.euid, creds.egid)
+            LsmProcessCtx::new(
+                proc.pid, proc.tgid, creds.uid, creds.gid, creds.euid, creds.egid,
+            )
         };
 
         (inode, task)

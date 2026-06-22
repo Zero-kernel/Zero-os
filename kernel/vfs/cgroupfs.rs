@@ -298,8 +298,7 @@ impl FileSystem for CgroupFs {
         }
 
         // Get parent cgroup to inherit controllers
-        let parent_cgroup =
-            cgroup::lookup_cgroup(dir.cgroup_id).ok_or(FsError::NotFound)?;
+        let parent_cgroup = cgroup::lookup_cgroup(dir.cgroup_id).ok_or(FsError::NotFound)?;
         let controllers = parent_cgroup.controllers();
 
         // Create child cgroup
@@ -333,8 +332,7 @@ impl FileSystem for CgroupFs {
         }
 
         // Find child cgroup by name
-        let parent_cgroup =
-            cgroup::lookup_cgroup(dir.cgroup_id).ok_or(FsError::NotFound)?;
+        let parent_cgroup = cgroup::lookup_cgroup(dir.cgroup_id).ok_or(FsError::NotFound)?;
 
         // CF-2 FIX: Find child cgroup by matching name against the pseudo-name (ID string)
         let child_id = parent_cgroup
@@ -685,8 +683,7 @@ impl CgroupCtrlInode {
 
                 // P1-3: Delegated managers can only move tasks within their subtree.
                 if is_delegate {
-                    let old_cg = cgroup::lookup_cgroup(old_cgroup_id)
-                        .ok_or(FsError::NotFound)?;
+                    let old_cg = cgroup::lookup_cgroup(old_cgroup_id).ok_or(FsError::NotFound)?;
                     if !old_cg.is_delegated_to(euid) {
                         return Err(FsError::PermDenied);
                     }
@@ -699,9 +696,7 @@ impl CgroupCtrlInode {
                 // Note: must NOT hold proc.lock() when calling
                 // address_space_share_count (it acquires PROCESS_TABLE lock).
                 let memory_space = proc.lock().memory_space;
-                if memory_space != 0
-                    && process::address_space_share_count(memory_space) > 1
-                {
+                if memory_space != 0 && process::address_space_share_count(memory_space) > 1 {
                     return Err(FsError::Busy);
                 }
 
@@ -735,13 +730,14 @@ impl CgroupCtrlInode {
 
                 // Migrate task from old cgroup to this cgroup (atomic detach+attach),
                 // now UNDER the held Process lock.
-                cgroup::migrate_task(pid_num, old_cgroup_id, self.cgroup_id)
-                    .map_err(|e| match e {
+                cgroup::migrate_task(pid_num, old_cgroup_id, self.cgroup_id).map_err(
+                    |e| match e {
                         CgroupError::PidsLimitExceeded => FsError::NoSpace,
                         CgroupError::TaskNotAttached => FsError::Invalid,
                         CgroupError::NotFound => FsError::NotFound,
                         _ => FsError::Invalid,
-                    })?;
+                    },
+                )?;
 
                 // R143-1 FIX: Transfer cgroup memory charges from source to
                 // destination cgroup. Without this, exit-time uncharge targets
@@ -749,8 +745,7 @@ impl CgroupCtrlInode {
                 // permanent memory_current leak in the source and undercount
                 // in the destination. The snapshot + transfer + cgroup_id update
                 // stay under the SAME `proc_guard` acquired above.
-                let total_charged_bytes =
-                    process::compute_cgroup_charged_bytes(&proc_guard);
+                let total_charged_bytes = process::compute_cgroup_charged_bytes(&proc_guard);
 
                 // J2-7: combined cgroup migration with a HOLE-FREE rollback (same
                 // protocol as the sys_cgroup_attach path). Charge the FD count to
@@ -792,8 +787,7 @@ impl CgroupCtrlInode {
                 // then flush). Without this, the next tick's tag-mismatch
                 // branch would silently discard the source cgroup's deferred
                 // charge — a narrowed re-opening of the R170-3 evasion.
-                let quota_debt =
-                    (proc_guard.cpu_quota_debt_cgid, proc_guard.cpu_quota_debt_ns);
+                let quota_debt = (proc_guard.cpu_quota_debt_cgid, proc_guard.cpu_quota_debt_ns);
                 proc_guard.cpu_quota_debt_ns = 0;
                 cgroup::flush_cpu_quota_debt(
                     quota_debt.0,
@@ -895,7 +889,9 @@ impl CgroupCtrlInode {
                     if let Some(val) = part.strip_prefix("rbps=").or(part.strip_prefix("wbps=")) {
                         bps = Some(val.parse().map_err(|_| FsError::Invalid)?);
                         seen = true;
-                    } else if let Some(val) = part.strip_prefix("riops=").or(part.strip_prefix("wiops=")) {
+                    } else if let Some(val) =
+                        part.strip_prefix("riops=").or(part.strip_prefix("wiops="))
+                    {
                         iops = Some(val.parse().map_err(|_| FsError::Invalid)?);
                         seen = true;
                     } else {
@@ -991,8 +987,7 @@ impl Inode for CgroupCtrlInode {
             let can_write = kernel_core::current_is_host_root()
                 || kernel_core::current_host_euid()
                     .and_then(|euid| {
-                        cgroup::lookup_cgroup(self.cgroup_id)
-                            .filter(|cg| cg.is_delegated_to(euid))
+                        cgroup::lookup_cgroup(self.cgroup_id).filter(|cg| cg.is_delegated_to(euid))
                     })
                     .is_some();
             if can_write {
@@ -1256,8 +1251,8 @@ pub fn run_cgroupfs_j2_abi_self_test() {
     assert_eq!(read(CtrlKind::VfsDirCurrent), "0\n");
 
     // 3. Unlimited (unset) limit renders as "max".
-    let cg2 = cgroup::create_cgroup(0, CgroupControllers::FILES)
-        .expect("cgroupfs self-test: create cg2");
+    let cg2 =
+        cgroup::create_cgroup(0, CgroupControllers::FILES).expect("cgroupfs self-test: create cg2");
     let cg2_id = cg2.id();
     let files_max_cg2 = CgroupCtrlInode {
         fs_id: 0,
@@ -1342,9 +1337,18 @@ mod tests {
         );
         assert_eq!(CtrlKind::from_filename("invalid"), None);
         // J.2 round-trip.
-        assert_eq!(CtrlKind::from_filename("files.current"), Some(CtrlKind::FilesCurrent));
-        assert_eq!(CtrlKind::from_filename("ports.max"), Some(CtrlKind::PortsMax));
-        assert_eq!(CtrlKind::from_filename("vfs_dir.max"), Some(CtrlKind::VfsDirMax));
+        assert_eq!(
+            CtrlKind::from_filename("files.current"),
+            Some(CtrlKind::FilesCurrent)
+        );
+        assert_eq!(
+            CtrlKind::from_filename("ports.max"),
+            Some(CtrlKind::PortsMax)
+        );
+        assert_eq!(
+            CtrlKind::from_filename("vfs_dir.max"),
+            Some(CtrlKind::VfsDirMax)
+        );
     }
 
     #[test]

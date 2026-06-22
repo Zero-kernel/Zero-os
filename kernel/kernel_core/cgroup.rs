@@ -414,11 +414,11 @@ impl CgroupStats {
     /// exit).  This matches the `uncharge_memory` pattern used elsewhere.
     #[inline]
     fn decrement_pids(&self) {
-        let _ = self.pids_current.fetch_update(
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(1)),
-        );
+        let _ = self
+            .pids_current
+            .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
     }
 
     /// Records a pids.max exceeded event.
@@ -432,11 +432,11 @@ impl CgroupStats {
     /// wrap `fds_current` to `u64::MAX`.
     #[inline]
     fn decrement_fds(&self, n: u64) {
-        let _ = self.fds_current.fetch_update(
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(n)),
-        );
+        let _ = self
+            .fds_current
+            .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(n))
+            });
     }
 
     /// J2-7: Records an fds.max exceeded event.
@@ -451,11 +451,11 @@ impl CgroupStats {
     /// the entry) can never wrap `ports_current` to `u64::MAX`.
     #[inline]
     fn decrement_ports(&self, n: u64) {
-        let _ = self.ports_current.fetch_update(
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(n)),
-        );
+        let _ = self
+            .ports_current
+            .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(n))
+            });
     }
 
     /// R170-2: pin/unpin `n` origin-keyed charges of the given family on THIS
@@ -496,11 +496,11 @@ impl CgroupStats {
     /// protects against permanent un-deletability (FA-04).
     #[inline]
     fn unpin_origin_mem(&self, n: u64) {
-        let res = self.mem_pinned.fetch_update(
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(n)),
-        );
+        let res = self
+            .mem_pinned
+            .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(n))
+            });
         if let Ok(pre) = res {
             if pre < n {
                 // The subtract clamped at 0: `n - pre` bytes of unpin had no live
@@ -775,7 +775,8 @@ impl IoBucketState {
                 if elapsed > 0 && self.byte_tokens < effective_cap {
                     // Proportional refill: tokens = elapsed_secs * rate
                     let add = ((elapsed as u128 * bps as u128) / NS_PER_SEC as u128) as u64;
-                    self.byte_tokens = core::cmp::min(effective_cap, self.byte_tokens.saturating_add(add));
+                    self.byte_tokens =
+                        core::cmp::min(effective_cap, self.byte_tokens.saturating_add(add));
                 }
             }
         } else {
@@ -880,9 +881,7 @@ impl IoThrottleState {
         if let Some(iops) = limits.io_max_iops_per_sec {
             if bucket.iops_tokens == 0 {
                 // No IOPS tokens: wait for one token to refill
-                let nanos_per_io = NS_PER_SEC
-                    .checked_div(iops.max(1))
-                    .unwrap_or(NS_PER_SEC);
+                let nanos_per_io = NS_PER_SEC.checked_div(iops.max(1)).unwrap_or(NS_PER_SEC);
                 throttle_until = throttle_until.max(now_ns.saturating_add(nanos_per_io));
             } else {
                 bucket.iops_tokens = bucket.iops_tokens.saturating_sub(1);
@@ -937,8 +936,14 @@ pub enum CgroupError {
 impl fmt::Display for CgroupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CgroupError::DepthLimit => write!(f, "cgroup depth exceeds MAX_CGROUP_DEPTH ({})", MAX_CGROUP_DEPTH),
-            CgroupError::CgroupLimit => write!(f, "cgroup count exceeds MAX_CGROUPS ({})", MAX_CGROUPS),
+            CgroupError::DepthLimit => write!(
+                f,
+                "cgroup depth exceeds MAX_CGROUP_DEPTH ({})",
+                MAX_CGROUP_DEPTH
+            ),
+            CgroupError::CgroupLimit => {
+                write!(f, "cgroup count exceeds MAX_CGROUPS ({})", MAX_CGROUPS)
+            }
             CgroupError::NotFound => write!(f, "cgroup not found"),
             CgroupError::TaskAlreadyAttached => write!(f, "task already attached to this cgroup"),
             CgroupError::TaskNotAttached => write!(f, "task not attached to this cgroup"),
@@ -1036,9 +1041,9 @@ impl CgroupNode {
             stats: CgroupStats::new(),
             processes: Mutex::new(BTreeSet::new()),
             ref_count: AtomicU32::new(1),
-            deleted: AtomicBool::new(false), // R77-1 FIX
-            delegate_uid: Mutex::new(None), // P1-3
-            cpu_quota: CpuQuotaState::new(), // F.2: CPU quota tracking
+            deleted: AtomicBool::new(false),     // R77-1 FIX
+            delegate_uid: Mutex::new(None),      // P1-3
+            cpu_quota: CpuQuotaState::new(),     // F.2: CPU quota tracking
             io_throttle: IoThrottleState::new(), // F.2: IO throttle state
         }
     }
@@ -1363,9 +1368,9 @@ impl CgroupNode {
             stats: CgroupStats::new(),
             processes: Mutex::new(BTreeSet::new()),
             ref_count: AtomicU32::new(1),
-            deleted: AtomicBool::new(false), // R77-1 FIX
-            delegate_uid: Mutex::new(None), // P1-3
-            cpu_quota: CpuQuotaState::new(), // F.2: CPU quota tracking
+            deleted: AtomicBool::new(false),     // R77-1 FIX
+            delegate_uid: Mutex::new(None),      // P1-3
+            cpu_quota: CpuQuotaState::new(),     // F.2: CPU quota tracking
             io_throttle: IoThrottleState::new(), // F.2: IO throttle state
         });
 
@@ -2039,11 +2044,7 @@ pub fn cgroup_count() -> usize {
 /// NOT fold `address_space_share_count()` (which takes PROCESS_TABLE then foreign
 /// Process locks) into a "hold the target Process lock across `migrate_task`"
 /// obligation — that is the R156-1 child→parent ABBA / self-deadlock footgun.
-pub fn migrate_task(
-    task: TaskId,
-    from_id: CgroupId,
-    to_id: CgroupId,
-) -> Result<(), CgroupError> {
+pub fn migrate_task(task: TaskId, from_id: CgroupId, to_id: CgroupId) -> Result<(), CgroupError> {
     // R90-4 FIX: Hold registry read lock to block concurrent delete_cgroup.
     // delete_cgroup requires a write lock, so this prevents both source
     // and target from being deleted during the migration window.
@@ -2540,8 +2541,7 @@ pub fn try_charge_fds(cgroup_id: CgroupId, count: u64) -> Result<(), CgroupError
     }
 
     // Snapshot per-node limits (lock each briefly; never hold two at once).
-    let limits_snapshot: Vec<Option<u64>> =
-        chain.iter().map(|c| c.limits.lock().fds_max).collect();
+    let limits_snapshot: Vec<Option<u64>> = chain.iter().map(|c| c.limits.lock().fds_max).collect();
 
     // Track charged indices for rollback on rejection at a deeper level.
     let mut charged: Vec<usize> = Vec::new();
@@ -2923,11 +2923,7 @@ pub fn charge_io(
 /// # Returns
 ///
 /// Always returns `Allowed` once tokens are available.
-pub fn wait_for_io_window(
-    cgroup_id: CgroupId,
-    bytes: u64,
-    op: IoDirection,
-) -> IoThrottleStatus {
+pub fn wait_for_io_window(cgroup_id: CgroupId, bytes: u64, op: IoDirection) -> IoThrottleStatus {
     let mut now_ns = crate::current_timestamp_ms().saturating_mul(1_000_000);
 
     loop {
@@ -2981,11 +2977,17 @@ pub fn record_io_completion(cgroup_id: CgroupId, bytes: u64, op: IoDirection) {
         if cgroup.controllers.contains(CgroupControllers::IO) {
             match op {
                 IoDirection::Read => {
-                    cgroup.stats.io_read_bytes.fetch_add(bytes, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
+                    cgroup
+                        .stats
+                        .io_read_bytes
+                        .fetch_add(bytes, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
                     cgroup.stats.io_read_ios.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
                 }
                 IoDirection::Write => {
-                    cgroup.stats.io_write_bytes.fetch_add(bytes, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
+                    cgroup
+                        .stats
+                        .io_write_bytes
+                        .fetch_add(bytes, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
                     cgroup.stats.io_write_ios.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
                 }
             }
@@ -3051,11 +3053,7 @@ pub fn record_io_completion(cgroup_id: CgroupId, bytes: u64, op: IoDirection) {
 /// * `Allowed` - Quota available, time has been charged
 /// * `Throttled(until_ns)` - Quota exceeded/coasting; the delta was accumulated
 /// * `ContentionDeferred(retry_ns)` - lock contention; NOTHING was accumulated
-pub fn charge_cpu_quota(
-    cgroup_id: CgroupId,
-    delta_ns: u64,
-    now_ns: u64,
-) -> CpuQuotaStatus {
+pub fn charge_cpu_quota(cgroup_id: CgroupId, delta_ns: u64, now_ns: u64) -> CpuQuotaStatus {
     if delta_ns == 0 {
         return CpuQuotaStatus::Allowed;
     }
@@ -3216,7 +3214,8 @@ pub fn flush_cpu_quota_debt(cgroup_id: CgroupId, debt_ns: u64, now_ns: u64) {
                                 .load(Ordering::Relaxed)
                                 .saturating_add(period_ns);
                             quota.throttled_until_ns.store(until, Ordering::SeqCst);
-                            quota.throttle_events.fetch_add(1, Ordering::Relaxed); // lint-fetch-add: allow (statistics counter)
+                            // lint-fetch-add: allow (statistics counter)
+                            quota.throttle_events.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -3304,7 +3303,11 @@ pub fn cpu_quota_is_throttled(cgroup_id: CgroupId, now_ns: u64) -> Option<u64> {
         cursor = cgroup.parent();
     }
 
-    if overall_until != 0 { Some(overall_until) } else { None }
+    if overall_until != 0 {
+        Some(overall_until)
+    } else {
+        None
+    }
 }
 
 // ============================================================================
@@ -3328,16 +3331,25 @@ pub fn run_cgroup_fd_budget_self_test() {
     // real boot processes in root).
     let a = create_cgroup(0, CgroupControllers::FILES).expect("create A");
     let a_id = a.id();
-    a.set_limit(CgroupLimits { fds_max: Some(10), ..Default::default() })
-        .expect("set A.files.max");
+    a.set_limit(CgroupLimits {
+        fds_max: Some(10),
+        ..Default::default()
+    })
+    .expect("set A.files.max");
     let b = create_cgroup(a_id, CgroupControllers::FILES).expect("create B");
     let b_id = b.id();
-    b.set_limit(CgroupLimits { fds_max: Some(4), ..Default::default() })
-        .expect("set B.files.max");
+    b.set_limit(CgroupLimits {
+        fds_max: Some(4),
+        ..Default::default()
+    })
+    .expect("set B.files.max");
     let c = create_cgroup(0, CgroupControllers::FILES).expect("create C");
     let c_id = c.id();
-    c.set_limit(CgroupLimits { fds_max: Some(20), ..Default::default() })
-        .expect("set C.files.max");
+    c.set_limit(CgroupLimits {
+        fds_max: Some(20),
+        ..Default::default()
+    })
+    .expect("set C.files.max");
 
     // 1) Charge 3 under B (within B's cap): B and ancestor A both increment.
     try_charge_fds(b_id, 3).expect("charge 3 under B");
@@ -3400,12 +3412,18 @@ pub fn run_cgroup_ports_budget_self_test() {
     // Fresh, task-less NET cgroups under root: A(ports_max=10) ⊃ B(ports_max=4).
     let a = create_cgroup(0, CgroupControllers::NET).expect("create A");
     let a_id = a.id();
-    a.set_limit(CgroupLimits { ports_max: Some(10), ..Default::default() })
-        .expect("set A.ports.max");
+    a.set_limit(CgroupLimits {
+        ports_max: Some(10),
+        ..Default::default()
+    })
+    .expect("set A.ports.max");
     let b = create_cgroup(a_id, CgroupControllers::NET).expect("create B");
     let b_id = b.id();
-    b.set_limit(CgroupLimits { ports_max: Some(4), ..Default::default() })
-        .expect("set B.ports.max");
+    b.set_limit(CgroupLimits {
+        ports_max: Some(4),
+        ..Default::default()
+    })
+    .expect("set B.ports.max");
 
     // 1) Charge 3 under B (within cap): B and ancestor A both increment.
     try_charge_ports(b_id, 3).expect("charge 3 under B");
@@ -3569,8 +3587,8 @@ pub fn run_cgroup_mem_pinned_delete_gate_self_test() {
     // P carries MEMORY (with a generous memory.max) + PIDS; C is a MEMORY-DISABLED
     // leaf under P (new_child rejects an empty controller set, so PIDS-only =
     // "MEMORY-disabled for the family the gate samples" — the exact blind config).
-    let p = create_cgroup(0, CgroupControllers::MEMORY | CgroupControllers::PIDS)
-        .expect("create P");
+    let p =
+        create_cgroup(0, CgroupControllers::MEMORY | CgroupControllers::PIDS).expect("create P");
     let p_id = p.id();
     p.set_limit(CgroupLimits {
         memory_max: Some(4096 * PAGE),
@@ -3584,10 +3602,26 @@ pub fn run_cgroup_mem_pinned_delete_gate_self_test() {
     // 1) Charge keyed to C: the DISPLAY lands on P (the MEMORY ancestor) only;
     //    the PIN lands on the ORIGIN node C. C's own display stays 0.
     try_charge_memory(c_id, bytes).expect("charge bytes keyed to MEMORY-disabled leaf C");
-    assert_eq!(mem(&c), 0, "C display memory stays 0 (MEMORY controller off)");
-    assert_eq!(pin(&c), bytes, "C mem_pinned tracks the live origin-keyed charge");
-    assert_eq!(mem(&p), bytes, "P (MEMORY ancestor) display absorbs C's charge");
-    assert_eq!(pin(&p), 0, "P is NOT origin-pinned by a C-keyed charge (pin is origin-keyed)");
+    assert_eq!(
+        mem(&c),
+        0,
+        "C display memory stays 0 (MEMORY controller off)"
+    );
+    assert_eq!(
+        pin(&c),
+        bytes,
+        "C mem_pinned tracks the live origin-keyed charge"
+    );
+    assert_eq!(
+        mem(&p),
+        bytes,
+        "P (MEMORY ancestor) display absorbs C's charge"
+    );
+    assert_eq!(
+        pin(&p),
+        0,
+        "P is NOT origin-pinned by a C-keyed charge (pin is origin-keyed)"
+    );
 
     // 2) THE SLICE-3 FIX: the delete-gate must REJECT C while it is pinned, even
     //    though every display counter on C is 0 — the exact configuration that
@@ -3597,13 +3631,20 @@ pub fn run_cgroup_mem_pinned_delete_gate_self_test() {
         Err(CgroupError::NotEmpty),
         "pinned MEMORY-disabled leaf must be undeletable (gate keys on mem_pinned)"
     );
-    assert!(lookup_cgroup(c_id).is_some(), "C still registry-resident after refused delete");
+    assert!(
+        lookup_cgroup(c_id).is_some(),
+        "C still registry-resident after refused delete"
+    );
 
     // 3) Uncharge keyed to C: unpins the ORIGIN C and drains P's display — exactly
     //    the reconciliation the pre-SLICE-3 gate let the delete skip forever.
     uncharge_memory(c_id, bytes);
     assert_eq!(pin(&c), 0, "C unpinned after memory uncharge");
-    assert_eq!(mem(&p), 0, "P display memory drained after C's charge is uncharged");
+    assert_eq!(
+        mem(&p),
+        0,
+        "P display memory drained after C's charge is uncharged"
+    );
     assert_eq!(
         mem_unpin_underflow_take(),
         0,
@@ -3655,38 +3696,67 @@ pub fn run_cgroup_pt_kmem_self_test() {
     // A(memory.max=64 pages) ⊃ B(memory.max=8 pages), sibling C(memory.max=64 pages).
     let a = create_cgroup(0, CgroupControllers::MEMORY).expect("create A");
     let a_id = a.id();
-    a.set_limit(CgroupLimits { memory_max: Some(64 * PAGE), ..Default::default() })
-        .expect("set A.memory.max");
+    a.set_limit(CgroupLimits {
+        memory_max: Some(64 * PAGE),
+        ..Default::default()
+    })
+    .expect("set A.memory.max");
     let b = create_cgroup(a_id, CgroupControllers::MEMORY).expect("create B");
     let b_id = b.id();
-    b.set_limit(CgroupLimits { memory_max: Some(8 * PAGE), ..Default::default() })
-        .expect("set B.memory.max");
+    b.set_limit(CgroupLimits {
+        memory_max: Some(8 * PAGE),
+        ..Default::default()
+    })
+    .expect("set B.memory.max");
     let c = create_cgroup(a_id, CgroupControllers::MEMORY).expect("create C");
     let c_id = c.id();
-    c.set_limit(CgroupLimits { memory_max: Some(64 * PAGE), ..Default::default() })
-        .expect("set C.memory.max");
+    c.set_limit(CgroupLimits {
+        memory_max: Some(64 * PAGE),
+        ..Default::default()
+    })
+    .expect("set C.memory.max");
 
     // 1) FORCED PT charge + ANCESTOR propagation. charge_memory_forced is how
     //    sys_mmap records the page-table-frame kmem (the frame count is known only
     //    AFTER map_to runs ⇒ soft cap per IM-14). Charge 6 PT pages under B.
     charge_memory_forced(b_id, 6 * PAGE);
     assert_eq!(mem(&b), 6 * PAGE, "B after forced PT charge");
-    assert_eq!(mem(&a), 6 * PAGE, "A (ancestor) after forced PT charge under B");
+    assert_eq!(
+        mem(&a),
+        6 * PAGE,
+        "A (ancestor) after forced PT charge under B"
+    );
     // M2-1 SLICE-2: the forced charge PINS the ORIGIN (B) — and ONLY the origin,
     // controller-independently. The pin does NOT propagate to the ancestor A
     // (unlike the display counter, which the controller walk pushes up the
     // chain). This is the origin-keyed semantics the delete-gate now samples.
-    assert_eq!(pin(&b), 6 * PAGE, "B mem_pinned after forced PT charge (origin)");
-    assert_eq!(pin(&a), 0, "A mem_pinned stays 0 (pin is origin-keyed, not hierarchical)");
+    assert_eq!(
+        pin(&b),
+        6 * PAGE,
+        "B mem_pinned after forced PT charge (origin)"
+    );
+    assert_eq!(
+        pin(&a),
+        0,
+        "A mem_pinned stays 0 (pin is origin-keyed, not hierarchical)"
+    );
 
     // 2) SOFT overshoot: a forced PT charge NEVER rejects, even past memory.max.
     //    6 + 4 = 10 > B.max(8) is ALLOWED — the frames physically exist, and
     //    over-count is the safe direction (bounded by one mmap's tiny pt delta in
     //    practice). Both B and the ancestor A rise.
     charge_memory_forced(b_id, 4 * PAGE);
-    assert_eq!(mem(&b), 10 * PAGE, "B forced past memory.max (soft, over-count-safe)");
+    assert_eq!(
+        mem(&b),
+        10 * PAGE,
+        "B forced past memory.max (soft, over-count-safe)"
+    );
     assert_eq!(mem(&a), 10 * PAGE, "A after forced overshoot under B");
-    assert_eq!(pin(&b), 10 * PAGE, "B mem_pinned tracks the soft overshoot (origin)");
+    assert_eq!(
+        pin(&b),
+        10 * PAGE,
+        "B mem_pinned tracks the soft overshoot (origin)"
+    );
 
     // 3) The HARD gate RE-ENFORCES on the NEXT data-style allocation: now that B is
     //    over its max, try_charge_memory (the Phase-1 DATA gate) rejects — so the
@@ -3701,7 +3771,11 @@ pub fn run_cgroup_pt_kmem_self_test() {
     // origin FIRST, then unpinned the full allocation in its Err arm — so B's pin
     // is UNCHANGED (10 pages), NOT 11. Omitting the rollback-unpin would leave a
     // permanent +1-page pin here (FA-04 undeletability) — caught by this assert.
-    assert_eq!(pin(&b), 10 * PAGE, "B mem_pinned unchanged after rejected hard charge (rollback-unpin)");
+    assert_eq!(
+        pin(&b),
+        10 * PAGE,
+        "B mem_pinned unchanged after rejected hard charge (rollback-unpin)"
+    );
 
     // 4) ROOT NOT EXEMPT (INV-5 trap): unlike files/ports/vfs_dir, the MEMORY
     //    controller charges the root cgroup. A root-targeted forced charge MUST
@@ -3713,11 +3787,27 @@ pub fn run_cgroup_pt_kmem_self_test() {
     // root too — both pin AND unpin are id==0-non-exempt, so root telescopes.
     let root_pin_before = pin(&root);
     charge_memory_forced(0, 5 * PAGE);
-    assert_eq!(mem(&root), root_before + 5 * PAGE, "root IS charged (no exemption)");
-    assert_eq!(pin(&root), root_pin_before + 5 * PAGE, "root mem_pinned moves (no id==0 exemption)");
+    assert_eq!(
+        mem(&root),
+        root_before + 5 * PAGE,
+        "root IS charged (no exemption)"
+    );
+    assert_eq!(
+        pin(&root),
+        root_pin_before + 5 * PAGE,
+        "root mem_pinned moves (no id==0 exemption)"
+    );
     uncharge_memory(0, 5 * PAGE);
-    assert_eq!(mem(&root), root_before, "root PT uncharge restores baseline");
-    assert_eq!(pin(&root), root_pin_before, "root mem_pinned telescopes back (no id==0 exemption)");
+    assert_eq!(
+        mem(&root),
+        root_before,
+        "root PT uncharge restores baseline"
+    );
+    assert_eq!(
+        pin(&root),
+        root_pin_before,
+        "root mem_pinned telescopes back (no id==0 exemption)"
+    );
 
     // 5) MIGRATION TRANSFER (compute_cgroup_charged_bytes path): move B's 10 PT
     //    pages B → C. B's chain (B, A) drops by 10; C's chain (C, A) gains 10. The
@@ -3725,21 +3815,41 @@ pub fn run_cgroup_pt_kmem_self_test() {
     migrate_memory_charges(10 * PAGE, b_id, c_id).expect("migrate PT B→C");
     assert_eq!(mem(&b), 0, "B drained after PT migrate");
     assert_eq!(mem(&c), 10 * PAGE, "C charged after PT migrate");
-    assert_eq!(mem(&a), 10 * PAGE, "A (shared ancestor) net unchanged by sibling migrate");
+    assert_eq!(
+        mem(&a),
+        10 * PAGE,
+        "A (shared ancestor) net unchanged by sibling migrate"
+    );
     // M2-1 SLICE-2: the pin RE-HOMES via the primitive composition
     // (try_charge_memory(C) pins C, uncharge_memory(B) unpins B) — no bespoke
     // migrate-level pin code. Source pin telescopes to EXACTLY 0 (the migrated
     // `bytes` == B's entire live pin), destination gains it. The shared ancestor
     // A was never pinned (origin-keyed), so it stays 0 across the sibling move.
-    assert_eq!(pin(&b), 0, "B mem_pinned drained to 0 by migrate source-unpin");
-    assert_eq!(pin(&c), 10 * PAGE, "C mem_pinned gained by migrate dest-pin");
-    assert_eq!(pin(&a), 0, "A mem_pinned stays 0 (origin-keyed, not hierarchical)");
+    assert_eq!(
+        pin(&b),
+        0,
+        "B mem_pinned drained to 0 by migrate source-unpin"
+    );
+    assert_eq!(
+        pin(&c),
+        10 * PAGE,
+        "C mem_pinned gained by migrate dest-pin"
+    );
+    assert_eq!(
+        pin(&a),
+        0,
+        "A mem_pinned stays 0 (origin-keyed, not hierarchical)"
+    );
 
     // 6) EXIT BALANCE: last-exit uncharge of C's PT returns the chain to baseline.
     uncharge_memory(c_id, 10 * PAGE);
     assert_eq!(mem(&c), 0, "C drained after exit uncharge");
     assert_eq!(mem(&a), 0, "A drained after C exit uncharge");
-    assert_eq!(pin(&c), 0, "C mem_pinned telescopes to 0 after exit uncharge");
+    assert_eq!(
+        pin(&c),
+        0,
+        "C mem_pinned telescopes to 0 after exit uncharge"
+    );
 
     // 7) FORK == EXIT balance (per-process +X / -X): fork charges the inherited
     //    child PT to the PARENT cgroup with the HARD gate (the value is known
@@ -3747,14 +3857,26 @@ pub fn run_cgroup_pt_kmem_self_test() {
     try_charge_memory(a_id, 6 * PAGE).expect("fork: charge inherited child PT to parent cgroup");
     assert_eq!(mem(&a), 6 * PAGE, "A after fork PT charge");
     // M2-1 SLICE-2: the fork lump pins the PARENT-cgroup origin (here a_id).
-    assert_eq!(pin(&a), 6 * PAGE, "A mem_pinned after fork PT charge (parent-cgroup origin)");
+    assert_eq!(
+        pin(&a),
+        6 * PAGE,
+        "A mem_pinned after fork PT charge (parent-cgroup origin)"
+    );
     uncharge_memory(a_id, 6 * PAGE); // child last-exit
-    assert_eq!(mem(&a), 0, "A back to baseline: fork PT charge cancelled by child exit");
+    assert_eq!(
+        mem(&a),
+        0,
+        "A back to baseline: fork PT charge cancelled by child exit"
+    );
     // M2-1 SLICE-2: the fork-lump pin telescopes to 0 against the child's exit
     // uncharge AT THE SAME ORIGIN — proving the amount-asymmetry (1 lump add vs
     // N exit subs) is harmless for a COUNTER (telescopes on Σ equality), refuting
     // the historical FA-04 objection at the delete-gate (cgroup.rs:1822-1833).
-    assert_eq!(pin(&a), 0, "A mem_pinned telescopes to 0: fork lump cancelled by child exit");
+    assert_eq!(
+        pin(&a),
+        0,
+        "A mem_pinned telescopes to 0: fork lump cancelled by child exit"
+    );
 
     // ── M2-1 SLICE-2 PROOF CHECKPOINT (lens SATURATING-UNPIN-MASKING) ──
     // EVERY step above (1-7) was a MATCHED charge/uncharge sequence. If the pin
@@ -3784,7 +3906,11 @@ pub fn run_cgroup_pt_kmem_self_test() {
     //    reconciled at 0, so uncharging 999 pages is a pure saturation demo.
     uncharge_memory(a_id, 999 * PAGE);
     assert_eq!(mem(&a), 0, "A saturates at 0 on over-uncharge");
-    assert_eq!(pin(&a), 0, "A mem_pinned saturates at 0 on over-uncharge (lenient direction)");
+    assert_eq!(
+        pin(&a),
+        0,
+        "A mem_pinned saturates at 0 on over-uncharge (lenient direction)"
+    );
     // M2-1 SLICE-2: and CRUCIALLY — the tripwire FIRED on this deliberate
     // over-uncharge (pre-value 0 < 999 pages ⇒ the whole amount was absorbed by
     // the floor). This proves the tripwire actually DETECTS the masking that
@@ -3847,16 +3973,25 @@ pub fn run_cgroup_mem_pinned_coresidency_self_test() {
     // A is exactly where a co-resident over-unpin would corrupt the shared total.
     let a = create_cgroup(0, CgroupControllers::MEMORY).expect("create A");
     let a_id = a.id();
-    a.set_limit(CgroupLimits { memory_max: Some(1024 * PAGE), ..Default::default() })
-        .expect("set A.memory.max");
+    a.set_limit(CgroupLimits {
+        memory_max: Some(1024 * PAGE),
+        ..Default::default()
+    })
+    .expect("set A.memory.max");
     let s = create_cgroup(a_id, CgroupControllers::MEMORY).expect("create S");
     let s_id = s.id();
-    s.set_limit(CgroupLimits { memory_max: Some(512 * PAGE), ..Default::default() })
-        .expect("set S.memory.max");
+    s.set_limit(CgroupLimits {
+        memory_max: Some(512 * PAGE),
+        ..Default::default()
+    })
+    .expect("set S.memory.max");
     let d = create_cgroup(a_id, CgroupControllers::MEMORY).expect("create D");
     let d_id = d.id();
-    d.set_limit(CgroupLimits { memory_max: Some(512 * PAGE), ..Default::default() })
-        .expect("set D.memory.max");
+    d.set_limit(CgroupLimits {
+        memory_max: Some(512 * PAGE),
+        ..Default::default()
+    })
+    .expect("set D.memory.max");
 
     // Two DISTINCT per-process footprints (X != Y so a residual of the WRONG
     // process is detectable — a same-size pair could alias an over-unpin).
@@ -3868,9 +4003,17 @@ pub fn run_cgroup_mem_pinned_coresidency_self_test() {
     //    origin pin AGGREGATES: mem_pinned(S) == x + y.
     try_charge_memory(s_id, x).expect("charge process X to S");
     try_charge_memory(s_id, y).expect("charge process Y to S");
-    assert_eq!(pin(&s), x + y, "S pin AGGREGATES both co-resident processes");
+    assert_eq!(
+        pin(&s),
+        x + y,
+        "S pin AGGREGATES both co-resident processes"
+    );
     assert_eq!(mem(&s), x + y, "S display aggregates both processes");
-    assert_eq!(mem(&a), x + y, "A (shared ancestor) display aggregates both");
+    assert_eq!(
+        mem(&a),
+        x + y,
+        "A (shared ancestor) display aggregates both"
+    );
     assert_eq!(pin(&d), 0, "D not yet pinned");
     assert_eq!(mem(&d), 0, "D display still 0");
     assert_eq!(
@@ -3892,13 +4035,25 @@ pub fn run_cgroup_mem_pinned_coresidency_self_test() {
         y,
         "S pin == Y: the co-resident process's share SURVIVES (NOT 0, NOT floored)"
     );
-    assert_ne!(pin(&s), 0, "S must NOT be drained to 0 by a single-process migrate");
-    assert_eq!(pin(&d), x, "D pin == X (exactly the migrated process's share)");
+    assert_ne!(
+        pin(&s),
+        0,
+        "S must NOT be drained to 0 by a single-process migrate"
+    );
+    assert_eq!(
+        pin(&d),
+        x,
+        "D pin == X (exactly the migrated process's share)"
+    );
     // Display counters telescope identically (S loses x, D gains x; shared A
     // unchanged — a sibling migrate nets 0 on the common ancestor).
     assert_eq!(mem(&s), y, "S display drops to Y after X migrates out");
     assert_eq!(mem(&d), x, "D display rises to X after X migrates in");
-    assert_eq!(mem(&a), x + y, "A (shared ancestor) net unchanged by sibling migrate");
+    assert_eq!(
+        mem(&a),
+        x + y,
+        "A (shared ancestor) net unchanged by sibling migrate"
+    );
     // THE FLOOR-NEVER-FIRED PROOF: the migration's source unpin
     // (uncharge_memory(s, x)) saw pre-value x + y >= x, so unpin_origin_mem never
     // clamped. The tripwire (fires IFF a saturating unpin absorbed a surplus) is
@@ -3916,15 +4071,27 @@ pub fn run_cgroup_mem_pinned_coresidency_self_test() {
     //    this exit a NO-OP and stranded Y's display on the ancestor; instead it
     //    reconciles.
     uncharge_memory(s_id, y);
-    assert_eq!(pin(&s), 0, "S fully reconciled after its last process (Y) exits");
+    assert_eq!(
+        pin(&s),
+        0,
+        "S fully reconciled after its last process (Y) exits"
+    );
     assert_eq!(mem(&s), 0, "S display drained after Y exits");
-    assert_eq!(mem(&a), x, "A retains only the migrated process X (now keyed to D)");
+    assert_eq!(
+        mem(&a),
+        x,
+        "A retains only the migrated process X (now keyed to D)"
+    );
 
     // 4) DRAIN PROCESS X (its last-exit) from D: uncharge_memory(d, x).
     uncharge_memory(d_id, x);
     assert_eq!(pin(&d), 0, "D reconciled after migrated process X exits");
     assert_eq!(mem(&d), 0, "D display drained");
-    assert_eq!(mem(&a), 0, "A (shared ancestor) fully drained: every process exited");
+    assert_eq!(
+        mem(&a),
+        0,
+        "A (shared ancestor) fully drained: every process exited"
+    );
     // Σpin (x + y for the two charges, + x for the migrate dest charge) ==
     // Σunpin (x migrate source + y Y-exit + x X-exit). Tripwire confirms NO
     // saturating clamp anywhere in the matched sequence.
@@ -3945,7 +4112,11 @@ pub fn run_cgroup_mem_pinned_coresidency_self_test() {
     migrate_memory_charges(x, s_id, d_id).expect("migrate X out (1st)");
     assert_eq!(pin(&s), y, "S == Y after first co-resident migrate");
     migrate_memory_charges(y, s_id, d_id).expect("migrate Y out (2nd, exact-residual boundary)");
-    assert_eq!(pin(&s), 0, "S == 0 after BOTH migrate out (exact telescope, pre == n)");
+    assert_eq!(
+        pin(&s),
+        0,
+        "S == 0 after BOTH migrate out (exact telescope, pre == n)"
+    );
     assert_eq!(pin(&d), x + y, "D now holds both migrated processes");
     assert_eq!(mem(&a), x + y, "A still holds both (both now keyed to D)");
     assert_eq!(
@@ -4038,16 +4209,25 @@ pub fn run_cgroup_mem_pinned_exec_after_migrate_self_test() {
     // re-home as the ONLY origin-keyed motion.
     let rt = create_cgroup(0, CgroupControllers::MEMORY).expect("create RT");
     let rt_id = rt.id();
-    rt.set_limit(CgroupLimits { memory_max: Some(4096 * PAGE), ..Default::default() })
-        .expect("set RT.memory.max");
+    rt.set_limit(CgroupLimits {
+        memory_max: Some(4096 * PAGE),
+        ..Default::default()
+    })
+    .expect("set RT.memory.max");
     let a = create_cgroup(rt_id, CgroupControllers::MEMORY).expect("create A");
     let a_id = a.id();
-    a.set_limit(CgroupLimits { memory_max: Some(2048 * PAGE), ..Default::default() })
-        .expect("set A.memory.max");
+    a.set_limit(CgroupLimits {
+        memory_max: Some(2048 * PAGE),
+        ..Default::default()
+    })
+    .expect("set A.memory.max");
     let b = create_cgroup(rt_id, CgroupControllers::MEMORY).expect("create B");
     let b_id = b.id();
-    b.set_limit(CgroupLimits { memory_max: Some(2048 * PAGE), ..Default::default() })
-        .expect("set B.memory.max");
+    b.set_limit(CgroupLimits {
+        memory_max: Some(2048 * PAGE),
+        ..Default::default()
+    })
+    .expect("set B.memory.max");
 
     // OLD-image FOUR-TERM footprint, each term a DISTINCT size so a swapped /
     // mis-keyed lane is detectable (an aliased equal-size set could hide a
@@ -4068,9 +4248,17 @@ pub fn run_cgroup_mem_pinned_exec_after_migrate_self_test() {
     try_charge_memory(a_id, heap).expect("old-image heap charge to A");
     try_charge_memory(a_id, elf).expect("old-image elf charge to A");
     charge_memory_forced(a_id, pt); // forced (soft) — pt frame count known post-map_to
-    assert_eq!(pin(&a), total, "A pin AGGREGATES the old image's four lanes (charge origin)");
+    assert_eq!(
+        pin(&a),
+        total,
+        "A pin AGGREGATES the old image's four lanes (charge origin)"
+    );
     assert_eq!(mem(&a), total, "A display holds the whole old image");
-    assert_eq!(mem(&rt), total, "RT (shared ancestor) display holds it via the chain");
+    assert_eq!(
+        mem(&rt),
+        total,
+        "RT (shared ancestor) display holds it via the chain"
+    );
     assert_eq!(pin(&b), 0, "B not yet touched");
     assert_eq!(mem(&b), 0, "B display still 0");
     assert_eq!(
@@ -4092,11 +4280,23 @@ pub fn run_cgroup_mem_pinned_exec_after_migrate_self_test() {
     migrate_memory_charges(total, a_id, b_id).expect("migrate old image A -> B (whole footprint)");
 
     // THE RE-HOME ASSERTIONS — A drains to EXACTLY 0, B gains the whole image:
-    assert_eq!(pin(&a), 0, "A pin telescopes to EXACTLY 0 by the migrate source-unpin (pre == n)");
-    assert_eq!(pin(&b), total, "B pin == total: the old image's pin RE-HOMED to B");
+    assert_eq!(
+        pin(&a),
+        0,
+        "A pin telescopes to EXACTLY 0 by the migrate source-unpin (pre == n)"
+    );
+    assert_eq!(
+        pin(&b),
+        total,
+        "B pin == total: the old image's pin RE-HOMED to B"
+    );
     assert_eq!(mem(&a), 0, "A display drained by the migrate");
     assert_eq!(mem(&b), total, "B display holds the re-homed old image");
-    assert_eq!(mem(&rt), total, "RT (shared ancestor) net unchanged by the sibling A->B move");
+    assert_eq!(
+        mem(&rt),
+        total,
+        "RT (shared ancestor) net unchanged by the sibling A->B move"
+    );
     // FLOOR-NEVER-FIRED on the SOURCE migrate: uncharge_memory(A, total) saw
     // pre-value total >= total, so unpin_origin_mem never clamped. A telescoping
     // to 0 here is a TRUE re-home, not a floored over-unpin of an aggregate that
@@ -4121,11 +4321,27 @@ pub fn run_cgroup_mem_pinned_exec_after_migrate_self_test() {
     uncharge_memory(b_id, pt); // exec-replace pt leg (syscall.rs:4601)
 
     // THE GAP ASSERTIONS — the destination is fully reconciled, the source stays 0:
-    assert_eq!(pin(&b), 0, "B pin telescopes to EXACTLY 0: exec-uncharge at B cancelled the re-homed image");
-    assert_eq!(pin(&a), 0, "A pin STAYS 0: the exec-uncharge did NOT touch the original charge origin");
-    assert_eq!(mem(&b), 0, "B display drained by the exec image-replace uncharge");
+    assert_eq!(
+        pin(&b),
+        0,
+        "B pin telescopes to EXACTLY 0: exec-uncharge at B cancelled the re-homed image"
+    );
+    assert_eq!(
+        pin(&a),
+        0,
+        "A pin STAYS 0: the exec-uncharge did NOT touch the original charge origin"
+    );
+    assert_eq!(
+        mem(&b),
+        0,
+        "B display drained by the exec image-replace uncharge"
+    );
     assert_eq!(mem(&a), 0, "A display still 0");
-    assert_eq!(mem(&rt), 0, "RT (shared ancestor) fully drained: the whole old image released");
+    assert_eq!(
+        mem(&rt),
+        0,
+        "RT (shared ancestor) fully drained: the whole old image released"
+    );
     // THE DISTINGUISHING PROOF — true re-home vs masked over-unpin at B:
     // if the migration had FAILED to re-home the pin to B (the hazard the gap
     // flags: the exec uncharge relying on a re-home that didn't happen), B's pin
@@ -4158,9 +4374,17 @@ pub fn run_cgroup_mem_pinned_exec_after_migrate_self_test() {
     assert_eq!(pin(&b), total, "B holds the re-homed image again");
     // Exit / ExecSpaceGuard-rollback wholesale uncharge at the CURRENT (migrated) id:
     uncharge_memory(b_id, total);
-    assert_eq!(pin(&b), 0, "B telescopes to 0 on the wholesale exit/rollback uncharge at the migrated id");
+    assert_eq!(
+        pin(&b),
+        0,
+        "B telescopes to 0 on the wholesale exit/rollback uncharge at the migrated id"
+    );
     assert_eq!(pin(&a), 0, "A untouched by the exit/rollback uncharge");
-    assert_eq!(mem(&rt), 0, "RT fully drained after the exit/rollback variant");
+    assert_eq!(
+        mem(&rt),
+        0,
+        "RT fully drained after the exit/rollback variant"
+    );
     assert_eq!(
         mem_unpin_underflow_take(),
         0,
@@ -4250,12 +4474,18 @@ pub fn run_cgroup_mem_pinned_clone_abort_self_test() {
     //   keys to (== parent_cgroup_id == the aborted child's cgroup_id).
     let p = create_cgroup(0, CgroupControllers::MEMORY).expect("create P");
     let p_id = p.id();
-    p.set_limit(CgroupLimits { memory_max: Some(4096 * PAGE), ..Default::default() })
-        .expect("set P.memory.max");
+    p.set_limit(CgroupLimits {
+        memory_max: Some(4096 * PAGE),
+        ..Default::default()
+    })
+    .expect("set P.memory.max");
     let cd = create_cgroup(p_id, CgroupControllers::MEMORY).expect("create CD");
     let cd_id = cd.id();
-    cd.set_limit(CgroupLimits { memory_max: Some(2048 * PAGE), ..Default::default() })
-        .expect("set CD.memory.max");
+    cd.set_limit(CgroupLimits {
+        memory_max: Some(2048 * PAGE),
+        ..Default::default()
+    })
+    .expect("set CD.memory.max");
 
     // The inherited child footprint, by lane, each a DISTINCT size so a swapped /
     // mis-keyed exit-uncharge lane is detectable (an aliased equal-size set could
@@ -4266,8 +4496,8 @@ pub fn run_cgroup_mem_pinned_clone_abort_self_test() {
     let heap: u64 = 7 * PAGE; // page_align(brk) - page_align(brk_start) (fork.rs:209-217 / process.rs:4322-4331)
     let elf: u64 = 4 * PAGE; // parent_mm.elf_charged_bytes (fork.rs:220 / process.rs:4334-4338)
     let pt: u64 = 2 * PAGE; // parent_mm.pt_charged_bytes (fork.rs:233 / process.rs:4356-4360)
-    // fork_charge_bytes is ONE aggregated lump (the single try_charge_memory call
-    // at fork.rs:240) — the amount-asymmetry seed: 1 charge add vs 4 exit subs.
+                            // fork_charge_bytes is ONE aggregated lump (the single try_charge_memory call
+                            // at fork.rs:240) — the amount-asymmetry seed: 1 charge add vs 4 exit subs.
     let fork_charge_bytes: u64 = data + heap + elf + pt;
 
     // 1) FORK CHARGE: `fork::sys_fork()` charges the inherited footprint as ONE
@@ -4277,9 +4507,17 @@ pub fn run_cgroup_mem_pinned_clone_abort_self_test() {
     //    origin == this charge origin (P). The lump PINS P.
     try_charge_memory(p_id, fork_charge_bytes)
         .expect("fork: charge inherited child footprint to PARENT cgroup (fork.rs:240)");
-    assert_eq!(pin(&p), fork_charge_bytes, "P pin == the fork lump (parent-cgroup origin)");
+    assert_eq!(
+        pin(&p),
+        fork_charge_bytes,
+        "P pin == the fork lump (parent-cgroup origin)"
+    );
     assert_eq!(mem(&p), fork_charge_bytes, "P display holds the fork lump");
-    assert_eq!(pin(&cd), 0, "sibling/descendant CD untouched by the fork charge (origin-keyed)");
+    assert_eq!(
+        pin(&cd),
+        0,
+        "sibling/descendant CD untouched by the fork charge (origin-keyed)"
+    );
     assert_eq!(
         mem_unpin_underflow_take(),
         0,
@@ -4312,12 +4550,17 @@ pub fn run_cgroup_mem_pinned_clone_abort_self_test() {
     // THE GAP ASSERTIONS — the fork lump telescopes to EXACTLY 0 at the parent
     // origin via the ABNORMAL four-term teardown drain:
     assert_eq!(
-        pin(&p), 0,
+        pin(&p),
+        0,
         "P pin telescopes to EXACTLY 0: the fork lump (1 add) is cancelled by the abnormal \
          four-term terminate_process/cleanup_zombie teardown drain (4 subs) at the SAME origin \
          — amount-asymmetry harmless for a COUNTER (Σadd == Σsub)"
     );
-    assert_eq!(mem(&p), 0, "P display drained by the abnormal teardown uncharge");
+    assert_eq!(
+        mem(&p),
+        0,
+        "P display drained by the abnormal teardown uncharge"
+    );
     // THE DISTINGUISHING PROOF — true telescope vs masked over-unpin:
     // if ANY exit leg had mis-keyed (e.g. uncharged a cgroup the child had NOT
     // charged, the FA-09 cross-origin hazard) or the lump had been under-pinned,
@@ -4343,8 +4586,16 @@ pub fn run_cgroup_mem_pinned_clone_abort_self_test() {
     try_charge_memory(p_id, fork_charge_bytes).expect("re-charge fork lump to P");
     assert_eq!(pin(&p), fork_charge_bytes, "P re-pins the whole fork lump");
     uncharge_memory(p_id, fork_charge_bytes); // wholesale abnormal-teardown drain
-    assert_eq!(pin(&p), 0, "P telescopes to 0 on the wholesale abnormal-teardown drain (pre == n)");
-    assert_eq!(mem(&p), 0, "P display fully drained by the wholesale variant");
+    assert_eq!(
+        pin(&p),
+        0,
+        "P telescopes to 0 on the wholesale abnormal-teardown drain (pre == n)"
+    );
+    assert_eq!(
+        mem(&p),
+        0,
+        "P display fully drained by the wholesale variant"
+    );
     assert_eq!(
         mem_unpin_underflow_take(),
         0,
@@ -4406,7 +4657,11 @@ impl VfsDirBudgetGuard {
     /// Process lock held — it acquires CGROUP_REGISTRY (Level 5).
     pub fn charge(cgroup_id: CgroupId, want: usize) -> Self {
         if cgroup_id == 0 || want == 0 {
-            return Self { chain: Vec::new(), bytes: 0, granted: want };
+            return Self {
+                chain: Vec::new(),
+                bytes: 0,
+                granted: want,
+            };
         }
         // Collect target + ancestors with the MEMORY controller.
         let mut depth: u32 = 0;
@@ -4423,7 +4678,11 @@ impl VfsDirBudgetGuard {
             cursor = cgroup.parent();
         }
         if chain.is_empty() {
-            return Self { chain, bytes: 0, granted: want };
+            return Self {
+                chain,
+                bytes: 0,
+                granted: want,
+            };
         }
         let want_u = want as u64;
         let floor = (MIN_VFS_DIR_BUDGET as u64).min(want_u);
@@ -4449,9 +4708,15 @@ impl VfsDirBudgetGuard {
             }
             if headroom < floor {
                 for node in &chain {
-                    node.stats.vfs_dir_current.fetch_add(floor, Ordering::SeqCst); // lint-fetch-add: allow (statistics counter)
+                    node.stats
+                        .vfs_dir_current
+                        .fetch_add(floor, Ordering::SeqCst); // lint-fetch-add: allow (statistics counter)
                 }
-                return Self { chain, bytes: floor, granted: floor as usize };
+                return Self {
+                    chain,
+                    bytes: floor,
+                    granted: floor as usize,
+                };
             }
             let grant = want_u.min(headroom); // in [floor, want]
             let mut charged: Vec<usize> = Vec::new();
@@ -4479,7 +4744,11 @@ impl VfsDirBudgetGuard {
                 }
             }
             if committed {
-                return Self { chain, bytes: grant, granted: grant as usize };
+                return Self {
+                    chain,
+                    bytes: grant,
+                    granted: grant as usize,
+                };
             }
             // Roll back the partial reservation (saturating) and retry.
             for &i in &charged {
@@ -4518,7 +4787,11 @@ impl VfsDirBudgetGuard {
             }
         }
         if committed {
-            return Self { chain, bytes: floor, granted: floor as usize };
+            return Self {
+                chain,
+                bytes: floor,
+                granted: floor as usize,
+            };
         }
         for &i in &charged {
             let _ = chain[i].stats.vfs_dir_current.fetch_update(
@@ -4530,9 +4803,15 @@ impl VfsDirBudgetGuard {
         // Even `floor` does not fit under the cap → force it (bounded over-count
         // ≤ floor per concurrent call) so enumeration still makes forward progress.
         for node in &chain {
-            node.stats.vfs_dir_current.fetch_add(floor, Ordering::SeqCst); // lint-fetch-add: allow (statistics counter)
+            node.stats
+                .vfs_dir_current
+                .fetch_add(floor, Ordering::SeqCst); // lint-fetch-add: allow (statistics counter)
         }
-        Self { chain, bytes: floor, granted: floor as usize }
+        Self {
+            chain,
+            bytes: floor,
+            granted: floor as usize,
+        }
     }
 
     /// The byte budget granted to the caller (use as the readdir allocation cap).
@@ -4579,8 +4858,11 @@ pub fn run_cgroup_vfs_dir_budget_self_test() {
     // P(vfs_dir_max=10000) ⊃ A(vfs_dir_max unlimited): fresh, task-less.
     let p = create_cgroup(0, CgroupControllers::MEMORY).expect("create P");
     let p_id = p.id();
-    p.set_limit(CgroupLimits { vfs_dir_max: Some(10_000), ..Default::default() })
-        .expect("set P.vfs_dir_max");
+    p.set_limit(CgroupLimits {
+        vfs_dir_max: Some(10_000),
+        ..Default::default()
+    })
+    .expect("set P.vfs_dir_max");
     let a = create_cgroup(p_id, CgroupControllers::MEMORY).expect("create A");
     let a_id = a.id();
 
@@ -4612,7 +4894,11 @@ pub fn run_cgroup_vfs_dir_budget_self_test() {
         assert!(lookup_cgroup(a_id).is_none(), "A removed from registry");
         // g drops here → uncharges the HELD [A_arc, P_arc], not lookup(a_id).
     }
-    assert_eq!(vdir(&p), 0, "P uncharged despite A deletion (Arc-pinned uncharge)");
+    assert_eq!(
+        vdir(&p),
+        0,
+        "P uncharged despite A deletion (Arc-pinned uncharge)"
+    );
 
     // 4) Root id==0 exemption: no charge, full grant.
     {

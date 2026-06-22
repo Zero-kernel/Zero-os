@@ -364,10 +364,7 @@ impl TcpState {
     pub fn can_receive(&self) -> bool {
         matches!(
             self,
-            TcpState::Established
-                | TcpState::FinWait1
-                | TcpState::FinWait2
-                | TcpState::CloseWait
+            TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 | TcpState::CloseWait
         )
     }
 
@@ -631,20 +628,26 @@ pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
         // alloc; replace with try_reserve + push for OOM safety on all paths.
         TcpOptionKind::EndOfList => {
             let mut b = Vec::new();
-            if b.try_reserve(1).is_err() { return Vec::new(); }
+            if b.try_reserve(1).is_err() {
+                return Vec::new();
+            }
             b.push(0);
             b
         }
         TcpOptionKind::Nop => {
             let mut b = Vec::new();
-            if b.try_reserve(1).is_err() { return Vec::new(); }
+            if b.try_reserve(1).is_err() {
+                return Vec::new();
+            }
             b.push(1);
             b
         }
         TcpOptionKind::Mss(mss) => {
             // R163-10 FIX: 4-byte option, reserved fallibly.
             let mut bytes = Vec::new();
-            if bytes.try_reserve(4).is_err() { return Vec::new(); }
+            if bytes.try_reserve(4).is_err() {
+                return Vec::new();
+            }
             bytes.extend_from_slice(&[2, 4]); // kind=2, len=4
             bytes.extend_from_slice(&mss.to_be_bytes());
             bytes
@@ -652,14 +655,18 @@ pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
         TcpOptionKind::WindowScale(scale) => {
             // R163-10 FIX: 3-byte option, reserved fallibly.
             let mut b = Vec::new();
-            if b.try_reserve(3).is_err() { return Vec::new(); }
+            if b.try_reserve(3).is_err() {
+                return Vec::new();
+            }
             b.extend_from_slice(&[3, 3, scale]);
             b
         }
         TcpOptionKind::SackPermitted => {
             // R163-10 FIX: 2-byte option, reserved fallibly.
             let mut b = Vec::new();
-            if b.try_reserve(2).is_err() { return Vec::new(); }
+            if b.try_reserve(2).is_err() {
+                return Vec::new();
+            }
             b.extend_from_slice(&[4, 2]);
             b
         }
@@ -669,8 +676,10 @@ pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
             let len = 2u8.saturating_add((count as u8).saturating_mul(8));
             // R163-10 FIX: SACK option is largest (up to 34 bytes), reserved fallibly.
             let mut bytes = Vec::new();
-            if bytes.try_reserve(len as usize).is_err() { return Vec::new(); }
-            bytes.push(5);   // kind
+            if bytes.try_reserve(len as usize).is_err() {
+                return Vec::new();
+            }
+            bytes.push(5); // kind
             bytes.push(len);
             for block in blocks.iter().take(count) {
                 bytes.extend_from_slice(&block.left_edge.to_be_bytes());
@@ -681,7 +690,9 @@ pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
         TcpOptionKind::Timestamps { ts_val, ts_ecr } => {
             // R163-10 FIX: 10-byte option, reserved fallibly.
             let mut bytes = Vec::new();
-            if bytes.try_reserve(10).is_err() { return Vec::new(); }
+            if bytes.try_reserve(10).is_err() {
+                return Vec::new();
+            }
             bytes.extend_from_slice(&[8, 10]); // kind=8, len=10
             bytes.extend_from_slice(&ts_val.to_be_bytes());
             bytes.extend_from_slice(&ts_ecr.to_be_bytes());
@@ -692,7 +703,9 @@ pub fn serialize_tcp_option(option: &TcpOptionKind) -> Vec<u8> {
             let effective_len = len.max(2);
             // R163-10 FIX: Variable-length unknown option, reserved fallibly.
             let mut bytes = Vec::new();
-            if bytes.try_reserve(effective_len as usize).is_err() { return Vec::new(); }
+            if bytes.try_reserve(effective_len as usize).is_err() {
+                return Vec::new();
+            }
             bytes.push(kind);
             bytes.push(effective_len);
             bytes.resize(effective_len as usize, 0);
@@ -1065,8 +1078,8 @@ impl TcpControlBlock {
             // R148-I3 FIX: TCP keepalive defaults per RFC 1122 §4.2.3.6.
             // Disabled by default; applications opt in via socket option.
             keepalive_enabled: false,
-            keepalive_idle_ms: 7_200_000,    // 2 hours
-            keepalive_interval_ms: 75_000,   // 75 seconds
+            keepalive_idle_ms: 7_200_000,  // 2 hours
+            keepalive_interval_ms: 75_000, // 75 seconds
             keepalive_probes_max: 9,
             keepalive_probes_sent: 0,
         }
@@ -1299,15 +1312,13 @@ impl TcpControlBlock {
                 let rm_off = removed.seq.wrapping_sub(merged_start) as usize;
                 if rm_off < merged_len {
                     let rm_len = removed.data.len().min(merged_len.saturating_sub(rm_off));
-                    merged_data[rm_off..rm_off + rm_len]
-                        .copy_from_slice(&removed.data[..rm_len]);
+                    merged_data[rm_off..rm_off + rm_len].copy_from_slice(&removed.data[..rm_len]);
                 }
 
                 let ns_off = new_seg.seq.wrapping_sub(merged_start) as usize;
                 if ns_off < merged_len {
                     let ns_len = new_seg.data.len().min(merged_len.saturating_sub(ns_off));
-                    merged_data[ns_off..ns_off + ns_len]
-                        .copy_from_slice(&new_seg.data[..ns_len]);
+                    merged_data[ns_off..ns_off + ns_len].copy_from_slice(&new_seg.data[..ns_len]);
                 }
 
                 // R135-4 FIX + R144-2 FIX: Preserve FIN if EITHER segment carries it.
@@ -1382,9 +1393,7 @@ impl TcpControlBlock {
                 }
                 // Remove the segment (fully consumed or redundant)
                 let removed = self.ooo_queue.pop_front().unwrap();
-                self.ooo_bytes = self
-                    .ooo_bytes
-                    .saturating_sub(removed.data.len() as u32);
+                self.ooo_bytes = self.ooo_bytes.saturating_sub(removed.data.len() as u32);
 
                 // R133-3 FIX: Process FIN received in OOO segment.
                 // FIN occupies one sequence number after the data payload.
@@ -1405,9 +1414,7 @@ impl TcpControlBlock {
                     // to prevent attacker-injected data beyond FIN from being
                     // delivered after the connection is logically closed.
                     while let Some(stale) = self.ooo_queue.pop_front() {
-                        self.ooo_bytes = self
-                            .ooo_bytes
-                            .saturating_sub(stale.data.len() as u32);
+                        self.ooo_bytes = self.ooo_bytes.saturating_sub(stale.data.len() as u32);
                     }
                     break;
                 }
@@ -2322,12 +2329,16 @@ pub fn parse_tcp_options(data: &[u8], header: &TcpHeader) -> TcpOptions {
                         break;
                     }
                     let left = u32::from_be_bytes([
-                        opts_data[j], opts_data[j + 1],
-                        opts_data[j + 2], opts_data[j + 3],
+                        opts_data[j],
+                        opts_data[j + 1],
+                        opts_data[j + 2],
+                        opts_data[j + 3],
                     ]);
                     let right = u32::from_be_bytes([
-                        opts_data[j + 4], opts_data[j + 5],
-                        opts_data[j + 6], opts_data[j + 7],
+                        opts_data[j + 4],
+                        opts_data[j + 5],
+                        opts_data[j + 6],
+                        opts_data[j + 7],
                     ]);
                     // Discard invalid blocks where left >= right (wrap-safe)
                     if seq_lt(left, right) {
@@ -2622,7 +2633,9 @@ fn isn_secret() -> u64 {
     // R149-5 FIX: Use fill_random (FIPS boundary pub API).
     let strong_result = {
         let mut buf = [0u8; 8];
-        security::fill_random(&mut buf).ok().map(|()| u64::from_le_bytes(buf))
+        security::fill_random(&mut buf)
+            .ok()
+            .map(|()| u64::from_le_bytes(buf))
     };
     if let Some(strong) = strong_result {
         let prev = ISN_SECRET.load(Ordering::Acquire);
