@@ -46,6 +46,7 @@
 
 use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
+use core::borrow::Borrow;
 use core::ops::{Bound, RangeBounds};
 
 /// An ordered map backed by a key-sorted `Vec`, with allocation-fallible growth.
@@ -84,14 +85,27 @@ impl<K: Ord, V> FallibleOrderedMap<K, V> {
 
     /// Locate `key`: `Ok(idx)` if present at `idx`, else `Err(idx)` where `idx`
     /// is the sorted insertion position.
+    ///
+    /// `Borrow`-generic (like `BTreeMap`): a `FallibleOrderedMap<String, _>` can be
+    /// probed with a `&str`, a `<usize, _>` with a `&usize`, etc., so this is a true
+    /// drop-in for the `BTreeMap` lookup subset (R172-22).
     #[inline]
-    fn find(&self, key: &K) -> Result<usize, usize> {
-        self.entries.binary_search_by(|(probe, _)| probe.cmp(key))
+    fn find<Q>(&self, key: &Q) -> Result<usize, usize>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.entries
+            .binary_search_by(|(probe, _)| probe.borrow().cmp(key))
     }
 
     /// Shared reference to the value for `key`, if present. O(log n).
     #[inline]
-    pub fn get(&self, key: &K) -> Option<&V> {
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         match self.find(key) {
             Ok(idx) => Some(&self.entries[idx].1),
             Err(_) => None,
@@ -100,7 +114,11 @@ impl<K: Ord, V> FallibleOrderedMap<K, V> {
 
     /// Mutable reference to the value for `key`, if present. O(log n).
     #[inline]
-    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         match self.find(key) {
             Ok(idx) => Some(&mut self.entries[idx].1),
             Err(_) => None,
@@ -109,7 +127,11 @@ impl<K: Ord, V> FallibleOrderedMap<K, V> {
 
     /// Whether `key` is present. O(log n).
     #[inline]
-    pub fn contains_key(&self, key: &K) -> bool {
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         self.find(key).is_ok()
     }
 
@@ -145,7 +167,11 @@ impl<K: Ord, V> FallibleOrderedMap<K, V> {
     }
 
     /// Remove and return the value for `key`, if present. O(n) (Vec shift).
-    pub fn remove(&mut self, key: &K) -> Option<V> {
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         match self.find(key) {
             Ok(idx) => Some(self.entries.remove(idx).1),
             Err(_) => None,
@@ -362,4 +388,45 @@ pub fn run_fallible_ordered_map_self_test() {
     assert_eq!(adopted.len(), 3);
     assert_eq!(adopted.range(2..=3).count(), 2);
     assert_eq!(adopted.get(&1), Some(&10));
+
+    // R172-22: String-keyed coverage — the exact instantiation ramfs migrated to. The
+    // usize-keyed cases above cannot witness the `K = String` + Borrow-generic `&str`
+    // lookups (get/contains_key/remove with `&str`) the ramfs rename/add_child paths rely
+    // on; this block does (the one migration mis-wire a green boot alone can't catch).
+    {
+        use alloc::string::{String, ToString};
+        let mut sm: FallibleOrderedMap<String, usize> = FallibleOrderedMap::new();
+        assert_eq!(
+            sm.try_insert("banana".to_string(), 2)
+                .expect("insert banana"),
+            None
+        );
+        assert_eq!(
+            sm.try_insert("apple".to_string(), 1).expect("insert apple"),
+            None
+        );
+        assert_eq!(
+            sm.try_insert("cherry".to_string(), 3)
+                .expect("insert cherry"),
+            None
+        );
+        // Borrow-generic &str probes (the BTreeMap-compatible lookup ramfs relies on).
+        assert_eq!(sm.get("apple"), Some(&1));
+        assert!(sm.contains_key("banana") && !sm.contains_key("durian"));
+        assert_eq!(sm.get("durian"), None);
+        // dest-exists insert is an in-place replace returning the old value, no grow.
+        assert_eq!(
+            sm.try_insert("banana".to_string(), 22)
+                .expect("replace banana"),
+            Some(2)
+        );
+        assert_eq!(sm.get("banana"), Some(&22));
+        // sorted iteration over String keys.
+        let keys: Vec<&str> = sm.keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, alloc::vec!["apple", "banana", "cherry"]);
+        // remove via &str + length bookkeeping.
+        assert_eq!(sm.remove("banana"), Some(22));
+        assert_eq!(sm.get("banana"), None);
+        assert_eq!(sm.len(), 2);
+    }
 }

@@ -197,11 +197,15 @@ pub fn sys_fork() -> Result<ProcessId, ForkError> {
             let parent_mm = parent.mm.lock();
 
             // Sum non-PROT_NONE mmap regions (inherited verbatim from parent)
-            for (&_base, &len_with_flags) in parent_mm.mmap_regions.iter() {
+            for (_base, len_with_flags) in parent_mm.mmap_regions.iter() {
+                // R172-22: annotate the value type — FallibleOrderedMap::iter() returns an
+                // opaque `impl Iterator`, so the (now Borrow-generic) map's Item type is not
+                // inferable here without it.
+                let len_with_flags: &crate::syscall::MmapEntry = len_with_flags;
                 if len_with_flags.is_prot_none() {
                     continue;
                 }
-                let len = crate::syscall::mmap_region_len(len_with_flags) as u64;
+                let len = crate::syscall::mmap_region_len(*len_with_flags) as u64;
                 bytes = bytes.saturating_add(len);
             }
 
@@ -299,7 +303,7 @@ fn fork_inner(
         if parent_mm
             .mmap_regions
             .values()
-            .any(|&len_with_flags| len_with_flags.has_transient())
+            .any(|len_with_flags: &crate::syscall::MmapEntry| len_with_flags.has_transient())
         {
             return Err(ForkError::MmapTransientState);
         }
@@ -516,12 +520,11 @@ fn fork_inner(
             // D2 Phase 2: strip transient flags via the typed accessor (clears
             // PENDING_*, preserves PROT_NONE + prot bits — load-bearing for the
             // child's cgroup-charge skip).
-            snap.extend(
-                parent_mm
-                    .mmap_regions
-                    .iter()
-                    .map(|(&base, &len_with_flags)| (base, len_with_flags.fork_stripped())),
-            );
+            snap.extend(parent_mm.mmap_regions.iter().map(
+                |(&base, len_with_flags): (&usize, &crate::syscall::MmapEntry)| {
+                    (base, len_with_flags.fork_stripped())
+                },
+            ));
 
             let child_mm = crate::process::MmState {
                 // next-phase #11 / R165-14 (CLOSED, was AD-02 tech-debt): the

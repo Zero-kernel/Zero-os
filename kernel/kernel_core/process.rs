@@ -4921,11 +4921,13 @@ fn free_process_resources(
     // charged cgroup memory (R123-1 invariant INV-MM-PROT-NONE).
     if !keep_address_space && !mm_shared && proc.memory_space != 0 {
         let cgroup_id = proc.cgroup_id;
-        for (&_base, &len_with_flags) in mm.mmap_regions.iter() {
+        for (_base, len_with_flags) in mm.mmap_regions.iter() {
+            // R172-22: annotate value type (opaque iter() + Borrow-generic map).
+            let len_with_flags: &crate::syscall::MmapEntry = len_with_flags;
             if len_with_flags.is_prot_none() {
                 continue;
             }
-            let len = crate::syscall::mmap_region_len(len_with_flags) as u64;
+            let len = crate::syscall::mmap_region_len(*len_with_flags) as u64;
             if len > 0 {
                 crate::cgroup::uncharge_memory(cgroup_id, len);
             }
@@ -5351,17 +5353,19 @@ pub fn compute_cgroup_charged_bytes(proc: &Process) -> u64 {
     let mmap_bytes: u64 = mm
         .mmap_regions
         .iter()
-        .filter_map(|(&_base, &len_with_flags)| {
-            if len_with_flags.is_prot_none() {
-                return None;
-            }
-            let len = crate::syscall::mmap_region_len(len_with_flags) as u64;
-            if len > 0 {
-                Some(len)
-            } else {
-                None
-            }
-        })
+        .filter_map(
+            |(_base, len_with_flags): (&usize, &crate::syscall::MmapEntry)| {
+                if len_with_flags.is_prot_none() {
+                    return None;
+                }
+                let len = crate::syscall::mmap_region_len(*len_with_flags) as u64;
+                if len > 0 {
+                    Some(len)
+                } else {
+                    None
+                }
+            },
+        )
         .sum();
 
     // Compute brk heap charge (page-aligned).
