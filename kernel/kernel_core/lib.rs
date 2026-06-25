@@ -123,8 +123,8 @@ pub use scheduler_hook::{
     register_timer_callback, request_resched_from_irq, reschedule_if_needed,
 };
 pub use signal::{
-    default_action, register_resume_callback, send_signal, signal_name, PendingSignals, Signal,
-    SignalAction, SignalError,
+    default_action, register_kick_callback, register_resume_callback, send_signal, signal_name,
+    PendingSignals, Signal, SignalAction, SignalError,
 };
 pub use syscall::{
     drain_deferred_stdin_wakes,
@@ -143,6 +143,7 @@ pub use syscall::{
     register_vfs_open_with_resolve_callback,
     register_vfs_read_file_callback,
     register_vfs_readdir_callback,
+    register_vfs_rename_callback,
     register_vfs_stat_callback,
     register_vfs_truncate_callback,
     register_vfs_unlink_callback,

@@ -559,6 +559,13 @@ pub enum CapError {
     /// Generation counter exhausted after 2^32 allocations (R25-2 fix).
     /// This is a fatal condition - the capability table can no longer be used safely.
     GenerationExhausted,
+
+    /// R172-06: heap allocation failed while GROWING the table (distinct from TableFull,
+    /// the MAX_CAP_SLOTS hard ceiling). Maps to ENOMEM. Lets `allocate` grow both `slots`
+    /// and `free` FALLIBLY before mutating, so the `free.capacity() >= slots.len()` invariant
+    /// holds and `apply_cloexec`/`revoke`'s `free.push` can never reallocate (panic) — which
+    /// in exec ran PAST the point-of-no-return.
+    OutOfMemory,
 }
 
 impl fmt::Display for CapError {
@@ -571,6 +578,7 @@ impl fmt::Display for CapError {
             CapError::DelegationDenied => write!(f, "capability delegation denied"),
             CapError::InvalidOperation => write!(f, "invalid operation for object type"),
             CapError::GenerationExhausted => write!(f, "capability generation counter exhausted"),
+            CapError::OutOfMemory => write!(f, "out of memory growing capability table"),
         }
     }
 }

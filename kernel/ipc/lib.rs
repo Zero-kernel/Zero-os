@@ -223,15 +223,18 @@ fn fs_error_to_syscall(err: vfs::types::FsError) -> SyscallError {
         FsError::Exists => SyscallError::EEXIST,
         FsError::PermDenied => SyscallError::EACCES,
         FsError::BadFd => SyscallError::EBADF,
-        FsError::ReadOnly => SyscallError::EACCES,
+        // M0-6 slice 2: errno fidelity, matching FsError::to_errno + the VFS mappers —
+        // ReadOnly=>EROFS, NameTooLong=>ENAMETOOLONG, NotEmpty=>ENOTEMPTY.
+        FsError::ReadOnly => SyscallError::EROFS,
         FsError::NoSpace | FsError::NoMem => SyscallError::ENOMEM,
         FsError::Io => SyscallError::EIO,
-        FsError::Invalid | FsError::NameTooLong | FsError::Seek => SyscallError::EINVAL,
+        FsError::NameTooLong => SyscallError::ENAMETOOLONG,
+        FsError::Invalid | FsError::Seek => SyscallError::EINVAL,
         FsError::CrossDev => SyscallError::EXDEV,
         FsError::SymlinkLoop => SyscallError::ELOOP,
         FsError::NotSupported => SyscallError::ENOSYS,
         FsError::Pipe => SyscallError::EPIPE,
-        FsError::NotEmpty => SyscallError::EBUSY,
+        FsError::NotEmpty => SyscallError::ENOTEMPTY,
         FsError::Busy => SyscallError::EBUSY,
     }
 }

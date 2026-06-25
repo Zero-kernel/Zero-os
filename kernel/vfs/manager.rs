@@ -1231,6 +1231,144 @@ impl Vfs {
         fs.unlink(&parent, filename)
     }
 
+    /// M0-6 slice 2: rename / renameat2(RENAME_NOREPLACE). A two-parent atomic move with
+    /// full DAC + dual-end sticky-bit + pre-mutation LSM gating; ALL checks run before any
+    /// mutation (and the ramfs body is itself atomic), so a denied/raced rename never
+    /// half-mutates. `noreplace` rejects an existing destination with EEXIST.
+    pub fn rename(&self, old: &str, new: &str, noreplace: bool) -> Result<(), FsError> {
+        // (1) Trailing-dot guard on the RAW paths: a final '.'/'..' component is EINVAL in
+        // Linux rename, but normalize_path collapses it, so it must be caught pre-normalize.
+        for raw in [old, new] {
+            let last = raw.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            if last == "." || last == ".." {
+                return Err(FsError::Invalid);
+            }
+        }
+        // (2) Normalize. (A same-path rename is NOT short-circuited here: that would wrongly
+        // return success for a NON-EXISTENT path — Linux returns ENOENT. The genuine
+        // same-inode no-op is handled atomically by ramfs::rename's ptr_eq check, which runs
+        // only AFTER the source is confirmed to exist.)
+        let old_n = normalize_path(old)?;
+        let new_n = normalize_path(new)?;
+        // (3) Split into (parent, name) for both ends.
+        let (op, oname) = split_path(&old_n)?;
+        let (np, nname) = split_path(&new_n)?;
+        // Renaming the root / an empty final name is rejected (covers the only mount root in
+        // a single-mount boot; nested-mount-root rename is a documented residual).
+        if oname.is_empty() || nname.is_empty() {
+            return Err(FsError::Invalid);
+        }
+        // (4) Subtree-loop guard: a directory cannot be moved into its own subtree
+        // (new == old + "/..."), which would detach a cycle. Lexical on normalized paths.
+        if new_n.len() > old_n.len()
+            && new_n.as_bytes().get(old_n.len()) == Some(&b'/')
+            && new_n.starts_with(old_n.as_str())
+        {
+            return Err(FsError::Invalid);
+        }
+        // (4b) R172-14 FIX (Layer-2 fast-path): the symmetric strict-ANCESTOR guard — moving a
+        // directory ONTO its own parent/ancestor (e.g. rename("/a/sub","/a")) overwrites a
+        // parent of the source (orphan/cycle) and, in ramfs, would make the victim resolve to
+        // a held-write-guard parent -> child_count() self-deadlock. Lexical fast-path only; the
+        // AUTHORITATIVE checks are in ramfs (rename_decide's held-guard pointer reject for the
+        // deadlock, and the under-lock ancestry walk for the cycle), which do not trust path
+        // strings. EINVAL matches the descendant guard above and Linux dir-loop semantics.
+        if old_n.len() > new_n.len()
+            && old_n.as_bytes().get(new_n.len()) == Some(&b'/')
+            && old_n.starts_with(new_n.as_str())
+        {
+            return Err(FsError::Invalid);
+        }
+        // (5) Resolve BOTH parents (parent paths follow symlinks — correct; the final
+        // component is looked up non-following below so the link itself is moved).
+        let oparent = self.lookup_path(&op)?;
+        let nparent = self.lookup_path(&np)?;
+        if !oparent.is_dir() || !nparent.is_dir() {
+            return Err(FsError::NotDir);
+        }
+        // (6) EXDEV BEFORE any mutation, via the RESOLVED-INODE fs_id (a symlinked path
+        // cannot defeat this the way a path-string mount comparison could).
+        if oparent.fs_id() != nparent.fs_id() {
+            return Err(FsError::CrossDev);
+        }
+        // (7) DAC pass 1: write+exec on BOTH parents (omitting nparent's check would be a
+        // confused-deputy create into a directory the caller cannot write).
+        let ops = oparent.stat()?;
+        if !check_access_permission(&ops, false, true, true) {
+            return Err(FsError::PermDenied);
+        }
+        let nps = nparent.stat()?;
+        if !check_access_permission(&nps, false, true, true) {
+            return Err(FsError::PermDenied);
+        }
+        // (8) Single-component (non-following) source + dest lookup; capture inos.
+        let (_, ofs, _) = self.find_mount(&old_n)?;
+        let src = ofs.lookup(&oparent, oname)?;
+        let src_ino = src.ino();
+        let src_stat = src.stat()?;
+        let dest_before = ofs.lookup(&nparent, nname).ok();
+        let dest_ino = dest_before.as_ref().map(|d| d.ino());
+        // (9) C.4 TOCTOU revalidation on BOTH ends, immediately before the move: re-stat
+        // both parents (ino-stable + DAC) and re-look-up source (ino-stable) and dest
+        // (still-absent or the SAME inode) — defeats a name-swap between the LSM decision
+        // and the mutation.
+        let latest_ops = oparent.stat()?;
+        if latest_ops.ino != ops.ino || !check_access_permission(&latest_ops, false, true, true) {
+            return Err(FsError::PermDenied);
+        }
+        let latest_nps = nparent.stat()?;
+        if latest_nps.ino != nps.ino || !check_access_permission(&latest_nps, false, true, true) {
+            return Err(FsError::PermDenied);
+        }
+        let src_now = ofs.lookup(&oparent, oname)?;
+        if src_now.ino() != src_ino {
+            return Err(FsError::PermDenied);
+        }
+        match (ofs.lookup(&nparent, nname).ok().map(|d| d.ino()), dest_ino) {
+            (Some(now), Some(prev)) if now == prev => {}
+            (None, None) => {}
+            // dest appeared, vanished, or was swapped since the first observation -> reject.
+            _ => return Err(FsError::PermDenied),
+        }
+        // (10) Sticky-bit (+t) on the FRESHEST stats, host-mapped euid, BOTH ends.
+        // SOURCE: a sticky old_parent restricts who may remove the source.
+        if latest_ops.mode.perm & 0o1000 != 0 {
+            let euid = current_host_euid().unwrap_or(0);
+            if euid != 0 && euid != src_stat.uid && euid != latest_ops.uid {
+                return Err(FsError::PermDenied);
+            }
+        }
+        // DEST (only when overwriting): a sticky new_parent restricts who may clobber the
+        // EXISTING dest — keyed on the DEST inode's uid, NOT the source's.
+        if let Some(dest) = &dest_before {
+            if latest_nps.mode.perm & 0o1000 != 0 {
+                let dest_stat = dest.stat()?;
+                let euid = current_host_euid().unwrap_or(0);
+                if euid != 0 && euid != dest_stat.uid && euid != latest_nps.uid {
+                    return Err(FsError::PermDenied);
+                }
+            }
+        }
+        // (11) LSM hook BEFORE the move, with the revalidated parent inos (its first caller).
+        if let Some(task) = LsmProcessCtx::from_current() {
+            lsm::hook_file_rename(
+                &task,
+                latest_ops.ino,
+                hash_path(oname),
+                latest_nps.ino,
+                hash_path(nname),
+            )
+            .map_err(|_| FsError::PermDenied)?;
+        }
+        // (12) Commit: pass the validated source/dest inos so ramfs binds THIS decision to
+        // the inode it actually moves (a create/unlink could swap a name in the gap before
+        // ramfs takes its spanning lock — ramfs fails closed on an identity mismatch). The
+        // ramfs body also re-validates dest type/emptiness under that same lock.
+        ofs.rename(
+            &oparent, oname, &nparent, nname, noreplace, src_ino, dest_ino,
+        )
+    }
+
     /// Find the mount point for a given path (in current process's namespace)
     ///
     /// Uses current_mount_ns() to get the process's namespace, falling back
@@ -1480,12 +1618,16 @@ fn fs_error_to_syscall(e: FsError) -> SyscallError {
         FsError::Exists => SyscallError::EEXIST,
         FsError::NotDir => SyscallError::ENOTDIR,
         FsError::IsDir => SyscallError::EISDIR,
-        FsError::NotEmpty => SyscallError::EBUSY,
+        // M0-6 slice 2: errno fidelity (mirror types.rs From<FsError> + to_errno) —
+        // NotEmpty=>ENOTEMPTY, ReadOnly=>EROFS, NameTooLong=>ENAMETOOLONG. cgroup-rmdir's
+        // EBUSY is preserved by its producer mapping CgroupError::NotEmpty=>FsError::Busy.
+        FsError::NotEmpty => SyscallError::ENOTEMPTY,
         FsError::Busy => SyscallError::EBUSY,
-        FsError::ReadOnly => SyscallError::EACCES,
+        FsError::ReadOnly => SyscallError::EROFS,
         FsError::NoSpace | FsError::NoMem => SyscallError::ENOMEM,
         FsError::Io => SyscallError::EIO,
-        FsError::Invalid | FsError::NameTooLong | FsError::Seek => SyscallError::EINVAL,
+        FsError::NameTooLong => SyscallError::ENAMETOOLONG,
+        FsError::Invalid | FsError::Seek => SyscallError::EINVAL,
         FsError::CrossDev => SyscallError::EXDEV,
         FsError::SymlinkLoop => SyscallError::ELOOP,
         FsError::NotSupported => SyscallError::ENOSYS,
@@ -1635,6 +1777,123 @@ pub fn run_exec_read_file_self_test() {
     }
 }
 
+/// M0-6 slice 2 self-test (ramfs-staged, stage-or-skip-loudly). The errno-mapper assertions
+/// and the HALF-MUTATION ATOMICITY GUARD are the load-bearing checks: they pin the dual-mapper
+/// errno-fidelity fix and the insert-first/remove-after rewrite (the bug this slice fixes
+/// removed the source BEFORE the add, losing the entry when the add failed).
+pub fn run_rename_self_test() {
+    // --- Pure errno-mapper fidelity (always runs; no staging needed) ---
+    assert!(matches!(
+        fs_error_to_syscall(FsError::NotEmpty),
+        SyscallError::ENOTEMPTY
+    ));
+    assert!(matches!(
+        fs_error_to_syscall(FsError::ReadOnly),
+        SyscallError::EROFS
+    ));
+    assert!(matches!(
+        fs_error_to_syscall(FsError::NameTooLong),
+        SyscallError::ENAMETOOLONG
+    ));
+    // Absent source => ENOENT (holds regardless of staging).
+    assert!(matches!(
+        VFS.rename("/zeroos_m06_absent_src", "/zeroos_m06_dst", false),
+        Err(FsError::NotFound)
+    ));
+
+    // --- Staged behavioral tests ---
+    let da = "/zeroos_m06_rn_a";
+    let db = "/zeroos_m06_rn_b";
+    let staged = VFS.create(da, FileMode::directory(0o755)).is_ok()
+        && VFS.create(db, FileMode::directory(0o755)).is_ok()
+        && VFS
+            .create(&(da.to_string() + "/f"), FileMode::regular(0o644))
+            .is_ok();
+    if !staged {
+        klog_always!(
+            "    \u{26a0} M0-6 rename: mapper+ENOENT ok; staged path SKIPPED (no ramfs stage)"
+        );
+        return;
+    }
+    let src = da.to_string() + "/f";
+    let dst = db.to_string() + "/f";
+
+    // (1) HAPPY cross-dir move: old gone, new present.
+    assert!(VFS.rename(&src, &dst, false).is_ok(), "happy rename");
+    assert!(
+        matches!(VFS.lookup_path(&src), Err(FsError::NotFound)),
+        "source gone after rename"
+    );
+    assert!(
+        VFS.lookup_path(&dst).is_ok(),
+        "destination present after rename"
+    );
+
+    // (2) HALF-MUTATION ATOMICITY GUARD (load-bearing): a rename to an over-long final
+    // component fails BEFORE any mutation, so the source SURVIVES.
+    let overlong = db.to_string() + "/" + &"x".repeat(256);
+    assert!(
+        VFS.rename(&dst, &overlong, false).is_err(),
+        "over-long new name must fail"
+    );
+    assert!(
+        VFS.lookup_path(&dst).is_ok(),
+        "source must SURVIVE a failed rename (atomicity)"
+    );
+
+    // (3) RENAME_NOREPLACE: rename onto an existing dest with noreplace => EEXIST; both survive.
+    let g = db.to_string() + "/g";
+    assert!(
+        VFS.create(&g, FileMode::regular(0o644)).is_ok(),
+        "stage g for NOREPLACE"
+    );
+    assert!(
+        matches!(VFS.rename(&dst, &g, true), Err(FsError::Exists)),
+        "NOREPLACE onto existing => EEXIST"
+    );
+    assert!(
+        VFS.lookup_path(&dst).is_ok() && VFS.lookup_path(&g).is_ok(),
+        "both survive a NOREPLACE rejection"
+    );
+
+    // (4) ENOTEMPTY: a directory cannot replace a NON-EMPTY directory.
+    let d1 = db.to_string() + "/d1";
+    let d2 = db.to_string() + "/d2";
+    let ne_ok = VFS.create(&d1, FileMode::directory(0o755)).is_ok()
+        && VFS
+            .create(&(d1.clone() + "/c"), FileMode::regular(0o644))
+            .is_ok()
+        && VFS.create(&d2, FileMode::directory(0o755)).is_ok();
+    if ne_ok {
+        assert!(
+            matches!(VFS.rename(&d2, &d1, false), Err(FsError::NotEmpty)),
+            "dir over non-empty dir => NotEmpty"
+        );
+        assert!(
+            VFS.lookup_path(&d2).is_ok(),
+            "source dir survives NotEmpty rejection"
+        );
+    }
+
+    // (5) R172-22 SAME-PARENT move: exercises the same-parent `g.try_insert` grow arm of
+    // the FallibleOrderedMap migration (test (1) exercised the cross-parent `ng.try_insert`
+    // arm). Old name gone, new name present, same directory.
+    let g2 = db.to_string() + "/g2";
+    assert!(VFS.rename(&g, &g2, false).is_ok(), "same-parent rename");
+    assert!(
+        matches!(VFS.lookup_path(&g), Err(FsError::NotFound)),
+        "same-parent rename: old name gone"
+    );
+    assert!(
+        VFS.lookup_path(&g2).is_ok(),
+        "same-parent rename: new name present"
+    );
+
+    klog_always!(
+        "    \u{2713} M0-6 rename: mapper(ENOTEMPTY/EROFS/ENAMETOOLONG) + happy move + atomicity guard + NOREPLACE + NotEmpty + same-parent(R172-22)"
+    );
+}
+
 /// Register VFS callbacks with kernel_core
 pub fn register_syscall_callbacks() {
     kernel_core::register_vfs_open_callback(vfs_open_callback);
@@ -1644,6 +1903,7 @@ pub fn register_syscall_callbacks() {
     kernel_core::register_vfs_lseek_callback(vfs_lseek_callback);
     kernel_core::register_vfs_create_callback(vfs_create_callback);
     kernel_core::register_vfs_unlink_callback(vfs_unlink_callback);
+    kernel_core::register_vfs_rename_callback(vfs_rename_callback);
     kernel_core::register_vfs_readdir_callback(vfs_readdir_callback);
     kernel_core::register_vfs_truncate_callback(vfs_truncate_callback);
 
@@ -1685,6 +1945,13 @@ fn vfs_create_callback(path: &str, mode: u32, is_dir: bool) -> Result<(), Syscal
 /// Called by sys_unlink/sys_rmdir to delete files/directories
 fn vfs_unlink_callback(path: &str) -> Result<(), SyscallError> {
     VFS.unlink(path).map_err(fs_error_to_syscall)
+}
+
+/// VFS rename callback for syscall registration (M0-6 slice 2).
+///
+/// Called by sys_rename / sys_renameat / sys_renameat2.
+fn vfs_rename_callback(old: &str, new: &str, noreplace: bool) -> Result<(), SyscallError> {
+    VFS.rename(old, new, noreplace).map_err(fs_error_to_syscall)
 }
 
 /// VFS readdir callback for syscall registration

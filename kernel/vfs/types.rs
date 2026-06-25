@@ -293,12 +293,17 @@ impl From<FsError> for SyscallError {
             FsError::Exists => SyscallError::EEXIST,
             FsError::NotDir => SyscallError::ENOTDIR,
             FsError::IsDir => SyscallError::EISDIR,
-            FsError::NotEmpty => SyscallError::EBUSY,
+            // M0-6 slice 2: errno fidelity — NotEmpty=>ENOTEMPTY (Linux rmdir/rename of a
+            // non-empty dir), ReadOnly=>EROFS, NameTooLong=>ENAMETOOLONG. Cross-checked
+            // against FsError::to_errno (the correct reference: -39/-30/-36). The cgroupfs
+            // EBUSY case is preserved by mapping its producer to FsError::Busy instead.
+            FsError::NotEmpty => SyscallError::ENOTEMPTY,
             FsError::Busy => SyscallError::EBUSY,
-            FsError::ReadOnly => SyscallError::EACCES,
+            FsError::ReadOnly => SyscallError::EROFS,
             FsError::NoSpace | FsError::NoMem => SyscallError::ENOMEM,
             FsError::Io => SyscallError::EIO,
-            FsError::Invalid | FsError::NameTooLong | FsError::Seek => SyscallError::EINVAL,
+            FsError::NameTooLong => SyscallError::ENAMETOOLONG,
+            FsError::Invalid | FsError::Seek => SyscallError::EINVAL,
             FsError::CrossDev => SyscallError::EXDEV,
             FsError::SymlinkLoop => SyscallError::ELOOP,
             FsError::NotSupported => SyscallError::ENOSYS,
