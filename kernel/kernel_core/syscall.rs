@@ -1711,6 +1711,12 @@ pub type VfsCreateCallback = fn(&str, u32, bool) -> Result<(), SyscallError>;
 /// 参数: (path) -> () 或错误
 pub type VfsUnlinkCallback = fn(&str) -> Result<(), SyscallError>;
 
+/// VFS 重命名回调类型 (M0-6 slice 2)
+///
+/// 由 vfs 模块注册；参数: (old_path, new_path, noreplace) -> () 或错误。
+/// `noreplace` 来自 renameat2 的 RENAME_NOREPLACE 标志。
+pub type VfsRenameCallback = fn(&str, &str, bool) -> Result<(), SyscallError>;
+
 /// VFS 读取目录项回调类型
 ///
 /// 由 vfs 模块注册，处理目录内容读取
@@ -1806,6 +1812,8 @@ lazy_static::lazy_static! {
     static ref VFS_CREATE_CALLBACK: spin::Mutex<Option<VfsCreateCallback>> = spin::Mutex::new(None);
     /// VFS 删除回调
     static ref VFS_UNLINK_CALLBACK: spin::Mutex<Option<VfsUnlinkCallback>> = spin::Mutex::new(None);
+    /// VFS 重命名回调 (M0-6 slice 2)
+    static ref VFS_RENAME_CALLBACK: spin::Mutex<Option<VfsRenameCallback>> = spin::Mutex::new(None);
     /// VFS 读取目录回调
     static ref VFS_READDIR_CALLBACK: spin::Mutex<Option<VfsReaddirCallback>> = spin::Mutex::new(None);
     /// VFS 截断回调
@@ -1872,6 +1880,11 @@ pub fn register_vfs_create_callback(cb: VfsCreateCallback) {
 /// 注册 VFS 删除回调
 pub fn register_vfs_unlink_callback(cb: VfsUnlinkCallback) {
     *VFS_UNLINK_CALLBACK.lock() = Some(cb);
+}
+
+/// 注册 VFS 重命名回调 (M0-6 slice 2)
+pub fn register_vfs_rename_callback(cb: VfsRenameCallback) {
+    *VFS_RENAME_CALLBACK.lock() = Some(cb);
 }
 
 /// 注册 VFS 读取目录回调
@@ -2841,6 +2854,22 @@ pub fn syscall_dispatcher(
         83 => sys_mkdir(arg0 as *const u8, arg1 as u32),
         84 => sys_rmdir(arg0 as *const u8),
         87 => sys_unlink(arg0 as *const u8),
+        // M0-6 slice 2: rename family. 82 is pledge-promised (WPATH); 264/316 dispatch as
+        // plain unpledged arms (no seccomp constant -> default-denied for a pledged process).
+        82 => sys_rename(arg0 as *const u8, arg1 as *const u8),
+        264 => sys_renameat(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as i32,
+            arg3 as *const u8,
+        ),
+        316 => sys_renameat2(
+            arg0 as i32,
+            arg1 as *const u8,
+            arg2 as i32,
+            arg3 as *const u8,
+            arg4 as u32,
+        ),
         90 => sys_chmod(arg0 as *const u8, arg1 as u32),
         91 => sys_fchmod(arg0 as i32, arg1 as u32),
         95 => sys_umask(arg0 as u32),
@@ -5081,6 +5110,12 @@ fn exec_from_bytes(
                                        // no fallible operations remain between lock release and commit(); if the
                                        // guard were to roll back, it uncharges via its own charged_bytes field.
             mm.elf_charged_bytes = load_result.charged_bytes;
+            // M0-7 item7 SLICE 4: the fresh image's eager stack is mapped down to the
+            // architectural mapped floor (allocate_user_stack_tracked maps the whole
+            // window minus the guard), so the demand-grow watermark starts there. A
+            // future SLICE-5 grow lowers it; a fork COPIES it (the grown region is
+            // COW-inherited). Charged DATA below this floor goes to elf_charged_bytes.
+            mm.stack_floor_committed = crate::elf_loader::user_stack_mapped_floor() as usize;
             mm.mmap_regions.clear();
             // H.2 Partial KASLR: Re-randomize mmap base on exec for ASLR
             mm.next_mmap_addr = security::randomized_mmap_base(0x4000_0000);
@@ -6544,8 +6579,74 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
     };
     crate::signal_frame::sanitize_fxsave_for_export(&mut fxcopy);
 
-    let stack_floor =
-        crate::elf_loader::USER_STACK_TOP as u64 - crate::elf_loader::USER_STACK_SIZE as u64;
+    // R172-25 / R172-X-F2: the sigframe early-reject floor must track the DELIVERING
+    // task's OWN stack, not the main-thread geometry constant — a CLONE_VM thread's stack
+    // is a separate mmap'd region, so the constant floor spuriously E2BIG'd a below-floor
+    // thread (fatal SIGSEGV) and under-guarded an above-floor one. Tier-1 (RSP in the main
+    // window) needs NO lock; only a non-main RSP triggers the brief Process->MmState VMA
+    // lookup below. The locks are dropped BEFORE compute_sigframe_layout / the faultable
+    // copy_to_user, so the floor is a plain u64 fully decoupled from the lock. The floor is
+    // EITHER the exact base of the VMA rsp sits in/atop (tier 1/2) OR fail-closed == rsp
+    // (tier-3 unlocatable stack), so the frame is confined to rsp's own region and a
+    // genuine overflow becomes E2BIG/EFAULT -> fatal SIGSEGV — never a write into a foreign
+    // mapped region (a permissive 0 floor would NOT be caught by copy_to_user; Codex
+    // impl-diff `019ef337`).
+    let (win_start, win_end) = crate::elf_loader::user_stack_window();
+    let main_guard_top = crate::elf_loader::user_stack_mapped_floor();
+    let tracked_vma_base: Option<u64> =
+        if (win_start as u64) <= ctx.rsp && ctx.rsp < (win_end as u64) {
+            None // tier-1 main window: no VMA lookup needed
+        } else if let Some(arc) = get_process(pid) {
+            let proc = arc.lock();
+            let mm = proc.mm.lock();
+            // Find the delivering task's stack VMA to bound the sigframe floor. Only a real
+            // (non-PROT_NONE, non-transient) mapping qualifies. TWO-STEP (Codex impl-diff
+            // `019ef337` — a bare `rsp-1` predecessor probe is UNSAFE for the rsp==base
+            // bottom edge, where it would pick the adjacent region BELOW and permit a write
+            // into foreign mapped memory):
+            //   PRIMARY — the VMA that CONTAINS rsp (`base <= rsp < end`). Covers mid-stack
+            //   AND the fully-consumed rsp==base bottom (floor=base; the frame is BELOW rsp,
+            //   so it then E2BIGs and is rejected — it is NEVER attributed to the region
+            //   below, so there is no cross-region spill).
+            //   FALLBACK (only when NO VMA contains rsp — the exclusive-TOP case rsp==base+len,
+            //   common right after clone): the VMA whose `end == rsp`. The sigframe writes
+            //   into [frame_base, rsp), which lies inside THAT region.
+            // PROT_NONE reservations and in-flight PENDING_MAP/UNMAP/MPROTECT regions fall
+            // through to the tier-3 fail-closed floor.
+            let region_floor = |va: u64, require_end_eq: Option<u64>| -> Option<u64> {
+                mm.mmap_regions
+                    .range(..=(va as usize))
+                    .next_back()
+                    .and_then(|(&base, &entry)| {
+                        let base = base as u64;
+                        let end = base.saturating_add(entry.len() as u64);
+                        let ok = !entry.is_prot_none()
+                            && !entry.has_transient()
+                            && base <= va
+                            && va < end
+                            && require_end_eq.map_or(true, |r| end == r);
+                        if ok {
+                            Some(base)
+                        } else {
+                            None
+                        }
+                    })
+            };
+            let found = region_floor(ctx.rsp, None)
+                .or_else(|| region_floor(ctx.rsp.saturating_sub(1), Some(ctx.rsp)));
+            drop(mm);
+            drop(proc);
+            found
+        } else {
+            None // task gone mid-flight: tier-3 permissive, copy_to_user backstops
+        };
+    let stack_floor = crate::signal_frame::resolve_sigframe_stack_floor(
+        ctx.rsp,
+        win_start as u64,
+        win_end as u64,
+        main_guard_top,
+        tracked_vma_base,
+    );
     let layout = match crate::signal_frame::compute_sigframe_layout(ctx.rsp, stack_floor) {
         Ok(l) => l,
         // No room for the frame on the user stack: fatal SIGSEGV (Linux force_sigsegv).
@@ -7101,7 +7202,7 @@ const DISPATCHED_PROMISED: &[u64] = &[
     9, 10, 11, 12, // mmap mprotect munmap brk (VM promise)
     24, 39, // sched_yield getpid
     56, 57, 59, 60, 61, 62, // clone fork execve exit wait4 kill
-    83, 84, 87, // mkdir rmdir unlink
+    82, 83, 84, 87, // rename mkdir rmdir unlink  (82 = M0-6 slice 2)
     90, 91, // chmod fchmod
     97, 160, 302, // getrlimit setrlimit prlimit64  (M0-6 NEW)
     102, 104, 107, 108, 110, // getuid getgid geteuid getegid getppid
@@ -7138,7 +7239,22 @@ const INTENTIONAL_UNDISPATCHED: &[(u64, &str)] = &[
         "waitid: PROC promise, dispatch deferred (M0-6 later slice)",
     ),
 ];
-const MAX_EXEMPT: usize = 9;
+const MAX_EXEMPT: usize = 8;
+
+/// R172-P6-F3: syscall numbers that are PRIVATE / native dispatch arms (reachable by direct
+/// syscall number) but MUST NEVER appear in the pledge union — there is no seccomp constant
+/// for them and they are not pledge-grantable. The parity test fences ALL of them (not just
+/// 517): a future engineer who grants e.g. WPATH and naively adds renameat(264)/renameat2(316)
+/// to the pledge union would otherwise hit the MISLEADING "must be dispatched XOR exempt"
+/// failure (they are dispatched but NOT in DISPATCHED_PROMISED), which invites "fixing" it by
+/// adding them to DISPATCHED_PROMISED — a fail-open seccomp escape (a private arm reachable
+/// from a pledged sandbox). To LEGITIMATELY pledge one: remove it here, add it IDENTICALLY to
+/// pledge_to_filter (seccomp/lib.rs) AND promise_allows_syscall (seccomp/types.rs) per R150-3,
+/// AND add it to DISPATCHED_PROMISED — never silence the XOR assert by editing
+/// DISPATCHED_PROMISED alone. Members: 517 spawn_image (Zero-OS-private native), 264 renameat
+/// / 316 renameat2 (siblings of pledged 82 rename), 437 openat2 (sibling of pledged 257
+/// openat), 262 newfstatat (sibling of pledged 4/5/6 stat-family).
+const PRIVATE_NEVER_PLEDGED: &[u64] = &[262, 264, 316, 437, 517];
 
 fn rlimit_is_exempt(nr: u64) -> bool {
     INTENTIONAL_UNDISPATCHED.iter().any(|&(n, _)| n == nr)
@@ -7182,10 +7298,27 @@ pub fn run_pledge_dispatch_parity_self_test() {
             nr
         );
     }
-    assert!(
-        !union.contains(&517),
-        "M0-6: spawn_image(517) must not be pledge-able"
-    );
+    // R172-P6-F3: fence EVERY private/native arm out of the pledge union (the both-directions
+    // form), not just 517 — so the misleading-XOR fail-open trap is closed for the whole
+    // class (rename/openat/stat siblings), not just one number.
+    for &nr in PRIVATE_NEVER_PLEDGED {
+        assert!(
+            !union.contains(&nr),
+            "R172-P6-F3 fail-open seccomp escape: private/native syscall {} must NEVER be pledge-able",
+            nr
+        );
+    }
+    // Disjointness seal (the second direction): a private arm must NOT also be in
+    // DISPATCHED_PROMISED. If a misled engineer adds e.g. 264 to DISPATCHED_PROMISED to
+    // silence the XOR assert, THIS fires instead with a clear contradiction message,
+    // converting the misleading invitation into an explicit stop sign.
+    for &nr in PRIVATE_NEVER_PLEDGED {
+        assert!(
+            !DISPATCHED_PROMISED.contains(&nr),
+            "R172-P6-F3 contradiction: {} is in BOTH PRIVATE_NEVER_PLEDGED and DISPATCHED_PROMISED",
+            nr
+        );
+    }
 }
 
 /// M0-6: machine-check BPF<->semantic agreement (R150-3) + promise non-vacuity.
@@ -7228,10 +7361,23 @@ pub fn run_pledge_semantic_parity_self_test() {
 
 /// M0-6: rlimit data-model + validator self-test (pure).
 pub fn run_rlimit_self_test() {
-    use crate::process::{default_rlimits, RLimit, RLIMIT_NOFILE, RLIM_INFINITY};
+    use crate::process::{default_rlimits, RLimit, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY};
     let d = default_rlimits();
     assert_eq!(d[RLIMIT_NOFILE].rlim_cur, crate::process::MAX_FD as u64);
     assert_eq!(d[0].rlim_cur, RLIM_INFINITY); // CPU index = infinity
+                                              // M0-7: STACK soft limit reports the ACTUAL writable stack = reserved window minus
+                                              // the permanently-unmapped low guard page (must NOT overstate the mapped extent).
+    assert_eq!(
+        d[RLIMIT_STACK].rlim_cur,
+        (crate::elf_loader::USER_STACK_SIZE - crate::elf_loader::USER_STACK_GUARD_SIZE) as u64
+    );
+    // R172-X-F2: pin the limit to the single-sourced geometry helper so this test and the
+    // stack-window geometry test agree (a guard-size change moves both together).
+    assert_eq!(
+        d[RLIMIT_STACK].rlim_cur,
+        crate::elf_loader::USER_STACK_TOP - crate::elf_loader::user_stack_mapped_floor()
+    );
+    assert_eq!(d[RLIMIT_STACK].rlim_max, RLIM_INFINITY);
     let old = RLimit {
         rlim_cur: 100,
         rlim_max: 200,
@@ -8447,6 +8593,16 @@ fn sys_brk(addr: usize) -> SyscallResult {
         if addr >= USER_SPACE_TOP {
             return Ok(mm.brk);
         }
+        // M0-7 slice 2 (SLICE 1): a brk grow must never enter the reserved user-stack
+        // window [stack_base, USER_STACK_TOP) (guard-INCLUSIVE). sys_brk previously bounded
+        // ONLY on USER_SPACE_TOP (0x1FFFE000 ABOVE the window) — runtime-blind to the stack
+        // ceiling the elf_loader OverlapWithStack segment guards already enforce. The
+        // page-aligned new break (same `page_align_up(addr)` used to compute new_top below)
+        // must not exceed the window base. Refusal contract: return the break UNCHANGED
+        // (Linux brk-on-failure semantics), matching the USER_SPACE_TOP arm above.
+        if page_align_up(addr) > crate::elf_loader::user_stack_window().0 {
+            return Ok(mm.brk);
+        }
         // A sibling brk() on this shared MmState is mid-flight. Linux brk()
         // returns the current break on failure, so report it unchanged and let
         // the caller retry instead of racing the page tables.
@@ -9397,6 +9553,194 @@ pub fn run_recording_frame_allocator_split_self_test() {
     fa.deallocate_frame(p);
 }
 
+/// M0-7 slice 2 (SLICE 1): resolve an AUTO-selected (`addr==0`) mmap base so it SKIPS the
+/// reserved stack window instead of failing inside it. If `[candidate, candidate+length)`
+/// intersects `[win_start, win_end)`, advance to `win_end` (the tail gap above the window);
+/// otherwise keep the candidate. Pure → the boot self-test pins it without a live process.
+/// (Reachable via one large PROT_NONE reservation driving `next_mmap_addr` to the window —
+/// Codex impl-diff.)
+fn resolve_auto_mmap_base(
+    candidate: usize,
+    length: usize,
+    win_start: usize,
+    win_end: usize,
+) -> usize {
+    if candidate < win_end && candidate.saturating_add(length) > win_start {
+        win_end
+    } else {
+        candidate
+    }
+}
+
+/// M0-7 slice 2 (SLICE 1) self-test: pin the third-door stack-window exclusion logic used
+/// by `sys_mmap` (half-open `[base,end)` intersection) and `sys_brk` (`page_align_up(addr)
+/// > window_start`). PURE — it exercises the SAME `user_stack_window()` const + the SAME
+/// `page_align_up` the live paths use, so it cannot pass while the runtime checks drift
+/// (e.g. to the guard_top floor) or get the half-open boundary off-by-one (which would
+/// spuriously reject a legal mmap exactly at `USER_STACK_TOP`). It does NOT call sys_mmap /
+/// sys_brk (those need a live process + MmState; a boot self-test has neither schedulably).
+pub fn run_stack_window_exclusion_self_test() {
+    let (win_start, win_end) = crate::elf_loader::user_stack_window();
+    let page = 0x1000usize;
+
+    // The window is the GUARD-INCLUSIVE architectural range, never the guard_top floor.
+    let (stack_base, usable_base, _pc) = crate::elf_loader::user_stack_layout();
+    assert_eq!(
+        win_start, stack_base,
+        "window base MUST be the guard-INCLUSIVE stack_base, not guard_top/usable_base"
+    );
+    assert!(
+        win_start < usable_base,
+        "the guard page [stack_base, usable_base) MUST be inside the excluded window"
+    );
+    assert_eq!(
+        win_end,
+        crate::elf_loader::USER_STACK_TOP as usize,
+        "window end MUST be USER_STACK_TOP"
+    );
+
+    // sys_mmap half-open intersection: [base,end) is excluded iff base < win_end && end > win_start.
+    let mmap_excluded = |base: usize, end: usize| base < win_end && end > win_start;
+    // INSIDE the window: the guard page (stack_base), guard_top, and the topmost eager page.
+    assert!(
+        mmap_excluded(win_start, win_start + page),
+        "mmap AT stack_base (window low edge / guard page) must be excluded"
+    );
+    assert!(
+        mmap_excluded(usable_base, usable_base + page),
+        "mmap at guard_top (first mapped eager page) must be excluded"
+    );
+    assert!(
+        mmap_excluded(win_end - page, win_end),
+        "mmap at the topmost eager page must be excluded"
+    );
+    // BOUNDARY half-open exactness: a mapping ENDING exactly at stack_base (entirely below)
+    // and one STARTING exactly at USER_STACK_TOP (entirely above) are BOTH legal.
+    assert!(
+        !mmap_excluded(win_start - page, win_start),
+        "mmap ending exactly at stack_base (below the window) must be allowed"
+    );
+    assert!(
+        !mmap_excluded(win_end, win_end + page),
+        "mmap starting exactly at USER_STACK_TOP (above the window) must be allowed"
+    );
+
+    // R172-X-F3: sys_mprotect is the third page-permission door; pin it to the SAME
+    // single-sourced window const and the SAME half-open predicate as sys_mmap so it
+    // cannot drift to guard_top or flip the boundary independently.
+    let mprotect_rejects = |addr: usize, end: usize| addr < win_end && end > win_start;
+    assert!(
+        mprotect_rejects(win_start, win_start + page),
+        "mprotect AT stack_base (guard page) must be rejected"
+    );
+    assert!(
+        mprotect_rejects(usable_base, usable_base + page),
+        "mprotect at guard_top (first mapped eager page) must be rejected"
+    );
+    assert!(
+        mprotect_rejects(win_end - page, win_end),
+        "mprotect at the topmost eager page must be rejected"
+    );
+    assert!(
+        mprotect_rejects(win_start, win_end),
+        "mprotect spanning the whole window must be rejected"
+    );
+    assert!(
+        !mprotect_rejects(win_start - page, win_start),
+        "mprotect ending exactly at stack_base (below the window) must be allowed"
+    );
+    assert!(
+        !mprotect_rejects(win_end, win_end + page),
+        "mprotect starting exactly at USER_STACK_TOP (above the window) must be allowed"
+    );
+
+    // sys_brk ceiling: page_align_up(new_break) > window_start is rejected; == is allowed.
+    let brk_rejects = |addr: usize| page_align_up(addr) > win_start;
+    assert!(
+        !brk_rejects(win_start),
+        "brk grow to exactly window_start (heap entirely below the window) must be allowed"
+    );
+    assert!(
+        brk_rejects(win_start + 1),
+        "brk grow that page-rounds INTO the window must be rejected"
+    );
+    assert!(
+        brk_rejects(win_end - page),
+        "brk grow deep into the window must be rejected"
+    );
+
+    // Auto-placement (addr==0) SKIPS the window to the tail gap rather than a false ENOMEM
+    // inside it (the PROT_NONE-reservation reachability Codex flagged).
+    assert_eq!(
+        resolve_auto_mmap_base(win_start, page, win_start, win_end),
+        win_end,
+        "an auto base AT stack_base must skip to win_end (USER_STACK_TOP), not fail inside the window"
+    );
+    assert_eq!(
+        resolve_auto_mmap_base(win_start - page, page, win_start, win_end),
+        win_start - page,
+        "an auto base whose range stays entirely below the window is unchanged"
+    );
+    assert_eq!(
+        resolve_auto_mmap_base(win_end, page, win_start, win_end),
+        win_end,
+        "an auto base already AT the tail (== win_end) is unchanged (no double-skip)"
+    );
+    // A range starting below but CROSSING into the window also skips (large auto request).
+    assert_eq!(
+        resolve_auto_mmap_base(win_start - page, page * 4, win_start, win_end),
+        win_end,
+        "an auto range crossing into the window from below must skip to win_end"
+    );
+
+    // R172-16: the brk-grow VA reservation uses the SAME half-open intersection predicate
+    // as the mmap-overlap check, with `lo < hi` gating an ACTIVE reservation.
+    let resv_intersects =
+        |lo: usize, hi: usize, base: usize, end: usize| lo < hi && base < hi && end > lo;
+    let (r_lo, r_hi) = (0x1000_0000usize, 0x1000_4000usize); // a 4-page in-flight grow window
+    assert!(
+        resv_intersects(r_lo, r_hi, r_lo, r_lo + page),
+        "mmap at the reservation low edge must intersect (rejected)"
+    );
+    assert!(
+        resv_intersects(r_lo, r_hi, r_hi - page, r_hi),
+        "mmap at the reservation high edge must intersect (rejected)"
+    );
+    assert!(
+        !resv_intersects(r_lo, r_hi, r_lo - page, r_lo),
+        "mmap ending exactly at the reservation low edge is allowed"
+    );
+    assert!(
+        !resv_intersects(r_lo, r_hi, r_hi, r_hi + page),
+        "mmap starting exactly at the reservation high edge is allowed"
+    );
+    assert!(
+        !resv_intersects(0, 0, r_lo, r_hi),
+        "an inactive reservation (lo == hi) never intersects"
+    );
+
+    // R172-X-F2: the guard-EXCLUSIVE mapped floor MUST agree across all three geometry
+    // derivations — the new single-source helper, the layout usable_base, and
+    // window_start + GUARD — so no future site can re-derive a drifted floor (the green
+    // build alone cannot catch a geometry drift).
+    let floor = crate::elf_loader::user_stack_mapped_floor();
+    assert_eq!(
+        floor as usize, usable_base,
+        "mapped_floor() MUST equal user_stack_layout().1 (usable_base)"
+    );
+    assert_eq!(
+        floor as usize,
+        win_start + crate::elf_loader::USER_STACK_GUARD_SIZE,
+        "mapped_floor() MUST equal window_start + USER_STACK_GUARD_SIZE"
+    );
+    // The RLIMIT_STACK magnitude is exactly TOP - mapped_floor (the writable extent).
+    assert_eq!(
+        crate::elf_loader::USER_STACK_TOP - floor,
+        (crate::elf_loader::USER_STACK_SIZE - crate::elf_loader::USER_STACK_GUARD_SIZE) as u64,
+        "RLIMIT_STACK magnitude (TOP - mapped_floor) MUST equal SIZE - GUARD"
+    );
+}
+
 /// sys_mmap - 内存映射
 ///
 /// 使用当前进程的地址空间进行映射，确保进程隔离
@@ -9495,11 +9839,20 @@ fn sys_mmap(
                 .ok_or(SyscallError::EINVAL)?
                 & !0xfff;
             // Ensure we don't auto-select addresses below MMAP_MIN_ADDR
-            if candidate < crate::usercopy::MMAP_MIN_ADDR {
+            let candidate = if candidate < crate::usercopy::MMAP_MIN_ADDR {
                 crate::usercopy::MMAP_MIN_ADDR
             } else {
                 candidate
-            }
+            };
+            // M0-7 slice 2 (SLICE 1): auto-placement must SKIP the reserved stack window,
+            // not fail INSIDE it. A single large PROT_NONE reservation (no RAM, no cgroup
+            // charge) can advance next_mmap_addr up to the window base in ONE VMA (Codex
+            // impl-diff: reachable, not the theoretical 128-TiB case), so without this a
+            // later small auto-mmap would get a FALSE ENOMEM while the tail gap
+            // [USER_STACK_TOP, USER_SPACE_TOP) is still free. Jump past the window; an
+            // over-large request is still rejected by the USER_SPACE_TOP check below.
+            let (win_start, win_end) = crate::elf_loader::user_stack_window();
+            resolve_auto_mmap_base(candidate, length_aligned, win_start, win_end)
         } else {
             addr
         };
@@ -9523,6 +9876,30 @@ fn sys_mmap(
             return Err(SyscallError::EFAULT);
         }
 
+        // M0-7 slice 2 (SLICE 1): reject any mapping that intersects the reserved
+        // user-stack window [stack_base, USER_STACK_TOP) (guard-INCLUSIVE). This is the
+        // "third door": the checks above bound only on USER_SPACE_TOP (0x1FFFE000 ABOVE
+        // the window) and the overlap loop below scans only `mmap_regions` (the stack is
+        // NEVER inserted there — that would make free_address_space/munmap double-free it,
+        // R123-1), so a hinted OR MAP_FIXED mmap can currently land inside the stack window
+        // and alias it (and, once demand-grow lands, let a stack fault grow over an
+        // existing mapping). `base` here is the FINAL resolved address for BOTH the
+        // auto-select and the fixed arm, so this single half-open test covers both. The
+        // static architectural-constant check is TOCTOU-free (the window is a fixed VA
+        // range, not `mmap_regions` state).
+        {
+            // M0-7 slice 2 (SLICE 1): reject a user-specified FIXED/hinted address whose
+            // [base,end) intersects the reserved user-stack window [stack_base,
+            // USER_STACK_TOP) (guard-INCLUSIVE) — an invalid address (EINVAL). The
+            // auto-placement arm (addr==0) cannot reach this: `resolve_auto_mmap_base`
+            // already skipped the window above, so `base` is either below win_start or at
+            // win_end (==USER_STACK_TOP, not `< win_end`). Half-open intersection test.
+            let (win_start, win_end) = crate::elf_loader::user_stack_window();
+            if base < win_end && end > win_start {
+                return Err(SyscallError::EINVAL);
+            }
+        }
+
         // R130-1 FIX: Bound mmap_regions to prevent kernel heap exhaustion DoS.
         // Without this check, unlimited PROT_NONE (or normal) mmaps can grow
         // the BTreeMap until alloc_error_handler panics the kernel.
@@ -9539,6 +9916,19 @@ fn sys_mmap(
             if base < region_end && end > region_base {
                 return Err(SyscallError::EINVAL);
             }
+        }
+
+        // R172-16: a sibling sys_brk grow on this shared MmState (CLONE_VM / CLONE_THREAD)
+        // reserves its in-flight [old_top, new_top) heap-grow VA range here while it drops
+        // the MmState lock for page-table work. Reject any mmap intersecting that window
+        // (EINVAL, matching the existing-region and stack-window arms) so the brk grow
+        // cannot silently adopt this mapping's page into the heap. Read under this same
+        // Phase-1 MmState lock as a fixed VA range (TOCTOU-free); inactive ⇔ lo == hi.
+        if mm.brk_grow_resv_lo < mm.brk_grow_resv_hi
+            && base < mm.brk_grow_resv_hi
+            && end > mm.brk_grow_resv_lo
+        {
+            return Err(SyscallError::EINVAL);
         }
 
         // R147-I1 FIX: Charge cgroup memory BEFORE inserting PENDING_MAP entry.
@@ -10232,6 +10622,29 @@ fn sys_mprotect(addr: usize, len: usize, prot: i32) -> SyscallResult {
     let end = addr.checked_add(len_aligned).ok_or(SyscallError::EINVAL)?;
     if end > USER_SPACE_TOP {
         return Err(SyscallError::EINVAL);
+    }
+
+    // R172-X-F3: mprotect is the THIRD page-permission door. brk (sys_brk) and mmap
+    // (sys_mmap) both consume `user_stack_window()` to bar the reserved user-stack window
+    // [stack_base, USER_STACK_TOP) (guard-INCLUSIVE), but mprotect did NOT — its only stack
+    // protection was INCIDENTAL: the stack is mapped directly and intentionally never
+    // inserted into mmap_regions (R123-1 double-free avoidance), so the Phase-0 coverage
+    // loop below happens to hit coverage<end -> ENOMEM. That is an emergent side effect of
+    // two unrelated invariants, not an architectural guarantee — a future coverage
+    // relaxation, or any non-stack mmap_regions entry overlapping the window, would let
+    // mprotect flip stack/guard PTEs to PROT_EXEC-only or PROT_NONE (the W^X reject below
+    // blocks only literal W+X, not EXEC-only / PROT_NONE on the stack). Make stack/guard
+    // permission immutability STRUCTURAL via the SAME single-sourced half-open window and
+    // the SAME EINVAL the sys_mmap FIXED/hinted arm returns (an architecturally-reserved
+    // invalid VA, never a missing-mapping ENOMEM). TOCTOU-free (a fixed VA range, not
+    // mmap_regions state); `addr` is page-aligned and `end == addr + len_aligned`, both
+    // computed above; `len == 0` already returned Ok(0). Complementary to (not redundant
+    // with) the Phase-0 coverage<end ENOMEM gap-reject below.
+    {
+        let (win_start, win_end) = crate::elf_loader::user_stack_window();
+        if addr < win_end && end > win_start {
+            return Err(SyscallError::EINVAL);
+        }
     }
 
     // W^X 安全检查：禁止同时可写可执行
@@ -12263,25 +12676,96 @@ fn sys_unlink(path: *const u8) -> SyscallResult {
         }
     }
 
-    // LSM hook: check unlink permission
-    if let Some(proc_ctx) = lsm_current_process_ctx() {
-        let (parent_hash, name_hash) = match path_str.rfind('/') {
-            Some(0) => (audit::hash_path("/"), audit::hash_path(&path_str[1..])),
-            Some(idx) => (
-                audit::hash_path(&path_str[..idx]),
-                audit::hash_path(&path_str[idx + 1..]),
-            ),
-            None => (audit::hash_path("."), audit::hash_path(path_str)),
-        };
-        if let Err(err) = lsm::hook_file_unlink(&proc_ctx, parent_hash, name_hash) {
-            return Err(lsm_error_to_syscall(err));
-        }
-    }
-
-    // 通过回调删除文件
+    // R172-X-F4: the syscall-layer path-hash LSM prehook is REMOVED. VFS Manager::unlink
+    // fires hook_file_unlink ONCE with the revalidated parent inode (manager.rs:1219). The
+    // is_directory EISDIR guard above is a POSIX type check (not MAC) and stays.
     let unlink_fn = VFS_UNLINK_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
     unlink_fn(path_str)?;
     Ok(0)
+}
+
+// ===== M0-6 slice 2: rename(82) / renameat(264) / renameat2(316) =====
+
+/// renameat2 flags (Linux). Only RENAME_NOREPLACE is implemented this slice.
+const RENAME_NOREPLACE: u32 = 1;
+const RENAME_EXCHANGE: u32 = 2;
+const RENAME_WHITEOUT: u32 = 4;
+
+/// Copy both rename pathnames from user space (EFAULT on null/bad ptr).
+///
+/// M0 path-length note: `copy_user_cstring` caps at `MAX_CSTRING_LEN` (4096) and returns a
+/// generic Err for "no NUL within 4096 bytes", which is indistinguishable from a bad
+/// pointer, so a whole-path that exceeds PATH_MAX surfaces here as EFAULT (not
+/// ENAMETOOLONG) — a documented divergence shared by EVERY path syscall (open/stat/unlink/
+/// …). A per-COMPONENT name > 255 bytes still surfaces as ENAMETOOLONG via the fs mapper.
+fn copy_rename_paths(oldp: *const u8, newp: *const u8) -> Result<(Vec<u8>, Vec<u8>), SyscallError> {
+    if oldp.is_null() || newp.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    let old_bytes = crate::usercopy::copy_user_cstring(oldp).map_err(|_| SyscallError::EFAULT)?;
+    let new_bytes = crate::usercopy::copy_user_cstring(newp).map_err(|_| SyscallError::EFAULT)?;
+    Ok((old_bytes, new_bytes))
+}
+
+/// Shared rename core: copy the pathnames then invoke the VFS rename callback. R172-X-F4:
+/// the rename MAC decision lives ONLY at the VFS layer (Manager::rename, keyed on the
+/// REVALIDATED parent inodes under RAMFS_RENAME_LOCK — the coherent inode-identity object,
+/// consistent with the R172-15 bind). The former syscall-layer path-hash prehook
+/// double-keyed the decision (incoherent vs the VFS ino key) and double-emitted the audit
+/// record on denial; a denial now surfaces as the VFS error (EACCES).
+fn do_rename_str(old_str: &str, new_str: &str, noreplace: bool) -> SyscallResult {
+    let rename_fn = VFS_RENAME_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
+    rename_fn(old_str, new_str, noreplace)?;
+    Ok(0)
+}
+
+/// sys_rename(82) — POSIX rename. Resolves relative paths from "/" (no per-PCB cwd in M0).
+fn sys_rename(oldp: *const u8, newp: *const u8) -> SyscallResult {
+    let (old_bytes, new_bytes) = copy_rename_paths(oldp, newp)?;
+    let old_str = core::str::from_utf8(&old_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let new_str = core::str::from_utf8(&new_bytes).map_err(|_| SyscallError::EINVAL)?;
+    do_rename_str(old_str, new_str, false)
+}
+
+/// Both *at paths must be ABSOLUTE (no per-PCB cwd / dirfd-relative resolution in M0 —
+/// mirrors sys_openat's EOPNOTSUPP for a relative + non-AT_FDCWD path, extended to reject
+/// relative + AT_FDCWD too). Absolute paths ignore dirfd (Linux).
+fn rename_at_paths_absolute(old_str: &str, new_str: &str) -> Result<(), SyscallError> {
+    if !old_str.starts_with('/') || !new_str.starts_with('/') {
+        return Err(SyscallError::EOPNOTSUPP);
+    }
+    Ok(())
+}
+
+/// sys_renameat(264).
+fn sys_renameat(_olddirfd: i32, oldp: *const u8, _newdirfd: i32, newp: *const u8) -> SyscallResult {
+    let (old_bytes, new_bytes) = copy_rename_paths(oldp, newp)?;
+    let old_str = core::str::from_utf8(&old_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let new_str = core::str::from_utf8(&new_bytes).map_err(|_| SyscallError::EINVAL)?;
+    rename_at_paths_absolute(old_str, new_str)?;
+    do_rename_str(old_str, new_str, false)
+}
+
+/// sys_renameat2(316). RENAME_NOREPLACE implemented; EXCHANGE/WHITEOUT/unknown-bit => EINVAL.
+fn sys_renameat2(
+    _olddirfd: i32,
+    oldp: *const u8,
+    _newdirfd: i32,
+    newp: *const u8,
+    flags: u32,
+) -> SyscallResult {
+    if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
+        return Err(SyscallError::EINVAL); // unknown flag bit
+    }
+    if flags & (RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
+        return Err(SyscallError::EINVAL); // unimplemented (also rejects NOREPLACE|EXCHANGE)
+    }
+    let noreplace = flags & RENAME_NOREPLACE != 0;
+    let (old_bytes, new_bytes) = copy_rename_paths(oldp, newp)?;
+    let old_str = core::str::from_utf8(&old_bytes).map_err(|_| SyscallError::EINVAL)?;
+    let new_str = core::str::from_utf8(&new_bytes).map_err(|_| SyscallError::EINVAL)?;
+    rename_at_paths_absolute(old_str, new_str)?;
+    do_rename_str(old_str, new_str, noreplace)
 }
 
 /// sys_access - 检查文件访问权限
@@ -14802,6 +15286,25 @@ fn sys_cgroup_attach(cgroup_id: u64) -> Result<usize, SyscallError> {
     // so the membership move and the exec charge are mutually exclusive. The exec
     // window is bounded and self-clears → EAGAIN (retry) is the correct response.
     if proc.exec_in_progress {
+        return Err(SyscallError::EAGAIN);
+    }
+
+    // M0-7 item7 SLICE 4: refuse to re-home a task whose address space is mid
+    // `try_grow_user_stack`. The grow HARD-charges the grow DATA to its snapshot cgroup
+    // with the Process lock DROPPED for page-table work; migrating in that window would
+    // snapshot compute_cgroup_charged_bytes and could strand the in-flight lane on the
+    // snapshot cgroup. Checked here UNDER the held Process lock (briefly locking the
+    // MmState, canonical Process -> MmState order), BEFORE migrate_task, so the
+    // membership move and the grow are mutually exclusive. Bounded + self-clearing →
+    // EAGAIN (retry). Mirrors the exec_in_progress / brk reservation gates.
+    //
+    // NOTE: the cgroupfs `cgroup.procs` migration front-door (vfs/cgroupfs.rs) does NOT
+    // carry this gate — like brk (which gates NEITHER attach path), it relies on the
+    // pending lane: compute_cgroup_charged_bytes sums stack_grow_pending_bytes and the
+    // grow's rollback re-reads the current cgroup_id, so a migration there transfers the
+    // in-flight charge rather than stranding it (Codex SLICE-4: accounting-safe, only the
+    // transient-state POLICY is asymmetric; SLICE 5 may unify both front doors).
+    if proc.mm.lock().stack_grow_in_progress {
         return Err(SyscallError::EAGAIN);
     }
 
