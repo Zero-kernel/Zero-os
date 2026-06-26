@@ -401,6 +401,11 @@ pub fn test_user_stack_builder() {
     // aliasing the reserved stack window.
     kernel_core::syscall::run_stack_window_exclusion_self_test();
     klog_always!("    ✓ M0-7 slice 2 (SLICE 1): mmap/brk stack-window exclusion (guard-inclusive, half-open boundary exact)");
+    // M0-7 SLICE 3a: pin the naked timer-IRQ stub's IrqGprFrame layout against the asm
+    // push order. A size/offset drift would triple-fault on the first timer tick with no
+    // diagnostic; this offset_of! assertion localizes such a mis-wire to make test.
+    arch::interrupts::run_irq_gpr_frame_layout_self_test();
+    klog_always!("    ✓ M0-7 SLICE 3a: IrqGprFrame layout matches the timer-IRQ stub push order (r15@0..rax@0x70, size 0x78)");
 }
 
 /// 运行所有集成测试
