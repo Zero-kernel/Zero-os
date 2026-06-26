@@ -460,7 +460,18 @@ lazy_static! {
         idt.virtualization.set_handler_fn(virtualization_handler);
 
         // 硬件中断处理器 (32-255)
-        idt[32].set_handler_fn(timer_interrupt_handler);      // IRQ 0: Timer
+        // M0-7 SLICE 3a: the timer vector targets the naked GPR-saving stub (NOT an
+        // extern "x86-interrupt" fn) so the full user GPR set is captured for SLICE 3b's
+        // preemptive signal delivery. set_handler_addr installs the raw stub address; the
+        // gate type/DPL/present default to an interrupt gate (DPL 0), matching the other
+        // IRQ vectors. The stub does NO swapgs (the body is GS-independent — see the stub
+        // doc). All OTHER vectors + IST entries (NMI/#DF/page_fault) keep set_handler_fn.
+        // SAFETY: timer_interrupt_stub is a valid naked interrupt entry that saves/restores
+        // all GPRs and iretqs; its address is a real fn pointer in kernel .text.
+        unsafe {
+            idt[32].set_handler_addr(x86_64::VirtAddr::new(timer_interrupt_stub as u64));
+            // IRQ 0: Timer
+        }
         idt[33].set_handler_fn(keyboard_interrupt_handler);   // IRQ 1: Keyboard
         idt[36].set_handler_fn(serial_interrupt_handler);     // IRQ 4: Serial COM1
 
@@ -1233,7 +1244,126 @@ extern "x86-interrupt" fn virtualization_handler(_stack_frame: InterruptStackFra
 ///
 /// 注意：必须先发送 EOI 再执行抢占，避免上下文切换后 IRQ0 被屏蔽。
 /// 内核态中断不抢占，以避免持锁时发生调度。
-extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
+///
+/// # M0-7 SLICE 3a — naked GPR-saving entry stub (behavior-identical refactor)
+///
+/// The timer vector is registered to the naked `timer_interrupt_stub` (NOT the
+/// `extern "x86-interrupt"` ABI) so that the FULL user general-purpose register set
+/// (rax..r15) is captured on the stack and made available to the Rust body as
+/// `&mut IrqGprFrame`. SLICE 3b will consume those GPRs to build a signal frame for
+/// preemptive IRQ-return signal delivery; SLICE 3a adds NO new behavior — the body
+/// below is the former handler verbatim, reading the hardware frame via `isf`.
+///
+/// ## GS / CR3 invariant (LOAD-BEARING — do NOT add swapgs here)
+///
+/// This stub does **NO** `swapgs` and **NO** CR3 switch, exactly matching the prior
+/// `extern "x86-interrupt"` handler. The timer body is **GS-INDEPENDENT**: per-CPU
+/// access goes through `current_cpu_id()` (kernel/cpu_local/lib.rs — reads the LAPIC
+/// MMIO ID register, bits 31:24 of `lapic_mmio_base()+0x20`) and `CpuLocal`/atomic
+/// indexing, NOT `gs:[...]` (contrast the SYSCALL stub at arch/syscall.rs:942/1212,
+/// which DOES swapgs precisely because it uses `gs:[percpu_*]`). Adding swapgs here
+/// would be a behavior change AND a regression risk (returning to Ring-3 on the wrong
+/// GS if any path skipped the swap-out). INVARIANT FOR FUTURE EDITS: if the timer body
+/// is ever changed to access per-CPU data via `gs:[...]`, this stub MUST then adopt the
+/// full CS-RPL-gated swapgs (+lfence) + KPTI CR3 discipline of the syscall entry/exit
+/// stubs — until then it is intentionally absent. (Codex-confirmed, session 019efcb9.)
+#[unsafe(naked)]
+unsafe extern "C" fn timer_interrupt_stub() -> ! {
+    // Push the 15 general-purpose registers so the interrupted user (or kernel) GPR
+    // state is contiguous on the stack directly below the CPU-pushed InterruptStackFrame.
+    // PUSH ORDER (must match IrqGprFrame field order EXACTLY — pinned by
+    // irq_gpr_frame_layout_self_test): rax FIRST => highest address (just below the HW
+    // frame); r15 LAST => lowest address == &IrqGprFrame. RSP itself is NOT pushed (it is
+    // sourced from the HW InterruptStackFrame.stack_pointer by the body).
+    //
+    // The timer vector (32) is an interrupt gate with NO error code, so the HW frame
+    // (5 words: RIP/CS/RFLAGS/RSP/SS) sits at [rsp + IRQ_GPR_FRAME_BYTES] after all GPRs
+    // are pushed, and the CS word is at [rsp + IRQ_GPR_FRAME_BYTES + 8].
+    core::arch::naked_asm!(
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        // rdi = &mut IrqGprFrame (current rsp, r15 at the lowest address).
+        "mov rdi, rsp",
+        // rsi = &mut InterruptStackFrameValue (just above the pushed GPRs).
+        "lea rsi, [rsp + {gpr_bytes}]",
+        // Align the stack to 16 bytes for the SysV C call (preserve the real rsp in rbp).
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "call {body}",
+        "mov rsp, rbp",
+        // Restore in reverse push order.
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        "iretq",
+        gpr_bytes = const IRQ_GPR_FRAME_BYTES,
+        body = sym timer_interrupt_body,
+    );
+}
+
+/// M0-7 SLICE 3a: the interrupted general-purpose register file, laid out to match the
+/// `timer_interrupt_stub` push order (rax pushed first => highest address; r15 pushed
+/// last => lowest address, which is where `&IrqGprFrame` points). `#[repr(C)]` fixes the
+/// field order; `irq_gpr_frame_layout_self_test` asserts every `offset_of!` against the
+/// push offsets so a mis-wire fails `make test` instead of triple-faulting silently.
+#[repr(C)]
+pub struct IrqGprFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+}
+
+/// Byte size of the pushed GPR block (15 × 8 = 120 = 0x78). The stub uses this as the
+/// offset from the saved GPRs to the CPU-pushed InterruptStackFrame.
+const IRQ_GPR_FRAME_BYTES: usize = 0x78;
+
+/// M0-7 SLICE 3a: the timer IRQ Rust body, called by `timer_interrupt_stub` with the
+/// saved GPR file and the hardware InterruptStackFrame. This is the former
+/// `timer_interrupt_handler` body VERBATIM (the hardware frame is read via `isf` instead
+/// of the `extern "x86-interrupt"` `stack_frame` argument). `_gpr` is unused in 3a; SLICE
+/// 3b consumes it to build a preemptive signal frame.
+extern "C" fn timer_interrupt_body(
+    _gpr: &mut IrqGprFrame,
+    isf: &mut x86_64::structures::idt::InterruptStackFrameValue,
+) {
+    let stack_frame = isf;
     // S-6 fix: Immediately restore SMAP protection
     clac_if_smap();
 
@@ -1399,6 +1529,41 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
 
     // R69-3 FIX: Mark leaving IRQ context
     current_cpu().irq_exit();
+}
+
+/// M0-7 SLICE 3a self-test: pin the `IrqGprFrame` layout against the
+/// `timer_interrupt_stub` push order. A mismatch between the asm push sequence and the
+/// `#[repr(C)]` field order would make the body read the WRONG register (and SLICE 3b
+/// would build a corrupt signal frame) — but worse, a size/offset drift triple-faults
+/// the kernel on the very first timer tick with no diagnostic. This boot-time
+/// `offset_of!` assertion is the only defense that localizes such a mis-wire. Pure.
+pub fn run_irq_gpr_frame_layout_self_test() {
+    use core::mem::{offset_of, size_of};
+    // Push order: rax FIRST (highest addr), r15 LAST (lowest addr == &IrqGprFrame).
+    // So r15 is at offset 0 and rax is at offset 0x70 (14 * 8).
+    assert_eq!(offset_of!(IrqGprFrame, r15), 0x00, "r15 offset");
+    assert_eq!(offset_of!(IrqGprFrame, r14), 0x08, "r14 offset");
+    assert_eq!(offset_of!(IrqGprFrame, r13), 0x10, "r13 offset");
+    assert_eq!(offset_of!(IrqGprFrame, r12), 0x18, "r12 offset");
+    assert_eq!(offset_of!(IrqGprFrame, r11), 0x20, "r11 offset");
+    assert_eq!(offset_of!(IrqGprFrame, r10), 0x28, "r10 offset");
+    assert_eq!(offset_of!(IrqGprFrame, r9), 0x30, "r9 offset");
+    assert_eq!(offset_of!(IrqGprFrame, r8), 0x38, "r8 offset");
+    assert_eq!(offset_of!(IrqGprFrame, rbp), 0x40, "rbp offset");
+    assert_eq!(offset_of!(IrqGprFrame, rdi), 0x48, "rdi offset");
+    assert_eq!(offset_of!(IrqGprFrame, rsi), 0x50, "rsi offset");
+    assert_eq!(offset_of!(IrqGprFrame, rdx), 0x58, "rdx offset");
+    assert_eq!(offset_of!(IrqGprFrame, rcx), 0x60, "rcx offset");
+    assert_eq!(offset_of!(IrqGprFrame, rbx), 0x68, "rbx offset");
+    assert_eq!(offset_of!(IrqGprFrame, rax), 0x70, "rax offset");
+    // The whole block is exactly 15 GPRs, and the stub's offset constant must match.
+    assert_eq!(size_of::<IrqGprFrame>(), 0x78, "IrqGprFrame size");
+    assert_eq!(IRQ_GPR_FRAME_BYTES, 0x78, "IRQ_GPR_FRAME_BYTES");
+    assert_eq!(
+        size_of::<IrqGprFrame>(),
+        IRQ_GPR_FRAME_BYTES,
+        "IrqGprFrame size must equal the stub's GPR-block byte offset"
+    );
 }
 
 /// IRQ 1 - Keyboard Interrupt (键盘中断)
