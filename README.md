@@ -1,8 +1,13 @@
 [Switch to Chinese (切换到中文)](README_zh.md)
 
-# Zero-OS
+# Nilix
 
 A security-first hybrid microkernel operating system written in Rust for the x86_64 architecture.
+
+> **Nilix** is a recursive acronym — **N**ilix **I**s **L**inux **I**ndependent e**X**istence — in the
+> self-referential naming tradition of GNU and Linux. The name captures the positioning: Linux-*compatible*
+> (a byte-exact syscall ABI runs a real musl libc binary unmodified) yet Linux-*independent* (its own
+> from-scratch Rust kernel, not a fork).
 
 **Design Principle:** Security > Correctness > Efficiency > Performance
 
@@ -10,7 +15,7 @@ A security-first hybrid microkernel operating system written in Rust for the x86
 
 ## 1. Overview
 
-Zero-OS is an enterprise-grade hybrid kernel inspired by Linux's modular design, hardened
+Nilix is an enterprise-grade hybrid kernel inspired by Linux's modular design, hardened
 through **172 successive security-audit rounds**. It pairs a capability- and LSM-gated
 in-kernel hot path with a roadmap toward a de-privileged Linux-compatible user-space
 personality.
@@ -50,7 +55,7 @@ after the R172 audit + same-day remediation. See [Section 6](#6-security-audit-s
 | IOMMU / VT-d | 🟡 Infrastructure | Full Intel VT-d driver (DMA isolation, IRQ remapping, fault handling); DMAR discovery wiring pending |
 | Live Patching | 🟡 Infrastructure | ECDSA P-256 signed kpatch, INT3 detour, fail-closed LSM gate |
 | User Mode & ABI (Phase U / M0) | 🟡 In Progress | Ring 3, 100+ Linux syscalls, SysV auxv, signal delivery, static-musl libc runs end-to-end |
-| CI & Quality Gates | ✅ Complete | GitHub Actions (fmt/clippy, build, lint, boot+musl), custom lint gates, remote pre-push hook |
+| CI & Quality Gates | ✅ Complete | GitHub Actions (fmt/clippy, build, lint, boot+musl), custom lint gates, local-first pre-push hook with optional SSH offload |
 
 ---
 
@@ -60,7 +65,7 @@ The kernel is a Cargo workspace of focused crates (`kernel/<subsystem>/`), each 
 concern. The bootloader and the user-space programs are separate build units.
 
 ```text
-Zero-OS/
+Nilix/
 ├── bootloader/             # UEFI bootloader: ELF load, relocation (PIE), high-half paging, KASLR slide
 ├── kernel/
 │   ├── arch/               # x86_64: IDT/exceptions, context switch, SYSCALL/SYSRET, GDT/TSS, APIC, SMP, IPI, INVPCID
@@ -92,7 +97,7 @@ Zero-OS/
 ├── scripts/                # CI gate scripts: boot_check.sh, musl_check.sh, smp_check.sh, iommu_check.sh, …
 ├── docs/                   # roadmap.md, roadmap-enterprise.md, next-phase-plan.md, review/ (QA reports)
 ├── .github/workflows/ci.yml  # GitHub Actions pipeline
-├── .githooks/pre-push      # Remote fmt + clippy gate
+├── .githooks/pre-push      # Local-first fmt + clippy gate (optional SSH offload)
 └── Makefile                # Build / run / lint / gate targets
 ```
 
@@ -242,8 +247,8 @@ and hardware RNG are exercised by default. Run `make help` for the full target l
 
 ## 5. Continuous Integration & Quality Gates
 
-Zero-OS enforces correctness, style, and boot health automatically. All build/test commands run
-on a Linux build host (the local checkout is a read-only mirror).
+Nilix enforces correctness, style, and boot health automatically — the same gates run in CI, and
+contributors can run them locally (the maintainer's Windows mirror offloads to a Linux build host).
 
 ### 5.1 GitHub Actions (`.github/workflows/ci.yml`)
 
@@ -290,16 +295,17 @@ Lightweight grep-based gates that catch regressions the compiler can't:
   `rustfmt.toml` pins `newline_style = "Windows"` because the repo stores CRLF blobs.
 - **`make clippy`** — clippy across all three build units (bootloader, kernel, userspace) in
   isolated target dirs; deny-by-default correctness errors fail the build.
-- **`.githooks/pre-push`** — opt-in (`git config core.hooksPath .githooks`). Because the local
-  Windows mirror has no toolchain, the hook SSHes to the build host and runs `make fmt-check`
-  + `make clippy` against the mirrored tree before each push. Bypass a single push with
-  `SKIP_PREPUSH=1 git push`.
+- **`.githooks/pre-push`** — opt-in (`make hooks`). The hook is **local-first**: it runs
+  `make fmt-check` + `make clippy` locally when a Rust toolchain is present, and can offload
+  over SSH for a toolchain-less mirror (`git config zeroos.remote`/`zeroos.remoteDir`). Bypass
+  a single push with `SKIP_PREPUSH=1 git push`. A pre-commit-framework equivalent
+  (`.pre-commit-config.yaml`) is also provided — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
 ## 6. Security Audit Status
 
-Zero-OS is developed under a continuous adversarial-review process: each round audits the
+Nilix is developed under a continuous adversarial-review process: each round audits the
 kernel, files findings by severity, fixes them, and converges via bidirectional peer review
 (Claude Code + the Codex MCP) before the round closes.
 
@@ -352,10 +358,15 @@ See [docs/roadmap.md](docs/roadmap.md) and
 
 ## 8. Contributing
 
-1. Run `make build`, `make lint`, `make boot-check`, and (for ABI changes) `make musl-check`
-   before pushing; the pre-push hook additionally runs `fmt-check` + `clippy`.
-2. New features need documentation updates; bug fixes should include regression tests
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full setup (toolchain, hooks, PR flow). In short:
+
+1. Contributors with a local Rust toolchain build, lint, and test locally — exactly what CI
+   does. (The maintainer's Windows mirror has no toolchain and offloads to a Linux build host.)
+2. Run `make build`, `make lint`, `make boot-check`, and (for ABI changes) `make musl-check`
+   before pushing; enable the pre-push `fmt-check` + `clippy` hook with `make hooks`.
+3. New features need documentation updates; bug fixes should include regression tests
    (the kernel runs in-kernel self-tests on boot).
+4. Git commits are manual — nothing is auto-committed or auto-pushed.
 
 ---
 

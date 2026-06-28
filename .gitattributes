@@ -1,0 +1,9 @@
+# Keep shell scripts and Git hooks LF so /bin/sh runs them on Linux/macOS
+# regardless of a contributor's core.autocrlf setting (a CRLF hook fails with
+# "/bin/sh^M: bad interpreter").
+#
+# Deliberately scoped: the rest of the repo intentionally uses CRLF blobs
+# (rustfmt is pinned to newline_style = "Windows"), so this does NOT set
+# `* text=auto` — Rust sources are left untouched.
+.githooks/** text eol=lf
+*.sh         text eol=lf

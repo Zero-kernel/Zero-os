@@ -1,41 +1,103 @@
 #!/bin/sh
 #
-# Zero-OS pre-push hook — run `cargo fmt --check` + `cargo clippy` before every push.
+# Nilix pre-push hook — run `cargo fmt --check` + `cargo clippy` before every push.
 #
-# The local Windows mirror has no Rust toolchain, so the checks run on the remote
-# build host (the project's authoritative build environment) over SSH.
+# Resolution order:
+#   1. SKIP_PREPUSH=1              -> skip
+#   2. local `cargo` present       -> run `make fmt-check` + `make clippy` locally
+#   3. else a remote is configured -> run the same checks over SSH (toolchain-less mirror)
+#   4. else                        -> warn + skip (CI remains the gate)
 #
-# Enable once per clone:   git config core.hooksPath .githooks
-# Bypass a single push:    SKIP_PREPUSH=1 git push
+# Enable this hook once per clone:
+#   git config --local core.hooksPath .githooks      (or: make hooks)
 #
-# Override the target via env if your setup differs:
-#   ZEROOS_REMOTE       SSH host alias        (default: 40c-devbox-ts)
-#   ZEROOS_REMOTE_DIR   repo path on remote   (default: /home/dev/workspace/project/rsproject/Zero-os)
+# Bypass a single push:
+#   SKIP_PREPUSH=1 git push
 #
-# Note: the checks run against the remote's working tree, which mirrors local via
-# the project's dual-write rule. If they can drift, sync the remote before pushing.
+# Optional remote offload — used ONLY when no local `cargo` is found (e.g. a
+# Windows mirror with no toolchain). Configure BOTH of:
+#   git config zeroos.remote     <ssh-host-alias>
+#   git config zeroos.remoteDir  <repo-path-on-that-host>
+# Environment variables override git config (and win even when set empty, so
+# `ZEROOS_REMOTE= git push` temporarily disables offload):
+#   ZEROOS_REMOTE        ZEROOS_REMOTE_DIR
+#
+# Note: remote offload validates the REMOTE working tree, not your local one;
+# keep the mirror in sync before pushing.
 
 set -e
 
-if [ -n "$SKIP_PREPUSH" ]; then
-	echo "[pre-push] skipped (SKIP_PREPUSH set)"
+say()  { printf '%s\n' "[pre-push] $*"; }
+warn() { printf '%s\n' "[pre-push] WARN: $*" >&2; }
+fail() { printf '%s\n' "[pre-push] FAILED: $*" >&2; exit 1; }
+
+# POSIX single-quote a string so it can be embedded safely in a remote command.
+shquote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+run_local() {
+	if ! command -v make >/dev/null 2>&1; then
+		warn "found local 'cargo' but no 'make'; skipping fmt-check/clippy (install GNU make — CI will still enforce them)."
+		exit 0
+	fi
+	say "running fmt-check + clippy locally (SKIP_PREPUSH=1 to bypass)..."
+	if make fmt-check && make clippy; then
+		say "OK — cargo fmt + clippy clean."
+		exit 0
+	fi
+	fail "fmt-check/clippy failed; fix the issues, or bypass with: SKIP_PREPUSH=1 git push"
+}
+
+run_remote() {
+	alias_host=$1
+	remote_dir=$2
+	# `$HOME`/`$PATH` are escaped so they expand on the REMOTE, not locally.
+	remote_cmd="export PATH=\$HOME/.cargo/bin:\$PATH; cd $(shquote "$remote_dir") && make fmt-check && make clippy"
+	say "no local 'cargo'; running fmt-check + clippy on '$alias_host' (can take a few minutes; SKIP_PREPUSH=1 to bypass)..."
+	if ssh -n "$alias_host" "sh -c $(shquote "$remote_cmd")"; then
+		say "OK — cargo fmt + clippy clean (remote)."
+		exit 0
+	fi
+	fail "remote fmt-check/clippy failed on '$alias_host'; fix the issues (sync the mirror first), or bypass with: SKIP_PREPUSH=1 git push"
+}
+
+# 1) explicit bypass
+if [ -n "${SKIP_PREPUSH:-}" ]; then
+	say "skipped (SKIP_PREPUSH set)"
+	exit 0
+fi
+
+# 2) local toolchain — the path every contributor can use
+if command -v cargo >/dev/null 2>&1; then
+	run_local
+fi
+
+# 3) no local cargo: offload to a configured remote, if any.
+#    env var wins even when set-but-empty; otherwise fall back to git config.
+if [ "${ZEROOS_REMOTE+x}" = x ]; then
+	remote_alias=$ZEROOS_REMOTE
+elif ! remote_alias=$(git config --local --get zeroos.remote 2>/dev/null); then
+	remote_alias=
+fi
+
+if [ -z "$remote_alias" ]; then
+	warn "no local 'cargo' and no remote configured (set 'git config zeroos.remote <host>'); skipping fmt-check/clippy (CI will enforce)."
+	exit 0
+fi
+
+if [ "${ZEROOS_REMOTE_DIR+x}" = x ]; then
+	remote_dir=$ZEROOS_REMOTE_DIR
+elif ! remote_dir=$(git config --local --get zeroos.remoteDir 2>/dev/null); then
+	remote_dir=
+fi
+
+if [ -z "$remote_dir" ]; then
+	warn "remote '$remote_alias' is configured but no remote dir is set (set 'git config zeroos.remoteDir <path>'); skipping fmt-check/clippy (CI will enforce)."
 	exit 0
 fi
 
 if ! command -v ssh >/dev/null 2>&1; then
-	echo "[pre-push] WARN: 'ssh' not found locally; skipping remote fmt/clippy (CI will enforce them)." >&2
+	warn "remote '$remote_alias' is configured but 'ssh' is unavailable; skipping fmt-check/clippy (CI will enforce)."
 	exit 0
 fi
 
-REMOTE_ALIAS="${ZEROOS_REMOTE:-40c-devbox-ts}"
-REMOTE_DIR="${ZEROOS_REMOTE_DIR:-/home/dev/workspace/project/rsproject/Zero-os}"
-
-echo "[pre-push] running fmt-check + clippy on '$REMOTE_ALIAS' (this can take a few minutes; SKIP_PREPUSH=1 to bypass)..."
-
-if ssh "$REMOTE_ALIAS" "export PATH=\$HOME/.cargo/bin:\$PATH; cd '$REMOTE_DIR' && make fmt-check && make clippy"; then
-	echo "[pre-push] OK — cargo fmt + clippy clean."
-	exit 0
-else
-	echo "[pre-push] FAILED — fix fmt/clippy issues, or override with: SKIP_PREPUSH=1 git push" >&2
-	exit 1
-fi
+run_remote "$remote_alias" "$remote_dir"

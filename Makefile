@@ -1,4 +1,4 @@
-.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint boot-check musl-check fmt fmt-check clippy
+.PHONY: all build build-shell run run-shell run-shell-gui run-blk run-blk-serial run-smp run-smp-debug clean lint-release lint-smap lint-fetch-add lint-repr-c-copy lint boot-check musl-check fmt fmt-check clippy hooks
 
 OVMF_PATH = $(shell \
 	if [ -f /usr/share/qemu/OVMF.fd ]; then \
@@ -468,12 +468,19 @@ lint-repr-c-copy:
 lint: lint-release lint-smap lint-fetch-add lint-repr-c-copy
 
 # ──────────────────────────────────────────────────────────────────────────
-# Code-style + clippy gates. Run on the build host (the local Windows mirror
-# has no toolchain). CI runs these on every push/PR, and .githooks/pre-push
-# runs `fmt-check` + `clippy` on the remote before each push. Enable the hook:
-#     git config core.hooksPath .githooks
+# Code-style + clippy gates — plain local cargo, exactly what CI runs.
+# `make fmt-check` / `make clippy` need a local Rust toolchain (see
+# CONTRIBUTING.md). The .githooks/pre-push hook runs them automatically before
+# each push: locally when a toolchain is present, or offloaded over SSH for a
+# toolchain-less mirror. Enable it with `make hooks` (or the pre-commit
+# framework via .pre-commit-config.yaml — pick ONE, see CONTRIBUTING.md).
 # rustfmt.toml pins newline_style=Windows (the repo is CRLF) so fmt is stable.
 # ──────────────────────────────────────────────────────────────────────────
+
+# Enable the repo's pre-push hook (runs fmt-check + clippy before each push).
+hooks:
+	git config --local core.hooksPath .githooks
+	@echo "OK: pre-push hook enabled (core.hooksPath=.githooks). Bypass once with: SKIP_PREPUSH=1 git push"
 
 # Auto-format every crate: the workspace (bootloader + kernel and its path-dep
 # sub-crates) plus the workspace-excluded userspace crate.

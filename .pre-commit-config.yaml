@@ -1,0 +1,34 @@
+# pre-commit framework config (https://pre-commit.com) — an ALTERNATIVE to the
+# .githooks/pre-push shell hook, for contributors who have a local Rust toolchain.
+#
+# Use EITHER this OR `make hooks` (the shell hook), not both: with
+# core.hooksPath=.githooks set, Git ignores .git/hooks, so `pre-commit install`
+# would silently never run. See CONTRIBUTING.md.
+#
+# Setup:
+#   pip install pre-commit
+#   git config --unset core.hooksPath 2>/dev/null || true   # only if `make hooks` was run before
+#   pre-commit install                  # wires the pre-commit + pre-push stages
+#
+# Bypass once:  git push --no-verify    (or, per-hook:  SKIP=clippy git push)
+#
+# Both hooks call the same `make` targets CI runs, so the checks stay in parity.
+minimum_pre_commit_version: "3.2.0"
+default_install_hook_types: [pre-commit, pre-push]
+
+repos:
+  - repo: local
+    hooks:
+      - id: fmt-check
+        name: cargo fmt --check (make fmt-check)
+        entry: make fmt-check
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: clippy
+        name: cargo clippy (make clippy)
+        entry: make clippy
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
