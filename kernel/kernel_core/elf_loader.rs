@@ -41,6 +41,19 @@ pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_E000;
 /// 用户栈保留窗口大小（默认 2MB，含低端 1 页守护）
 pub const USER_STACK_SIZE: usize = 0x20_0000;
 
+/// M0-7 SLICE 5: Eager-mapped top region size (16 KB = 4 pages).
+///
+/// The top of the user stack is eagerly mapped to back initial stack usage
+/// (argc/argv/envp/auxv in build_initial_user_stack, signal frames in
+/// maybe_deliver_signal, IRQ signal delivery). The rest of the stack window
+/// grows on-demand via #PF.
+///
+/// Rationale for 16KB:
+/// - Enough for typical initial stack usage (few KB)
+/// - Small enough to make lazy region useful
+/// - Page-aligned for clean geometry
+pub const USER_STACK_EAGER_SIZE: usize = 16 * 1024; // 16 KB = 4 pages
+
 /// M0-7: 用户栈低端永久未映射的守护页大小（1×4 KiB）。
 ///
 /// 栈向下溢出落入该页 → not-present 的用户态写缺页 → 经 `interrupts.rs` 既有的
@@ -831,23 +844,31 @@ fn load_segment_tracked(
     Ok((charge_bytes, frame_alloc.take_pt_frames()))
 }
 
-/// M0-7: the eager user-stack map geometry — the SINGLE source of truth for BOTH the
-/// loader (`allocate_user_stack_tracked`) and `run_user_stack_guard_range_self_test`,
-/// so the test cannot drift from the real map-loop bounds.
+/// M0-7 SLICE 5: the user-stack map geometry — SINGLE source of truth for BOTH the
+/// loader (`allocate_user_stack_tracked`) and tests.
 ///
-/// Returns `(stack_base, usable_base, page_count)`:
-/// * `stack_base`  — architectural low boundary of the reserved window
+/// Returns `(stack_base, usable_base, eager_floor, eager_page_count)`:
+/// * `stack_base`        — architectural low boundary of the reserved window
 ///   (`USER_STACK_TOP - USER_STACK_SIZE`); brk/segments are barred below it.
-/// * `usable_base` — `stack_base + USER_STACK_GUARD_SIZE`, the lowest *mapped* VA;
-///   `[stack_base, usable_base)` is the permanently-UNMAPPED guard page.
-/// * `page_count`  — `(USER_STACK_SIZE - USER_STACK_GUARD_SIZE) / PAGE_SIZE` eager pages
-///   mapped upward from `usable_base`; the topmost ends EXACTLY at `USER_STACK_TOP`
-///   (nothing is mapped above the window — the old `+1` anti-guard is gone).
-pub(crate) const fn user_stack_layout() -> (usize, usize, usize) {
+/// * `usable_base`       — `stack_base + USER_STACK_GUARD_SIZE`, the lowest VA that
+///   COULD be mapped (guard is unmapped); the lazy region base.
+/// * `eager_floor`       — `USER_STACK_TOP - USER_STACK_EAGER_SIZE`, the lowest
+///   EAGERLY-mapped VA; the eager region base.
+/// * `eager_page_count`  — `USER_STACK_EAGER_SIZE / PAGE_SIZE` (4 pages = 16KB)
+///   eagerly mapped downward from `USER_STACK_TOP`.
+///
+/// Geometry:
+/// ```
+/// [stack_base, usable_base)         — UNMAPPED guard page (4KB)
+/// [usable_base, eager_floor)        — LAZY region (demand-grow on #PF)
+/// [eager_floor, USER_STACK_TOP)     — EAGER region (mapped at exec)
+/// ```
+pub(crate) const fn user_stack_layout() -> (usize, usize, usize, usize) {
     let stack_base = USER_STACK_TOP as usize - USER_STACK_SIZE;
     let usable_base = stack_base + USER_STACK_GUARD_SIZE;
-    let page_count = (USER_STACK_SIZE - USER_STACK_GUARD_SIZE) / PAGE_SIZE;
-    (stack_base, usable_base, page_count)
+    let eager_floor = USER_STACK_TOP as usize - USER_STACK_EAGER_SIZE;
+    let eager_page_count = USER_STACK_EAGER_SIZE / PAGE_SIZE;
+    (stack_base, usable_base, eager_floor, eager_page_count)
 }
 
 /// M0-7 slice 2 (SLICE 1+2): the SINGLE SOURCE of the architectural user-stack window
@@ -920,30 +941,32 @@ pub(crate) fn stack_grow_floor(rlim_cur: u64) -> usize {
 /// "anti-guard" (a page above `USER_STACK_TOP`) or a forgotten guard carve fails
 /// `make test`. Pure — exercises the loader's own `user_stack_layout` helper.
 pub fn run_user_stack_guard_range_self_test() {
-    let (stack_base, usable_base, page_count) = user_stack_layout();
+    let (stack_base, usable_base, eager_floor, eager_page_count) = user_stack_layout();
     // The guard is exactly ONE page at the window's low end.
     assert_eq!(
         usable_base - stack_base,
         USER_STACK_GUARD_SIZE,
         "guard page must be exactly USER_STACK_GUARD_SIZE at the window low end"
     );
-    // Exactly (window - guard) pages are eagerly mapped (511 for the default geometry).
+    // M0-7 SLICE 5: Exactly USER_STACK_EAGER_SIZE / PAGE_SIZE pages are eagerly mapped (4 pages = 16KB).
     assert_eq!(
-        page_count,
-        (USER_STACK_SIZE - USER_STACK_GUARD_SIZE) / PAGE_SIZE,
-        "eager page_count must be (USER_STACK_SIZE - guard)/PAGE_SIZE"
+        eager_page_count,
+        USER_STACK_EAGER_SIZE / PAGE_SIZE,
+        "eager page_count must be USER_STACK_EAGER_SIZE / PAGE_SIZE"
     );
-    // The topmost eager page ends EXACTLY at USER_STACK_TOP — nothing maps above the
-    // window (proves the dead +1 anti-guard is gone).
+    // M0-7 SLICE 5: The topmost eager page ends EXACTLY at USER_STACK_TOP.
+    // The eager region is [eager_floor, USER_STACK_TOP).
     assert_eq!(
-        usable_base + page_count * PAGE_SIZE,
+        eager_floor + eager_page_count * PAGE_SIZE,
         USER_STACK_TOP as usize,
         "top eager page must end exactly at USER_STACK_TOP (no page above the window)"
     );
-    // The whole eager map stays strictly inside the reserved window, above the guard.
+    // M0-7 SLICE 5: The eager map stays strictly inside the reserved window.
+    // The eager region [eager_floor, USER_STACK_TOP) is above the guard and below USER_STACK_TOP.
     assert!(
         usable_base == stack_base + USER_STACK_GUARD_SIZE
-            && usable_base + page_count * PAGE_SIZE <= USER_STACK_TOP as usize,
+            && eager_floor >= usable_base
+            && eager_floor + eager_page_count * PAGE_SIZE <= USER_STACK_TOP as usize,
         "eager stack map must lie within (stack_base+guard .. USER_STACK_TOP]"
     );
 }
@@ -964,18 +987,12 @@ fn allocate_user_stack_tracked(
     tracked: &mut Vec<MappedEntry>,
     cgroup_id: cgroup::CgroupId,
 ) -> Result<(u64, Vec<PhysFrame<Size4KiB>>), ElfLoadError> {
-    // M0-7: single source of truth for the eager map geometry (also pinned by
-    // `run_user_stack_guard_range_self_test`). The window's low page
-    // `[stack_base, usable_base)` is the permanently-UNMAPPED guard; we map `page_count`
-    // (=511) pages upward from `usable_base`, the topmost ending EXACTLY at
-    // USER_STACK_TOP. The old `+1` "anti-guard" page above the top is GONE —
-    // `build_initial_user_stack` writes strictly below `USER_STACK_TOP-16`, so nothing
-    // above the window is ever needed, and there is now a real guard BELOW the stack.
-    let (_, usable_base, page_count) = user_stack_layout();
+    // M0-7 SLICE 5: Map only the EAGER top region (16KB = 4 pages). The rest of the
+    // stack window grows on-demand via #PF handler. The guard page remains unmapped.
+    let (_, usable_base, eager_floor, eager_page_count) = user_stack_layout();
 
-    // R93-6 FIX: Pre-charge memory for user stack.
-    // This enforces cgroup memory limits for stack allocation.
-    let charge_bytes = (page_count * PAGE_SIZE) as u64;
+    // R93-6 FIX: Pre-charge memory for eager stack region only.
+    let charge_bytes = (eager_page_count * PAGE_SIZE) as u64;
     if cgroup::try_charge_memory(cgroup_id, charge_bytes).is_err() {
         klog!(
             Error,
@@ -1003,8 +1020,10 @@ fn allocate_user_stack_tracked(
 
     let map_result = unsafe {
         page_table::with_current_manager(VirtAddr::new(0), |mgr| -> Result<(), ElfLoadError> {
-            for i in 0..page_count {
-                let va = VirtAddr::new((usable_base + i * PAGE_SIZE) as u64);
+            // M0-7 SLICE 5: Map eager_page_count pages starting at eager_floor
+            // (the top of the stack, growing downward toward usable_base)
+            for i in 0..eager_page_count {
+                let va = VirtAddr::new((eager_floor + i * PAGE_SIZE) as u64);
                 let page: Page<Size4KiB> = Page::containing_address(va);
 
                 // M2-1 SLICE-4d: DATA frame via allocate_data_frame (NOT recorded).
@@ -1036,10 +1055,10 @@ fn allocate_user_stack_tracked(
                 stack_mapped.push((page, frame));
                 tracked.push((page, frame));
             }
-            // M0-7: the low guard page MUST stay unmapped (a fully-unused PTE). The loop
-            // started at `usable_base` and never visited the page below it, so this holds
-            // by construction; assert it so a future edit that maps the guard — or installs
-            // an explicit non-present guard PTE that free_address_space's R123-1 leaf
+            // M0-7 SLICE 5: the low guard page + lazy region MUST stay unmapped.
+            // The loop maps only [eager_floor, USER_STACK_TOP), so
+            // [stack_base, usable_base) remains the unmapped guard and
+            // [usable_base, eager_floor) is the lazy region (unmapped until #PF).
             // reclaim would double-free — is caught at boot (debug builds).
             debug_assert!(
                 mgr.translate_addr(VirtAddr::new((usable_base - USER_STACK_GUARD_SIZE) as u64))
@@ -1062,11 +1081,12 @@ fn allocate_user_stack_tracked(
     }
 
     // 【修复】使用直映物理地址清零栈区域
-    // R100-5 FIX: 清零所有已映射的栈页（page_count 页）以防信息泄漏。
-    // M0-7: page_count、charge_bytes 与下面的 remaining 都源自同一 user_stack_layout()
-    // 的 page_count，三者恒一致；故 remaining 恰在覆盖最后一页后归零。下方两个断言把
-    // 这一 lockstep 钉死：半改 page_count 会导致少清零（信息泄漏）或多扣费（cgroup 泄漏）。
-    let mut remaining = page_count * PAGE_SIZE;
+    // R100-5 FIX: 清零所有已映射的栈页（eager_page_count 页）以防信息泄漏。
+    // M0-7 SLICE 5: eager_page_count、charge_bytes 与下面的 remaining 都源自同一
+    // user_stack_layout() 的 eager_page_count，三者恒一致；故 remaining 恰在覆盖
+    // 最后一页后归零。下方两个断言把这一 lockstep 钉死：半改 eager_page_count 会导致
+    // 少清零（信息泄漏）或多扣费（cgroup 泄漏）。
+    let mut remaining = eager_page_count * PAGE_SIZE;
     for (_, frame) in stack_mapped.iter() {
         let base = unsafe { phys_to_virt(frame.start_address()).as_mut_ptr::<u8>() };
         let len = cmp::min(PAGE_SIZE, remaining);
@@ -1080,7 +1100,7 @@ fn allocate_user_stack_tracked(
     }
     debug_assert_eq!(
         stack_mapped.len(),
-        page_count,
+        eager_page_count,
         "stack mapped-page count must equal page_count (charge/zero lockstep)"
     );
     debug_assert_eq!(

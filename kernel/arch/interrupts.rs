@@ -1113,6 +1113,36 @@ extern "x86-interrupt" fn page_fault_handler(
         panic!("Usercopy page fault (details redacted) - TOCTOU detected (no current PID)");
     }
 
+    // M0-7 SLICE 5: User-stack demand-grow handler
+    //
+    // If a user-mode not-present page fault lands in the lazy stack region
+    // [usable_base, eager_floor), try to grow the stack to cover it.
+    //
+    // DEFERRED-CHARGE design (IRQs-off, no Process lock):
+    // 1. Map up to 8 pages in the leaf PT (IRQs-off, bounded time)
+    // 2. Defer the cgroup charge to a process-context safepoint
+    // 3. If charge fails later, the process is killed
+    //
+    // SMP gating: Only enabled on single-CPU until SLICE 6 implements deferred-flush.
+    let is_user_mode = error_code.contains(PageFaultErrorCode::USER_MODE);
+    let is_not_present = !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
+
+    if is_user_mode && is_not_present && fault_addr < USER_SPACE_TOP {
+        // Check if this is a stack grow opportunity
+        if let Some(pid) = kernel_core::process::current_pid() {
+            // SMP gate: Only attempt demand-grow on single-CPU
+            // (SLICE 6 will add deferred TLB flush for SMP)
+            let online_cpus = cpu_local::num_online_cpus();
+            if online_cpus == 1 {
+                // Try to grow the stack (bounded batch, IRQs-off, deferred charge)
+                if kernel_core::syscall::try_demand_grow_user_stack(pid, fault_addr).is_ok() {
+                    // Stack grown successfully, return to user mode
+                    return;
+                }
+            }
+        }
+    }
+
     // 【安全修复 S-3】检查是否为用户态触发的用户空间缺页
     // USER_MODE 标志表示 CPU 在 Ring 3（用户态）时触发了缺页
     // 只有在用户态触发且地址在用户空间时才终止进程
@@ -1354,13 +1384,124 @@ pub struct IrqGprFrame {
 /// offset from the saved GPRs to the CPU-pushed InterruptStackFrame.
 const IRQ_GPR_FRAME_BYTES: usize = 0x78;
 
+// ────────────────────────────────────────────────────────────────────────────────
+// M0-7 SLICE 3b: IRQ-context signal delivery helpers
+// ────────────────────────────────────────────────────────────────────────────────
+
+/// M0-7 SLICE 3b: Extract scalar user-context values from the IRQ-captured GPR frame
+/// and hardware interrupt stack frame. Returns None if this was a kernel-mode interrupt
+/// (RPL != 3).
+fn extract_irq_user_context(
+    gpr: &IrqGprFrame,
+    isf: &x86_64::structures::idt::InterruptStackFrameValue,
+) -> Option<(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)> {
+    // Only extract for Ring-3 interrupts (RPL == 3 in CS).
+    let cs_value: u16 = isf.code_segment.0;
+    if cs_value & 3 != 3 {
+        return None;
+    }
+
+    // Return (rip, rsp, rflags, rax..r15) — all GPRs needed for signal frame construction.
+    Some((
+        isf.instruction_pointer.as_u64(),
+        isf.stack_pointer.as_u64(),
+        isf.cpu_flags.bits(),
+        gpr.rax,
+        gpr.rbx,
+        gpr.rcx,
+        gpr.rdx,
+        gpr.rsi,
+        gpr.rdi,
+        gpr.rbp,
+        gpr.r8,
+        gpr.r9,
+        gpr.r10,
+        gpr.r11,
+        gpr.r12,
+        gpr.r13,
+        gpr.r14,
+        gpr.r15,
+    ))
+}
+
+/// M0-7 SLICE 3b FIX C: Capture the FPU state for an IRQ signal frame.
+/// Atomic-by-construction: FIRST unconditionally copy the 512B IRQ_FPU_AREAS
+/// + read TS/owner lock-free, THEN decide which source to use, THEN optionally
+/// try_lock the PCB for context.fx. On contention, DEFER emits the default state
+/// (no half-image leak).
+unsafe fn capture_irq_sigframe_fpu(pid: usize) -> [u8; 512] {
+    // Phase 1: Lock-free snapshot (IF=0, same-CPU — no race).
+    let per_cpu = current_cpu();
+    let mut local_irq_area = [0u8; 512];
+
+    // Copy from the IRQ FPU save area
+    IRQ_FPU_AREAS.with(|area| {
+        core::ptr::copy_nonoverlapping(
+            area.data.as_ptr(),
+            local_irq_area.as_mut_ptr(),
+            512
+        );
+    });
+
+    let ts_was_set = IRQ_FPU_TS_WAS_SET.with(|flag| flag.load(Ordering::Relaxed));
+    let fpu_owner = per_cpu.get_fpu_owner();
+
+    // Phase 2: Decide which source to use (pure decision logic).
+    #[derive(PartialEq)]
+    enum FpuSource {
+        IrqArea, // !ts_was_set && owner==pid
+        PcbFx,   // fpu_used (needs try_lock)
+        Default, // FCW=0x037F, MXCSR=0x1F80, all XMM/x87 zero
+    }
+
+    let source = if !ts_was_set && fpu_owner == pid {
+        FpuSource::IrqArea
+    } else {
+        // Check if the process has ever used FPU (needs PCB access).
+        match kernel_core::process::try_get_process(pid) {
+            Some(Some(arc)) => match arc.try_lock() {
+                Some(_proc) => {
+                    // The fpu_used flag is not on Context; we conservatively use PcbFx
+                    // if the owner doesn't match (the PCB holds the last saved state).
+                    FpuSource::PcbFx
+                }
+                None => FpuSource::Default, // Contended — defer to default.
+            },
+            _ => FpuSource::Default,
+        }
+    };
+
+    // Phase 3: Select and sanitize the chosen image.
+    let mut result = match source {
+        FpuSource::IrqArea => {
+            // Use the lock-free snapshot.
+            local_irq_area
+        }
+        FpuSource::PcbFx => {
+            // Re-acquire the PCB lock to read context.fx (we dropped it above).
+            match kernel_core::process::try_get_process(pid) {
+                Some(Some(arc)) => match arc.try_lock() {
+                    Some(proc) => proc.context.fx.data,
+                    None => kernel_core::syscall::default_fxsave_area(),
+                },
+                _ => kernel_core::syscall::default_fxsave_area(),
+            }
+        }
+        FpuSource::Default => kernel_core::syscall::default_fxsave_area(),
+    };
+
+    // Sanitize: zero the reserved tail (bytes 416..512).
+    kernel_core::syscall::sanitize_fxsave_for_export(&mut result);
+    result
+}
+
 /// M0-7 SLICE 3a: the timer IRQ Rust body, called by `timer_interrupt_stub` with the
 /// saved GPR file and the hardware InterruptStackFrame. This is the former
 /// `timer_interrupt_handler` body VERBATIM (the hardware frame is read via `isf` instead
-/// of the `extern "x86-interrupt"` `stack_frame` argument). `_gpr` is unused in 3a; SLICE
-/// 3b consumes it to build a preemptive signal frame.
+/// of the `extern "x86-interrupt"` `stack_frame` argument). SLICE 3b consumes `gpr` to
+/// build a preemptive signal frame.
 extern "C" fn timer_interrupt_body(
-    _gpr: &mut IrqGprFrame,
+    gpr: &mut IrqGprFrame,
     isf: &mut x86_64::structures::idt::InterruptStackFrameValue,
 ) {
     let stack_frame = isf;
@@ -1519,7 +1660,71 @@ extern "C" fn timer_interrupt_body(
             }
         }
 
-        kernel_core::request_resched_from_irq();
+        // M0-7 SLICE 3b: IRQ-context signal delivery hook.
+        // INVARIANT FOR FUTURE EDITS (FIX B): This hook site requires: (1) the
+        // syscall-path signal-frame build (maybe_deliver_signal Phase 2/3) completes
+        // entirely at Ring-0 with no SYSRET-to-user before in_signal_handler=true
+        // (see INVARIANT comment at syscall.rs:6966), and (2) the timer IRQ delivers
+        // ONLY when interrupting Ring-3 (RPL==3 gate: `returning_to_user` at line 1477).
+        // If kernel-mode preemption is ever added, a delivery-in-progress interlock
+        // (e.g. an atomic flag checked here + set by maybe_deliver_signal Phase 2)
+        // becomes MANDATORY to prevent double-delivery (IRQ hook + syscall-path both
+        // mid-build). Today the RPL==3 + in_signal_handler exclusion is airtight.
+        if kernel_core::signal::any_handler_installed() {
+            if let Some(pid) = kernel_core::process::current_pid() {
+                // Extract scalar user context from arch-local types.
+                if let Some((rip, rsp, rflags, rax, rbx, rcx, rdx, rsi, rdi, rbp,
+                            r8, r9, r10, r11, r12, r13, r14, r15)) =
+                    extract_irq_user_context(gpr, stack_frame)
+                {
+                    // FIX C: Capture FPU atomically (lock-free snapshot first).
+                    let fpu_state = unsafe { capture_irq_sigframe_fpu(pid) };
+
+                    // Try to deliver (all-try_lock call graph, FIX A).
+                    if let Some((handler_rip, handler_rsp, new_rflags)) =
+                        kernel_core::syscall::try_deliver_signal_on_irq_return(
+                            pid as u64, rip, rsp, rflags, rax, rbx, rcx, rdx, rsi, rdi, rbp,
+                            r8, r9, r10, r11, r12, r13, r14, r15, &fpu_state,
+                        )
+                    {
+                        // Delivery succeeded — redirect the interrupted context.
+                        // Handler entry sees rax=0 (no syscall result on IRQ-return path).
+                        // This is conventional for non-error entry; the interrupted rax is
+                        // preserved in the signal frame ucontext for handler inspection.
+                        gpr.rax = 0;
+                        gpr.rbx = rbx;
+                        gpr.rcx = rcx;
+                        gpr.rdx = rdx;
+                        gpr.rsi = rsi;
+                        gpr.rdi = rdi;
+                        gpr.rbp = rbp;
+                        gpr.r8 = r8;
+                        gpr.r9 = r9;
+                        gpr.r10 = r10;
+                        gpr.r11 = r11;
+                        gpr.r12 = r12;
+                        gpr.r13 = r13;
+                        gpr.r14 = r14;
+                        gpr.r15 = r15;
+                        stack_frame.instruction_pointer = x86_64::VirtAddr::new(handler_rip);
+                        stack_frame.stack_pointer = x86_64::VirtAddr::new(handler_rsp);
+                        stack_frame.cpu_flags = x86_64::registers::rflags::RFlags::from_bits_truncate(new_rflags);
+                        // Do NOT call request_resched_from_irq — we just redirected the return.
+                        // Fall through to irq_restore_fpu and IRETQ.
+                    } else {
+                        // Delivery deferred — proceed with original return + reschedule.
+                        kernel_core::request_resched_from_irq();
+                    }
+                } else {
+                    // Kernel-mode interrupt — original path.
+                    kernel_core::request_resched_from_irq();
+                }
+            } else {
+                kernel_core::request_resched_from_irq();
+            }
+        } else {
+            kernel_core::request_resched_from_irq();
+        }
     }
 
     // R65-18 FIX: Restore FPU state before returning from IRQ

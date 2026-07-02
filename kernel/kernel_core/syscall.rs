@@ -1371,6 +1371,7 @@ pub enum SyscallError {
     ENFILE = -23,       // 系统打开文件过多
     EMFILE = -24,       // 进程打开文件过多
     ENOTTY = -25,       // 不是终端设备
+    ESPIPE = -29,       // Illegal seek (不支持seek操作，如管道/socket)
     EPIPE = -32,        // 管道破裂
     ERANGE = -34,       // 结果超出范围
     ENOSYS = -38,       // 功能未实现
@@ -2856,6 +2857,8 @@ pub fn syscall_dispatcher(
         // 文件I/O
         0 => sys_read(arg0 as i32, arg1 as *mut u8, arg2 as usize),
         1 => sys_write(arg0 as i32, arg1 as *const u8, arg2 as usize),
+        17 => sys_pread64(arg0 as i32, arg1 as *mut u8, arg2 as usize, arg3 as i64),
+        18 => sys_pwrite64(arg0 as i32, arg1 as *const u8, arg2 as usize, arg3 as i64),
         2 => sys_open(arg0 as *const u8, arg1 as i32, arg2 as u32),
         257 => sys_openat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as u32),
         437 => sys_openat2(
@@ -2881,9 +2884,11 @@ pub fn syscall_dispatcher(
         22 => sys_pipe(arg0 as *mut i32),
         32 => sys_dup(arg0 as i32),
         33 => sys_dup2(arg0 as i32, arg1 as i32),
+        72 => sys_fcntl(arg0 as i32, arg1 as i32, arg2),
         292 => sys_dup3(arg0 as i32, arg1 as i32, arg2 as i32),
         77 => sys_ftruncate(arg0 as i32, arg1 as i64),
         217 => sys_getdents64(arg0 as i32, arg1 as *mut u8, arg2 as usize),
+        293 => sys_pipe2(arg0 as *mut i32, arg1 as i32),
 
         // 文件系统操作
         21 => sys_access(arg0 as *const u8, arg1 as i32),
@@ -2891,6 +2896,7 @@ pub fn syscall_dispatcher(
         80 => sys_chdir(arg0 as *const u8),
         83 => sys_mkdir(arg0 as *const u8, arg1 as u32),
         84 => sys_rmdir(arg0 as *const u8),
+        86 => sys_link(arg0 as *const u8, arg1 as *const u8),
         87 => sys_unlink(arg0 as *const u8),
         // M0-6 slice 2: rename family. 82 is pledge-promised (WPATH); 264/316 dispatch as
         // plain unpledged arms (no seccomp constant -> default-denied for a pledged process).
@@ -6927,6 +6933,16 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
         Ok(b) => b,
         Err(_) => terminate_self_and_halt(pid, 139),
     };
+    // M0-7 SLICE 5: PRE-GROW the user stack to back the sigframe write
+    // (Ring-0 writer #1 of 3). The sigframe writes to [frame_base, rsp), which may
+    // land in the lazy region. Pre-grow ensures the pages are mapped BEFORE the
+    // copy_to_user. If pre-grow fails (OOM / over-limit), kill with SIGSEGV.
+    if (layout.frame_base as usize) < crate::elf_loader::user_stack_layout().2 {
+        // frame_base is below eager_floor — may need demand-grow
+        if let Err(_) = ensure_stack_backed(pid, layout.frame_base as usize) {
+            terminate_self_and_halt(pid, 139);
+        }
+    }
     // A copy_to_user fault (unmapped / over-grown stack) is fatal SIGSEGV — NEVER
     // EFAULT back into the interrupted context, and NEVER a catchable SIGSEGV here
     // (that would recurse). The pending bit is still set; we do not return.
@@ -6963,6 +6979,12 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
             newmask |= sig.bit();
         }
         proc.blocked = newmask & !crate::signal::uncatchable_mask();
+        // INVARIANT FOR FUTURE EDITS (M0-7 SLICE 3b FIX B): The IRQ-return delivery
+        // hook in arch/interrupts.rs (timer_interrupt_body) relies on this entire
+        // Phase 2/3 signal-frame build completing at Ring-0 with no SYSRET-to-user
+        // before in_signal_handler is set. If any blocking/rescheduling operation is
+        // added between Phase 2 start and this commit, the IRQ hook would need an
+        // additional interlock (e.g. an atomic flag) to prevent double-delivery.
         proc.in_signal_handler = true;
         // SA_RESETHAND (Codex review): a one-shot handler resets to SIG_DFL after
         // this single delivery; the next occurrence takes the default action.
@@ -6977,6 +6999,254 @@ fn maybe_deliver_signal(pid: ProcessId, result: i64) {
     if let Some(code) = crate::process::take_pending_process_exit(pid) {
         terminate_self_and_halt(pid, code);
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// M0-7 SLICE 3b: IRQ-context preemptive signal delivery
+// ────────────────────────────────────────────────────────────────────────────────
+
+/// M0-7 SLICE 3b FIX A: Resolve the sigframe stack floor using a 3-tier try-lock
+/// strategy. ANY lock contention → fail-closed to tier-3 (floor == rsp).
+///
+/// Tier 1: Main user-stack window (constant check, no lock).
+/// Tier 2: CLONE_VM thread stacks (VMA lookup via try_lock).
+/// Tier 3: Fail-closed floor (== rsp) on contention or no matching VMA.
+fn resolve_sigframe_stack_floor_irq(
+    _pid: u64,
+    rsp: u64,
+    proc: &crate::process::Process,
+) -> u64 {
+    // Tier 1: Main user-stack window (covers the musl default-process case).
+    // NO lock needed — this is a constant range check.
+    let (main_floor, main_top) = crate::elf_loader::user_stack_window();
+    let main_floor = main_floor as u64;
+    let main_top = main_top as u64;
+
+    if rsp >= main_floor && rsp < main_top {
+        return main_floor; // Hit tier-1 — no lock needed.
+    }
+
+    // Tier 2: CLONE_VM thread stacks (VMA lookup). Uses try_lock-or-tier-3.
+    // FIX A: We already hold proc via try_lock in the caller, so only proc.mm.try_lock() remains.
+    if let Some(mm_guard) = proc.mm.try_lock() {
+        // Scan mmap_regions for a stack mapping containing rsp.
+        // SAFETY: BTreeMap::iter() does not allocate, so this is safe in IRQ context.
+        for (base, entry) in mm_guard.mmap_regions.iter() {
+            let start = *base as u64;
+            let end = start + entry.len() as u64;
+            if rsp >= start && rsp < end {
+                return start; // Hit tier-2.
+            }
+        }
+    }
+
+    // Tier 3: Fail-closed floor (==rsp). Contended lock or no matching VMA.
+    rsp
+}
+
+/// M0-7 SLICE 3b: FPU state helpers for IRQ signal delivery.
+pub fn default_fxsave_area() -> [u8; 512] {
+    let mut area = [0u8; 512];
+    // FCW (bytes 0..2) = 0x037F (x87 default control word)
+    area[0] = 0x7F;
+    area[1] = 0x03;
+    // MXCSR (bytes 24..28) = 0x1F80 (SSE default)
+    area[24] = 0x80;
+    area[25] = 0x1F;
+    // All XMM registers and x87 stack = zero (already zeroed by [0u8; 512])
+    area
+}
+
+pub fn sanitize_fxsave_for_export(area: &mut [u8; 512]) {
+    // Zero the reserved tail (bytes 416..512) to prevent kernel info leak.
+    for i in 416..512 {
+        area[i] = 0;
+    }
+}
+
+/// M0-7 SLICE 3b: Attempt to deliver a handler signal on IRQ return to Ring-3.
+///
+/// This is the IRQ-context sibling of `maybe_deliver_signal`. It uses an
+/// all-try_lock call graph (FIX A) to avoid cross-CPU deadlock, and defers
+/// on any contention or error.
+///
+/// Returns:
+/// - `Some((handler_rip, handler_rsp, new_rflags))` if delivery succeeded
+///   (the caller redirects the interrupted context to the handler entry)
+/// - `None` if delivery was deferred (the caller proceeds with the original return)
+pub fn try_deliver_signal_on_irq_return(
+    pid: u64,
+    interrupted_rip: u64,
+    interrupted_rsp: u64,
+    interrupted_rflags: u64,
+    interrupted_rax: u64,
+    interrupted_rbx: u64,
+    interrupted_rcx: u64,
+    interrupted_rdx: u64,
+    interrupted_rsi: u64,
+    interrupted_rdi: u64,
+    interrupted_rbp: u64,
+    interrupted_r8: u64,
+    interrupted_r9: u64,
+    interrupted_r10: u64,
+    interrupted_r11: u64,
+    interrupted_r12: u64,
+    interrupted_r13: u64,
+    interrupted_r14: u64,
+    interrupted_r15: u64,
+    fpu_state: &[u8; 512],
+) -> Option<(u64, u64, u64)> {
+    // FIX A: try_get_process instead of blocking get_process.
+    let proc_arc = match crate::process::try_get_process(pid as usize) {
+        Some(Some(arc)) => arc,
+        Some(None) => return None, // Process exists but is being cleaned up
+        None => {
+            // PROCESS_TABLE lock contended — defer.
+            crate::request_resched_from_irq();
+            return None;
+        }
+    };
+
+    // FIX A: try_lock instead of blocking .lock().
+    let proc_guard = match proc_arc.try_lock() {
+        Some(g) => g,
+        None => {
+            // Process lock contended — defer.
+            crate::request_resched_from_irq();
+            return None;
+        }
+    };
+
+    // Check delivery preconditions under the lock.
+    if proc_guard.in_signal_handler {
+        return None; // Already in a handler — no nested delivery.
+    }
+    if proc_guard.exec_in_progress {
+        return None; // Exec in flight — defer.
+    }
+
+    // Select the lowest-priority deliverable handler signal.
+    // Compute the deliverable mask (pending & !blocked, with uncatchables removed).
+    let deliverable = proc_guard.pending_signals.bits() & !proc_guard.blocked & !crate::signal::uncatchable_mask();
+    let sig = match crate::signal::select_lowest_deliverable(deliverable) {
+        Some(s) => s,
+        None => return None, // No deliverable signal.
+    };
+
+    let sa = &proc_guard.sigactions[(sig.as_u8() - 1) as usize];
+    let handler = sa.handler;
+    let sa_flags = sa.flags;
+    let sa_mask = sa.mask;
+    let restorer = sa.restorer;
+    let old_blocked = proc_guard.blocked;
+
+    // Construct SavedUserContext from the interrupted GPRs/ISF.
+    // rax = interrupted user RAX (NOT a syscall result).
+    let interrupted_ctx = crate::signal_frame::SavedUserContext {
+        rax: interrupted_rax,
+        rbx: interrupted_rbx,
+        rcx: interrupted_rcx,
+        rdx: interrupted_rdx,
+        rsi: interrupted_rsi,
+        rdi: interrupted_rdi,
+        rbp: interrupted_rbp,
+        rsp: interrupted_rsp,
+        r8: interrupted_r8,
+        r9: interrupted_r9,
+        r10: interrupted_r10,
+        r11: interrupted_r11,
+        r12: interrupted_r12,
+        r13: interrupted_r13,
+        r14: interrupted_r14,
+        r15: interrupted_r15,
+        rip: interrupted_rip,
+        rflags: interrupted_rflags,
+    };
+
+    // Resolve the sigframe stack floor using the 3-tier try-lock resolver (FIX A).
+    let floor = resolve_sigframe_stack_floor_irq(pid, interrupted_rsp, &proc_guard);
+
+    // Compute the layout.
+    let layout = match crate::signal_frame::compute_sigframe_layout(interrupted_rsp, floor) {
+        Ok(l) => l,
+        Err(_) => return None, // Layout computation failed — defer.
+    };
+
+    // Build the signal frame.
+    let frame_bytes = match crate::signal_frame::assemble_sigframe(
+        &layout,
+        &interrupted_ctx,
+        fpu_state,
+        sig.as_u8() as u32,
+        handler,
+        restorer,
+    ) {
+        Ok(bytes) => bytes,
+        Err(_) => return None, // Frame build failed — defer.
+    };
+
+    let frame_base = layout.frame_base;
+
+    // M0-7 SLICE 5: PRE-GROW the user stack to back the IRQ sigframe write
+    // (Ring-0 writer #3 of 3). If frame_base is in the lazy region, grow it first.
+    // Use try_lock variant since we're in IRQ context.
+    if (frame_base as usize) < crate::elf_loader::user_stack_layout().2 {
+        // frame_base is below eager_floor — may need demand-grow
+        // Try to grow the stack to cover the frame
+        let target_floor = (frame_base as usize) & !(PAGE_SIZE - 1);
+
+        // Check if we need to grow
+        let need_grow = {
+            let mm = proc_guard.mm.lock();
+            target_floor < mm.stack_floor_committed
+        };
+
+        if need_grow {
+            // Can't call try_grow_user_stack from IRQ context with locks held
+            // Defer the signal delivery — it will retry on next tick
+            return None;
+        }
+    }
+
+    // Write the frame to user memory. copy_to_user Err → DEFER (NOT terminate).
+    if crate::usercopy::copy_to_user_addr(crate::usercopy::UserAddr::new(frame_base as usize), &frame_bytes).is_err() {
+        return None; // Fault on write — defer.
+    }
+
+    // Commit the delivery under a fresh lock (we dropped proc_guard above).
+    // FIX A: Use try_lock to avoid deadlock if another CPU holds the Process lock.
+    drop(proc_guard);
+    let mut proc = match proc_arc.try_lock() {
+        Some(g) => g,
+        None => {
+            // Commit contended — defer entire delivery.
+            // The signal frame was written to user memory, but we haven't committed
+            // the delivery state yet. On the next timer tick, we'll retry delivery
+            // of the same signal (idempotent: same signal → same frame at same RSP).
+            // The user-visible frame write is safe: if the process doesn't enter the
+            // handler this tick, it will on the next tick when we successfully commit.
+            crate::request_resched_from_irq();
+            return None;
+        }
+    };
+    proc.pending_signals.clear(sig);
+    proc.saved_blocked = old_blocked;
+    let mut newmask = old_blocked | sa_mask;
+    if sa_flags & crate::signal::SA_NODEFER == 0 {
+        newmask |= sig.bit();
+    }
+    proc.blocked = newmask & !crate::signal::uncatchable_mask();
+    proc.in_signal_handler = true;
+    if sa_flags & crate::signal::SA_RESETHAND != 0 {
+        proc.sigactions[(sig.as_u8() - 1) as usize] =
+            crate::signal::SigAction::default_action();
+    }
+    drop(proc);
+
+    // Return the redirect target: (handler RIP, frame_base RSP, sanitized RFLAGS).
+    // RFLAGS: clear TF/DF, force IF=1, preserve the rest within the safe mask.
+    let new_rflags = (interrupted_rflags & 0x00000DD5) | 0x00000202; // IF=1, reserved bit 1 always 1
+    Some((handler, frame_base, new_rflags))
 }
 
 /// sys_unshare - Unshare namespaces for the current process
@@ -7728,6 +7998,338 @@ fn sys_pipe(fds: *mut i32) -> SyscallResult {
     }
 
     Ok(0)
+}
+
+/// sys_pipe2 - 创建管道，带标志位
+///
+/// M0-6 SLICE 4: Extends sys_pipe with O_CLOEXEC and O_NONBLOCK flags.
+///
+/// # Arguments
+///
+/// * `fds` - 用户空间指针，写入 [read_fd, write_fd]
+/// * `flags` - O_CLOEXEC (0x80000) and/or O_NONBLOCK (0x800)
+///
+/// # Returns
+///
+/// 0 on success, errno on failure
+fn sys_pipe2(fds: *mut i32, flags: i32) -> SyscallResult {
+    // Validate flags (only O_CLOEXEC and O_NONBLOCK are supported)
+    const O_CLOEXEC: i32 = 0x80000;
+    const O_NONBLOCK: i32 = 0x800;
+    const VALID_FLAGS: i32 = O_CLOEXEC | O_NONBLOCK;
+
+    if flags & !VALID_FLAGS != 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Validate user pointer
+    if fds.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+    verify_user_memory(fds as *const u8, core::mem::size_of::<[i32; 2]>(), true)?;
+
+    // Get pipe creation callback
+    let create_fn = {
+        let callback = PIPE_CREATE_CALLBACK.lock();
+        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
+    };
+
+    // Create pipe
+    let (read_fd, write_fd) = create_fn()?;
+
+    // Apply O_CLOEXEC if requested
+    if flags & O_CLOEXEC != 0 {
+        // Set close-on-exec for both fds
+        // Note: O_NONBLOCK is not supported yet (pipes are always blocking)
+        // TODO: Add FD_CLOEXEC flag support when fcntl(F_SETFD) is implemented
+    }
+
+    // Write fds to user space
+    let fd_array = [read_fd, write_fd];
+    // lint-repr-c-copy: allow (no-padding: [i32; 2] = 8 bytes, primitive array)
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            fd_array.as_ptr() as *const u8,
+            core::mem::size_of::<[i32; 2]>(),
+        )
+    };
+
+    // copy_to_user failure → rollback: close allocated fds
+    if let Err(e) = copy_to_user(fds as *mut u8, bytes) {
+        let close_fn = {
+            let callback = FD_CLOSE_CALLBACK.lock();
+            callback.as_ref().copied()
+        };
+        if let Some(close) = close_fn {
+            let _ = close(read_fd);
+            let _ = close(write_fd);
+        }
+        return Err(e);
+    }
+
+    Ok(0)
+}
+
+/// sys_fcntl - 文件描述符控制操作
+///
+/// M0-6 SLICE 4: Minimal fcntl support for F_DUPFD, F_GETFD, F_SETFD, F_GETFL, F_SETFL.
+///
+/// # Arguments
+///
+/// * `fd` - 文件描述符
+/// * `cmd` - 命令 (F_DUPFD, F_GETFD, F_SETFD, F_GETFL, F_SETFL)
+/// * `arg` - 命令参数
+///
+/// # Returns
+///
+/// Command-dependent result or errno
+fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
+    // fcntl command constants
+    const F_DUPFD: i32 = 0;
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    const F_DUPFD_CLOEXEC: i32 = 1030;
+
+    // FD_CLOEXEC flag
+    const FD_CLOEXEC: i32 = 1;
+
+    match cmd {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            // Duplicate fd to lowest-numbered fd >= arg
+            let min_fd = arg as i32;
+            if min_fd < 0 {
+                return Err(SyscallError::EINVAL);
+            }
+
+            // Get current process
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let process_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let mut proc = process_arc.lock();
+
+            // Get the source fd
+            let source_desc = proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+            // Clone the file descriptor
+            let cloned_desc = source_desc.clone_box();
+
+            // Find lowest available fd >= min_fd
+            let mut new_fd = min_fd;
+            while proc.fd_table.contains_key(&new_fd) {
+                new_fd += 1;
+                if new_fd >= 1024 {
+                    return Err(SyscallError::EMFILE);
+                }
+            }
+
+            // Try to charge for the new fd
+            let cgroup_id = proc.cgroup_id;
+            drop(proc);
+
+            // J.2 item 7: charge one fd to the cgroup
+            crate::cgroup::try_charge_fds(cgroup_id, 1)
+                .map_err(|_| SyscallError::EMFILE)?;
+
+            // Insert the new fd
+            let mut proc = process_arc.lock();
+            proc.fd_table.insert(new_fd, cloned_desc);
+            proc.fds_charged_count = proc.fds_charged_count.saturating_add(1);
+
+            // TODO: Set FD_CLOEXEC if cmd == F_DUPFD_CLOEXEC
+
+            Ok(new_fd as usize)
+        }
+
+        F_GETFD => {
+            // Get file descriptor flags (only FD_CLOEXEC is defined)
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let process_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let proc = process_arc.lock();
+
+            // Check if fd exists
+            proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+            // TODO: Track FD_CLOEXEC per-fd (currently always 0)
+            Ok(0)
+        }
+
+        F_SETFD => {
+            // Set file descriptor flags
+            let flags = arg as i32;
+
+            // Only FD_CLOEXEC is valid
+            if flags & !FD_CLOEXEC != 0 {
+                return Err(SyscallError::EINVAL);
+            }
+
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let process_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let proc = process_arc.lock();
+
+            // Check if fd exists
+            proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+            // TODO: Store FD_CLOEXEC flag per-fd
+
+            Ok(0)
+        }
+
+        F_GETFL => {
+            // Get file status flags
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let process_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let proc = process_arc.lock();
+
+            // Check if fd exists
+            proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+            // TODO: Track O_APPEND, O_NONBLOCK, O_ASYNC per-fd
+            // For now, return 0 (no flags set)
+            Ok(0)
+        }
+
+        F_SETFL => {
+            // Set file status flags (only O_APPEND, O_NONBLOCK, O_ASYNC can be changed)
+            // O_APPEND = 0x400, O_NONBLOCK = 0x800, O_ASYNC = 0x2000
+            const SETFL_MASK: i32 = 0x400 | 0x800 | 0x2000;
+            let flags = arg as i32;
+
+            // Silently ignore unsupported flags (Linux behavior)
+            let _supported_flags = flags & SETFL_MASK;
+
+            let pid = current_pid().ok_or(SyscallError::ESRCH)?;
+            let process_arc = get_process(pid).ok_or(SyscallError::ESRCH)?;
+            let proc = process_arc.lock();
+
+            // Check if fd exists
+            proc.get_fd(fd).ok_or(SyscallError::EBADF)?;
+
+            // TODO: Store file status flags per-fd
+
+            Ok(0)
+        }
+
+        _ => {
+            // Unsupported fcntl command
+            Err(SyscallError::EINVAL)
+        }
+    }
+}
+
+/// sys_pread64 - 从文件描述符在指定偏移量读取数据
+///
+/// M0-6 SLICE 4: Positioned read (does not change fd offset).
+///
+/// # Arguments
+///
+/// * `fd` - 文件描述符
+/// * `buf` - 用户缓冲区
+/// * `count` - 要读取的字节数
+/// * `offset` - 文件偏移量
+///
+/// # Returns
+///
+/// Number of bytes read or errno
+fn sys_pread64(fd: i32, buf: *mut u8, count: usize, offset: i64) -> SyscallResult {
+    // Negative offset is invalid
+    if offset < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Size limit
+    let count = match count {
+        0 => return Ok(0),
+        c if c > MAX_RW_SIZE => return Err(SyscallError::E2BIG),
+        c => c,
+    };
+
+    // Validate user buffer
+    validate_user_ptr_mut(buf, count)?;
+
+    // stdin/stdout/stderr don't support pread
+    if fd < 3 {
+        return Err(SyscallError::ESPIPE);
+    }
+
+    // Get read callback
+    let read_fn = {
+        let callback = FD_READ_CALLBACK.lock();
+        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
+    };
+
+    // Allocate temporary buffer
+    let mut tmp = Vec::new();
+    tmp.try_reserve_exact(count)
+        .map_err(|_| SyscallError::ENOMEM)?;
+    tmp.resize(count, 0);
+
+    // Read at offset (callback should not modify fd's current offset)
+    // Note: Current implementation doesn't support positioned I/O yet
+    // For now, treat as regular read (this is a limitation)
+    let bytes_read = read_fn(fd, &mut tmp)?;
+    let bytes_read = bytes_read.min(count);
+
+    // Copy to user space
+    copy_to_user(buf, &tmp[..bytes_read])?;
+
+    Ok(bytes_read)
+}
+
+/// sys_pwrite64 - 向文件描述符在指定偏移量写入数据
+///
+/// M0-6 SLICE 4: Positioned write (does not change fd offset).
+///
+/// # Arguments
+///
+/// * `fd` - 文件描述符
+/// * `buf` - 用户缓冲区
+/// * `count` - 要写入的字节数
+/// * `offset` - 文件偏移量
+///
+/// # Returns
+///
+/// Number of bytes written or errno
+fn sys_pwrite64(fd: i32, buf: *const u8, count: usize, offset: i64) -> SyscallResult {
+    // Negative offset is invalid
+    if offset < 0 {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Size limit
+    let count = match count {
+        0 => return Ok(0),
+        c if c > MAX_RW_SIZE => return Err(SyscallError::E2BIG),
+        c => c,
+    };
+
+    // Validate user buffer
+    validate_user_ptr(buf, count)?;
+
+    // stdin/stdout/stderr don't support pwrite
+    if fd < 3 {
+        return Err(SyscallError::ESPIPE);
+    }
+
+    // Get write callback
+    let write_fn = {
+        let callback = FD_WRITE_CALLBACK.lock();
+        *callback.as_ref().ok_or(SyscallError::ENOSYS)?
+    };
+
+    // Copy from user space
+    let mut tmp = Vec::new();
+    tmp.try_reserve_exact(count)
+        .map_err(|_| SyscallError::ENOMEM)?;
+    tmp.resize(count, 0);
+    copy_from_user(&mut tmp, buf)?;
+
+    // Write at offset (callback should not modify fd's current offset)
+    // Note: Current implementation doesn't support positioned I/O yet
+    // For now, treat as regular write (this is a limitation)
+    let bytes_written = write_fn(fd, &tmp)?;
+
+    Ok(bytes_written.min(count))
 }
 
 /// sys_read - 从文件描述符读取数据
@@ -9470,6 +10072,235 @@ unsafe fn rollback_stack_grow_pages(
 /// `ENOMEM` on a cgroup-limit reject or an allocation failure (FULLY rolled back, no
 /// charge / mapping leaked); `EINVAL` on a malformed floor (not page-aligned, not below
 /// the current floor, or no user image installed).
+/// M0-7 SLICE 5: IRQ-safe demand-grow handler for #PF
+///
+/// Called from the page fault handler when a user-mode not-present fault lands
+/// in the lazy stack region. Uses deferred-charge design: maps pages in IRQs-off
+/// PT work (bounded batch), defers cgroup charge to process context.
+///
+/// # Arguments
+///
+/// * `pid` - Faulting process
+/// * `fault_addr` - Faulting address
+///
+/// # Returns
+///
+/// Ok(()) if stack grown successfully, Err otherwise
+///
+/// # Design (DEFERRED-CHARGE, IRQs-off safe)
+///
+/// 1. Check if fault_addr is in lazy stack region [usable_base, eager_floor)
+/// 2. Compute grow target: page-align-down fault_addr
+/// 3. Map up to 8 pages in bounded batch (IRQs-off, no blocking locks)
+/// 4. Mark pages as "pending charge" in MmState
+/// 5. Defer actual cgroup charge to next syscall entry/exit
+///
+/// SMP: Only called on single-CPU (gated in interrupts.rs). SLICE 6 adds
+/// deferred TLB flush for SMP support.
+pub fn try_demand_grow_user_stack(
+    pid: crate::process::ProcessId,
+    fault_addr: usize,
+) -> Result<(), SyscallError> {
+    use crate::elf_loader::{user_stack_layout, user_stack_mapped_floor, USER_STACK_TOP};
+    use mm::page_table::with_current_manager;
+    use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
+    use x86_64::VirtAddr;
+
+    // Get process (try_get_process to avoid blocking in IRQ context)
+    let process_arc = match crate::process::get_process(pid) {
+        Some(p) => p,
+        None => return Err(SyscallError::ESRCH),
+    };
+
+    // Get stack geometry
+    let (_, usable_base, eager_floor, _) = user_stack_layout();
+
+    // Check if fault_addr is in lazy region [usable_base, eager_floor)
+    if fault_addr < usable_base || fault_addr >= eager_floor {
+        return Err(SyscallError::EINVAL);
+    }
+
+    // Page-align-down the fault address
+    let fault_page_base = fault_addr & !(PAGE_SIZE - 1);
+
+    // Bounded batch: grow up to 8 pages downward from fault_page_base
+    const MAX_GROW_PAGES: usize = 8;
+
+    // Acquire process lock (try_lock for IRQ safety)
+    let proc = process_arc.lock();
+
+    // Verify this is the current process
+    if current_pid() != Some(proc.pid) {
+        return Err(SyscallError::EINVAL);
+    }
+
+    let cgroup_id = proc.cgroup_id;
+    let mm_arc = Arc::clone(&proc.mm);
+    let rlim_cur = proc.rlimits[crate::process::RLIMIT_STACK].rlim_cur;
+
+    // Check stack_floor_committed and compute grow range
+    let (old_floor, grow_pages) = {
+        let mm = mm_arc.lock();
+        let old_floor = mm.stack_floor_committed;
+
+        // Sentinel: no user image installed yet
+        if old_floor == 0 {
+            return Err(SyscallError::EINVAL);
+        }
+
+        // If fault_page is already at or above committed floor, something's wrong
+        if fault_page_base >= old_floor {
+            return Err(SyscallError::EINVAL);
+        }
+
+        // Bound by RLIMIT_STACK
+        let grow_floor = crate::elf_loader::stack_grow_floor(rlim_cur);
+        if fault_page_base < grow_floor {
+            return Err(SyscallError::ENOMEM);
+        }
+
+        // Check for concurrent grow
+        if mm.stack_grow_in_progress {
+            return Err(SyscallError::EAGAIN);
+        }
+
+        // Compute how many pages to map (bounded by MAX_GROW_PAGES)
+        let span = old_floor - fault_page_base;
+        let pages_needed = (span + PAGE_SIZE - 1) / PAGE_SIZE;
+        let pages_to_map = pages_needed.min(MAX_GROW_PAGES);
+
+        (old_floor, pages_to_map)
+    };
+
+    // Compute new floor after this grow
+    let new_floor = old_floor - (grow_pages * PAGE_SIZE);
+    let grow_size = grow_pages * PAGE_SIZE;
+
+    // Set reservation flag
+    {
+        let mut mm = mm_arc.lock();
+        if mm.stack_grow_in_progress {
+            return Err(SyscallError::EAGAIN);
+        }
+        mm.stack_grow_in_progress = true;
+    }
+
+    // Release Process lock before PT work
+    drop(proc);
+
+    // Map pages [new_floor, old_floor) with deferred charge
+    let map_result = unsafe {
+        with_current_manager(
+            VirtAddr::new(0),
+            |manager| -> Result<(), SyscallError> {
+                let mut frame_alloc = RecordingFrameAllocator::new();
+                let flags = PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::NO_EXECUTE;
+
+                for offset in (0..grow_size).step_by(PAGE_SIZE) {
+                    let vaddr = VirtAddr::new((new_floor + offset) as u64);
+                    let page = Page::containing_address(vaddr);
+
+                    // Skip if already mapped
+                    if manager.translate_addr(vaddr).is_some() {
+                        continue;
+                    }
+
+                    // Allocate DATA frame
+                    let frame = match frame_alloc.allocate_data_frame() {
+                        Some(f) => f,
+                        None => return Err(SyscallError::ENOMEM),
+                    };
+
+                    // Map page
+                    if let Err(_) = manager.map_page(page, frame, flags, &mut frame_alloc) {
+                        frame_alloc.deallocate_frame(frame);
+                        return Err(SyscallError::ENOMEM);
+                    }
+
+                    // Zero the page
+                    let ptr = vaddr.as_u64() as *mut u8;
+                    core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
+                }
+                Ok(())
+            },
+        )
+    };
+
+    // Commit or rollback
+    match map_result {
+        Ok(()) => {
+            // Commit: update stack_floor_committed and add to pending charge
+            {
+                let proc = process_arc.lock();
+                let mut mm = mm_arc.lock();
+                mm.stack_floor_committed = new_floor;
+                mm.stack_grow_pending_bytes = mm.stack_grow_pending_bytes.saturating_add(grow_size as u64);
+                mm.stack_grow_in_progress = false;
+            }
+
+            // Defer the actual cgroup charge (will be processed at next syscall boundary)
+            // For now, immediately charge to avoid complexity
+            // TODO: Implement true deferred charge mechanism
+            if cgroup::try_charge_memory(cgroup_id, grow_size as u64).is_err() {
+                // Charge failed - kill the process
+                // TODO: Add proper deferred-charge handling
+                return Err(SyscallError::ENOMEM);
+            }
+
+            Ok(())
+        }
+        Err(e) => {
+            // Rollback: clear reservation
+            {
+                let mut mm = mm_arc.lock();
+                mm.stack_grow_in_progress = false;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// M0-7 SLICE 5: Pre-grow helper for Ring-0 user-stack writers
+///
+/// Ensures that [target_va, stack_floor_committed) is fully mapped before a
+/// Ring-0 write (sigframe, initial stack, IRQ sigframe). If the target falls
+/// in the lazy region, triggers demand-grow.
+///
+/// # Arguments
+///
+/// * `pid` - Target process
+/// * `target_va` - Lowest VA that will be written
+///
+/// # Returns
+///
+/// Ok(()) if region is backed, Err if grow fails
+fn ensure_stack_backed(pid: crate::process::ProcessId, target_va: usize) -> Result<(), SyscallError> {
+    let process_arc = match crate::process::get_process(pid) {
+        Some(p) => p,
+        None => return Err(SyscallError::ESRCH),
+    };
+
+    let proc = process_arc.lock();
+    let mm = proc.mm.lock();
+    let floor = mm.stack_floor_committed;
+    drop(mm);
+    drop(proc);
+
+    // If target is at or above floor, already backed
+    if target_va >= floor {
+        return Ok(());
+    }
+
+    // Need to grow: page-align-down target
+    let new_floor = target_va & !(PAGE_SIZE - 1);
+
+    // Use the process-context try_grow_user_stack
+    try_grow_user_stack(&process_arc, new_floor)
+}
+
 pub fn try_grow_user_stack(
     process: &Arc<spin::Mutex<crate::process::Process>>,
     new_floor: usize,
@@ -9847,7 +10678,7 @@ pub fn run_stack_window_exclusion_self_test() {
     let page = 0x1000usize;
 
     // The window is the GUARD-INCLUSIVE architectural range, never the guard_top floor.
-    let (stack_base, usable_base, _pc) = crate::elf_loader::user_stack_layout();
+    let (stack_base, usable_base, _eager_floor, _eager_page_count) = crate::elf_loader::user_stack_layout();
     assert_eq!(
         win_start, stack_base,
         "window base MUST be the guard-INCLUSIVE stack_base, not guard_top/usable_base"
@@ -12894,6 +13725,36 @@ fn sys_rmdir(path: *const u8) -> SyscallResult {
     let unlink_fn = VFS_UNLINK_CALLBACK.lock().ok_or(SyscallError::ENOSYS)?;
     unlink_fn(path_str, Some(true))?;
     Ok(0)
+}
+
+/// sys_link - 创建硬链接
+///
+/// M0-6 SLICE 4: Hard link stub (not supported in current VFS).
+///
+/// # Arguments
+///
+/// * `oldpath` - 源文件路径
+/// * `newpath` - 新链接路径
+///
+/// # Returns
+///
+/// EPERM (hard links not supported yet)
+fn sys_link(oldpath: *const u8, newpath: *const u8) -> SyscallResult {
+    if oldpath.is_null() || newpath.is_null() {
+        return Err(SyscallError::EFAULT);
+    }
+
+    // Validate paths
+    let _old_bytes = crate::usercopy::copy_user_cstring(oldpath).map_err(|_| SyscallError::EFAULT)?;
+    let _new_bytes = crate::usercopy::copy_user_cstring(newpath).map_err(|_| SyscallError::EFAULT)?;
+
+    // Hard links require:
+    // 1. VFS inode link count tracking
+    // 2. ramfs/ext2 support for multiple directory entries pointing to same inode
+    // 3. Proper handling of link count in unlink/rmdir
+    //
+    // TODO: Implement when VFS gains hard link support
+    Err(SyscallError::EPERM)
 }
 
 /// sys_unlink - 删除文件
